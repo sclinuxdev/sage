@@ -4,7 +4,7 @@
 -- Linking: Fully dynamically linked to system shared libraries
 
 set_project("sage")
-set_version("0.1.2")
+set_version("0.1.3")
 set_license("BSD-2-Clause")
 set_description("Sage: High-performance, modular, multi-layer universal Linux package manager")
 

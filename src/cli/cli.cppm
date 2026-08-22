@@ -27,7 +27,7 @@ struct CliOptions {
 };
 
 void print_banner() {
-    std::println("{}🌿 Sage Package Manager v0.1.2 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
+    std::println("{}🌿 Sage Package Manager v0.1.3 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
 }
 
 void print_help() {
