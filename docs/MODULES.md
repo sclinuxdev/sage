@@ -22,7 +22,7 @@ graph TD
     subgraph Layer2["Layer 2: Models & Parsing (src/model/)"]
         CONFIG["sage.config<br/>(system.toml parser & provider configuration)"]
         PKG["sage.package<br/>(Package model, recipe.toml, manifest.toml, triggers)"]
-        SVC["sage.service<br/>(Universal service.toml -> OpenRC/Runit/Systemd/Dinit/s6)"]
+        SVC["sage.service<br/>(Universal service.toml -> Loom/OpenRC/Runit/Systemd/Dinit/s6)"]
     end
 
     subgraph SysSubgraph["System Subsystems (src/sys/)"]

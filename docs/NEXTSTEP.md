@@ -47,7 +47,7 @@ config_dir = "/etc/sage"
 
 [providers]
 # Core mutually exclusive system structural components
-init = "openrc"        # Options: openrc, systemd, runit, dinit, s6
+init = "openrc"        # Options: loom, openrc, systemd, runit, dinit, s6
 udev = "eudev"         # Options: eudev, systemd-udev, mdev-ng
 libc = "glibc"         # Options: glibc, musl
 ```

@@ -455,6 +455,10 @@ public:
         std::string init_prov = desired_config.providers.contains("virtual/init") ? 
                                 desired_config.providers.at("virtual/init") : "openrc";
         plan.target_init = service::parse_init_type(init_prov);
+        if (plan.target_init == service::InitType::Unknown) {
+            return std::unexpected(std::format(
+                "Unsupported virtual/init provider '{}'", init_prov));
+        }
 
         if (!plan.has_changes) {
             return plan;
@@ -624,6 +628,7 @@ public:
                 service::remove_service(removal.name, service::InitType::Runit, sysroot);
                 service::remove_service(removal.name, service::InitType::Dinit, sysroot);
                 service::remove_service(removal.name, service::InitType::S6, sysroot);
+                service::remove_service(removal.name, service::InitType::Loom, sysroot);
             }
         }
 
@@ -710,7 +715,10 @@ public:
                     service::to_string(plan.target_init));
                 continue;
             }
-            auto gen_res = service::generate_service(*spec, plan.target_init, sysroot);
+            auto gen_res = plan.target_init == service::InitType::Loom
+                ? service::generate_loom_service(
+                    pkg.service_toml, spec->name, sysroot)
+                : service::generate_service(*spec, plan.target_init, sysroot);
             if (gen_res) {
                 gen_count++;
             } else {

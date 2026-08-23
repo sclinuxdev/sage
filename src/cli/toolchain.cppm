@@ -77,7 +77,7 @@ export int cmd_service(const CliOptions& opts) {
     }
     std::string sub = opts.args[0];
     if (sub == "list") {
-        sage::util::log_info("Available native init targets: OpenRC, Runit, Systemd, Dinit, s6");
+        sage::util::log_info("Available native init targets: Loom, OpenRC, Runit, Systemd, Dinit, s6");
     } else if (sub == "generate" && opts.args.size() >= 2) {
         std::string name = opts.args[1];
         sage::service::ServiceSpec spec;

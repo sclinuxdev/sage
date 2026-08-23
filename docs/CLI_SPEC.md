@@ -110,7 +110,7 @@ sage query owner /usr/bin/rg
 ```
 
 ### `sage service [list|status|generate]`
-Inspects daemon definitions and manually re-generates service scripts.
+Inspects daemon definitions and manually re-generates native Loom or legacy init service definitions.
 ```bash
 # List all installed services and their active init mapping
 sage service list

@@ -878,6 +878,22 @@ install = [
         sage::util::log_error("Service generation test failed");
         return 1;
     }
+    auto loom_destination = sage::service::service_destination(
+        "sshd", sage::service::InitType::Loom, extract_root);
+    auto schema_two = sage::service::ServiceSpec::parse_toml(R"(
+schema_version = 2
+[service]
+name = "sshd"
+command = ["/usr/bin/sshd", "-D"]
+restart = "on-failure"
+)");
+    if (!loom_destination
+        || *loom_destination != extract_root / "usr/lib/loom/services/sshd.toml"
+        || !schema_two
+        || schema_two->command != std::vector<std::string>{"/usr/bin/sshd", "-D"}) {
+        sage::util::log_error("Loom service target or schema v2 parsing failed");
+        return 1;
+    }
     std::ifstream openrc_script(extract_root / "etc/init.d/sshd");
     std::string openrc_shebang;
     std::getline(openrc_script, openrc_shebang);
@@ -885,7 +901,7 @@ install = [
         sage::util::log_error("OpenRC service uses a non-canonical interpreter path");
         return 1;
     }
-    sage::util::log_success("4. Universal Multi-Init Service Generator (OpenRC/Systemd/Runit/Dinit/s6) OK");
+    sage::util::log_success("4. Universal Multi-Init Service Generator (Loom/OpenRC/Systemd/Runit/Dinit/s6) OK");
 
     // 5. LMDB Database & Rebuild Engine Test
     auto db_dir = temp_dir / "db";

@@ -22,7 +22,7 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
   - Performs atomic package swaps (e.g., swapping `systemd` with `openrc` + `eudev`).
   - Automatically re-generates native service configurations for all installed daemons.
 * **🔌 Universal Service Specification (`service.toml`)**:
-  - Package daemons are declared with a single init-agnostic spec, auto-compiled into **OpenRC**, **Runit**, **Systemd**, **Dinit**, or **s6** scripts.
+  - Package daemons are declared with a single init-agnostic spec, auto-compiled into native **Loom**, **OpenRC**, **Runit**, **Systemd**, **Dinit**, or **s6** definitions.
 * **🧩 Native C++23 PubGrub / CDCL SAT Dependency Solver**:
   - Zero external solver dependencies.
   - Generates clear, human-readable conflict diagnostic cause trees.
@@ -39,7 +39,7 @@ sage
  ├── 状态引擎: LMDB (零拷贝 mmap B+ 树，/var/lib/sage/data.mdb，微秒级读写)
  ├── 归档引擎: libzstd + 原生 C++23 流式 Tar 解包与打包器 (无 libarchive 依赖)
  ├── 求解引擎: 自研 C++23 PubGrub / CDCL SAT 依赖求解器 (顶级因果树诊断)
- ├── 服务体系: 通用 service.toml -> OpenRC / Runit / Systemd / Dinit / s6 自动生成
+ ├── 服务体系: 通用 service.toml -> Loom / OpenRC / Runit / Systemd / Dinit / s6 自动生成
  ├── 抽象收敛: 精简虚拟提供者 virtual/init, virtual/udev, virtual/libc
  └── 系统重构: sage rebuild 自动基于 /etc/sage/system.toml 执行原子大件迁移与服务重构
 ```
