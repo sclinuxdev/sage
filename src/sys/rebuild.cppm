@@ -699,6 +699,10 @@ public:
             if (pkg.service_toml.empty()) continue;
             auto spec = service::ServiceSpec::parse_toml(pkg.service_toml);
             if (!spec) {
+                if (plan.target_init == service::InitType::Loom) {
+                    return std::unexpected(std::format(
+                        "Invalid service for '{}': {}", pkg.name, spec.error()));
+                }
                 util::log_warn("Skipping service for '{}': {}", pkg.name, spec.error());
                 continue;
             }
@@ -707,6 +711,10 @@ public:
             // wins over the generated form.
             auto dest = service::service_destination(spec->name, plan.target_init, sysroot);
             if (!dest) {
+                if (plan.target_init == service::InitType::Loom) {
+                    return std::unexpected(std::format(
+                        "Invalid Loom destination for '{}': {}", pkg.name, dest.error()));
+                }
                 util::log_warn("Skipping service for '{}': {}", pkg.name, dest.error());
                 continue;
             }
@@ -722,10 +730,17 @@ public:
                 : service::generate_service(*spec, plan.target_init, sysroot);
             if (gen_res) {
                 gen_count++;
+            } else if (plan.target_init == service::InitType::Loom) {
+                return std::unexpected(std::format(
+                    "Cannot generate Loom service for '{}': {}", pkg.name, gen_res.error()));
             } else {
                 util::log_warn("Cannot generate {} script for '{}': {}",
                     service::to_string(plan.target_init), pkg.name, gen_res.error());
             }
+        }
+        if (plan.target_init == service::InitType::Loom) {
+            auto valid = service::validate_loom_services(sysroot);
+            if (!valid) return std::unexpected(valid.error());
         }
 
         // 5. Execute post-transaction triggers

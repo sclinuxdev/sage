@@ -427,6 +427,38 @@ inline std::expected<std::filesystem::path, std::string> generate_loom_service(
     return *destination;
 }
 
+inline std::expected<void, std::string> validate_loom_services(
+    const std::filesystem::path& sysroot = "/")
+{
+    const auto executable = std::filesystem::absolute(
+        sysroot / "usr/lib/loom/loom").string();
+    const auto root = std::filesystem::absolute(sysroot).string();
+    const pid_t child = ::fork();
+    if (child < 0) {
+        return std::unexpected(std::format(
+            "Cannot fork Loom validator: {}", std::strerror(errno)));
+    }
+    if (child == 0) {
+        ::execl(
+            executable.c_str(), executable.c_str(), "validate", "--root",
+            root.c_str(), static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        return std::unexpected(std::format(
+            "Cannot wait for Loom validator: {}", std::strerror(errno)));
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return std::unexpected(std::string("Loom rejected the generated service graph"));
+    }
+    return {};
+}
+
 inline bool remove_service(
     std::string_view name,
     InitType init_type,

@@ -901,6 +901,23 @@ restart = "on-failure"
         sage::util::log_error("Loom service target or schema v2 parsing failed");
         return 1;
     }
+    const auto loom_binary = extract_root / "usr/lib/loom/loom";
+    std::filesystem::create_directories(loom_binary.parent_path());
+    {
+        std::ofstream validator(loom_binary);
+        validator << "#!/bin/sh\n[ \"$1\" = validate ]\n";
+    }
+    std::filesystem::permissions(loom_binary, std::filesystem::perms::owner_all);
+    auto valid_loom_graph = sage::service::validate_loom_services(extract_root);
+    {
+        std::ofstream validator(loom_binary);
+        validator << "#!/bin/sh\nexit 1\n";
+    }
+    auto invalid_loom_graph = sage::service::validate_loom_services(extract_root);
+    if (!valid_loom_graph || invalid_loom_graph) {
+        sage::util::log_error("Loom graph validation result was not enforced");
+        return 1;
+    }
     std::ifstream openrc_script(extract_root / "etc/init.d/sshd");
     std::string openrc_shebang;
     std::getline(openrc_script, openrc_shebang);
