@@ -19,12 +19,12 @@ To ensure long-term stability, deterministic upgrades, and backward/forward comp
         ┌───────────────────────┬─────────────┴─────────┬────────────────────────┐
         ▼                       ▼                       ▼                        ▼
 【系统与通道配置】        【包配方与清单】          【服务与触发器】          【远程仓库索引】
-system.toml (v1)        recipe.toml (v1)        service.toml (v1)        index.toml (v1)
+system.toml (v1)        recipe.toml (v1)        service.toml (v2)        index.toml (v1)
 channels.toml (v1)      manifest.toml (v1)      triggers.toml (v1)       files.idx (v1)
 ```
 
 ### 1.1 Compatibility Invariants
-* **Current Supported Version**: `schema_version = 1`.
+* **Current Supported Versions**: `schema_version = 1` for v1 formats and `schema_version = 2` for `service.toml`.
 * **Forward Compatibility Rule**: If a Sage engine reads a file with `schema_version > CURRENT_SUPPORTED_VERSION`, it MUST fail gracefully with an explicit diagnostic message instructing the user to upgrade `sage`.
 * **Backward Compatibility Rule**: When newer schema versions are introduced (e.g. `v2`), future Sage engines MUST maintain zero-copy parsing adapters or migration handlers for older schema versions.
 
@@ -211,19 +211,17 @@ provides = [
 conflicts = []
 ```
 
-### 3.3 Universal Daemon Specification `service.toml` (Schema Version 1)
+### 3.3 Universal Daemon Specification `service.toml` (Schema Version 2)
 Included inside `.METADATA/service.toml` (or auto-generated for init daemons):
 
 ```toml
 # .METADATA/service.toml - Universal Service Specification
-schema_version = 1
+schema_version = 2
 
 [service]
 name = "sshd"
 description = "OpenSSH Server Daemon"
-exec_start = "/usr/sbin/sshd -D"
-exec_stop = "/bin/kill -TERM $MAINPID"
-exec_reload = "/bin/kill -HUP $MAINPID"
+command = ["/usr/sbin/sshd", "-D"]
 user = "root"
 group = "root"
 working_dir = "/"
