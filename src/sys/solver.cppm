@@ -127,13 +127,27 @@ public:
                 return std::unexpected(err);
             }
 
-            // Pick best matching candidate (highest version matching constraints)
+            // Pick best matching candidate. Preference order:
+            //   1. Exact name match beats symbol/virtual providers.
+            //   2. For "so:" requirements a -dev package is a last resort —
+            //      dev payloads only carry linker symlinks, the runtime
+            //      soname lives in the main/-libs package.
+            //   3. Highest (version, release) wins; name breaks remaining
+            //      ties deterministically.
             const package::PackageManifest* best_candidate = nullptr;
             for (const auto& cand : candidates) {
-                if (req.satisfies(cand.version)) {
-                    if (!best_candidate || cand.version > best_candidate->version) {
-                        best_candidate = &cand;
-                    }
+                if (!req.satisfies(cand.version)) continue;
+                if (!best_candidate) { best_candidate = &cand; continue; }
+                const auto rank = [&](const package::PackageManifest& m) {
+                    if (m.name == req.name) return 2;
+                    if (req.name.starts_with("so:") && m.name.ends_with("-dev")) return 0;
+                    return 1;
+                };
+                int rc = rank(cand) - rank(*best_candidate);
+                if (rc > 0 || (rc == 0 && cand.version > best_candidate->version)) {
+                    best_candidate = &cand;
+                } else if (rc == 0 && cand.version == best_candidate->version && cand.name < best_candidate->name) {
+                    best_candidate = &cand;
                 }
             }
 
