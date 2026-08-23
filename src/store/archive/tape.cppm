@@ -222,7 +222,7 @@ inline std::expected<void, std::string> walk_archive_entries(
 {
     vendor::zstd::ZstdDecompressStream zstd_stream;
     if (!zstd_stream) {
-        return std::unexpected("Failed to initialize ZSTD decompressor");
+        return std::unexpected(std::string("Failed to initialize ZSTD decompressor"));
     }
 
     constexpr size_t in_buf_size = 64 * 1024;
@@ -253,14 +253,14 @@ inline std::expected<void, std::string> walk_archive_entries(
                 continue;
             }
             if (end_zero_blocks > 0) {
-                return std::unexpected("Tar archive contains data after its end marker");
+                return std::unexpected(std::string("Tar archive contains data after its end marker"));
             }
 
             // Verify checksum
             uint32_t expected_chk = static_cast<uint32_t>(parse_octal(hdr->chksum, sizeof(hdr->chksum)));
             uint32_t actual_chk = compute_tar_checksum(*hdr);
             if (expected_chk != actual_chk) {
-                return std::unexpected("Tar header checksum mismatch");
+                return std::unexpected(std::string("Tar header checksum mismatch"));
             }
 
             std::string full_name;
@@ -326,7 +326,7 @@ inline std::expected<void, std::string> walk_archive_entries(
         return std::unexpected("Truncated tar block in package archive: " + std::string(archive_name));
     }
     if (end_zero_blocks < 2) {
-        return std::unexpected("Tar archive is missing its end marker");
+        return std::unexpected(std::string("Tar archive is missing its end marker"));
     }
 
     return {};
@@ -364,32 +364,32 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
     auto walk_res = walk_archive_entries(archive_file, archive_name, [&](const ArchiveEntryView& entry)
         -> std::expected<void, std::string> {
         if (entry.name == ".METADATA/manifest.toml") {
-            if (manifest_seen) return std::unexpected("Package archive contains multiple manifests");
-            if (entry.typeflag != '0') return std::unexpected("Package manifest must be a regular file");
+            if (manifest_seen) return std::unexpected(std::string("Package archive contains multiple manifests"));
+            if (entry.typeflag != '0') return std::unexpected(std::string("Package manifest must be a regular file"));
             manifest_seen = true;
             manifest_content.assign(
                 reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
             return {};
         }
         if (entry.name == ".METADATA/service.toml") {
-            if (service_seen) return std::unexpected("Package archive contains multiple service manifests");
-            if (entry.typeflag != '0') return std::unexpected("Package service manifest must be a regular file");
+            if (service_seen) return std::unexpected(std::string("Package archive contains multiple service manifests"));
+            if (entry.typeflag != '0') return std::unexpected(std::string("Package service manifest must be a regular file"));
             service_seen = true;
             service_content.assign(
                 reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
             return {};
         }
         if (entry.name == ".METADATA/triggers.toml") {
-            if (triggers_seen) return std::unexpected("Package archive contains multiple trigger manifests");
-            if (entry.typeflag != '0') return std::unexpected("Package trigger manifest must be a regular file");
+            if (triggers_seen) return std::unexpected(std::string("Package archive contains multiple trigger manifests"));
+            if (entry.typeflag != '0') return std::unexpected(std::string("Package trigger manifest must be a regular file"));
             triggers_seen = true;
             triggers_content.assign(
                 reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
             return {};
         }
         if (entry.name == ".METADATA/files.idx") {
-            if (files_idx_seen) return std::unexpected("Package archive contains multiple file indexes");
-            if (entry.typeflag != '0') return std::unexpected("Package file index must be a regular file");
+            if (files_idx_seen) return std::unexpected(std::string("Package archive contains multiple file indexes"));
+            if (entry.typeflag != '0') return std::unexpected(std::string("Package file index must be a regular file"));
             files_idx_seen = true;
             files_idx_content.assign(
                 reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
@@ -434,7 +434,7 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
     if (!walk_res) return std::unexpected(walk_res.error());
 
     if (!manifest_seen) {
-        return std::unexpected("Package archive is missing .METADATA/manifest.toml");
+        return std::unexpected(std::string("Package archive is missing .METADATA/manifest.toml"));
     }
     auto manifest_res = package::PackageManifest::parse_toml(manifest_content);
     if (!manifest_res) {
