@@ -105,6 +105,13 @@ export int cmd_install(
                 sage::util::log_error("Invalid package archive '{}': {}", arg, inspect_res.error());
                 return 1;
             }
+            if (!sage::package::package_architecture_matches(
+                    inspect_res->manifest.arch, cfg.architecture)) {
+                sage::util::log_error(
+                    "Package archive '{}' targets architecture '{}', but this system targets '{}'",
+                    arg, inspect_res->manifest.arch, cfg.architecture);
+                return 1;
+            }
             if (!direct_package_names.insert(inspect_res->manifest.name).second) {
                 sage::util::log_error(
                     "Multiple direct archives were provided for package '{}'",
