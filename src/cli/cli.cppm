@@ -26,8 +26,14 @@ struct CliOptions {
     int wait_seconds{0};      // --wait[=SECONDS]: wait for a concurrent sage
 };
 
+#ifndef SAGE_VERSION
+// 直接调用编译器而不经 xmake 时的兜底。走正常构建路径时永远用不到这一支。
+#define SAGE_VERSION "0.0.0-unknown"
+#endif
+
 void print_banner() {
-    std::println("{}🌿 Sage Package Manager v0.1.3 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
+    std::println("{}🌿 Sage Package Manager v{} (Modern C++23){}",
+                 sage::util::color::green, SAGE_VERSION, sage::util::color::reset);
 }
 
 void print_help() {
