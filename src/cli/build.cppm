@@ -448,6 +448,8 @@ export int cmd_build(const CliOptions& opts) {
                     jobs_makeflags, jobs,
                     pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(),
                     work_dir.string(), cmd_line);
+                if (opts.verbose)
+                    sage::util::log_info("CMD: {}", full_cmd);
                 int ret = std::system(full_cmd.c_str());
                 if (ret != 0) {
                     sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
