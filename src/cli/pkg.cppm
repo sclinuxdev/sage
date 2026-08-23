@@ -46,14 +46,18 @@ std::expected<std::vector<Result>, std::string> collect_parallel(
     const auto worker_count = std::min<size_t>(count, std::max(1U, requested));
     std::vector<std::optional<Result>> slots(count);
     std::vector<std::string> errors(count);
-    std::atomic_size_t next{0};
+    // Plain size_t + __atomic_fetch_add: GCC's modules implementation loses
+    // the always_inline body of std::atomic's fetch_add across a module
+    // import, which fails instantiation of this template in test binaries.
+    size_t next{0};
     std::atomic_bool failed{false};
     std::vector<std::jthread> workers;
     workers.reserve(worker_count);
     for (size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&] {
             while (!failed.load(std::memory_order_relaxed)) {
-                const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                const auto index = __atomic_fetch_add(
+                    &next, static_cast<size_t>(1), __ATOMIC_RELAXED);
                 if (index >= count) return;
                 auto result = work(index);
                 if (!result) {
