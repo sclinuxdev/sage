@@ -241,13 +241,12 @@ export int cmd_install(
     std::map<sage::package::PackageIdentity, sage::archive::InspectedPackage> inspected_packages;
     for (const auto& pkg : unique_to_install) {
         const auto identity = sage::package::package_identity(pkg);
-        auto archive_it = package_archive_map.find(identity);
-        if (archive_it == package_archive_map.end() || !std::filesystem::exists(archive_it->second)) {
-            sage::util::log_error("Package archive for '{}' not found at {}", pkg.name,
-                (archive_it != package_archive_map.end()) ? archive_it->second.string() : "<unknown>");
+        auto archive_res = sage::rebuild::ensure_local_archive(snapshot, identity);
+        if (!archive_res) {
+            sage::util::log_error("{}", archive_res.error());
             return 1;
         }
-        auto inspect_res = sage::archive::inspect_package(archive_it->second);
+        auto inspect_res = sage::archive::inspect_package(*archive_res);
         if (!inspect_res) {
             sage::util::log_error(
                 "Invalid package archive for '{}': {}", pkg.name, inspect_res.error());
@@ -351,7 +350,11 @@ export int cmd_install(
     // 3. Streaming Unpack & LMDB State Registration
     for (const auto& pkg : unique_to_install) {
         const auto identity = sage::package::package_identity(pkg);
-        auto archive_it = package_archive_map.find(identity);
+        auto archive_res = sage::rebuild::ensure_local_archive(snapshot, identity);
+        if (!archive_res) {
+            sage::util::log_error("{}", archive_res.error());
+            return 1;
+        }
         auto inspected_it = inspected_packages.find(identity);
         auto package_txn = db.begin_write_txn();
         if (!package_txn) {
@@ -420,7 +423,7 @@ export int cmd_install(
         // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
         sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
         auto ext_res = sage::archive::extract_package(
-            archive_it->second, opts.target_root, &pkg, &inspected_it->second,
+            *archive_res, opts.target_root, &pkg, &inspected_it->second,
             *previous_package ? &**previous_package : nullptr);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());

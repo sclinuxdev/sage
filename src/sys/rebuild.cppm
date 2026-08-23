@@ -9,6 +9,7 @@ import sage.service;
 import sage.db;
 import sage.solver;
 import sage.util;
+import sage.vendor.curl;
 
 export namespace sage::rebuild {
 
@@ -26,6 +27,10 @@ using std::size_t;
 struct RepoSnapshot {
     std::vector<package::PackageManifest> pool;
     std::map<package::PackageIdentity, std::filesystem::path> archives;
+    // Remote channel URL per archive that is not directly readable from
+    // disk; stays empty for file:// channels. ensure_local_archive()
+    // consults this to fetch a payload on first use.
+    std::map<package::PackageIdentity, std::string> remote_urls;
 };
 
 inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
@@ -58,6 +63,10 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
         if (!idx_res) continue;
 
         std::filesystem::path dir_base;
+        // A channel that is neither file:// nor a bare filesystem path is
+        // remote: its payloads must be downloaded into the per-root cache
+        // before they can be inspected or unpacked.
+        bool remote_channel = !ch.url.starts_with("file://") && !ch.url.starts_with("/");
         if (ch.url.starts_with("file://")) {
             dir_base = std::filesystem::path(ch.url.substr(7));
         } else if (ch.url.starts_with("/")) {
@@ -71,6 +80,12 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
             std::filesystem::path local_p;
             if (!pkg.file.empty()) {
                 local_p = dir_base / pkg.file;
+                if (remote_channel) {
+                    std::string base{ch.url};
+                    if (base.ends_with('/')) base.pop_back();
+                    snap.remote_urls[package::package_identity(pkg)] =
+                        base + "/" + pkg.file;
+                }
             } else {
                 // Legacy naming fallbacks for hand-rolled repositories.
                 local_p = dir_base / std::format(
@@ -92,6 +107,37 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
             channel_filter, cfg.root_dir.string()));
     }
     return snap;
+}
+
+// Resolve a selected package to a readable local archive, fetching it from
+// its channel first when the snapshot came from a remote URL. Downloads go
+// through vendor::curl::download_file, which stages to a .part file and only
+// renames after a fully successful transfer, so the cache never holds a
+// truncated archive that a later exists() check would trust.
+inline std::expected<std::filesystem::path, std::string>
+ensure_local_archive(const RepoSnapshot& snap, const package::PackageIdentity& identity) {
+    auto archive_it = snap.archives.find(identity);
+    if (archive_it == snap.archives.end()) {
+        return std::unexpected(std::format(
+            "No package archive available for '{}' {} in any configured channel",
+            identity.name, identity.version.to_string()));
+    }
+    if (std::filesystem::exists(archive_it->second)) return archive_it->second;
+
+    auto url_it = snap.remote_urls.find(identity);
+    if (url_it == snap.remote_urls.end()) {
+        return std::unexpected(std::format(
+            "Package archive for '{}' not found at {}",
+            identity.name, archive_it->second.string()));
+    }
+    util::log_info("  ↓ fetching {} from {}",
+        archive_it->second.filename().string(), url_it->second);
+    auto downloaded = vendor::curl::download_file(url_it->second, archive_it->second);
+    if (!downloaded) {
+        return std::unexpected(std::format(
+            "Failed to download archive for '{}': {}", identity.name, downloaded.error()));
+    }
+    return archive_it->second;
 }
 
 struct ProviderSwap {
@@ -597,13 +643,11 @@ public:
             if (!existing) return std::unexpected(existing.error());
             if (*existing && package::package_identity(**existing) == identity) continue;
 
-            auto archive_it = plan.repos.archives.find(identity);
-            if (archive_it == plan.repos.archives.end()) {
-                return std::unexpected(std::format(
-                    "No package archive available for '{}' {} in any configured channel",
-                    selected.name, selected.version.to_string()));
+            auto archive_res = ensure_local_archive(plan.repos, identity);
+            if (!archive_res) {
+                return std::unexpected(archive_res.error());
             }
-            auto inspect_res = archive::inspect_package(archive_it->second);
+            auto inspect_res = archive::inspect_package(*archive_res);
             if (!inspect_res) {
                 return std::unexpected(std::format(
                     "Invalid package archive for '{}': {}", selected.name, inspect_res.error()));
@@ -614,7 +658,7 @@ public:
             }
 
             util::log_info("Unpacking {} -> {}...", selected.name, sysroot.string());
-            auto ext_res = archive::extract_package(archive_it->second, sysroot, &selected, &*inspect_res);
+            auto ext_res = archive::extract_package(*archive_res, sysroot, &selected, &*inspect_res);
             if (!ext_res) {
                 return std::unexpected(std::format(
                     "Failed to extract package '{}': {}", selected.name, ext_res.error()));
