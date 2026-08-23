@@ -284,6 +284,10 @@ export int cmd_verify(const CliOptions& opts) {
     for (const auto& pkg : targets) {
         for (const auto& f : pkg.files) {
             if (f.type != sage::package::FileType::Regular) continue;
+            // The shared install-info index is appended to by every info
+            // page installation; the ownership conflict check already
+            // exempts it, so integrity verification must not flag it either.
+            if (f.path == "usr/share/info/dir" || f.path.ends_with("/info/dir")) continue;
             if (f.sha256.empty()) { unhashed++; continue; }
 
             std::filesystem::path on_disk = opts.target_root / f.path;
