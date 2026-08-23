@@ -19,14 +19,14 @@ To ensure long-term stability, deterministic upgrades, and backward/forward comp
         ┌───────────────────────┬─────────────┴─────────┬────────────────────────┐
         ▼                       ▼                       ▼                        ▼
 【系统与通道配置】        【包配方与清单】          【服务与触发器】          【远程仓库索引】
-system.toml (v1)        recipe.toml (v1)        service.toml (v2)        index.toml (v1)
+system.toml (v1)        recipe.toml (v1)        service.toml (v1)        index.toml (v1)
 channels.toml (v1)      manifest.toml (v1)      triggers.toml (v1)       files.idx (v1)
 ```
 
 ### 1.1 Compatibility Invariants
-* **Current Supported Versions**: `schema_version = 1` for all v1 formats and `schema_version = 2` for `service.toml`.
+* **Current Supported Version**: `schema_version = 1`.
 * **Forward Compatibility Rule**: If a Sage engine reads a file with `schema_version > CURRENT_SUPPORTED_VERSION`, it MUST fail gracefully with an explicit diagnostic message instructing the user to upgrade `sage`.
-* **Backward Compatibility Rule**: Newer schemas retain explicit migration handlers for supported older versions. `service.toml` v1 remains readable through a strict argv tokenizer; new Recipes emit v2.
+* **Backward Compatibility Rule**: When newer schema versions are introduced (e.g. `v2`), future Sage engines MUST maintain zero-copy parsing adapters or migration handlers for older schema versions.
 
 ---
 
@@ -204,20 +204,19 @@ provides = [
 conflicts = []
 ```
 
-### 3.3 Universal Daemon Specification `service.toml` (Schema Version 2)
+### 3.3 Universal Daemon Specification `service.toml` (Schema Version 1)
 Included inside `.METADATA/service.toml` (or auto-generated for init daemons):
 
 ```toml
 # .METADATA/service.toml - Universal Service Specification
-schema_version = 2
+schema_version = 1
 
 [service]
 name = "sshd"
 description = "OpenSSH Server Daemon"
-architectures = ["amd64", "aarch64"] # Or ["any"] for architecture-independent services
-command = ["/usr/sbin/sshd", "-D"]
-stop_command = ["/bin/kill", "-TERM", "$MAINPID"]
-reload_command = ["/bin/kill", "-HUP", "$MAINPID"]
+exec_start = "/usr/sbin/sshd -D"
+exec_stop = "/bin/kill -TERM $MAINPID"
+exec_reload = "/bin/kill -HUP $MAINPID"
 user = "root"
 group = "root"
 working_dir = "/"

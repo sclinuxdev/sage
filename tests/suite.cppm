@@ -884,15 +884,13 @@ install = [
 schema_version = 2
 [service]
 name = "sshd"
-architectures = ["amd64", "aarch64"]
 command = ["/usr/bin/sshd", "-D"]
 restart = "on-failure"
 )");
     if (!loom_destination
         || *loom_destination != extract_root / "usr/lib/loom/services/sshd.toml"
         || !schema_two
-        || schema_two->command != std::vector<std::string>{"/usr/bin/sshd", "-D"}
-        || schema_two->architectures != std::vector<std::string>{"amd64", "aarch64"}) {
+        || schema_two->command != std::vector<std::string>{"/usr/bin/sshd", "-D"}) {
         sage::util::log_error("Loom service target or schema v2 parsing failed");
         return 1;
     }
