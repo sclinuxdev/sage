@@ -91,6 +91,7 @@ struct ServiceSpec {
     std::vector<std::string> command;
     std::vector<std::string> stop_command;
     std::vector<std::string> reload_command;
+    std::vector<std::string> architectures;
     std::string user{"root"};
     std::string group{"root"};
     std::string working_dir{"/"};
@@ -129,6 +130,31 @@ struct ServiceSpec {
             parse_argv("command", s.command);
             parse_argv("stop_command", s.stop_command);
             parse_argv("reload_command", s.reload_command);
+            parse_argv("architectures", s.architectures);
+            if (s.schema_version == 1 && s.architectures.empty()) {
+                s.architectures.push_back("any");
+            }
+            if (s.schema_version == 2 && s.architectures.empty()) {
+                return std::unexpected(
+                    "service.toml schema 2 requires a non-empty architectures array");
+            }
+            std::set<std::string> architecture_set;
+            for (const auto& architecture : s.architectures) {
+                if (architecture != "amd64"
+                    && architecture != "aarch64"
+                    && architecture != "any") {
+                    return std::unexpected(std::format(
+                        "Unsupported service architecture '{}'", architecture));
+                }
+                if (!architecture_set.insert(architecture).second) {
+                    return std::unexpected(std::format(
+                        "Duplicate service architecture '{}'", architecture));
+                }
+            }
+            if (architecture_set.size() > 1 && architecture_set.contains("any")) {
+                return std::unexpected(
+                    "Service architecture 'any' cannot be combined with a concrete architecture");
+            }
             if (s.schema_version == 2) {
                 if (!s.exec_start.empty() || !s.exec_stop.empty() || !s.exec_reload.empty()) {
                     return std::unexpected(
