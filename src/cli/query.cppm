@@ -288,6 +288,9 @@ export int cmd_verify(const CliOptions& opts) {
             // page installation; the ownership conflict check already
             // exempts it, so integrity verification must not flag it either.
             if (f.path == "usr/share/info/dir" || f.path.ends_with("/info/dir")) continue;
+            // The loader cache is regenerated in place by the ldconfig
+            // trigger on every library-touching transaction.
+            if (f.path == "etc/ld.so.cache") continue;
             if (f.sha256.empty()) { unhashed++; continue; }
 
             std::filesystem::path on_disk = opts.target_root / f.path;
