@@ -32,6 +32,54 @@ load_install_snapshot(
     return current;
 }
 
+template <typename Result, typename Work>
+std::expected<std::vector<Result>, std::string> collect_parallel(
+    size_t count,
+    int configured_jobs,
+    Work&& work)
+{
+    if (count == 0) return std::vector<Result>{};
+    const auto available = std::max(1U, std::thread::hardware_concurrency());
+    const auto requested = configured_jobs > 0
+        ? static_cast<unsigned>(configured_jobs)
+        : available;
+    const auto worker_count = std::min<size_t>(count, std::max(1U, requested));
+    std::vector<std::optional<Result>> slots(count);
+    std::vector<std::string> errors(count);
+    std::atomic_size_t next{0};
+    std::atomic_bool failed{false};
+    std::vector<std::jthread> workers;
+    workers.reserve(worker_count);
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+        workers.emplace_back([&] {
+            while (!failed.load(std::memory_order_relaxed)) {
+                const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= count) return;
+                auto result = work(index);
+                if (!result) {
+                    errors[index] = std::move(result.error());
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                slots[index] = std::move(*result);
+            }
+        });
+    }
+    workers.clear();
+    if (failed.load(std::memory_order_relaxed)) {
+        auto error = std::ranges::find_if(errors, [](const auto& value) {
+            return !value.empty();
+        });
+        return std::unexpected(error == errors.end()
+            ? "Parallel package operation failed"
+            : std::move(*error));
+    }
+    std::vector<Result> results;
+    results.reserve(count);
+    for (auto& slot : slots) results.push_back(std::move(*slot));
+    return results;
+}
+
 // Self-tests may execute trigger commands on the host while package payloads
 // remain isolated under their temporary target root.
 export int cmd_install(
@@ -245,27 +293,43 @@ export int cmd_install(
         return 0;
     }
 
-    std::map<sage::package::PackageIdentity, sage::archive::InspectedPackage> inspected_packages;
+    std::vector<std::filesystem::path> archive_paths;
+    archive_paths.reserve(unique_to_install.size());
     for (const auto& pkg : unique_to_install) {
-        const auto identity = sage::package::package_identity(pkg);
-        auto archive_res = sage::rebuild::ensure_local_archive(snapshot, identity);
-        if (!archive_res) {
-            sage::util::log_error("{}", archive_res.error());
+        auto archive = sage::rebuild::ensure_local_archive(
+            snapshot, sage::package::package_identity(pkg));
+        if (!archive) {
+            sage::util::log_error("{}", archive.error());
             return 1;
         }
-        auto inspect_res = sage::archive::inspect_package(*archive_res);
-        if (!inspect_res) {
-            sage::util::log_error(
-                "Invalid package archive for '{}': {}", pkg.name, inspect_res.error());
-            return 1;
-        }
-        if (sage::package::package_identity(inspect_res->manifest) != identity) {
-            sage::util::log_error(
-                "Package archive identity does not match selected package '{} {} [{}; {}]'",
-                pkg.name, pkg.version.to_string(), pkg.arch, pkg.channel);
-            return 1;
-        }
-        inspected_packages.emplace(identity, std::move(*inspect_res));
+        archive_paths.push_back(std::move(*archive));
+    }
+    auto inspections = collect_parallel<sage::archive::InspectedPackage>(
+        unique_to_install.size(), cfg.build.jobs, [&](size_t index)
+            -> std::expected<sage::archive::InspectedPackage, std::string> {
+            const auto& pkg = unique_to_install[index];
+            auto inspected = sage::archive::inspect_package(archive_paths[index]);
+            if (!inspected) {
+                return std::unexpected(std::format(
+                    "Invalid package archive for '{}': {}", pkg.name, inspected.error()));
+            }
+            if (sage::package::package_identity(inspected->manifest)
+                != sage::package::package_identity(pkg)) {
+                return std::unexpected(std::format(
+                    "Package archive identity does not match selected package '{} {} [{}; {}]'",
+                    pkg.name, pkg.version.to_string(), pkg.arch, pkg.channel));
+            }
+            return std::move(*inspected);
+        });
+    if (!inspections) {
+        sage::util::log_error("{}", inspections.error());
+        return 1;
+    }
+    std::map<sage::package::PackageIdentity, sage::archive::InspectedPackage> inspected_packages;
+    for (size_t index = 0; index < unique_to_install.size(); ++index) {
+        inspected_packages.emplace(
+            sage::package::package_identity(unique_to_install[index]),
+            std::move((*inspections)[index]));
     }
 
     // Self-heal: prune file registrations owned by packages that are no longer
@@ -303,7 +367,8 @@ export int cmd_install(
     bool any_package_committed = false;
     bool aggregate_done = false;
 
-    auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg) {
+    auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg,
+                                           bool regenerate_profile) {
         auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
         if (spec.scope == sage::channel::ChannelScope::Toolchain
             && !spec.category.empty() && !spec.slot.empty()) {
@@ -315,9 +380,10 @@ export int cmd_install(
                     spec.category, spec.slot, act_res.error());
             }
         }
-
-        (void)sage::channel::ProfileManager::regenerate_fhs_profile(
-            opts.target_root, active_channels);
+        if (regenerate_profile) {
+            (void)sage::channel::ProfileManager::regenerate_fhs_profile(
+                opts.target_root, active_channels);
+        }
     };
 
     auto run_aggregate_triggers = [&]() -> bool {
@@ -353,6 +419,144 @@ export int cmd_install(
             (void)run_aggregate_triggers();
         }
     }};
+
+    bool batch_has_payload_conflict = false;
+    bool batch_has_unsafe_replacement = false;
+    std::unordered_map<std::string, bool> batch_path_types;
+    for (const auto& pkg : unique_to_install) {
+        const auto& inspected = inspected_packages.at(
+            sage::package::package_identity(pkg));
+        for (const auto& file : inspected.data_files) {
+            const auto path = sage::util::clean_rel_path(file.path);
+            if (path == "usr/share/info/dir" || path.ends_with("/info/dir")) continue;
+            const bool directory = file.type == sage::package::FileType::Directory;
+            if (!directory) {
+                std::error_code status_error;
+                const auto existing = std::filesystem::symlink_status(
+                    opts.target_root / path, status_error);
+                if (!status_error
+                    && std::filesystem::exists(existing)
+                    && std::filesystem::is_directory(existing)) {
+                    batch_has_unsafe_replacement = true;
+                    break;
+                }
+            }
+            auto [existing, inserted] = batch_path_types.emplace(path, directory);
+            if (!inserted && (!directory || !existing->second)) {
+                batch_has_payload_conflict = true;
+                break;
+            }
+        }
+        if (batch_has_payload_conflict || batch_has_unsafe_replacement) break;
+    }
+
+    // A fresh root has no upgrade/conffile cleanup ordering to preserve. Reserve
+    // every ownership claim in one uncommitted LMDB transaction, extract
+    // independent package payloads concurrently, flush the filesystem once,
+    // then commit the registry. A crash can leave unregistered payload files,
+    // but can never publish registry state ahead of durable files.
+    if (installed_packages.empty() && unique_to_install.size() > 1
+        && !batch_has_payload_conflict
+        && !batch_has_unsafe_replacement) {
+        auto batch_txn = db.begin_write_txn();
+        if (!batch_txn) {
+            sage::util::log_error(
+                "Failed to open batch database transaction: {}", batch_txn.error());
+            return 1;
+        }
+        std::vector<sage::package::PackageManifest> batch_manifests;
+        batch_manifests.reserve(unique_to_install.size());
+        for (const auto& pkg : unique_to_install) {
+            const auto identity = sage::package::package_identity(pkg);
+            const auto& inspected = inspected_packages.at(identity);
+            auto installed_pkg = pkg;
+            installed_pkg.files = inspected.data_files;
+            installed_pkg.capability_hooks = inspected.manifest.capability_hooks;
+            installed_pkg.triggers = inspected.manifest.triggers;
+            installed_pkg.conffiles = inspected.manifest.conffiles;
+            auto files = db.register_files(
+                *batch_txn, installed_pkg.name, installed_pkg.channel,
+                installed_pkg.files);
+            if (!files) {
+                sage::util::log_error(
+                    "Cannot reserve files for '{}': {}", pkg.name, files.error());
+                return 1;
+            }
+            auto package = db.put_package(*batch_txn, installed_pkg);
+            if (!package) {
+                sage::util::log_error(
+                    "Cannot stage package '{}': {}", pkg.name, package.error());
+                return 1;
+            }
+            auto provides = db.register_provides(
+                *batch_txn, installed_pkg.name, installed_pkg.provides);
+            if (!provides) {
+                sage::util::log_error(
+                    "Cannot stage provides for '{}': {}", pkg.name, provides.error());
+                return 1;
+            }
+            batch_manifests.push_back(std::move(installed_pkg));
+        }
+
+        auto extracted = collect_parallel<sage::archive::ExtractedPackage>(
+            unique_to_install.size(), cfg.build.jobs, [&](size_t index)
+                -> std::expected<sage::archive::ExtractedPackage, std::string> {
+                const auto& pkg = unique_to_install[index];
+                const auto& inspected = inspected_packages.at(
+                    sage::package::package_identity(pkg));
+                auto result = sage::archive::extract_package(
+                    archive_paths[index], opts.target_root, &pkg, &inspected,
+                    nullptr, sage::archive::ExtractionDurability::Batch);
+                if (!result) {
+                    return std::unexpected(std::format(
+                        "Failed to extract package '{}': {}", pkg.name, result.error()));
+                }
+                return std::move(*result);
+            });
+        if (!extracted) {
+            sage::util::log_error("{}", extracted.error());
+            return 1;
+        }
+        auto durable = sage::archive::sync_extracted_root(opts.target_root);
+        if (!durable) {
+            sage::util::log_error("{}", durable.error());
+            return 1;
+        }
+        for (size_t index = 0; index < batch_manifests.size(); ++index) {
+            batch_manifests[index].files = std::move((*extracted)[index].extracted_files);
+            auto package = db.put_package(*batch_txn, batch_manifests[index]);
+            if (!package) {
+                sage::util::log_error(
+                    "Cannot finalize package '{}': {}",
+                    batch_manifests[index].name, package.error());
+                return 1;
+            }
+        }
+        auto committed = batch_txn->commit();
+        if (!committed) {
+            sage::util::log_error(
+                "Failed to commit package batch: {}", committed.error());
+            return 1;
+        }
+        for (auto& installed_pkg : batch_manifests) {
+            all_touched_files.insert(
+                all_touched_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
+            run_package_postprocessing(installed_pkg, false);
+            committed_packages.push_back(std::move(installed_pkg));
+        }
+        any_package_committed = true;
+        (void)sage::channel::ProfileManager::regenerate_fhs_profile(
+            opts.target_root, active_channels);
+        if (!run_aggregate_triggers()) {
+            aggregate_done = true;
+            return 1;
+        }
+        aggregate_done = true;
+        sage::util::log_success(
+            "Successfully installed {} packages into {}",
+            unique_to_install.size(), opts.target_root.string());
+        return 0;
+    }
 
     // 3. Streaming Unpack & LMDB State Registration
     for (const auto& pkg : unique_to_install) {
@@ -585,7 +789,7 @@ export int cmd_install(
 
         // Toolchain activation and profile generation are needed immediately:
         // a later package may depend on the aliases created for this commit.
-        run_package_postprocessing(installed_pkg);
+        run_package_postprocessing(installed_pkg, true);
     }
 
     // Run triggers once after the complete install set. This happens after

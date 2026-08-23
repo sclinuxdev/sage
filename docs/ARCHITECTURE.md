@@ -63,6 +63,22 @@ The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tabl
 
 ### Package-state operation synchronization
 
+Fresh multi-package installs use one deep archive batch module. Sage resolves
+and downloads first, inspects archives concurrently using the configured build
+job count (or online CPU count), reserves every file claim in one uncommitted
+LMDB transaction, and extracts non-conflicting payloads concurrently. Payload
+files are installed with anchored temporary-file renames, the target filesystem
+is flushed once with `syncfs`, and only then is LMDB committed. Thus registry
+state never becomes durable before its files. Existing-root upgrades, conffile
+migrations, payload conflicts, and unsafe type replacements retain the ordered
+per-package path.
+
+The measured local-repository fixture on the development host installed a
+100-package dependency-closed set, including `ldconfig`, in 15.232, 16.723, and
+17.790 seconds with a release build and 20 online CPUs. The observed maximum is
+below the 20-second acceptance limit. This is a result for that cached fixture,
+not a claim about network downloads or arbitrary hardware.
+
 Root-only `install`, `remove`, and `rebuild` use
 `/run/sage/operation.lock` as one host-wide advisory lock. Sage creates a
 root-owned `0700` namespace and `0600` regular file, opens them without following

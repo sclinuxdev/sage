@@ -1,6 +1,9 @@
 module;
 
 #include <zstd.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <cstring>
 
 // USTAR wire format, the streaming archive walker, files.idx codec and
@@ -203,6 +206,11 @@ struct InspectedPackage {
     std::vector<package::FileEntry> data_files;
     std::vector<package::FileEntry> declared_files;
     std::string archive_sha256;
+    uint64_t source_device{0};
+    uint64_t source_inode{0};
+    uint64_t source_size{0};
+    uint64_t source_mtime_ns{0};
+    uint64_t source_ctime_ns{0};
 };
 struct ArchiveEntryView {
     std::string name;
@@ -572,11 +580,34 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
     const std::filesystem::path& archive_path,
     const std::filesystem::path* target_root)
 {
-    std::ifstream archive_file(archive_path, std::ios::binary);
-    if (!archive_file.is_open()) {
+    int flags = O_RDONLY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    UniqueFd source(::open(archive_path.c_str(), flags));
+    if (source.get() < 0) {
         return std::unexpected("Cannot open package archive: " + archive_path.string());
     }
-    return inspect_package_stream(archive_file, archive_path.string(), target_root);
+    struct stat status {};
+    if (::fstat(source.get(), &status) != 0 || !S_ISREG(status.st_mode)) {
+        return std::unexpected("Cannot inspect package archive identity");
+    }
+    std::ifstream archive_file(
+        std::format("/proc/self/fd/{}", source.get()), std::ios::binary);
+    if (!archive_file.is_open()) {
+        return std::unexpected("Cannot stream package archive: " + archive_path.string());
+    }
+    auto inspected = inspect_package_stream(
+        archive_file, archive_path.string(), target_root);
+    if (!inspected) return inspected;
+    inspected->source_device = static_cast<uint64_t>(status.st_dev);
+    inspected->source_inode = static_cast<uint64_t>(status.st_ino);
+    inspected->source_size = static_cast<uint64_t>(status.st_size);
+    inspected->source_mtime_ns = static_cast<uint64_t>(status.st_mtim.tv_sec) * 1'000'000'000
+        + static_cast<uint64_t>(status.st_mtim.tv_nsec);
+    inspected->source_ctime_ns = static_cast<uint64_t>(status.st_ctim.tv_sec) * 1'000'000'000
+        + static_cast<uint64_t>(status.st_ctim.tv_nsec);
+    return inspected;
 }
 
 inline std::expected<InspectedPackage, std::string> inspect_package(

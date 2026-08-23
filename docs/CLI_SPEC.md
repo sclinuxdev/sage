@@ -43,7 +43,7 @@ locks, or cache state. The root-only ephemeral host coordination state under
 
 ### `sage install <PKG...>`
 Resolves dependencies via PubGrub SAT solver, unpacks `*.pkg.tar.zst` streams to target channel scope, writes LMDB state records, and executes triggers.
-Archive writes are anchored to the target root without following parent symlinks. If the installed identity changes concurrently after dependency resolution, the command exits without applying the stale package migration.
+Archive writes are anchored to the target root without following parent symlinks. If the installed identity changes concurrently after dependency resolution, the command exits without applying the stale package migration. Fresh non-conflicting batches inspect and extract in parallel; `/etc/sage/build.toml` `jobs` controls concurrency and `0` uses the online CPU count. Upgrades and path-conflict cases preserve ordered installation.
 ```bash
 # Install packages into system channel (root)
 sage install ripgrep neovim

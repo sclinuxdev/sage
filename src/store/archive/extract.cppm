@@ -120,6 +120,11 @@ inline std::expected<void, std::string> remove_path_anchored(
 // Streaming Tar + Zstd Extractor (Extracts directly to target root)
 // ============================================================================
 
+enum class ExtractionDurability {
+    Immediate,
+    Batch,
+};
+
 // A declared conffile whose on-disk contents no longer match what the
 // previous package generation recorded must not be overwritten: the admin
 // edited it. True when `rel_path` exists under `target_root`, is declared by
@@ -156,10 +161,20 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& target_root,
     const package::PackageManifest* expected_manifest = nullptr,
     const InspectedPackage* expected_inspection = nullptr,
-    const package::PackageManifest* previous_manifest = nullptr)
+    const package::PackageManifest* previous_manifest = nullptr,
+    ExtractionDurability durability = ExtractionDurability::Immediate)
 {
+    const auto expected_source = expected_inspection
+        ? std::optional{std::array<uint64_t, 5>{
+              expected_inspection->source_device,
+              expected_inspection->source_inode,
+              expected_inspection->source_size,
+              expected_inspection->source_mtime_ns,
+              expected_inspection->source_ctime_ns,
+          }}
+        : std::nullopt;
     auto snapshot_res = PrivateArchiveSnapshot::create(
-        archive_path, target_root / "var/lib/sage/tmp");
+        archive_path, target_root / "var/lib/sage/tmp", expected_source);
     if (!snapshot_res) return std::unexpected(snapshot_res.error());
     auto snapshot = std::move(*snapshot_res);
 
@@ -169,27 +184,26 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             "Cannot open private archive snapshot for: " + archive_path.string());
     }
     const auto archive_name = archive_path.string();
-    auto inspect_res = inspect_package_stream(archive_file, archive_name, &target_root);
-    if (!inspect_res) return std::unexpected(inspect_res.error());
+    ExtractedPackage result;
+    if (expected_inspection) {
+        result.manifest = expected_inspection->manifest;
+        result.declared_files = expected_inspection->declared_files;
+    } else {
+        auto inspect_res = inspect_package_stream(archive_file, archive_name, &target_root);
+        if (!inspect_res) return std::unexpected(inspect_res.error());
+        result.manifest = std::move(inspect_res->manifest);
+        result.declared_files = std::move(inspect_res->declared_files);
+    }
     if (expected_manifest
-        && package::package_identity(inspect_res->manifest)
+        && package::package_identity(result.manifest)
             != package::package_identity(*expected_manifest)) {
         return std::unexpected(std::format(
             "Package archive identity mismatch: selected {} {} [{}; {}], archive contains {} {} [{}; {}]",
             expected_manifest->name, expected_manifest->version.to_string(),
             expected_manifest->arch, expected_manifest->channel,
-            inspect_res->manifest.name, inspect_res->manifest.version.to_string(),
-            inspect_res->manifest.arch, inspect_res->manifest.channel));
+            result.manifest.name, result.manifest.version.to_string(),
+            result.manifest.arch, result.manifest.channel));
     }
-    if (expected_inspection
-        && inspect_res->archive_sha256 != expected_inspection->archive_sha256) {
-        return std::unexpected(
-            "Package archive changed after ownership preflight");
-    }
-
-    ExtractedPackage result;
-    result.manifest = std::move(inspect_res->manifest);
-    result.declared_files = std::move(inspect_res->declared_files);
 
     std::error_code root_ec;
     std::filesystem::create_directories(target_root, root_ec);
@@ -208,11 +222,15 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     }
     UniqueFd extraction_root(root_fd);
 
-    archive_file.clear();
-    archive_file.seekg(0);
-    if (!archive_file) {
-        return std::unexpected("Cannot rewind package archive: " + archive_name);
+    if (!expected_inspection) {
+        archive_file.clear();
+        archive_file.seekg(0);
+        if (!archive_file) {
+            return std::unexpected("Cannot rewind package archive: " + archive_name);
+        }
     }
+    const bool durable = durability == ExtractionDurability::Immediate;
+    util::Sha256 archive_hasher;
     auto extract_res = walk_archive_entries(archive_file, archive_name, [&](const ArchiveEntryView& archive_entry)
         -> std::expected<void, std::string> {
         if (!archive_entry.name.starts_with("data/")) return {};
@@ -221,8 +239,13 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         auto path_res = normalize_data_path(std::string_view(archive_entry.name).substr(5));
         if (!path_res) return std::unexpected(path_res.error());
         std::string rel_path = std::move(*path_res);
+        const auto clean_path = util::clean_rel_path(rel_path);
+        if (!durable
+            && (clean_path == "usr/share/info/dir" || clean_path.ends_with("/info/dir"))) {
+            return {};
+        }
         auto destination = open_anchored_parent(
-            extraction_root.get(), std::filesystem::path(rel_path));
+            extraction_root.get(), std::filesystem::path(rel_path), durable);
         if (!destination) {
             return std::unexpected(std::format(
                 "Cannot open parent directory for '{}': {}", rel_path, destination.error()));
@@ -236,7 +259,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         if (archive_entry.typeflag == '5') {
             entry.type = package::FileType::Directory;
             auto directory_res = ensure_anchored_directory(
-                destination->directory.get(), destination->leaf);
+                destination->directory.get(), destination->leaf, durable);
             if (!directory_res) {
                 return std::unexpected(std::format(
                     "Cannot create directory '{}': {}", rel_path, directory_res.error()));
@@ -245,7 +268,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             entry.type = package::FileType::Symlink;
             entry.link_target = archive_entry.linkname;
             auto remove_res = remove_anchored_leaf(
-                destination->directory.get(), destination->leaf);
+                destination->directory.get(), destination->leaf, durable);
             if (!remove_res) {
                 return std::unexpected(std::format(
                     "Cannot replace '{}' with symlink: {}", rel_path, remove_res.error()));
@@ -257,7 +280,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                     "Cannot create symlink '{}' -> '{}': {}",
                     rel_path, archive_entry.linkname, std::strerror(errno)));
             }
-            if (::fsync(destination->directory.get()) != 0) {
+            if (durable && ::fsync(destination->directory.get()) != 0) {
                 return std::unexpected(std::format(
                     "Cannot sync parent after creating symlink '{}': {}",
                     rel_path, std::strerror(errno)));
@@ -286,7 +309,8 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(std::format(
                     "Cannot write '{}': {}", rel_path, write_res.error()));
             }
-            auto install_res = temp_res->install(destination_name, archive_entry.mode);
+            auto install_res = temp_res->install(
+                destination_name, archive_entry.mode, durable);
             if (!install_res) {
                 return std::unexpected(std::format(
                     "Cannot install '{}': {}", rel_path, install_res.error()));
@@ -305,11 +329,44 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 
         result.extracted_files.push_back(std::move(entry));
         return {};
-    });
+    }, expected_inspection ? &archive_hasher : nullptr);
     if (!extract_res) return std::unexpected(extract_res.error());
+    if (expected_inspection
+        && archive_hasher.finalize() != expected_inspection->archive_sha256) {
+        return std::unexpected("Package archive changed after ownership preflight");
+    }
 
     result.manifest.files = result.extracted_files;
 
     return result;
+}
+
+inline std::expected<void, std::string> sync_extracted_root(
+    const std::filesystem::path& target_root)
+{
+    int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    UniqueFd root(::open(target_root.c_str(), flags));
+    if (root.get() < 0) {
+        return std::unexpected(
+            "Cannot open target root for durability sync: "
+            + std::string(std::strerror(errno)));
+    }
+#ifdef __linux__
+    if (::syncfs(root.get()) != 0) {
+        return std::unexpected(
+            "Cannot sync installed package batch: "
+            + std::string(std::strerror(errno)));
+    }
+#else
+    if (::fsync(root.get()) != 0) {
+        return std::unexpected(
+            "Cannot sync installed package batch: "
+            + std::string(std::strerror(errno)));
+    }
+#endif
+    return {};
 }
 } // namespace sage::archive

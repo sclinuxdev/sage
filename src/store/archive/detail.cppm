@@ -87,7 +87,8 @@ public:
 
     static std::expected<PrivateArchiveSnapshot, std::string> create(
         const std::filesystem::path& source_path,
-        const std::filesystem::path& snapshot_root)
+        const std::filesystem::path& snapshot_root,
+        std::optional<std::array<uint64_t, 5>> expected_source = std::nullopt)
     {
         int source_flags = O_RDONLY;
 #ifdef O_CLOEXEC
@@ -106,6 +107,21 @@ public:
         }
         if (!S_ISREG(source_status.st_mode) || source_status.st_size < 0) {
             return std::unexpected("Package archive is not a regular file");
+        }
+        const auto mtime_ns = static_cast<uint64_t>(source_status.st_mtim.tv_sec) * 1'000'000'000
+            + static_cast<uint64_t>(source_status.st_mtim.tv_nsec);
+        const auto ctime_ns = static_cast<uint64_t>(source_status.st_ctim.tv_sec) * 1'000'000'000
+            + static_cast<uint64_t>(source_status.st_ctim.tv_nsec);
+        const std::array<uint64_t, 5> actual_source{
+            static_cast<uint64_t>(source_status.st_dev),
+            static_cast<uint64_t>(source_status.st_ino),
+            static_cast<uint64_t>(source_status.st_size),
+            mtime_ns,
+            ctime_ns,
+        };
+        if (expected_source && *expected_source != actual_source) {
+            return std::unexpected(
+                "Package archive changed after ownership preflight");
         }
 
         std::error_code directory_ec;
@@ -196,6 +212,27 @@ public:
             }
             remaining -= static_cast<uint64_t>(count);
         }
+        struct stat final_status {};
+        if (::fstat(source.get(), &final_status) != 0) {
+            return std::unexpected("Cannot recheck package archive identity");
+        }
+        const auto final_mtime_ns = static_cast<uint64_t>(final_status.st_mtim.tv_sec)
+                * 1'000'000'000
+            + static_cast<uint64_t>(final_status.st_mtim.tv_nsec);
+        const auto final_ctime_ns = static_cast<uint64_t>(final_status.st_ctim.tv_sec)
+                * 1'000'000'000
+            + static_cast<uint64_t>(final_status.st_ctim.tv_nsec);
+        const std::array<uint64_t, 5> final_source{
+            static_cast<uint64_t>(final_status.st_dev),
+            static_cast<uint64_t>(final_status.st_ino),
+            static_cast<uint64_t>(final_status.st_size),
+            final_mtime_ns,
+            final_ctime_ns,
+        };
+        if (final_source != actual_source) {
+            return std::unexpected(
+                "Package archive changed while creating private snapshot");
+        }
 
         return snapshot;
     }
@@ -216,7 +253,8 @@ struct AnchoredPath {
 
 inline std::expected<AnchoredPath, std::string> open_anchored_parent(
     int root_fd,
-    const std::filesystem::path& relative)
+    const std::filesystem::path& relative,
+    bool durable)
 {
     int duplicate = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
     if (duplicate < 0) {
@@ -242,7 +280,7 @@ inline std::expected<AnchoredPath, std::string> open_anchored_parent(
             // Persist the directory entry while its containing directory is
             // still anchored.  Fsyncing the child alone does not make the
             // parent's mkdir entry durable across power loss.
-            if (created && ::fsync(current.get()) != 0) {
+            if (created && durable && ::fsync(current.get()) != 0) {
                 return std::unexpected(std::format(
                     "Cannot sync parent after creating directory '{}': {}",
                     name, std::strerror(errno)));
@@ -264,11 +302,12 @@ inline std::expected<AnchoredPath, std::string> open_anchored_parent(
 
 inline std::expected<void, std::string> ensure_anchored_directory(
     int parent_fd,
-    std::string_view leaf)
+    std::string_view leaf,
+    bool durable)
 {
     const auto name = std::string(leaf);
     if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) {
-        if (::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
+        if (durable && ::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
         return {};
     }
     if (errno != EEXIST) {
@@ -287,7 +326,8 @@ inline std::expected<void, std::string> ensure_anchored_directory(
 
 inline std::expected<void, std::string> remove_anchored_leaf(
     int parent_fd,
-    std::string_view leaf)
+    std::string_view leaf,
+    bool durable)
 {
     const auto name = std::string(leaf);
     struct stat status {};
@@ -300,7 +340,7 @@ inline std::expected<void, std::string> remove_anchored_leaf(
     if (::unlinkat(parent_fd, name.c_str(), flags) != 0) {
         return std::unexpected(std::strerror(errno));
     }
-    if (::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
+    if (durable && ::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
     return {};
 }
 
@@ -334,7 +374,7 @@ public:
                 ".sage-tmp-{:x}-{:x}-{:x}",
                 static_cast<uint64_t>(::getpid()),
                 sequence.fetch_add(1, std::memory_order_relaxed),
-                static_cast<uint64_t>(std::random_device{}()));
+                attempt);
             int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
 #ifdef O_CLOEXEC
             flags |= O_CLOEXEC;
@@ -366,13 +406,14 @@ public:
 
     std::expected<void, std::string> install(
         std::string_view destination,
-        uint32_t mode)
+        uint32_t mode,
+        bool durable)
     {
         if (::fchmod(fd_, mode ? mode : 0644) != 0) {
             return std::unexpected(std::format(
                 "Cannot set mode: {}", std::strerror(errno)));
         }
-        if (::fsync(fd_) != 0) {
+        if (durable && ::fsync(fd_) != 0) {
             return std::unexpected(std::format(
                 "Cannot sync temporary file: {}", std::strerror(errno)));
         }
@@ -389,7 +430,7 @@ public:
                 "Cannot atomically install temporary file: " + std::string(std::strerror(errno)));
         }
         name_.clear();
-        if (::fsync(directory_.get()) != 0) {
+        if (durable && ::fsync(directory_.get()) != 0) {
             return std::unexpected(
                 "Cannot sync destination directory: " + std::string(std::strerror(errno)));
         }
