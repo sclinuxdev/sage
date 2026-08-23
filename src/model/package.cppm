@@ -483,6 +483,20 @@ inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers)
 // Package Manifest Model
 // ============================================================================
 
+inline std::expected<void, std::string> validate_package_architecture(
+    std::string_view architecture)
+{
+    if (architecture == "amd64"
+        || architecture == "x86_64"
+        || architecture == "aarch64"
+        || architecture == "any") {
+        return {};
+    }
+    return std::unexpected(std::format(
+        "Unsupported package architecture '{}'; expected amd64 (or legacy x86_64), aarch64, or any",
+        architecture));
+}
+
 struct PackageManifest {
     uint32_t schema_version{1};
     std::string name;
@@ -560,6 +574,8 @@ struct PackageManifest {
             m.license = (*pkg)["license"].value_or("");
             m.channel = (*pkg)["channel"].value_or("system");
             m.arch = (*pkg)["arch"].value_or("x86_64");
+            auto architecture = validate_package_architecture(m.arch);
+            if (!architecture) return std::unexpected(architecture.error());
             m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
             m.build_compiler = (*pkg)["build_compiler"].value_or("");
             m.build_compiler_version = (*pkg)["build_compiler_version"].value_or("");
@@ -857,6 +873,8 @@ struct Recipe {
             r.license = (*pkg)["license"].value_or("");
             r.channel = (*pkg)["channel"].value_or("system");
             r.arch = (*pkg)["arch"].value_or("x86_64");
+            auto architecture = validate_package_architecture(r.arch);
+            if (!architecture) return std::unexpected(architecture.error());
         } else {
             return std::unexpected("Missing [package] section in recipe");
         }

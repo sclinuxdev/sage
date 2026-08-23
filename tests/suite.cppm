@@ -959,6 +959,33 @@ schema_version = 1
 name = "absent-release"
 version = "1.0"
 )");
+    for (const std::string_view architecture : {"amd64", "aarch64", "any", "x86_64"}) {
+        auto recipe = sage::package::Recipe::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "architecture-test"
+version = "1.0.0"
+release = "1"
+arch = "{}"
+)", architecture));
+        if (!recipe || recipe->arch != architecture) {
+            sage::util::log_error("Valid package architecture '{}' was rejected", architecture);
+            return 1;
+        }
+    }
+    auto invalid_architecture = sage::package::Recipe::parse_toml(R"(
+schema_version = 1
+[package]
+name = "architecture-test"
+version = "1.0.0"
+release = "1"
+arch = "mips"
+)");
+    if (invalid_architecture) {
+        sage::util::log_error("Unknown package architecture was accepted");
+        return 1;
+    }
+
     auto absent_release_recipe = sage::package::Recipe::parse_toml(R"(
 schema_version = 1
 [package]

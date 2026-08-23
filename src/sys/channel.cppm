@@ -176,6 +176,8 @@ struct ChannelIndex {
                     m.license = (*ptab)["license"].value_or("");
                     m.channel = (*ptab)["channel"].value_or("system");
                     m.arch = (*ptab)["arch"].value_or("x86_64");
+                    auto architecture = package::validate_package_architecture(m.arch);
+                    if (!architecture) return std::unexpected(architecture.error());
                     m.installed_size = (*ptab)["installed_size"].value_or(0ULL);
                     m.file = (*ptab)["file"].value_or("");
 

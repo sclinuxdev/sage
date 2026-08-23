@@ -107,6 +107,12 @@ active = true
 
 ## 3. Package Build Recipe & Manifest Specifications
 
+Package architecture is a property of the package artifact, not its service.
+The singular `arch` field accepts `amd64`, `aarch64`, or `any`; legacy
+`x86_64` remains an alias accepted by existing repositories. `any` is reserved
+for architecture-independent payloads such as scripts, metadata, fonts, and
+documentation.
+
 ### 3.1 `recipe.toml` Specification (Schema Version 1)
 The declarative recipe used by `sage build <RECIPE_DIR>` to build reproducible packages:
 
@@ -122,7 +128,7 @@ epoch = 0
 description = "Fast line-oriented search tool"
 license = "MIT OR Unlicense"
 channel = "system"       # "system", "toolchain/<cat>:<slot>", "runtime/<cat>:<slot>"
-arch = "x86_64"
+arch = "amd64"           # "amd64", "aarch64", or "any"
 
 [source]
 url = "https://github.com/BurntSushi/ripgrep/archive/14.1.0.tar.gz"
@@ -188,7 +194,7 @@ epoch = 0
 description = "Fast line-oriented search tool"
 license = "MIT OR Unlicense"
 channel = "system"
-arch = "x86_64"
+arch = "amd64"
 installed_size = 5384912
 
 dependencies = [
