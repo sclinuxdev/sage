@@ -76,6 +76,7 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
         }
 
         for (const auto& pkg : idx_res->available_packages) {
+            if (!package::package_architecture_matches(pkg.arch, cfg.architecture)) continue;
             snap.pool.push_back(pkg);
             std::filesystem::path local_p;
             if (!pkg.file.empty()) {

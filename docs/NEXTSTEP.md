@@ -44,6 +44,7 @@ root_dir = "/"
 db_path = "/var/lib/sage/data.mdb"
 cache_dir = "/var/cache/sage"
 config_dir = "/etc/sage"
+architecture = "amd64" # Target package architecture; also supports "aarch64"
 
 [providers]
 # Core mutually exclusive system structural components

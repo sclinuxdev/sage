@@ -112,6 +112,16 @@ struct BuildConfig {
     }
 };
 
+inline std::string native_package_architecture() {
+#if defined(__x86_64__)
+    return "amd64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#else
+#error "Sage supports amd64 and aarch64 targets"
+#endif
+}
+
 struct SystemConfig {
     uint32_t schema_version{1};
     std::filesystem::path root_dir{"/"};
@@ -121,6 +131,7 @@ struct SystemConfig {
     std::filesystem::path system_config_path{"/etc/sage/system.toml"};
     std::filesystem::path channels_config_path{"/etc/sage/channels.toml"};
     std::filesystem::path build_config_path{"/etc/sage/build.toml"};
+    std::string architecture{native_package_architecture()};
 
     // Capability -> concrete provider binding.
     // e.g. "virtual/init" -> "systemd", "virtual/initramfs-generator" -> "mkinitcpio"
@@ -182,6 +193,14 @@ struct SystemConfig {
             cfg.root_dir = (*sys)["root_dir"].value_or("/");
             cfg.db_path = (*sys)["db_path"].value_or("/var/lib/sage/data.mdb");
             cfg.cache_dir = (*sys)["cache_dir"].value_or("/var/cache/sage");
+            cfg.architecture = (*sys)["architecture"].value_or(native_package_architecture());
+            if (cfg.architecture != "amd64"
+                && cfg.architecture != "x86_64"
+                && cfg.architecture != "aarch64") {
+                return std::unexpected(std::format(
+                    "Unsupported system package architecture '{}' (expected amd64 or aarch64)",
+                    cfg.architecture));
+            }
             if (auto* cfg_d = sys->get("config_dir")) {
                 cfg.config_dir = cfg_d->value_or("/etc/sage");
                 cfg.system_config_path = cfg.config_dir / "system.toml";
@@ -368,7 +387,8 @@ struct SystemConfig {
         ss << "root_dir = \"" << root_dir.string() << "\"\n";
         ss << "db_path = \"" << db_path.string() << "\"\n";
         ss << "cache_dir = \"" << cache_dir.string() << "\"\n";
-        ss << "config_dir = \"" << config_dir.string() << "\"\n\n";
+        ss << "config_dir = \"" << config_dir.string() << "\"\n";
+        ss << "architecture = \"" << architecture << "\"\n\n";
 
         ss << "[providers]\n";
         for (const auto& [k, v] : providers) {

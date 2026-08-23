@@ -28,12 +28,19 @@ export int run_all() {
         "[providers]\ninit = \"openrc\"\n");
     auto shared_override = sage::config::SystemConfig::parse_system_toml(
         "[providers]\ninit = \"openrc\"\n\n[capabilities]\ninit = \"shared\"\n");
+    auto aarch64_config = sage::config::SystemConfig::parse_system_toml(
+        "[system]\narchitecture = \"aarch64\"\n");
+    auto invalid_architecture_config = sage::config::SystemConfig::parse_system_toml(
+        "[system]\narchitecture = \"mips\"\n");
     if (!legacy_config
         || !legacy_config->is_exclusive_capability("virtual/init")
         || !legacy_config->is_exclusive_capability("virtual/udev")
         || !legacy_config->is_exclusive_capability("virtual/libc")
         || !shared_override
-        || shared_override->is_exclusive_capability("virtual/init")) {
+        || shared_override->is_exclusive_capability("virtual/init")
+        || !aarch64_config
+        || aarch64_config->architecture != "aarch64"
+        || invalid_architecture_config) {
         sage::util::log_error("Legacy capability defaults or explicit override failed");
         return 1;
     }
@@ -981,8 +988,11 @@ version = "1.0.0"
 release = "1"
 arch = "mips"
 )");
-    if (invalid_architecture) {
-        sage::util::log_error("Unknown package architecture was accepted");
+    if (invalid_architecture
+        || !sage::package::package_architecture_matches("any", "aarch64")
+        || !sage::package::package_architecture_matches("x86_64", "amd64")
+        || sage::package::package_architecture_matches("aarch64", "amd64")) {
+        sage::util::log_error("Package architecture validation or matching failed");
         return 1;
     }
 

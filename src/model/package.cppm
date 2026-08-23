@@ -483,6 +483,17 @@ inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers)
 // Package Manifest Model
 // ============================================================================
 
+inline bool package_architecture_matches(
+    std::string_view package_architecture,
+    std::string_view target_architecture)
+{
+    if (package_architecture == "any") return true;
+    const auto canonical = [](std::string_view architecture) {
+        return architecture == "x86_64" ? std::string_view{"amd64"} : architecture;
+    };
+    return canonical(package_architecture) == canonical(target_architecture);
+}
+
 inline std::expected<void, std::string> validate_package_architecture(
     std::string_view architecture)
 {
