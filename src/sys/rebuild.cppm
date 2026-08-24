@@ -515,8 +515,8 @@ public:
         const std::map<std::string, std::string>& providers = {})
     {
         if (!plan.has_changes) {
-            util::log_info("System state matches desired configuration. No reconcile needed.");
-            return {};
+            util::log_info(
+                "System providers already match; regenerating service definitions.");
         }
 
         util::log_info("Executing Declarative System Reconcile (Target Init: {})...", service::to_string(plan.target_init));
@@ -664,7 +664,10 @@ public:
             }
 
             util::log_info("Unpacking {} -> {}...", selected.name, sysroot.string());
-            auto ext_res = archive::extract_package(*archive_res, sysroot, &selected, &*inspect_res);
+            const package::PackageManifest* previous =
+                *existing ? &**existing : nullptr;
+            auto ext_res = archive::extract_package(
+                *archive_res, sysroot, &selected, &*inspect_res, previous);
             if (!ext_res) {
                 return std::unexpected(std::format(
                     "Failed to extract package '{}': {}", selected.name, ext_res.error()));
@@ -674,6 +677,8 @@ public:
             installed_pkg.files = ext_res->extracted_files;
             installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
             installed_pkg.triggers = ext_res->manifest.triggers;
+            installed_pkg.conffiles = ext_res->manifest.conffiles;
+            installed_pkg.service_toml = ext_res->manifest.service_toml;
 
             auto p_res = db.put_package(*wtxn, installed_pkg);
             if (!p_res) return std::unexpected(p_res.error());

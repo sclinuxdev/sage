@@ -474,6 +474,7 @@ export int cmd_install(
             installed_pkg.capability_hooks = inspected.manifest.capability_hooks;
             installed_pkg.triggers = inspected.manifest.triggers;
             installed_pkg.conffiles = inspected.manifest.conffiles;
+            installed_pkg.service_toml = inspected.manifest.service_toml;
             auto files = db.register_files(
                 *batch_txn, installed_pkg.name, installed_pkg.channel,
                 installed_pkg.files);
@@ -644,18 +645,15 @@ export int cmd_install(
         auto installed_pkg = pkg;
         installed_pkg.files = ext_res->extracted_files;
 
-        // The channel index is a solving summary: it carries names, versions,
-        // dependencies and provides, but not capability hooks or triggers.
-        // Those live in the archive's own manifest, and the post-transaction
-        // trigger pass reads them back out of the database -- so adopt them
-        // here, or an installed initramfs generator would be invisible to the
-        // very trigger that has to run it.
+        // The channel index is only a solving summary. Archive-only metadata
+        // must be adopted before this package record is persisted.
         installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
         installed_pkg.triggers = ext_res->manifest.triggers;
         // Conffile declarations likewise ride in the archive manifest, so the
         // stale-claim cleanup below can honor them even if the channel index
         // predates the declaration.
         installed_pkg.conffiles = ext_res->manifest.conffiles;
+        installed_pkg.service_toml = ext_res->manifest.service_toml;
         auto package_touched_files = installed_pkg.files;
 
         // Reinstall/upgrade cleanup: release ownership of paths the new payload

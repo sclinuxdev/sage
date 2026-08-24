@@ -849,6 +849,12 @@ install = [
     openrc_pkg.name = "openrc";
     openrc_pkg.version = sage::package::Version::parse("0.54.0-1");
     openrc_pkg.provides = {"openrc", "virtual/init"};
+    openrc_pkg.service_toml = R"(schema_version = 1
+[service]
+name = "reconcile-canary"
+description = "reconcile metadata canary"
+exec_start = "/usr/bin/openrc"
+)";
 
     repo_pool.push_back(libfoo);
     repo_pool.push_back(gcc15);
@@ -1318,8 +1324,13 @@ release = "10"
         return 1;
     }
     auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, extract_root, false);
-    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")) {
-        sage::util::log_error("Reconcile execute did not install the new provider payload: {}",
+    auto installed_openrc = db_res->get_package("openrc");
+    if (!exec_res
+        || !std::filesystem::exists(extract_root / "usr/bin/openrc")
+        || !std::filesystem::exists(extract_root / "etc/init.d/reconcile-canary")
+        || !installed_openrc || !*installed_openrc
+        || (**installed_openrc).service_toml != openrc_pkg.service_toml) {
+        sage::util::log_error("Reconcile execute lost provider payload or service metadata: {}",
             exec_res.error_or("payload missing"));
         return 1;
     }
@@ -3361,6 +3372,41 @@ after = ["net"]
             || spec_back->exec_start != "/usr/bin/svcanary --foreground"
             || spec_back->after.size() != 1 || spec_back->after[0] != "net") {
             sage::util::log_error("Manifest service_toml failed to round-trip through serialization");
+            return 1;
+        }
+        auto svc_root = temp_dir / "bcfg-svc-root";
+        std::filesystem::create_directories(svc_root / "etc/sage");
+        std::ofstream(svc_root / "etc/sage/system.toml") << "schema_version = 1\n";
+        CliOptions svc_install;
+        svc_install.target_root = svc_root;
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-1-x86_64.pkg.tar.zst").string()
+        };
+        if (cmd_install(svc_install) != 0) {
+            sage::util::log_error("Failed to install service manifest canary");
+            return 1;
+        }
+        auto svc_db = sage::db::Database::open(
+            svc_root / "var/lib/sage/data.mdb", true);
+        if (!svc_db) {
+            sage::util::log_error("Failed to open service manifest canary database");
+            return 1;
+        }
+        auto installed_svc = svc_db->get_package("svcanary");
+        if (!installed_svc || !*installed_svc
+            || (**installed_svc).service_toml != svcpkg->service_toml) {
+            sage::util::log_error("Installed package database lost service.toml");
+            return 1;
+        }
+        sage::rebuild::ReconcilePlan no_provider_changes;
+        no_provider_changes.target_init = sage::service::InitType::Systemd;
+        auto svc_rebuild = sage::rebuild::ReconcileEngine::execute(
+            *svc_db, no_provider_changes, svc_root);
+        if (!svc_rebuild
+            || !std::filesystem::exists(
+                svc_root / "usr/lib/systemd/system/svcanary.service")) {
+            sage::util::log_error(
+                "No-op rebuild did not regenerate the installed service definition");
             return 1;
         }
 
