@@ -14,7 +14,7 @@ Welcome to the **Sage** project! This document establishes the engineering rules
 * **Declarative Reconcile Engine (`sage rebuild`)**: Reads `/etc/sage/system.toml`, calculates state diffs, commits guarded provider/package state transitions through LMDB transactions, and auto-regenerates native service scripts for the active init system. Filesystem changes are not journaled, and concurrent same-privilege mutation of the target root is outside the supported operation model.
 * **Universal Service Specification (`service.toml`)**: Decouples services from any single init daemon, auto-compiling into OpenRC, Runit, Systemd, Dinit, and s6 configurations.
 * **Zero-Copy ACID State Storage (LMDB)**: Ultra-fast memory-mapped B+ tree database with nanosecond reads and Copy-on-Write transaction safety.
-* **Native C++23 Streaming Archive Engine**: Self-contained streaming Tar reader/writer directly compressed with `libzstd` (no `libarchive` bloat).
+* **libarchive-Backed Streaming Archive Engine**: Reproducible `tar.zst` package archives via a thin RAII bridge (`sage.vendor.libarchive`); extraction is anchored to the target root and never follows symlinks outside it (see `docs/adr/0009-libarchive-migration.md`).
 * **Native C++23 PubGrub / CDCL SAT Solver**: Mathematically complete dependency resolution with world-class human-readable conflict diagnostic cause trees.
 * **Dynamic Linking by Default**: Dynamically links against system shared libraries (`liblmdb`, `libzstd`, `libtomlplusplus`, `libc`), with automated ELF `DT_NEEDED` and `DT_SONAME` scanning.
 
@@ -45,7 +45,9 @@ All code contributions MUST strictly adhere to these 5 rules:
 
 ### Rule 5: Orthogonal Modular Architecture
 * Maintain strict unidirectional, acyclic module dependencies:
-  `vendor` -> `util` -> `config/package/service` -> `channel/archive/db` -> `solver` -> `rebuild` -> `sage` (root module) -> `cli`.
+  `vendor` -> `util` -> `package` -> `store/sys` -> `svc` -> `cli`. Engines
+  compose through dedicated seams (`sage.repo` for channel/archive resolution,
+  `sage.triggers` for post-transaction hooks) instead of growing monoliths.
 
 ---
 
@@ -59,7 +61,8 @@ sage/
 ├── docs/
 │   ├── ARCHITECTURE.md           # Full architectural specification
 │   ├── MODULES.md                # Module reference and dependency DAG
-│   └── CLI_SPEC.md               # Complete CLI command-line reference
+│   ├── CLI_SPEC.md               # Complete CLI command-line reference
+│   └── adr/                      # Architecture decision records
 ├── src/
 │   ├── main.cpp                  # Entry point: global option dispatch only
 │   ├── sage.cppm                 # Root module aggregating and re-exporting the engine
@@ -67,41 +70,60 @@ sage/
 │   │   ├── lmdb.cppm             # sage.vendor.lmdb -- zero-copy B+ tree bridge
 │   │   ├── zstd.cppm             # sage.vendor.zstd -- streaming Zstandard bridge
 │   │   ├── toml.cppm             # sage.vendor.toml -- tomlplusplus bridge
-│   │   └── curl.cppm             # sage.vendor.curl -- libcurl session & downloads
-│   ├── model/                    # Pure models & parsing (no process state)
-│   │   ├── util.cppm             # sage.util -- paths, ELF scanner, SHA256, formatting
-│   │   ├── package.cppm          # sage.package -- package model, recipes, manifests, triggers
-│   │   ├── config.cppm           # sage.config -- system.toml & provider configuration
-│   │   └── service.cppm          # sage.service -- universal init script generator
-│   ├── store/                    # Persistent state & archive formats
+│   │   ├── curl.cppm             # sage.vendor.curl -- libcurl session & downloads
+│   │   └── archive.cppm          # sage.vendor.libarchive -- libarchive reader/writer bridge
+│   ├── util/                     # Layer 1: foundation utilities (sage.util partitions)
+│   │   ├── util.cppm             # primary interface, re-exports all partitions
+│   │   ├── log.cppm              # :log -- ANSI colors & leveled console output
+│   │   ├── str.cppm              # :str -- string views, glob matching, human sizes
+│   │   ├── fs.cppm               # :fs -- path normalization, metadata snapshots, env
+│   │   ├── lock.cppm             # :lock -- process-wide operation lock (flock)
+│   │   ├── elf.cppm              # :elf -- DT_NEEDED / DT_SONAME scanner
+│   │   └── hash.cppm             # :hash -- SHA-256 (OpenSSL EVP)
+│   ├── package/                  # Layer 2: package domain (sage.package partitions)
+│   │   ├── package.cppm          # primary interface, re-exports all partitions
+│   │   ├── version.cppm          # :version -- epoch-ver-rel algebra, arch validation
+│   │   ├── deps.cppm             # :deps -- dependency constraints & satisfaction
+│   │   ├── trigger.cppm          # :trigger -- capability hooks & transaction triggers
+│   │   ├── manifest.cppm         # :manifest -- installed-package manifest & identity
+│   │   └── recipe.cppm           # :recipe -- recipe.toml build配方
+│   ├── store/                    # Layer 3: persistent state & archives
 │   │   ├── db.cppm               # sage.db -- LMDB registry, file ownership & transactions
-│   │   └── archive/              # sage.archive, split into module partitions
-│   │       ├── archive.cppm      # facade (export import of the partitions below)
-│   │       ├── detail.cppm       # :detail (internal) RAII handles & anchored path safety
-│   │       ├── tape.cppm         # :tape USTAR format, streaming walker, inspection
-│   │       ├── extract.cppm      # :extract anchored cleanup & streaming extraction
-│   │       └── pack.cppm         # :pack package creation & repository indexing
-│   ├── sys/                      # Stateful system subsystems
+│   │   └── archive.cppm          # sage.archive facade over store/archive/ partitions:
+│   │       ├── core.cppm         #   :core    shared constants & result structs
+│   │       ├── idx.cppm          #   :idx     files.idx integrity index I/O
+│   │       ├── detail.cppm       #   :detail  anchored path safety & removal
+│   │       ├── inspect.cppm      #   :inspect constant-cost .METADATA inspection
+│   │       ├── extract.cppm      #   :extract parallel anchored extraction
+│   │       └── pack.cppm         #   :pack    reproducible packing & repo index
+│   ├── sys/                      # Layer 4: system engines
+│   │   ├── config.cppm           # sage.config -- system.toml & provider configuration
 │   │   ├── channel.cppm          # sage.channel -- multi-layer channels & FHS profile
 │   │   ├── solver.cppm           # sage.solver -- PubGrub / CDCL dependency solver
+│   │   ├── repo.cppm             # sage.repo -- channel pool & archive resolution
+│   │   ├── triggers.cppm         # sage.triggers -- post-transaction trigger engine
 │   │   └── rebuild.cppm          # sage.rebuild -- declarative reconcile orchestration
-│   ├── cli/                      # Layer 5: command layer (sage.cli.* modules)
+│   ├── svc/
+│   │   └── service.cppm          # sage.service -- universal init script generator
+│   └── cli/                      # Layer 5: command layer, one module per group
 │       ├── cli.cppm              # sage.cli -- CliOptions, help text, argument parsing
-│       ├── pkg.cppm              # sage.cli.pkg -- install / remove / rebuild
+│       ├── install.cppm          # sage.cli.install -- cmd_install (+ self-test hooks)
+│       ├── remove.cppm           # sage.cli.remove -- cmd_remove
+│       ├── rebuild.cppm          # sage.cli.rebuild -- cmd_rebuild
 │       ├── build.cppm            # sage.cli.build -- build / repo index
 │       ├── query.cppm            # sage.cli.query -- query / list / count / verify / status
 │       └── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
-└── tests/                       # Standalone integration suite (sage-tests binary)
-    ├── suite.cppm               # sage.tests -- 11-scenario end-to-end regression
-    └── main.cpp                 # Suite entry point
+└── tests/                        # Standalone integration suite (sage-tests binary)
+    ├── suite.cppm                # sage.tests -- end-to-end regression
+    └── main.cpp                  # Suite entry point
 ```
 
-**Layout rules.** A directory corresponds to a dependency layer of Rule 5; a file
+**Layout rules.** A directory corresponds to one functional domain; a file
 corresponds to exactly one module or partition. File names drop the redundant
-`sage.*` prefix — the module name is found in the first line of the file. When a
-unit grows past roughly 500 lines or takes on a second responsibility, split it
-into a partition (within a module) or a sibling module (within the CLI layer).
-The CLI is pure `import` — no `#include` may appear in business logic or the CLI.
+`sage.*` prefix — the module name is found in the first line of the file.
+Oversized modules are split into **partitions** behind a thin facade that
+re-exports them, so import sites keep working unchanged. Hard cap: no source
+file exceeds **1000 lines**; aim for well under that.
 
 
 ---

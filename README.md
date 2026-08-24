@@ -10,7 +10,7 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
 
 * **⚡ Ultra-High Performance & Zero-Copy**:
   - Powered by **LMDB** (Memory-Mapped B+ Tree) for nanosecond package queries and Copy-on-Write ACID transactional safety.
-  - Native **C++23 streaming archive engine** over **libzstd**, eliminating heavy legacy tar libraries.
+  - **libarchive-backed streaming archive engine** (`tar.zst`), with anchored extraction that can never escape the target root.
 * **🌐 Universal Multi-Layer Channel System**:
   - Manages multiple OS layers seamlessly: System root (`/`), shared runtimes (`/usr/lib/runtimes`), toolchains (`/opt/channels`), and user-level apps (`~/.local`).
   - Adheres strictly to **FHS (Filesystem Hierarchy Standard)** via declarative profile symlinks and environment hooks.
@@ -37,7 +37,7 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
 ```
 sage
  ├── 状态引擎: LMDB (零拷贝 mmap B+ 树，/var/lib/sage/data.mdb，微秒级读写)
- ├── 归档引擎: libzstd + 原生 C++23 流式 Tar 解包与打包器 (无 libarchive 依赖)
+ ├── 归档引擎: libarchive 流式 tar+zst 解包/打包 (锚定路径安全，永不离开目标根)
  ├── 求解引擎: 自研 C++23 PubGrub / CDCL SAT 依赖求解器 (顶级因果树诊断)
  ├── 服务体系: 通用 service.toml -> Loom / OpenRC / Runit / Systemd / Dinit / s6 自动生成
  ├── 抽象收敛: 精简虚拟提供者 virtual/init, virtual/udev, virtual/libc
@@ -51,7 +51,7 @@ sage
 ### Requirements
 * **xmake** (>= 2.8.0)
 * **GCC** (>= 14.0 / 15.0 with C++23 modules) or **Clang** (>= 18.0)
-* Dynamic system libraries: `liblmdb`, `libzstd`, `libtomlplusplus`, `libcurl`
+* Dynamic system libraries: `liblmdb`, `libzstd`, `libtomlplusplus`, `libcurl`, `libarchive`, `libcrypto` (OpenSSL)
 
 ### Build with xmake
 ```bash
