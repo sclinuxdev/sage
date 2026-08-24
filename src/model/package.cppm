@@ -861,6 +861,10 @@ struct Recipe {
     // cxxflags empty mirrors cflags, mirroring BuildConfig's own rule.
     std::string cflags;
     std::string cxxflags;
+    // Optional per-recipe linker-flag override from the [build] table.
+    // Present-but-empty means "inject nothing" (kernel-style recipes whose
+    // link line ignores LDFLAGS must not inherit a false provenance stamp).
+    std::optional<std::string> ldflags;
     // A non-empty `cc` pins the toolchain: exactly this pair is used and the
     // global fallback never runs. Core system packages (glibc, systemd) pin
     // "gcc" because they must not silently rebuild under clang.
@@ -1015,6 +1019,7 @@ struct Recipe {
             if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
             if (auto v = (*bld)["cc"].value<std::string_view>()) r.cc = std::string(*v);
             if (auto v = (*bld)["cxx"].value<std::string_view>()) r.cxx = std::string(*v);
+            if (auto v = (*bld)["ldflags"].value<std::string_view>()) r.ldflags = std::string(*v);
         }
 
         parse_capability_hooks(tbl, r.capability_hooks);

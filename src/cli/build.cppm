@@ -51,6 +51,8 @@ std::optional<std::string> probe_compiler(std::string_view cc) {
 // (os-release) stays silent, and a rust build is labeled rustc, not clang.
 struct Provenance {
     bool compiled = false;          // any ELF / object-like file in the payload
+    // 最新的"编译产物"文件时间：用于区分本地真实编译与重分发的旧字节。
+    std::filesystem::file_time_type newest_compiled{};
     std::set<std::string> producers;
     // Versions per producer: linked executables embed the crt startup files'
     // .comment too, so a clang-built package honestly carries a gcc trace --
@@ -136,6 +138,11 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
     char magic[4] = {};
     if (!in.read(magic, 4)) return false;
     const std::string_view head(magic, 4);
+
+    std::error_code mtime_ec;
+    const auto mtime = std::filesystem::last_write_time(path, mtime_ec);
+    if (mtime_ec) return false;
+    if (mtime > prov.newest_compiled) prov.newest_compiled = mtime;
 
     if (head == ZSTD_FRAME) {
         in.clear();
@@ -375,6 +382,8 @@ export int cmd_build(const CliOptions& opts) {
     // left behind by a failed pass would poison the next candidate.
     Toolchain used;
     bool built = false;
+    const auto build_started = std::filesystem::file_time_type::clock::now()
+        - std::chrono::seconds(90);   // 容忍时钟粒度/复制延迟
     for (size_t attempt = 0; attempt < candidates.size(); ++attempt) {
         const Toolchain& cand = candidates[attempt];
         if (candidates.size() > 1) {
@@ -569,8 +578,12 @@ export int cmd_build(const CliOptions& opts) {
     // 二进制重分发包（mold、rust-bin 这类 build=[] 的重打包）即便载荷是
     // ELF 也一律不写 compiler/flags——.comment 只能证明"字节是谁产的"，
     // 不能证明"是我们用这些参数编的"。
-    const bool locally_compiled = !r.build_cmds.empty();
-    if (locally_compiled && provenance.compiled) {
+    // 只有当载荷里存在"本次构建期间新生成"的编译产物时才记录溯源；
+    // 重分发（mold/rust-bin 这类 cp -a 的上游二进制）保留其原始 mtime，
+    // 从而被判定为非本地编译，manifest 不写任何 build_* 字段。
+    provenance.compiled = provenance.compiled
+        && provenance.newest_compiled >= build_started;
+    if (provenance.compiled) {
         // One compiler, the one that actually produced the objects. Every
         // clang- or rustc-linked binary also carries a gcc trace in its crt
         // startup files' .comment, so a producer *set* is disambiguated by
@@ -599,7 +612,10 @@ export int cmd_build(const CliOptions& opts) {
         } else {
             if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
             if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
-            if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
+            // ldflags 同样以 recipe 覆盖优先（如 kernel 显式置空以声明
+            // 注入的 LDFLAGS 与真实链接行为无关）。
+            const std::string eff_ldflags = r.ldflags.value_or(bcfg.ldflags);
+            if (!eff_ldflags.empty()) manifest.build_ldflags = eff_ldflags;
         }
     }
 
