@@ -465,20 +465,12 @@ export int cmd_install(
     bool transaction_all_new = true;
     for (const auto& pkg : unique_to_install) {
         auto existing = db.get_package(pkg.name);
-        if (!existing) {
+        if (!existing || *existing) {
+            // 已有同名包（升级或同身份重装）都需要串行路径的 conffile
+            // 迁移与 stale 声明清理；只有纯新增才允许批量快速路径。
             transaction_all_new = false;
             break;
         }
-        if (*existing && sage::package::package_identity(**existing)
-                == sage::package::package_identity(pkg)) {
-            continue;
-        }
-        if (*existing) {
-            // 已安装同名的其他版本：升级语义，走串行。
-            transaction_all_new = false;
-            break;
-        }
-        // 未安装同名包但存在 provides 冲突等情形由批量预检兜底。
     }
     if (transaction_all_new
         && !batch_has_payload_conflict
