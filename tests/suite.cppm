@@ -12,7 +12,9 @@ import sage;
 
 import sage.cli;
 import sage.cli.build;
-import sage.cli.pkg;
+import sage.cli.install;
+import sage.cli.rebuild;
+import sage.cli.remove;
 
 namespace sage::tests {
 
@@ -119,7 +121,7 @@ export int run_all() {
         return 1;
     }
 
-    const auto builtin_triggers = sage::rebuild::TriggerEngine::builtin_triggers();
+    const auto builtin_triggers = sage::triggers::TriggerEngine::builtin_triggers();
     auto ldconfig_trigger = std::ranges::find_if(
         builtin_triggers, [](const auto& trigger) { return trigger.name == "ldconfig"; });
     auto certificates_trigger = std::ranges::find_if(
@@ -145,11 +147,11 @@ export int run_all() {
     });
     sage::package::FileEntry failing_trigger_file;
     failing_trigger_file.path = "usr/share/must-fail/input";
-    sage::rebuild::TriggerContext failing_trigger_context;
+    sage::triggers::TriggerContext failing_trigger_context;
     failing_trigger_context.touched_files = {failing_trigger_file};
     failing_trigger_context.installed_packages = {failing_trigger_package};
     auto failing_trigger_result =
-        sage::rebuild::TriggerEngine::run(failing_trigger_context);
+        sage::triggers::TriggerEngine::run(failing_trigger_context);
     if (failing_trigger_result
         || failing_trigger_result.error().find("must-fail") == std::string::npos) {
         sage::util::log_error("Trigger execution failure was not propagated");
@@ -158,7 +160,7 @@ export int run_all() {
     failing_trigger_package.triggers.front().name = "missing-trigger";
     failing_trigger_package.triggers.front().exec = "/usr/bin/sage-missing-trigger";
     failing_trigger_context.installed_packages = {failing_trigger_package};
-    auto missing_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    auto missing_trigger_result = sage::triggers::TriggerEngine::run(failing_trigger_context);
     if (missing_trigger_result
         || missing_trigger_result.error().find("Required executable") == std::string::npos) {
         sage::util::log_error("Missing required trigger executable was treated as success");
@@ -186,7 +188,7 @@ export int run_all() {
         failing_trigger_package.triggers.front().name = "sysroot-symlink-trigger";
         failing_trigger_package.triggers.front().exec = executable;
         failing_trigger_context.installed_packages = {failing_trigger_package};
-        if (auto result = sage::rebuild::TriggerEngine::run(failing_trigger_context); !result) {
+        if (auto result = sage::triggers::TriggerEngine::run(failing_trigger_context); !result) {
             sage::util::log_error(
                 "Target-root trigger symlink '{}' was not resolved: {}", executable, result.error());
             return 1;
@@ -195,7 +197,7 @@ export int run_all() {
     failing_trigger_package.triggers.front().name = "dangling-sysroot-trigger";
     failing_trigger_package.triggers.front().exec = "/usr/bin/dangling-trigger";
     failing_trigger_context.installed_packages = {failing_trigger_package};
-    auto dangling_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    auto dangling_trigger_result = sage::triggers::TriggerEngine::run(failing_trigger_context);
     if (dangling_trigger_result
         || dangling_trigger_result.error().find("Required executable") == std::string::npos) {
         sage::util::log_error("Dangling target-root trigger symlink was treated as executable");

@@ -2,8 +2,10 @@ import std;
 import sage;
 import sage.cli;
 import sage.cli.build;
-import sage.cli.pkg;
+import sage.cli.install;
 import sage.cli.query;
+import sage.cli.rebuild;
+import sage.cli.remove;
 import sage.cli.toolchain;
 
 // Entry point: global option parsing lives in sage.cli; this file only maps

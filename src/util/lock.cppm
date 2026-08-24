@@ -7,7 +7,7 @@ module;
 #include <cerrno>
 #include <cstring>
 
-export module sage.util:lock;
+export module sage.util:lock;  // process-wide operation lock (flock-based)
 
 import std;
 

@@ -27,6 +27,11 @@ end
 
 add_rules("mode.release", "mode.debug")
 
+-- Gentoo 的 fortify.h 在 -O 下自动定义 _FORTIFY_SOURCE=2，其 fortified 内联
+-- 重载带内部链接，导致 clang 预编译 GCC 的 std 模块（std.cc）时无法再导出。
+-- 显式关闭以稳定 `import std;` 的模块化构建（见 /usr/include/gentoo/fortify.h）。
+add_defines("_GENTOO_NO_FORTIFY_SOURCE")
+
 -- Sage CLI executable target
 target("sage")
     set_kind("binary")

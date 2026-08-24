@@ -21,4 +21,6 @@ export import sage.archive;
 
 // Layer 4: Orchestration & Dependency Solving
 export import sage.solver;
+export import sage.repo;
+export import sage.triggers;
 export import sage.rebuild;
