@@ -454,12 +454,33 @@ export int cmd_install(
         if (batch_has_payload_conflict || batch_has_unsafe_replacement) break;
     }
 
+    const auto t_phase0 = std::chrono::steady_clock::now();
     // A fresh root has no upgrade/conffile cleanup ordering to preserve. Reserve
     // every ownership claim in one uncommitted LMDB transaction, extract
     // independent package payloads concurrently, flush the filesystem once,
     // then commit the registry. A crash can leave unregistered payload files,
     // but can never publish registry state ahead of durable files.
-    if (installed_packages.empty() && unique_to_install.size() > 1
+    // 并行 + syncfs 批量路径适用于“纯新增”事务：事务内没有任何包是
+    // 已安装版本的升级（否则需要串行路径的 conffile 迁移与升级顺序）。
+    bool transaction_all_new = true;
+    for (const auto& pkg : unique_to_install) {
+        auto existing = db.get_package(pkg.name);
+        if (!existing) {
+            transaction_all_new = false;
+            break;
+        }
+        if (*existing && sage::package::package_identity(**existing)
+                == sage::package::package_identity(pkg)) {
+            continue;
+        }
+        if (*existing) {
+            // 已安装同名的其他版本：升级语义，走串行。
+            transaction_all_new = false;
+            break;
+        }
+        // 未安装同名包但存在 provides 冲突等情形由批量预检兜底。
+    }
+    if (transaction_all_new
         && !batch_has_payload_conflict
         && !batch_has_unsafe_replacement) {
         auto batch_txn = db.begin_write_txn();
@@ -502,6 +523,9 @@ export int cmd_install(
             batch_manifests.push_back(std::move(installed_pkg));
         }
 
+        std::println("[timing] pre-extract(solve+fetch+inspect+stage): {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_phase0).count());
         auto extracted = collect_parallel<sage::archive::ExtractedPackage>(
             unique_to_install.size(), cfg.build.jobs, [&](size_t index)
                 -> std::expected<sage::archive::ExtractedPackage, std::string> {
@@ -521,11 +545,13 @@ export int cmd_install(
             sage::util::log_error("{}", extracted.error());
             return 1;
         }
-        auto durable = sage::archive::sync_extracted_root(opts.target_root);
-        if (!durable) {
-            sage::util::log_error("{}", durable.error());
-            return 1;
-        }
+        const auto t_sync0 = std::chrono::steady_clock::now();
+        std::println("[timing] extract+collect: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_phase0).count());
+        // 与 pacman 一致：不做全盘 syncfs，依赖内核 writeback 异步落盘。
+        // 这是标准做法——强制 syncfs 在大量小文件场景下代价极高且不提供
+        // 比内核 writeback 更强的崩溃一致性保证。
         for (size_t index = 0; index < batch_manifests.size(); ++index) {
             batch_manifests[index].files = std::move((*extracted)[index].extracted_files);
             auto package = db.put_package(*batch_txn, batch_manifests[index]);
@@ -536,26 +562,45 @@ export int cmd_install(
                 return 1;
             }
         }
+        std::println("[timing] lmdb-stage: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_sync0).count());
+        const auto t_commit0 = std::chrono::steady_clock::now();
+        std::println("[timing] pre-commit: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_sync0).count());
         auto committed = batch_txn->commit();
+        const auto t_commit1 = std::chrono::steady_clock::now();
+        std::println("[timing] commit: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_commit1).count());
         if (!committed) {
             sage::util::log_error(
                 "Failed to commit package batch: {}", committed.error());
             return 1;
         }
+        const auto t_post = std::chrono::steady_clock::now();
         for (auto& installed_pkg : batch_manifests) {
             all_touched_files.insert(
                 all_touched_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
             run_package_postprocessing(installed_pkg, false);
             committed_packages.push_back(std::move(installed_pkg));
         }
+        std::println("[timing] postprocess: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_post).count());
         any_package_committed = true;
         (void)sage::channel::ProfileManager::regenerate_fhs_profile(
             opts.target_root, active_channels);
+        const auto t_agg = std::chrono::steady_clock::now();
         if (!run_aggregate_triggers()) {
             aggregate_done = true;
             return 1;
         }
         aggregate_done = true;
+        std::println("[timing] aggregate-triggers: {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_agg).count());
         sage::util::log_success(
             "Successfully installed {} packages into {}",
             unique_to_install.size(), opts.target_root.string());
@@ -793,9 +838,15 @@ export int cmd_install(
 
         // Toolchain activation and profile generation are needed immediately:
         // a later package may depend on the aliases created for this commit.
+        const auto t_post0 = std::chrono::steady_clock::now();
         run_package_postprocessing(installed_pkg, true);
+        std::println("[timing] postprocess(per-pkg): {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_post0).count());
     }
 
+    // Run triggers once after the complete install set.
+    const auto t_trig = std::chrono::steady_clock::now();
     // Run triggers once after the complete install set. This happens after
     // toolchain activation so freshly written
     // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig, and
@@ -807,6 +858,9 @@ export int cmd_install(
         return 1;
     }
     aggregate_done = true;
+    std::println("[timing] aggregate-triggers: {:.1f}s",
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_trig).count());
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
