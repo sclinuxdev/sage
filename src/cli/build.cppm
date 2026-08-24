@@ -564,7 +564,13 @@ export int cmd_build(const CliOptions& opts) {
     }
 
     // The provenance verdict, now that every payload file has been seen.
-    if (provenance.compiled) {
+    //
+    // 真实性规则：只有本地确实执行了编译相位（build 非空）才记录溯源；
+    // 二进制重分发包（mold、rust-bin 这类 build=[] 的重打包）即便载荷是
+    // ELF 也一律不写 compiler/flags——.comment 只能证明"字节是谁产的"，
+    // 不能证明"是我们用这些参数编的"。
+    const bool locally_compiled = !r.build_cmds.empty();
+    if (locally_compiled && provenance.compiled) {
         // One compiler, the one that actually produced the objects. Every
         // clang- or rustc-linked binary also carries a gcc trace in its crt
         // startup files' .comment, so a producer *set* is disambiguated by
@@ -583,9 +589,18 @@ export int cmd_build(const CliOptions& opts) {
             }
             break;
         }
-        if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
-        if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
-        if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
+        // rust 产物：只记 rustc 与实际生效的 RUSTFLAGS；C/C++ 产物：记录
+        // 注入到相位 shell 且真实生效的 CFLAGS/CXXFLAGS/LDFLAGS。
+        if (manifest.build_compiler == "rustc") {
+            if (const char* rf = std::getenv("RUSTFLAGS");
+                rf && *rf != '\0') {
+                manifest.build_rustflags = rf;
+            }
+        } else {
+            if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
+            if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
+            if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
+        }
     }
 
     // A package does not depend on itself: a soname it installs is not an

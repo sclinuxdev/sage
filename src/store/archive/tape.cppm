@@ -595,6 +595,13 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
     std::ifstream archive_file(
         std::format("/proc/self/fd/{}", source.get()), std::ios::binary);
     if (!archive_file.is_open()) {
+        // Chroots without a mounted /proc cannot resolve the fd path; fall
+        // back to reopening by path. Identity was already captured from the
+        // NOFOLLOW-opened descriptor above, and extraction re-verifies it via
+        // the private snapshot.
+        archive_file.open(archive_path, std::ios::binary);
+    }
+    if (!archive_file.is_open()) {
         return std::unexpected("Cannot stream package archive: " + archive_path.string());
     }
     auto inspected = inspect_package_stream(

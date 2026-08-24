@@ -300,6 +300,7 @@ inline std::expected<void, std::string> generate_repo_index(
         if (!m.build_cflags.empty()) ss << "build_cflags = \"" << quote(m.build_cflags) << "\"\n";
         if (!m.build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(m.build_cxxflags) << "\"\n";
         if (!m.build_ldflags.empty()) ss << "build_ldflags = \"" << quote(m.build_ldflags) << "\"\n";
+        if (!m.build_rustflags.empty()) ss << "build_rustflags = \"" << quote(m.build_rustflags) << "\"\n";
         ss << "dependencies = [\n";
         for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
         ss << "]\n";

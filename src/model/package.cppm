@@ -529,6 +529,8 @@ struct PackageManifest {
     std::string build_cflags;
     std::string build_cxxflags;
     std::string build_ldflags;
+    // 实际传给 rustc 的 RUSTFLAGS（仅 rust 产物且本地真实编译时非空）。
+    std::string build_rustflags;
 
     // Raw universal service definition (a full service.toml document) for
     // daemon packages: `sage rebuild` parses it and regenerates native
@@ -594,6 +596,7 @@ struct PackageManifest {
             m.build_cxxflags = (*pkg)["build_cxxflags"].value_or("");
             m.service_toml = (*pkg)["service_toml"].value_or("");
             m.build_ldflags = (*pkg)["build_ldflags"].value_or("");
+            m.build_rustflags = (*pkg)["build_rustflags"].value_or("");
         } else {
             return std::unexpected("Missing [package] section in manifest");
         }
@@ -715,6 +718,7 @@ struct PackageManifest {
         if (!build_cflags.empty()) ss << "build_cflags = \"" << quote(build_cflags) << "\"\n";
         if (!build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(build_cxxflags) << "\"\n";
         if (!build_ldflags.empty()) ss << "build_ldflags = \"" << quote(build_ldflags) << "\"\n";
+        if (!build_rustflags.empty()) ss << "build_rustflags = \"" << quote(build_rustflags) << "\"\n";
         if (!service_toml.empty()) ss << "service_toml = \"" << quote(service_toml) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
 
