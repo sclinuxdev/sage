@@ -24,7 +24,7 @@ jobs:
       - name: Install toolchain and dependencies
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git xmake \
+            base-devel git xmake rust \
             lmdb zstd tomlplusplus curl libarchive
 
       - uses: actions/checkout@v4
