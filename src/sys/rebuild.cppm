@@ -632,6 +632,17 @@ public:
             }
             if (*old_pkg) {
                 const auto& old_manifest = **old_pkg;
+                if (!old_manifest.service_toml.empty()) {
+                    auto old_service = service::ServiceSpec::parse_toml(
+                        old_manifest.service_toml);
+                    if (old_service) {
+                        plan_remove_service_scripts(fsx, old_service->name);
+                    } else {
+                        util::log_warn(
+                            "Cannot identify generated service paths for '{}': {}",
+                            old_manifest.name, old_service.error());
+                    }
+                }
                 auto my_owner = std::format("{}:{}", removal.name, old_manifest.channel);
 
                 // Manifest files plus anything still registered to this
@@ -681,7 +692,6 @@ public:
                 if (!provide_res) return std::unexpected(provide_res.error());
                 auto delete_res = db.del_package(*wtxn, removal.name);
                 if (!delete_res) return std::unexpected(delete_res.error());
-                plan_remove_service_scripts(fsx, removal.name);
             }
         }
 
@@ -717,6 +727,19 @@ public:
             if (package::package_identity(inspect_res->manifest) != identity) {
                 return std::unexpected(std::format(
                     "Archive identity does not match selected package '{}'", selected.name));
+            }
+            if (*existing
+                && (**existing).service_toml != inspect_res->manifest.service_toml
+                && !(**existing).service_toml.empty()) {
+                auto old_service = service::ServiceSpec::parse_toml(
+                    (**existing).service_toml);
+                if (old_service) {
+                    plan_remove_service_scripts(fsx, old_service->name);
+                } else {
+                    util::log_warn(
+                        "Cannot identify generated service paths for '{}': {}",
+                        selected.name, old_service.error());
+                }
             }
 
             const std::filesystem::path staging_root =

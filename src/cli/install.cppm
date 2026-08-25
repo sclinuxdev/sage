@@ -388,6 +388,20 @@ export int cmd_install(
         return 1;
     }
     auto& filesystem_transaction = *transaction_res;
+    auto plan_remove_service_scripts = [&](std::string_view name) {
+        filesystem_transaction.plan_remove_file(std::format("etc/init.d/{}", name));
+        filesystem_transaction.plan_remove_file(
+            std::format("usr/lib/systemd/system/{}.service", name));
+        filesystem_transaction.plan_remove_file(std::format("etc/dinit.d/{}", name));
+        filesystem_transaction.plan_remove_file(
+            std::format("usr/lib/loom/services/{}.toml", name));
+        filesystem_transaction.plan_remove_file(std::format("etc/sv/{}/run", name));
+        filesystem_transaction.plan_remove_dir(std::format("etc/sv/{}", name));
+        filesystem_transaction.plan_remove_file(
+            std::format("etc/s6/services/{}/run", name));
+        filesystem_transaction.plan_remove_dir(
+            std::format("etc/s6/services/{}", name));
+    };
 
     sage::archive::JournalContext journal_ctx;
     journal_ctx.kind = "install";
@@ -615,6 +629,19 @@ export int cmd_install(
         // so a daemon whose service.toml never reaches LMDB is a daemon no
         // init system will ever be told about.
         installed_pkg.service_toml = ext_res->manifest.service_toml;
+        if (*previous_package
+            && (**previous_package).service_toml != installed_pkg.service_toml
+            && !(**previous_package).service_toml.empty()) {
+            auto old_service = sage::service::ServiceSpec::parse_toml(
+                (**previous_package).service_toml);
+            if (old_service) {
+                plan_remove_service_scripts(old_service->name);
+            } else {
+                sage::util::log_warn(
+                    "Cannot identify generated service paths for '{}': {}",
+                    pkg.name, old_service.error());
+            }
+        }
 
         // Conffile protection under staging: extraction cannot compare against
         // the live tree (its fifth parameter would probe the empty staging

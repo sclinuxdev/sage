@@ -3964,6 +3964,13 @@ after = ["net"]
             sage::util::log_error("Failed to open the service canary database");
             return 1;
         }
+        auto close_service_db = [&]() {
+            svc_db = std::unexpected(std::string("service canary database closed"));
+        };
+        auto reopen_service_db = [&]() {
+            svc_db = sage::db::Database::open(svc_root / "var/lib/sage/data.mdb");
+            return static_cast<bool>(svc_db);
+        };
         auto installed_svc = svc_db->get_package("svcanary");
         if (!installed_svc || !*installed_svc
             || (**installed_svc).service_toml != svcpkg->service_toml) {
@@ -4008,6 +4015,140 @@ after = ["net"]
         if (!svc_exec_again) {
             sage::util::log_error("Second reconcile over a settled root failed: {}",
                 svc_exec_again.error());
+            return 1;
+        }
+
+        auto build_service_revision = [&](int release, std::string_view description,
+                                           std::string_view exec_start,
+                                           bool with_service) -> decltype(svcpkg) {
+            auto recipe = std::format(R"(schema_version = 1
+[package]
+name = "svcanary"
+version = "1.0.0"
+release = "{}"
+arch = "any"
+description = "service manifest canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/bin"',
+    'printf "#!/bin/sh\n" > "$DESTDIR/usr/bin/svcanary"',
+]
+)", release);
+            if (!write_canary_recipe(svc_dir, recipe)) return {};
+            if (with_service) {
+                std::ofstream f(svc_dir / "service.toml");
+                f << std::format(R"(schema_version = 1
+[service]
+name = "svcanary"
+description = "{}"
+exec_start = "{}"
+after = ["net"]
+)", description, exec_start);
+            } else {
+                std::filesystem::remove(svc_dir / "service.toml");
+            }
+            return build_with_root(
+                svc_dir, canary_root, temp_dir / std::format("bcfg-svc-x-{}", release),
+                std::format("svcanary-1.0.0-{}-any.pkg.tar.zst", release));
+        };
+        auto reconcile_service = [&]() -> std::expected<void, std::string> {
+            auto plan = sage::rebuild::ReconcileEngine::calculate_diff(
+                *svc_db, *svc_cfg, false);
+            if (!plan) return std::unexpected(plan.error());
+            if (plan->has_changes) {
+                return std::unexpected("service reconcile unexpectedly planned a provider change");
+            }
+            return sage::rebuild::ReconcileEngine::execute(
+                *svc_db, *plan, svc_root, false, svc_cfg->providers);
+        };
+        auto read_service_unit = [&]() {
+            std::ifstream f(svc_unit);
+            std::stringstream text;
+            text << f.rdbuf();
+            return text.str();
+        };
+
+        // Updating the universal definition withdraws the old generated unit
+        // during install. The next no-provider-change reconcile must render
+        // the new content rather than accepting the stale file by existence.
+        auto svcpkg_v2 = build_service_revision(
+            2, "updated canary daemon", "/usr/bin/svcanary --updated", true);
+        if (!svcpkg_v2) {
+            sage::util::log_error("Failed to build the updated service canary");
+            return 1;
+        }
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-2-any.pkg.tar.zst").string()
+        };
+        close_service_db();
+        if (cmd_install(svc_install, "/") != 0 || std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Service upgrade did not retire the old generated unit");
+            return 1;
+        }
+        if (!reopen_service_db()) {
+            sage::util::log_error("Failed to reopen the updated service database");
+            return 1;
+        }
+        auto svc_update = reconcile_service();
+        if (!svc_update
+            || read_service_unit().find("ExecStart=/usr/bin/svcanary --updated")
+                == std::string::npos) {
+            sage::util::log_error(
+                "Service upgrade did not render the updated definition: {}",
+                svc_update.error_or("updated content missing"));
+            return 1;
+        }
+
+        // Dropping service.toml on a later revision must retire the generated
+        // unit without waiting for a provider transition.
+        auto svcpkg_v3 = build_service_revision(3, "", "", false);
+        if (!svcpkg_v3) {
+            sage::util::log_error("Failed to build the service-less canary");
+            return 1;
+        }
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-3-any.pkg.tar.zst").string()
+        };
+        close_service_db();
+        if (cmd_install(svc_install, "/") != 0 || std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Dropping service.toml left a generated unit behind");
+            return 1;
+        }
+        if (!reopen_service_db()) {
+            sage::util::log_error("Failed to reopen the service-less database");
+            return 1;
+        }
+        auto installed_without_service = svc_db->get_package("svcanary");
+        if (!installed_without_service || !*installed_without_service
+            || !(**installed_without_service).service_toml.empty()) {
+            sage::util::log_error("Service-less upgrade kept stale service metadata");
+            return 1;
+        }
+
+        // Ordinary package removal must retire generated units too, not only
+        // provider-removal transactions in ReconcileEngine.
+        auto svcpkg_v4 = build_service_revision(
+            4, "removal canary daemon", "/usr/bin/svcanary --remove", true);
+        if (!svcpkg_v4) {
+            sage::util::log_error("Failed to build the removal service canary");
+            return 1;
+        }
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-4-any.pkg.tar.zst").string()
+        };
+        close_service_db();
+        if (cmd_install(svc_install, "/") != 0 || !reopen_service_db()
+            || !reconcile_service() || !std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Failed to prepare the service removal canary");
+            return 1;
+        }
+        CliOptions svc_remove;
+        svc_remove.target_root = svc_root;
+        svc_remove.args = {"svcanary"};
+        close_service_db();
+        if (cmd_remove(svc_remove) != 0 || std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Package removal left a generated unit behind");
             return 1;
         }
 
