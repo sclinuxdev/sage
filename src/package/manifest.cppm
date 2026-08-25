@@ -255,10 +255,24 @@ struct PackageManifest {
         if (!producers_tbl)
             if (auto* pkg2 = tbl.get_as<vendor::toml::table>("package"))
                 producers_tbl = pkg2->get_as<vendor::toml::array>("build_producers");
+        // Salvage for pre-0.2.3 serializers: those scoped package arrays
+        // (dependencies/provides/conflicts/conffiles) under the last
+        // [[build_producers]] element instead of root/[package], so legacy
+        // manifests carry stray keys inside producer tables. Probe each raw
+        // element and stash what turns up; adoption below only fills fields
+        // still empty after the normal reads above.
+        std::vector<Dependency> salvaged_deps;
+        std::vector<std::string> salvaged_provides;
+        std::vector<Dependency> salvaged_conflicts;
+        std::vector<std::string> salvaged_conffiles;
         if (producers_tbl) {
             for (auto&& el : *producers_tbl) {
                 auto* t = el.as_table();
                 if (!t) continue;
+                parse_deps(*t, "dependencies", salvaged_deps);
+                parse_strings(*t, "provides", salvaged_provides);
+                parse_deps(*t, "conflicts", salvaged_conflicts);
+                parse_strings(*t, "conffiles", salvaged_conffiles);
                 BuildProducer p;
                 p.name = (*t)["name"].value_or("");
                 if (p.name.empty()) continue;
@@ -273,6 +287,10 @@ struct PackageManifest {
                 m.build_producers.push_back(std::move(p));
             }
         }
+        if (m.dependencies.empty()) m.dependencies = std::move(salvaged_deps);
+        if (m.provides.empty()) m.provides = std::move(salvaged_provides);
+        if (m.conflicts.empty()) m.conflicts = std::move(salvaged_conflicts);
+        if (m.conffiles.empty()) m.conffiles = std::move(salvaged_conffiles);
         auto pt_arr = tbl.get_as<vendor::toml::array>("build_flag_passthrough");
         if (!pt_arr)
             if (auto* pkg3 = tbl.get_as<vendor::toml::table>("package"))

@@ -1087,6 +1087,39 @@ restart = "on-failure"
         sage::util::log_error("Package metadata TOML escaping round-trip failed");
         return 1;
     }
+    // Regression: pre-0.2.3 serializers scoped package arrays under the
+    // last [[build_producers]] element instead of root/[package]. The
+    // parser must salvage those stray keys when nothing else filled the
+    // fields.
+    auto salvaged_manifest = sage::package::PackageManifest::parse_toml(R"(
+schema_version = 1
+[package]
+name = "legacy-scoped"
+version = "1.0-1"
+description = "legacy layout"
+license = "MIT"
+
+[[build_producers]]
+name = "gcc"
+versions = ["13.2.0"]
+flags = "-O2"
+dependencies = ["zlib >= 1.2-1"]
+provides = ["legacy-scoped"]
+conflicts = ["old-legacy < 1.0-1"]
+conffiles = ["etc/legacy.conf"]
+)");
+    if (!salvaged_manifest
+        || salvaged_manifest->dependencies.size() != 1
+        || salvaged_manifest->dependencies.front().to_string() != "zlib >= 1.2-1"
+        || salvaged_manifest->provides != std::vector<std::string>{"legacy-scoped"}
+        || salvaged_manifest->conflicts.size() != 1
+        || salvaged_manifest->conflicts.front().to_string() != "old-legacy < 1.0-1"
+        || salvaged_manifest->conffiles != std::vector<std::string>{"etc/legacy.conf"}
+        || salvaged_manifest->build_producers.size() != 1
+        || salvaged_manifest->build_producers.front().name != "gcc") {
+        sage::util::log_error("Malformed pre-0.2.3 producer-scoped package arrays were not salvaged");
+        return 1;
+    }
 
     auto embedded_epoch_manifest = sage::package::PackageManifest::parse_toml(R"(
 schema_version = 1
