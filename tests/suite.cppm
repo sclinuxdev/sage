@@ -1032,6 +1032,17 @@ restart = "on-failure"
     escaped_manifest.name = "escaped-metadata";
     escaped_manifest.version = sage::package::Version::parse("7:1.0.0-1");
     escaped_manifest.description = "quoted \"value\" with \\ slash\nnext line";
+    escaped_manifest.dependencies.push_back(
+        sage::package::Dependency::parse("runtime-lib >= 2.0"));
+    escaped_manifest.provides = {"escaped-metadata", "virtual/escaped"};
+    escaped_manifest.conflicts.push_back(
+        sage::package::Dependency::parse("legacy-metadata < 2.0"));
+    escaped_manifest.conffiles = {"etc/escaped.conf"};
+    sage::package::PackageManifest::BuildProducer escaped_producer;
+    escaped_producer.name = "gcc";
+    escaped_producer.versions = {"16.2.0"};
+    escaped_producer.flags = "-O2";
+    escaped_manifest.build_producers.push_back(std::move(escaped_producer));
     sage::package::FileEntry escaped_file;
     escaped_file.path = R"(usr/lib/systemd/system/system-systemd\x2dmute.slice)";
     escaped_manifest.files.push_back(std::move(escaped_file));
@@ -1039,6 +1050,17 @@ restart = "on-failure"
     if (!escaped_round_trip
         || escaped_round_trip->version != escaped_manifest.version
         || escaped_round_trip->description != escaped_manifest.description
+        || escaped_round_trip->dependencies.size() != 1
+        || escaped_round_trip->dependencies.front().to_string() != "runtime-lib >= 2.0-1"
+        || escaped_round_trip->provides != escaped_manifest.provides
+        || escaped_round_trip->conflicts.size() != 1
+        || escaped_round_trip->conflicts.front().to_string() != "legacy-metadata < 2.0-1"
+        || escaped_round_trip->conffiles != escaped_manifest.conffiles
+        || escaped_round_trip->build_producers.size() != 1
+        || escaped_round_trip->build_producers.front().name != "gcc"
+        || escaped_round_trip->build_producers.front().versions
+            != std::vector<std::string>{"16.2.0"}
+        || escaped_round_trip->build_producers.front().flags != "-O2"
         || escaped_round_trip->files.size() != 1
         || escaped_round_trip->files.front().path != escaped_manifest.files.front().path) {
         sage::util::log_error("Package metadata TOML escaping round-trip failed");

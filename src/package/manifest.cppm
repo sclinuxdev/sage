@@ -326,23 +326,6 @@ struct PackageManifest {
             }
             ss << "]\n";
         }
-        // Same omission rule: [[build_producers]] appears only for packages
-        // whose artifacts named a producer.
-        for (const auto& p : build_producers) {
-            if (p.name.empty()) continue;
-            ss << "[[build_producers]]\n";
-            ss << "name = \"" << quote(p.name) << "\"\n";
-            ss << "versions = [\n";
-            for (const auto& v : p.versions) {
-                ss << "    \"" << quote(v) << "\",\n";
-            }
-            ss << "]\n";
-            if (!p.flags.empty()) {
-                ss << "flags = \"" << quote(p.flags) << "\"\n";
-            }
-            ss << "\n";
-        }
-
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {
             ss << "    \"" << quote(d.to_string()) << "\",\n";
@@ -417,6 +400,24 @@ struct PackageManifest {
             ss << "size = " << f.size << "\n";
             if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
             if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
+            ss << "\n";
+        }
+
+        // Array tables change the active TOML scope. Keep producer records
+        // last so package arrays written above cannot become fields of the
+        // final [[build_producers]] entry.
+        for (const auto& p : build_producers) {
+            if (p.name.empty()) continue;
+            ss << "[[build_producers]]\n";
+            ss << "name = \"" << quote(p.name) << "\"\n";
+            ss << "versions = [\n";
+            for (const auto& v : p.versions) {
+                ss << "    \"" << quote(v) << "\",\n";
+            }
+            ss << "]\n";
+            if (!p.flags.empty()) {
+                ss << "flags = \"" << quote(p.flags) << "\"\n";
+            }
             ss << "\n";
         }
 
