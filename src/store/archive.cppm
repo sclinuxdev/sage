@@ -7,4 +7,5 @@ export import :detail;
 export import :inspect;
 export import :extract;
 export import :pack;
+export import :journal;
 export import :transaction;

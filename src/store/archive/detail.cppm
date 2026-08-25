@@ -72,6 +72,7 @@ public:
     }
     ~UniqueFd() noexcept { reset(); }
     [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
 
 private:
     void reset() noexcept {

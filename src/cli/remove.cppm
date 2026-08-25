@@ -301,6 +301,25 @@ export int cmd_remove(
         } else {
             sage::util::log_info("Auto-removing orphaned dependency '{}' (version {})...", pkg_name, pkg.version.to_string());
         }
+        if (!pkg.service_toml.empty()) {
+            auto service = sage::service::ServiceSpec::parse_toml(pkg.service_toml);
+            if (service) {
+                auto retired = sage::service_registry::plan_remove_scripts(
+                    db, *wtxn, filesystem_transaction, service->name, pkg_name);
+                if (!retired) {
+                    sage::util::log_error(
+                        "Cannot retire generated service paths for '{}': {}",
+                        pkg_name, retired.error());
+                    return 1;
+                }
+                journal_ctx.touched.insert(
+                    journal_ctx.touched.end(), retired->begin(), retired->end());
+            } else {
+                sage::util::log_warn(
+                    "Cannot identify generated service paths for '{}': {}",
+                    pkg_name, service.error());
+            }
+        }
 
         // The LMDB files table is the authoritative owner registry: merge the
         // installed manifest's file list with all files still registered to
@@ -478,6 +497,14 @@ export int cmd_remove(
     if (!resumed) {
         sage::util::log_error(
             "Failed to complete pending filesystem operations: {}", resumed.error());
+        return 1;
+    }
+    auto repaired_services = sage::rebuild::ReconcileEngine::repair_missing_services(
+        db, opts.target_root);
+    if (!repaired_services) {
+        sage::util::log_error(
+            "Package removal completed, but service repair failed: {}",
+            repaired_services.error());
         return 1;
     }
 

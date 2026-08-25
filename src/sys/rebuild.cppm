@@ -1,5 +1,6 @@
 module;
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -21,10 +22,12 @@ import sage.config;
 import sage.package;
 import sage.repo;
 import sage.service;
+import sage.service_registry;
 import sage.db;
 import sage.solver;
 import sage.triggers;
 import sage.util;
+import sage.vendor.lmdb;
 
 export namespace sage::rebuild {
 
@@ -121,6 +124,21 @@ std::expected<void, std::string> run_postprocess(
         if (!regen) return std::unexpected(regen.error());
     }
 
+    const bool systemd_unit_tree_changed = std::ranges::any_of(
+        parsed.ctx.touched, [](const auto& touched) {
+            const auto& path = touched.second;
+            return path.starts_with("usr/lib/systemd/system/")
+                || path.starts_with("etc/systemd/system/");
+        });
+    if (systemd_unit_tree_changed && target_root == "/"
+        && std::filesystem::is_directory("/run/systemd/system")) {
+        const int status = std::system("/usr/bin/systemctl daemon-reload");
+        if (status != 0) {
+            return std::unexpected(std::format(
+                "systemctl daemon-reload failed with status {}", status));
+        }
+    }
+
     const std::filesystem::path trigger_sysroot = parsed.ctx.sysroot.empty()
         ? target_root
         : std::filesystem::path(parsed.ctx.sysroot);
@@ -156,28 +174,13 @@ std::expected<void, std::string> run_postprocess(
     return {};
 }
 
-// Plan the retirement of every generated init-script shape for a package
-// leaving the system. Missing entries publish as no-ops; directory-shaped
-// backends keep their directory when foreign content remains.
-void plan_remove_service_scripts(
-    archive::FilesystemTransaction& fsx, std::string_view name)
-{
-    fsx.plan_remove_file(std::format("etc/init.d/{}", name));
-    fsx.plan_remove_file(std::format("usr/lib/systemd/system/{}.service", name));
-    fsx.plan_remove_file(std::format("etc/dinit.d/{}", name));
-    fsx.plan_remove_file(std::format("usr/lib/loom/services/{}.toml", name));
-    fsx.plan_remove_file(std::format("etc/sv/{}/run", name));
-    fsx.plan_remove_dir(std::format("etc/sv/{}", name));
-    fsx.plan_remove_file(std::format("etc/s6/services/{}/run", name));
-    fsx.plan_remove_dir(std::format("etc/s6/services/{}", name));
-}
-
 std::expected<void, std::string> stage_text(
     archive::FilesystemTransaction& fsx,
     std::string_view stage_rel,
-    std::string_view content)
+    std::string_view content,
+    std::uint32_t mode)
 {
-    auto fd = fsx.open_staged_file(stage_rel);
+    auto fd = fsx.open_staged_file(stage_rel, mode);
     if (!fd) return std::unexpected(fd.error());
     size_t written = 0;
     while (written < content.size()) {
@@ -483,6 +486,62 @@ public:
         return plan;
     }
 
+    // True when some installed package declares a service that has no
+    // definition on disk yet. Packages shipping their own native unit are not
+    // pending: the reconcile pass lets package data win over the generated
+    // form, so a present owner means there is nothing to generate. Unparsable
+    // service.toml is not pending for backends that warn and skip it. Loom is
+    // fail-closed, however, so its parse/destination errors must enter execute()
+    // and preserve that error instead of being hidden by the no-op fast path.
+    static std::expected<bool, std::string> services_awaiting_generation(
+        db::Database& db,
+        service::InitType target_init,
+        const std::filesystem::path& sysroot)
+    {
+        auto txn = db.begin_read_txn();
+        if (!txn) {
+            return std::unexpected(
+                "Failed to open service ownership read transaction: " + txn.error());
+        }
+        auto installed = db.list_installed_packages(*txn);
+        if (!installed) {
+            return std::unexpected(
+                "Installed package database is inconsistent: " + installed.error());
+        }
+        for (const auto& pkg : *installed) {
+            if (pkg.service_toml.empty()) continue;
+            auto spec = service::ServiceSpec::parse_toml(pkg.service_toml);
+            if (!spec) {
+                if (target_init == service::InitType::Loom) return true;
+                continue;
+            }
+            auto dest = service::service_destination(spec->name, target_init, sysroot);
+            if (!dest) {
+                if (target_init == service::InitType::Loom) return true;
+                continue;
+            }
+            const auto target = dest->lexically_relative(sysroot).generic_string();
+            auto owners = db.get_path_owners(*txn, target);
+            if (!owners) return std::unexpected(owners.error());
+            if (!owners->empty()) continue;
+            std::error_code ec;
+            if (!std::filesystem::exists(*dest, ec)) return true;
+            if (target_init == service::InitType::Loom) continue;
+            const auto expected_mode = static_cast<std::filesystem::perms>(
+                service::script_is_executable(target_init) ? 0755 : 0644);
+            const auto actual_mode = std::filesystem::status(*dest, ec).permissions();
+            if (ec || (actual_mode & std::filesystem::perms::mask) != expected_mode) return true;
+            auto expected = service::render_service(*spec, target_init);
+            if (!expected) continue;
+            std::ifstream current(*dest);
+            if (!current) return true;
+            std::stringstream content;
+            content << current.rdbuf();
+            if (content.str() != *expected) return true;
+        }
+        return false;
+    }
+
     static std::expected<void, std::string> execute(
         db::Database& db,
         const ReconcilePlan& plan,
@@ -491,8 +550,24 @@ public:
         const std::map<std::string, std::string>& providers = {})
     {
         if (!plan.has_changes) {
-            util::log_info("System state matches desired configuration. No reconcile needed.");
-            return {};
+            // Providers already match, but that is not the only reason to
+            // reconcile: nothing in the install path renders service scripts,
+            // so a package carrying a service.toml has no definition on disk
+            // until a reconcile runs. Returning here unconditionally meant
+            // such a daemon was never wired up unless an unrelated provider
+            // swap happened to come along.
+            //
+            // The check stays cheap deliberately. Entering the body now costs
+            // a staging transaction, a journal and an fsync, so a genuine
+            // no-op must still cost nothing.
+            auto pending = services_awaiting_generation(db, plan.target_init, sysroot);
+            if (!pending) return std::unexpected(pending.error());
+            if (!*pending) {
+                util::log_info("System state matches desired configuration. No reconcile needed.");
+                return {};
+            }
+            util::log_info(
+                "System providers already match; generating missing service definitions.");
         }
 
         util::log_info("Executing Declarative System Reconcile (Target Init: {})...", service::to_string(plan.target_init));
@@ -533,6 +608,7 @@ public:
 
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
+        std::vector<std::pair<char, std::string>> service_touched;
 
         // The plan was computed before taking the writer lock. Validate every
         // provider binding before changing any of them so a stale reconcile
@@ -579,6 +655,21 @@ public:
             }
             if (*old_pkg) {
                 const auto& old_manifest = **old_pkg;
+                if (!old_manifest.service_toml.empty()) {
+                    auto old_service = service::ServiceSpec::parse_toml(
+                        old_manifest.service_toml);
+                    if (old_service) {
+                        auto retired = service_registry::plan_remove_scripts(
+                            db, *wtxn, fsx, old_service->name, old_manifest.name);
+                        if (!retired) return std::unexpected(retired.error());
+                        service_touched.insert(
+                            service_touched.end(), retired->begin(), retired->end());
+                    } else {
+                        util::log_warn(
+                            "Cannot identify generated service paths for '{}': {}",
+                            old_manifest.name, old_service.error());
+                    }
+                }
                 auto my_owner = std::format("{}:{}", removal.name, old_manifest.channel);
 
                 // Manifest files plus anything still registered to this
@@ -628,7 +719,6 @@ public:
                 if (!provide_res) return std::unexpected(provide_res.error());
                 auto delete_res = db.del_package(*wtxn, removal.name);
                 if (!delete_res) return std::unexpected(delete_res.error());
-                plan_remove_service_scripts(fsx, removal.name);
             }
         }
 
@@ -665,6 +755,26 @@ public:
                 return std::unexpected(std::format(
                     "Archive identity does not match selected package '{}'", selected.name));
             }
+            auto service_registration = service_registry::validate_unique(
+                db, *wtxn, selected.name, inspect_res->manifest.service_toml);
+            if (!service_registration) return std::unexpected(service_registration.error());
+            if (*existing
+                && (**existing).service_toml != inspect_res->manifest.service_toml
+                && !(**existing).service_toml.empty()) {
+                auto old_service = service::ServiceSpec::parse_toml(
+                    (**existing).service_toml);
+                if (old_service) {
+                    auto retired = service_registry::plan_remove_scripts(
+                        db, *wtxn, fsx, old_service->name, selected.name);
+                    if (!retired) return std::unexpected(retired.error());
+                    service_touched.insert(
+                        service_touched.end(), retired->begin(), retired->end());
+                } else {
+                    util::log_warn(
+                        "Cannot identify generated service paths for '{}': {}",
+                        selected.name, old_service.error());
+                }
+            }
 
             const std::filesystem::path staging_root =
                 sysroot / fsx.relative_dir() / "payload";
@@ -699,6 +809,11 @@ public:
             installed_pkg.files = std::move(ext_res->extracted_files);
             installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
             installed_pkg.triggers = ext_res->manifest.triggers;
+            // Same archive-only metadata the install path adopts: the channel
+            // index carries neither, and the service pass below reads the
+            // service definition back out of the database.
+            installed_pkg.conffiles = ext_res->manifest.conffiles;
+            installed_pkg.service_toml = ext_res->manifest.service_toml;
 
             auto p_res = db.put_package(*wtxn, installed_pkg);
             if (!p_res) return std::unexpected(p_res.error());
@@ -754,8 +869,10 @@ public:
             // A package may ship its own native script for this init (the
             // systemd split packages keep their upstream units): package data
             // wins over the generated form.
-            auto owners = db.get_path_owners(dest->string());
-            if (owners && !owners->empty()) {
+            const auto target = dest->lexically_relative(sysroot).generic_string();
+            auto owners = db.get_path_owners(*wtxn, target);
+            if (!owners) return std::unexpected(owners.error());
+            if (!owners->empty()) {
                 util::log_info("  · {:<20} ships its own {} script", spec->name,
                     service::to_string(plan.target_init));
                 continue;
@@ -767,15 +884,26 @@ public:
                 continue;
             }
             const std::string stage_rel = std::format("service-{}", staged_scripts++);
-            auto staged = stage_text(fsx, stage_rel, *content);
+            const std::uint32_t script_mode =
+                service::script_is_executable(plan.target_init) ? 0755 : 0644;
+            auto staged = stage_text(fsx, stage_rel, *content, script_mode);
             if (!staged) {
                 util::log_warn("Cannot stage {} script for '{}': {}",
                     service::to_string(plan.target_init), pkg.name, staged.error());
                 continue;
             }
+            const auto target_path = dest->lexically_relative(sysroot);
+            std::vector<std::filesystem::path> parents;
+            for (auto parent = target_path.parent_path(); !parent.empty() && parent != ".";
+                 parent = parent.parent_path()) {
+                parents.push_back(parent);
+            }
+            for (auto parent = parents.rbegin(); parent != parents.rend(); ++parent) {
+                fsx.plan_ensure_dir(parent->generic_string());
+            }
             fsx.plan_put_file(
-                dest->lexically_relative(sysroot).string(), stage_rel,
-                service::script_is_executable(plan.target_init) ? 0755 : 0644);
+                target_path.generic_string(), stage_rel, script_mode);
+            service_touched.emplace_back('F', target_path.generic_string());
             gen_count++;
         }
 
@@ -784,6 +912,8 @@ public:
         jctx.kind = "reconcile";
         jctx.final = true;
         jctx.sysroot = sysroot.string();
+        jctx.touched.insert(
+            jctx.touched.end(), service_touched.begin(), service_touched.end());
         for (const auto& pkg : installed_now) {
             for (const auto& f : pkg.files) {
                 jctx.touched.emplace_back(package::to_string(f.type)[0],
@@ -837,6 +967,32 @@ public:
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}",
             gen_count, service::to_string(plan.target_init));
         return {};
+    }
+
+    // A package removal can withdraw a native unit owned separately from the
+    // daemon that declares it. Repair only the now-missing generated form; a
+    // pending provider transition remains an explicit `sage rebuild` action.
+    static std::expected<void, std::string> repair_missing_services(
+        db::Database& db,
+        const std::filesystem::path& sysroot)
+    {
+        auto cfg = config::SystemConfig::load_from_root(sysroot);
+        if (!cfg) return std::unexpected(cfg.error());
+        auto current = db.get_all_system_providers();
+        if (!current) return std::unexpected(current.error());
+        for (const auto& [iface, desired] : cfg->exclusive_providers()) {
+            const auto installed = current->contains(iface) ? current->at(iface) : "";
+            if (installed != desired) return {};
+        }
+        const auto init_provider = cfg->providers.contains("virtual/init")
+            ? cfg->providers.at("virtual/init") : "systemd";
+        ReconcilePlan plan;
+        plan.target_init = service::parse_init_type(init_provider);
+        if (plan.target_init == service::InitType::Unknown) {
+            return std::unexpected(std::format(
+                "Unsupported virtual/init provider '{}'", init_provider));
+        }
+        return execute(db, plan, sysroot, false, cfg->providers);
     }
 };
 

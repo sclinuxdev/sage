@@ -610,6 +610,41 @@ export int cmd_install(
         // stale-claim cleanup below can honor them even if the channel index
         // predates the declaration.
         installed_pkg.conffiles = ext_res->manifest.conffiles;
+        // And the universal service definition, for the same reason: the
+        // reconcile pass renders init scripts from what the database holds,
+        // so a daemon whose service.toml never reaches LMDB is a daemon no
+        // init system will ever be told about.
+        installed_pkg.service_toml = ext_res->manifest.service_toml;
+        auto service_registration = sage::service_registry::validate_unique(
+            db, *package_txn, installed_pkg.name, installed_pkg.service_toml);
+        if (!service_registration) {
+            sage::util::log_error(
+                "Cannot install package '{}': {}", pkg.name, service_registration.error());
+            return 1;
+        }
+        if (*previous_package
+            && (**previous_package).service_toml != installed_pkg.service_toml
+            && !(**previous_package).service_toml.empty()) {
+            auto old_service = sage::service::ServiceSpec::parse_toml(
+                (**previous_package).service_toml);
+            if (old_service) {
+                auto retired = sage::service_registry::plan_remove_scripts(
+                    db, *package_txn, filesystem_transaction,
+                    old_service->name, pkg.name);
+                if (!retired) {
+                    sage::util::log_error(
+                        "Cannot retire generated service paths for '{}': {}",
+                        pkg.name, retired.error());
+                    return 1;
+                }
+                journal_ctx.touched.insert(
+                    journal_ctx.touched.end(), retired->begin(), retired->end());
+            } else {
+                sage::util::log_warn(
+                    "Cannot identify generated service paths for '{}': {}",
+                    pkg.name, old_service.error());
+            }
+        }
 
         // Conffile protection under staging: extraction cannot compare against
         // the live tree (its fifth parameter would probe the empty staging

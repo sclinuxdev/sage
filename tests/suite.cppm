@@ -15,6 +15,7 @@ import sage.cli.build;
 import sage.cli.install;
 import sage.cli.rebuild;
 import sage.cli.remove;
+import sage.tests.service_lifecycle;
 
 namespace sage::tests {
 
@@ -942,6 +943,12 @@ install = [
     openrc_pkg.name = "openrc";
     openrc_pkg.version = sage::package::Version::parse("0.54.0-1");
     openrc_pkg.provides = {"openrc", "virtual/init"};
+    openrc_pkg.service_toml = R"(schema_version = 1
+[service]
+name = "openrc"
+description = "OpenRC native-unit ownership canary"
+exec_start = "/usr/bin/openrc"
+)";
 
     repo_pool.push_back(libfoo);
     repo_pool.push_back(gcc15);
@@ -977,6 +984,20 @@ install = [
     if (!gen_openrc || !gen_sysd) {
         sage::util::log_error("Service generation test failed");
         return 1;
+    }
+    for (const auto invalid_name : {
+            "/tmp/host-file", "../escape", "nested/name", "space name"}) {
+        const auto document = std::format(R"(schema_version = 1
+[service]
+name = "{}"
+exec_start = "/usr/bin/false"
+)", invalid_name);
+        if (sage::service::ServiceSpec::parse_toml(document)
+            || sage::service::service_destination(
+                invalid_name, sage::service::InitType::Systemd, extract_root)) {
+            sage::util::log_error("Unsafe service name '{}' was accepted", invalid_name);
+            return 1;
+        }
     }
     auto loom_destination = sage::service::service_destination(
         "sshd", sage::service::InitType::Loom, extract_root);
@@ -1491,15 +1512,23 @@ release = "10"
     sys_cfg.providers["virtual/init"] = "openrc";
     sys_cfg.capabilities["virtual/init"] = sage::config::CapabilityKind::Exclusive;
     sys_cfg.cache_dir = temp_dir / "cache";
+    auto read_reconcile_file = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(
+            std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
 
     // Reconcile installs provider packages for real now, so back it with a
     // local file:// channel whose openrc archive carries an actual payload.
     auto reconcile_repo = temp_dir / "reconcile-repo";
     auto openrc_pkg_dir = temp_dir / "openrc-pkg";
     std::filesystem::create_directories(openrc_pkg_dir / "usr/bin");
+    std::filesystem::create_directories(openrc_pkg_dir / "etc/init.d");
     {
         std::ofstream openrc_bin(openrc_pkg_dir / "usr/bin/openrc");
         openrc_bin << "#!/bin/sh\nexit 0\n";
+        std::ofstream openrc_init(openrc_pkg_dir / "etc/init.d/openrc");
+        openrc_init << "#!/bin/sh\n# native openrc fixture\n";
     }
     std::filesystem::create_directories(reconcile_repo);
     if (!sage::archive::create_package(openrc_pkg, openrc_pkg_dir,
@@ -1526,7 +1555,9 @@ release = "10"
         return 1;
     }
     auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, extract_root, false);
-    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")) {
+    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")
+        || read_reconcile_file(extract_root / "etc/init.d/openrc")
+            != "#!/bin/sh\n# native openrc fixture\n") {
         sage::util::log_error("Reconcile execute did not install the new provider payload: {}",
             exec_res.error_or("payload missing"));
         return 1;
@@ -3910,50 +3941,7 @@ install = [
             }
         }
 
-        // (g) A service.toml beside the recipe rides the manifest verbatim;
-        // the parse round-trip must keep the daemon definition intact for
-        // `sage rebuild` to regenerate scripts on an init switch.
-        auto svc_dir = temp_dir / "bcfg-svc";
-        if (!write_canary_recipe(svc_dir, R"(schema_version = 1
-[package]
-name = "svcanary"
-version = "1.0.0"
-release = "1"
-description = "service manifest canary"
-license = "MIT"
-channel = "system"
-install = [
-    'mkdir -p "$DESTDIR/usr/bin"',
-    'printf "#!/bin/sh\n" > "$DESTDIR/usr/bin/svcanary"',
-]
-)")) {
-            sage::util::log_error("Failed to create service canary recipe");
-            return 1;
-        }
-        {
-            std::ofstream f(svc_dir / "service.toml");
-            f << R"(schema_version = 1
-[service]
-name = "svcanary"
-description = "canary daemon"
-exec_start = "/usr/bin/svcanary --foreground"
-after = ["net"]
-)";
-        }
-        auto svcpkg = build_with_root(svc_dir, canary_root, temp_dir / "bcfg-svc-x",
-                                      "svcanary-1.0.0-1-x86_64.pkg.tar.zst");
-        if (!svcpkg || svcpkg->service_toml.empty()) {
-            sage::util::log_error("service.toml did not ride the built manifest");
-            return 1;
-        }
-        auto spec_back = sage::service::ServiceSpec::parse_toml(svcpkg->service_toml);
-        if (!spec_back || spec_back->name != "svcanary"
-            || spec_back->exec_start != "/usr/bin/svcanary --foreground"
-            || spec_back->after.size() != 1 || spec_back->after[0] != "net") {
-            sage::util::log_error("Manifest service_toml failed to round-trip through serialization");
-            return 1;
-        }
-
+        if (run_service_lifecycle_tests(temp_dir, canary_root) != 0) return 1;
 
         // (h) Artifact-verified switches: compiling with -g makes GCC record
         // its exact command line in DW_AT_producer (.debug_str), so the
