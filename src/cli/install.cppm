@@ -388,20 +388,6 @@ export int cmd_install(
         return 1;
     }
     auto& filesystem_transaction = *transaction_res;
-    auto plan_remove_service_scripts = [&](std::string_view name) {
-        filesystem_transaction.plan_remove_file(std::format("etc/init.d/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("usr/lib/systemd/system/{}.service", name));
-        filesystem_transaction.plan_remove_file(std::format("etc/dinit.d/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("usr/lib/loom/services/{}.toml", name));
-        filesystem_transaction.plan_remove_file(std::format("etc/sv/{}/run", name));
-        filesystem_transaction.plan_remove_dir(std::format("etc/sv/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("etc/s6/services/{}/run", name));
-        filesystem_transaction.plan_remove_dir(
-            std::format("etc/s6/services/{}", name));
-    };
 
     sage::archive::JournalContext journal_ctx;
     journal_ctx.kind = "install";
@@ -635,7 +621,16 @@ export int cmd_install(
             auto old_service = sage::service::ServiceSpec::parse_toml(
                 (**previous_package).service_toml);
             if (old_service) {
-                plan_remove_service_scripts(old_service->name);
+                auto retired = sage::rebuild::plan_remove_service_scripts(
+                    db, *package_txn, filesystem_transaction, old_service->name);
+                if (!retired) {
+                    sage::util::log_error(
+                        "Cannot retire generated service paths for '{}': {}",
+                        pkg.name, retired.error());
+                    return 1;
+                }
+                journal_ctx.touched.insert(
+                    journal_ctx.touched.end(), retired->begin(), retired->end());
             } else {
                 sage::util::log_warn(
                     "Cannot identify generated service paths for '{}': {}",

@@ -283,20 +283,6 @@ export int cmd_remove(
         return 1;
     }
     auto& filesystem_transaction = *transaction_res;
-    auto plan_remove_service_scripts = [&](std::string_view name) {
-        filesystem_transaction.plan_remove_file(std::format("etc/init.d/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("usr/lib/systemd/system/{}.service", name));
-        filesystem_transaction.plan_remove_file(std::format("etc/dinit.d/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("usr/lib/loom/services/{}.toml", name));
-        filesystem_transaction.plan_remove_file(std::format("etc/sv/{}/run", name));
-        filesystem_transaction.plan_remove_dir(std::format("etc/sv/{}", name));
-        filesystem_transaction.plan_remove_file(
-            std::format("etc/s6/services/{}/run", name));
-        filesystem_transaction.plan_remove_dir(
-            std::format("etc/s6/services/{}", name));
-    };
 
     // One remove command is one journaled operation: the entire deletion plan
     // is prepared up front, committed together with the metadata deregistration
@@ -318,7 +304,16 @@ export int cmd_remove(
         if (!pkg.service_toml.empty()) {
             auto service = sage::service::ServiceSpec::parse_toml(pkg.service_toml);
             if (service) {
-                plan_remove_service_scripts(service->name);
+                auto retired = sage::rebuild::plan_remove_service_scripts(
+                    db, *wtxn, filesystem_transaction, service->name);
+                if (!retired) {
+                    sage::util::log_error(
+                        "Cannot retire generated service paths for '{}': {}",
+                        pkg_name, retired.error());
+                    return 1;
+                }
+                journal_ctx.touched.insert(
+                    journal_ctx.touched.end(), retired->begin(), retired->end());
             } else {
                 sage::util::log_warn(
                     "Cannot identify generated service paths for '{}': {}",

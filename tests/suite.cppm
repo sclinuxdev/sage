@@ -4152,6 +4152,63 @@ after = ["net"]
             return 1;
         }
 
+        // A separately owned native unit must survive a daemon metadata
+        // update. This models split packages such as systemd + systemd-units:
+        // the daemon carries service.toml while another package owns the unit.
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-4-any.pkg.tar.zst").string()
+        };
+        if (cmd_install(svc_install, "/") != 0 || !reopen_service_db()
+            || !reconcile_service() || !std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Failed to restore the native-owner service fixture");
+            return 1;
+        }
+        {
+            auto txn = svc_db->begin_write_txn();
+            sage::package::PackageManifest native_unit;
+            native_unit.name = "svcanary-native-unit";
+            native_unit.version = sage::package::Version::parse("1.0.0-1");
+            native_unit.channel = "system";
+            sage::package::FileEntry unit_file;
+            unit_file.path = "usr/lib/systemd/system/svcanary.service";
+            unit_file.type = sage::package::FileType::Regular;
+            unit_file.mode = 0644;
+            native_unit.files = {unit_file};
+            if (!txn
+                || !svc_db->put_package(*txn, native_unit)
+                || !svc_db->register_files(
+                    *txn, native_unit.name, native_unit.channel, native_unit.files)
+                || !txn->commit()) {
+                sage::util::log_error("Failed to register the native unit owner fixture");
+                return 1;
+            }
+            std::ofstream(svc_unit) << "native split-package unit\n";
+        }
+        auto svcpkg_v5 = build_service_revision(
+            5, "native owner update", "/usr/bin/svcanary --v5", true);
+        if (!svcpkg_v5) {
+            sage::util::log_error("Failed to build the native-owner update canary");
+            return 1;
+        }
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-5-any.pkg.tar.zst").string()
+        };
+        close_service_db();
+        if (cmd_install(svc_install, "/") != 0 || !reopen_service_db()
+            || read_service_unit() != "native split-package unit\n") {
+            sage::util::log_error("Service update removed a separately owned native unit");
+            return 1;
+        }
+        auto native_owners = svc_db->get_path_owners(
+            "usr/lib/systemd/system/svcanary.service");
+        if (!native_owners
+            || std::ranges::find(
+                *native_owners, "svcanary-native-unit:system")
+                == native_owners->end()) {
+            sage::util::log_error("Service update lost the native unit ownership claim");
+            return 1;
+        }
+
 
         // (h) Artifact-verified switches: compiling with -g makes GCC record
         // its exact command line in DW_AT_producer (.debug_str), so the

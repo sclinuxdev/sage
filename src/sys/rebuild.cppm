@@ -1,5 +1,6 @@
 module;
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -25,6 +26,7 @@ import sage.db;
 import sage.solver;
 import sage.triggers;
 import sage.util;
+import sage.vendor.lmdb;
 
 export namespace sage::rebuild {
 
@@ -121,6 +123,21 @@ std::expected<void, std::string> run_postprocess(
         if (!regen) return std::unexpected(regen.error());
     }
 
+    const bool systemd_units_changed = std::ranges::any_of(
+        parsed.ctx.touched, [](const auto& touched) {
+            const auto& path = touched.second;
+            return path.starts_with("usr/lib/systemd/system/")
+                && path.ends_with(".service");
+        });
+    if (systemd_units_changed && target_root == "/"
+        && std::filesystem::is_directory("/run/systemd/system")) {
+        const int status = std::system("/usr/bin/systemctl daemon-reload");
+        if (status != 0) {
+            return std::unexpected(std::format(
+                "systemctl daemon-reload failed with status {}", status));
+        }
+    }
+
     const std::filesystem::path trigger_sysroot = parsed.ctx.sysroot.empty()
         ? target_root
         : std::filesystem::path(parsed.ctx.sysroot);
@@ -156,22 +173,6 @@ std::expected<void, std::string> run_postprocess(
     return {};
 }
 
-// Plan the retirement of every generated init-script shape for a package
-// leaving the system. Missing entries publish as no-ops; directory-shaped
-// backends keep their directory when foreign content remains.
-void plan_remove_service_scripts(
-    archive::FilesystemTransaction& fsx, std::string_view name)
-{
-    fsx.plan_remove_file(std::format("etc/init.d/{}", name));
-    fsx.plan_remove_file(std::format("usr/lib/systemd/system/{}.service", name));
-    fsx.plan_remove_file(std::format("etc/dinit.d/{}", name));
-    fsx.plan_remove_file(std::format("usr/lib/loom/services/{}.toml", name));
-    fsx.plan_remove_file(std::format("etc/sv/{}/run", name));
-    fsx.plan_remove_dir(std::format("etc/sv/{}", name));
-    fsx.plan_remove_file(std::format("etc/s6/services/{}/run", name));
-    fsx.plan_remove_dir(std::format("etc/s6/services/{}", name));
-}
-
 std::expected<void, std::string> stage_text(
     archive::FilesystemTransaction& fsx,
     std::string_view stage_rel,
@@ -197,6 +198,37 @@ std::expected<void, std::string> stage_text(
 } // namespace detail
 
 using namespace detail; // unexported helpers, called from the API below
+
+// Plan retirement only for generated, unowned service artifacts. A path
+// registered to any package is a native unit and package data must win.
+std::expected<std::vector<std::pair<char, std::string>>, std::string>
+plan_remove_service_scripts(
+    db::Database& db,
+    vendor::lmdb::MdbTxn& txn,
+    archive::FilesystemTransaction& fsx,
+    std::string_view name)
+{
+    const std::array<std::pair<std::string, bool>, 8> paths{{
+        {std::format("etc/init.d/{}", name), false},
+        {std::format("usr/lib/systemd/system/{}.service", name), false},
+        {std::format("etc/dinit.d/{}", name), false},
+        {std::format("usr/lib/loom/services/{}.toml", name), false},
+        {std::format("etc/sv/{}/run", name), false},
+        {std::format("etc/sv/{}", name), true},
+        {std::format("etc/s6/services/{}/run", name), false},
+        {std::format("etc/s6/services/{}", name), true},
+    }};
+    std::vector<std::pair<char, std::string>> touched;
+    for (const auto& [path, directory] : paths) {
+        auto owners = db.get_path_owners(txn, path);
+        if (!owners) return std::unexpected(owners.error());
+        if (!owners->empty()) continue;
+        if (directory) fsx.plan_remove_dir(path);
+        else fsx.plan_remove_file(path);
+        touched.emplace_back(directory ? 'D' : 'F', path);
+    }
+    return touched;
+}
 
 // Read-only peek at the pending-operation table for status/query surfaces.
 // Never attempts recovery.
@@ -516,6 +548,14 @@ public:
             if (owners && !owners->empty()) continue;
             std::error_code ec;
             if (!std::filesystem::exists(*dest, ec)) return true;
+            if (target_init == service::InitType::Loom) continue;
+            auto expected = service::render_service(*spec, target_init);
+            if (!expected) continue;
+            std::ifstream current(*dest);
+            if (!current) return true;
+            std::stringstream content;
+            content << current.rdbuf();
+            if (content.str() != *expected) return true;
         }
         return false;
     }
@@ -586,6 +626,7 @@ public:
 
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
+        std::vector<std::pair<char, std::string>> service_touched;
 
         // The plan was computed before taking the writer lock. Validate every
         // provider binding before changing any of them so a stale reconcile
@@ -636,7 +677,11 @@ public:
                     auto old_service = service::ServiceSpec::parse_toml(
                         old_manifest.service_toml);
                     if (old_service) {
-                        plan_remove_service_scripts(fsx, old_service->name);
+                        auto retired = plan_remove_service_scripts(
+                            db, *wtxn, fsx, old_service->name);
+                        if (!retired) return std::unexpected(retired.error());
+                        service_touched.insert(
+                            service_touched.end(), retired->begin(), retired->end());
                     } else {
                         util::log_warn(
                             "Cannot identify generated service paths for '{}': {}",
@@ -734,7 +779,11 @@ public:
                 auto old_service = service::ServiceSpec::parse_toml(
                     (**existing).service_toml);
                 if (old_service) {
-                    plan_remove_service_scripts(fsx, old_service->name);
+                    auto retired = plan_remove_service_scripts(
+                        db, *wtxn, fsx, old_service->name);
+                    if (!retired) return std::unexpected(retired.error());
+                    service_touched.insert(
+                        service_touched.end(), retired->begin(), retired->end());
                 } else {
                     util::log_warn(
                         "Cannot identify generated service paths for '{}': {}",
@@ -866,6 +915,7 @@ public:
             fsx.plan_put_file(
                 target.generic_string(), stage_rel,
                 service::script_is_executable(plan.target_init) ? 0755 : 0644);
+            service_touched.emplace_back('F', target.generic_string());
             gen_count++;
         }
 
@@ -874,6 +924,8 @@ public:
         jctx.kind = "reconcile";
         jctx.final = true;
         jctx.sysroot = sysroot.string();
+        jctx.touched.insert(
+            jctx.touched.end(), service_touched.begin(), service_touched.end());
         for (const auto& pkg : installed_now) {
             for (const auto& f : pkg.files) {
                 jctx.touched.emplace_back(package::to_string(f.type)[0],
