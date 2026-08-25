@@ -487,9 +487,9 @@ public:
     // definition on disk yet. Packages shipping their own native unit are not
     // pending: the reconcile pass lets package data win over the generated
     // form, so a present owner means there is nothing to generate. Unparsable
-    // service.toml is not pending either -- the reconcile pass warns about
-    // those and skips them, and waking a whole transaction to repeat a warning
-    // helps nobody.
+    // service.toml is not pending for backends that warn and skip it. Loom is
+    // fail-closed, however, so its parse/destination errors must enter execute()
+    // and preserve that error instead of being hidden by the no-op fast path.
     static std::expected<bool, std::string> services_awaiting_generation(
         db::Database& db,
         service::InitType target_init,
@@ -503,9 +503,15 @@ public:
         for (const auto& pkg : *installed) {
             if (pkg.service_toml.empty()) continue;
             auto spec = service::ServiceSpec::parse_toml(pkg.service_toml);
-            if (!spec) continue;
+            if (!spec) {
+                if (target_init == service::InitType::Loom) return true;
+                continue;
+            }
             auto dest = service::service_destination(spec->name, target_init, sysroot);
-            if (!dest) continue;
+            if (!dest) {
+                if (target_init == service::InitType::Loom) return true;
+                continue;
+            }
             auto owners = db.get_path_owners(dest->string());
             if (owners && !owners->empty()) continue;
             std::error_code ec;
@@ -825,8 +831,17 @@ public:
                     service::to_string(plan.target_init), pkg.name, staged.error());
                 continue;
             }
+            const auto target = dest->lexically_relative(sysroot);
+            std::vector<std::filesystem::path> parents;
+            for (auto parent = target.parent_path(); !parent.empty() && parent != ".";
+                 parent = parent.parent_path()) {
+                parents.push_back(parent);
+            }
+            for (auto parent = parents.rbegin(); parent != parents.rend(); ++parent) {
+                fsx.plan_ensure_dir(parent->generic_string());
+            }
             fsx.plan_put_file(
-                dest->lexically_relative(sysroot).string(), stage_rel,
+                target.generic_string(), stage_rel,
                 service::script_is_executable(plan.target_init) ? 0755 : 0644);
             gen_count++;
         }

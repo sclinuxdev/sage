@@ -3959,7 +3959,7 @@ after = ["net"]
             sage::util::log_error("Failed to install the service manifest canary");
             return 1;
         }
-        auto svc_db = sage::db::Database::open(svc_root / "var/lib/sage/data.mdb", true);
+        auto svc_db = sage::db::Database::open(svc_root / "var/lib/sage/data.mdb");
         if (!svc_db) {
             sage::util::log_error("Failed to open the service canary database");
             return 1;
