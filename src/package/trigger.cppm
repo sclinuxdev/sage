@@ -74,7 +74,6 @@ struct Trigger {
     std::string name;
     std::vector<std::string> on_paths;
     std::vector<std::string> on_capability;
-    bool required{false};             // missing exec: hard error vs. warn+skip
     std::string exec;                 // absolute path inside the target root
     std::vector<std::string> args;
     std::string run_capability;       // resolved via the provider's hook
@@ -82,6 +81,10 @@ struct Trigger {
     // before the bootloader is asked to reference it, and ldconfig must have
     // run before anything that dlopen()s.
     int priority{50};
+    // Missing exec: hard error vs. warn+skip. Kept last so designated
+    // initializers can append it after the classic fields (GCC rejects
+    // out-of-order designators that clang tolerates).
+    bool required{false};
 
     [[nodiscard]] bool matches_path(std::string_view rel_path) const {
         for (const auto& prefix : on_paths) {

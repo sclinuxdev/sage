@@ -2153,8 +2153,9 @@ release = "10"
             if (!txn) return std::unexpected(txn.error());
             const std::string stage_rel =
                 std::format("staged/usr/bin/{}", leaf);
-            auto fd = txn->open_staged_file(stage_rel, 0600);
-            if (!fd) return std::unexpected(fd.error());
+            // Barrier publication renames the staged payload as-is, so the
+            // staged file must already carry its final mode.
+            auto fd = txn->open_staged_file(stage_rel, 0755);
             std::string payload = std::format("{} payload\n", leaf);
             if (::write(*fd, payload.data(), payload.size())
                 != static_cast<ssize_t>(payload.size())) {
@@ -2453,10 +2454,10 @@ release = "10"
         .name = "optional-missing-exec",
         .on_paths = {"usr/share/trigger-policy/"},
         .on_capability = {},
-        .required = false,
         .exec = "/usr/bin/sage-no-such-post-transaction-tool",
         .args = {},
         .run_capability = {},
+        .required = false,
     });
     sage::package::PackageManifest required_policy_pkg = optional_policy_pkg;
     required_policy_pkg.name = "required-trigger-pkg";

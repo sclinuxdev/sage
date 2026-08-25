@@ -915,6 +915,9 @@ export int cmd_install(
     const auto t_resume = std::chrono::steady_clock::now();
     auto resumed = sage::rebuild::resume_pending_operations(db, opts.target_root);
     if (!resumed) {
+        std::println("[timing] publish+postprocess (failed): {:.1f}s",
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_resume).count());
         sage::util::log_error(
             "Failed to complete pending filesystem operations: {}", resumed.error());
         return 1;

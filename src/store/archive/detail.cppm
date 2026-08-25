@@ -303,44 +303,6 @@ inline std::expected<void, std::string> copy_fd_exact(
     return {};
 }
 
-// fsync every regular file and every directory of an anchored subtree,
-// children strictly before their parent; `dir_fd` itself syncs last.
-inline std::expected<void, std::string> sync_tree_anchored(int dir_fd) {
-    auto names = list_dir_names(dir_fd);
-    if (!names) return std::unexpected(names.error());
-    for (const auto& name : *names) {
-        struct stat status {};
-        if (::fstatat(dir_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
-            return std::unexpected(std::format(
-                "Cannot stat '{}': {}", name, std::strerror(errno)));
-        }
-        if (S_ISDIR(status.st_mode)) {
-            int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
-#ifdef O_CLOEXEC
-            flags |= O_CLOEXEC;
-#endif
-            UniqueFd sub(::openat(dir_fd, name.c_str(), flags));
-            if (sub.get() < 0) {
-                return std::unexpected(std::format(
-                    "Cannot open '{}': {}", name, std::strerror(errno)));
-            }
-            if (auto synced = sync_tree_anchored(sub.get()); !synced) return synced;
-        } else if (S_ISREG(status.st_mode)) {
-            int flags = O_RDONLY | O_NOFOLLOW;
-#ifdef O_CLOEXEC
-            flags |= O_CLOEXEC;
-#endif
-            UniqueFd file(::openat(dir_fd, name.c_str(), flags));
-            if (file.get() < 0) {
-                return std::unexpected(std::format(
-                    "Cannot open '{}': {}", name, std::strerror(errno)));
-            }
-            if (auto synced = fsync_fd(file.get()); !synced)
-                return std::unexpected(name + ": " + synced.error());
-        }
-    }
-    return fsync_fd(dir_fd);
-}
 
 // Anchored rm -rf of one named child below `parent_fd`; missing names are
 // already gone and therefore success.

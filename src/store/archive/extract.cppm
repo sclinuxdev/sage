@@ -37,12 +37,7 @@ class WritePool {
 public:
     using Task = std::function<std::expected<void, std::string>()>;
 
-    explicit WritePool(unsigned workers, size_t capacity)
-        : capacity_(std::max<size_t>(capacity, workers)) {
-        for (unsigned i = 0; i < workers; ++i) {
-            workers_.emplace_back([this](std::stop_token stop) { loop(stop); });
-        }
-    }
+    explicit WritePool(unsigned workers, size_t capacity);
 
     WritePool(const WritePool&) = delete;
     WritePool& operator=(const WritePool&) = delete;
@@ -111,6 +106,16 @@ private:
     size_t busy_{0};
     bool drained_{false};
 };
+// Out-of-line on purpose: GCC 15's module writer segfaults (depset ICE) when
+// an exported partition class constructs std::jthread from a lambda inside an
+// inline constructor body. Same code, defined after the class; both compilers
+// accept it. Revisit when the compiler bug is fixed.
+inline WritePool::WritePool(unsigned workers, size_t capacity)
+    : capacity_(std::max<size_t>(capacity, workers)) {
+    for (unsigned i = 0; i < workers; ++i) {
+        workers_.emplace_back([this](std::stop_token stop) { loop(stop); });
+    }
+}
 
 inline std::expected<void, std::string> write_regular_anchored(
     int root_fd, std::string_view rel_path, std::string_view leaf,
@@ -281,7 +286,10 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     }
 
     detail::WritePool pool{
-        std::min<unsigned>(4u, std::max(1u, std::thread::hardware_concurrency())),
+        // 8 concurrent anchored writers: small-file installs are create/close
+        // bound, and NVMe queue depth absorbs far more than CPU count. The
+        // decode side stays single-threaded (libarchive single stream).
+        std::min<unsigned>(8u, std::max(1u, std::thread::hardware_concurrency())),
         64};
     std::mutex state_mutex;
     std::unordered_map<std::string, char> seen_paths;

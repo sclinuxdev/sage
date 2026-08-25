@@ -52,8 +52,8 @@ public:
             .name = "ldconfig",
             .on_paths = {"usr/lib/", "lib/"},
             .exec = "/usr/bin/ldconfig",
-            .required = true,
             .priority = 10,
+            .required = true,
         });
         t.push_back(package::Trigger{
             .name = "ca-certificates",
