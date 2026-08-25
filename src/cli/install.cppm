@@ -116,7 +116,7 @@ export int cmd_install(
             return 1;
         }
         db = std::move(*db_res);
-        auto installed_res = db.list_installed_packages();
+        auto installed_res = db.list_installed_package_summaries();
         if (!installed_res) {
             sage::util::log_error(
                 "Installed package database is inconsistent: {}", installed_res.error());
@@ -225,42 +225,12 @@ export int cmd_install(
         const bool exact_direct_request = direct_package_names.contains(pkg.name);
         if (!exact_direct_request
             && it != installed_by_name.end() && it->second.version >= pkg.version) {
-            std::vector<std::string> db_files;
-            if (it->second.files.empty()) {
-                auto db_files_res = db.get_package_files(pkg.name);
-                if (!db_files_res) {
-                    sage::util::log_error(
-                        "Failed to read files owned by '{}': {}", pkg.name, db_files_res.error());
-                    return 1;
-                }
-                db_files = std::move(*db_files_res);
-            }
-            bool files_present = true;
-            if (!it->second.files.empty()) {
-                for (const auto& f : it->second.files) {
-                    if (f.type != sage::package::FileType::Directory) {
-                        if (!std::filesystem::exists(opts.target_root / f.path)) {
-                            files_present = false;
-                            break;
-                        }
-                    }
-                }
-            } else if (!db_files.empty()) {
-                for (const auto& fpath : db_files) {
-                    if (!std::filesystem::exists(opts.target_root / fpath)) {
-                        files_present = false;
-                        break;
-                    }
-                }
-            } else {
-                files_present = false;
-            }
-            if (files_present) {
-                sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
-                continue;
-            } else {
-                sage::util::log_warn("  ! {:<20} {:<15} [files missing on disk, reinstalling]", pkg.name, pkg.version.to_string());
-            }
+            // The registry is authoritative during normal installs. Walking
+            // every file of every already-satisfied dependency made a tiny
+            // install O(total installed files); `sage verify` is the explicit
+            // integrity surface, while direct archives still force reinstall.
+            sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
+            continue;
         }
         to_install.push_back(std::move(pkg));
     }
@@ -306,17 +276,16 @@ export int cmd_install(
         return 0;
     }
 
-    std::vector<std::filesystem::path> archive_paths;
-    archive_paths.reserve(unique_to_install.size());
-    for (const auto& pkg : unique_to_install) {
-        auto archive = sage::repo::ensure_local_archive(
-            snapshot, sage::package::package_identity(pkg));
-        if (!archive) {
-            sage::util::log_error("{}", archive.error());
-            return 1;
-        }
-        archive_paths.push_back(std::move(*archive));
+    auto archives = collect_parallel<std::filesystem::path>(
+        unique_to_install.size(), cfg.build.jobs, [&](size_t index) {
+            return sage::repo::ensure_local_archive(
+                snapshot, sage::package::package_identity(unique_to_install[index]));
+        });
+    if (!archives) {
+        sage::util::log_error("{}", archives.error());
+        return 1;
     }
+    auto archive_paths = std::move(*archives);
     auto inspections = collect_parallel<sage::archive::InspectedPackage>(
         unique_to_install.size(), cfg.build.jobs, [&](size_t index)
             -> std::expected<sage::archive::InspectedPackage, std::string> {
@@ -338,33 +307,13 @@ export int cmd_install(
         sage::util::log_error("{}", inspections.error());
         return 1;
     }
+    std::map<sage::package::PackageIdentity, std::filesystem::path> local_archives;
     std::map<sage::package::PackageIdentity, sage::archive::InspectedPackage> inspected_packages;
     for (size_t index = 0; index < unique_to_install.size(); ++index) {
-        inspected_packages.emplace(
-            sage::package::package_identity(unique_to_install[index]),
+        const auto identity = sage::package::package_identity(unique_to_install[index]);
+        local_archives.emplace(identity, std::move(archive_paths[index]));
+        inspected_packages.emplace(identity,
             std::move((*inspections)[index]));
-    }
-
-    // Self-heal: prune file registrations owned by packages that are no longer
-    // installed (leftovers from previous versions with incomplete file lists),
-    // so the paths can be claimed by the packages about to be installed.
-    auto prune_txn = db.begin_write_txn();
-    if (!prune_txn) {
-        sage::util::log_error("Failed to open orphan-pruning transaction: {}", prune_txn.error());
-        return 1;
-    }
-    auto pruned = db.prune_orphaned_files(*prune_txn);
-    if (!pruned) {
-        sage::util::log_error("Failed to prune orphaned file registrations: {}", pruned.error());
-        return 1;
-    }
-    auto prune_commit = prune_txn->commit();
-    if (!prune_commit) {
-        sage::util::log_error("Failed to commit orphan-pruning transaction: {}", prune_commit.error());
-        return 1;
-    }
-    if (*pruned > 0) {
-        sage::util::log_info("  ~ pruned {} orphaned file registration(s)", *pruned);
     }
 
     // Staged transaction protocol (issue #9). State machine per operation:
@@ -485,6 +434,7 @@ export int cmd_install(
     // canonicalization exactly like the stale-claim cleanup below) so the
     // ownership checks tolerate precisely those in-transaction handovers.
     sage::db::ReleasedClaims batch_released_claims;
+    std::unordered_map<std::string, std::vector<std::string>> previous_paths_by_name;
     for (const auto& pkg : unique_to_install) {
         if (!installed_by_name.contains(pkg.name)) continue;
         std::unordered_set<std::string> kept_paths;
@@ -492,14 +442,33 @@ export int cmd_install(
             inspected_packages.at(sage::package::package_identity(pkg)).data_files) {
             kept_paths.insert(sage::util::clean_rel_path(f.path));
         }
-        auto previous_paths = db.get_package_files(pkg.name);
-        if (!previous_paths) {
+        auto previous = db.get_package(pkg.name);
+        if (!previous || !*previous) {
             sage::util::log_error(
-                "Failed to read previous files for '{}': {}",
-                pkg.name, previous_paths.error());
+                "Failed to read previous package '{}': {}",
+                pkg.name, previous ? "package disappeared" : previous.error());
             return 1;
         }
-        for (const auto& old_path : *previous_paths) {
+        auto& previous_paths = previous_paths_by_name[pkg.name];
+        previous_paths.reserve((**previous).files.size());
+        for (const auto& file : (**previous).files) {
+            previous_paths.push_back(sage::util::clean_rel_path(file.path));
+        }
+        // Compatibility for databases written by early Sage versions whose
+        // package record did not carry a complete files array. Canonical
+        // records take the O(package files) direct path and avoid an O(all
+        // installed files) ownership-table scan.
+        if (previous_paths.empty()) {
+            auto legacy_paths = db.get_package_files(pkg.name);
+            if (!legacy_paths) {
+                sage::util::log_error(
+                    "Failed to read previous files for '{}': {}",
+                    pkg.name, legacy_paths.error());
+                return 1;
+            }
+            previous_paths = std::move(*legacy_paths);
+        }
+        for (const auto& old_path : previous_paths) {
             auto canonical_old = sage::archive::canonicalize_merge_claim(old_path);
             if (!canonical_old || kept_paths.contains(*canonical_old)) continue;
             batch_released_claims[sage::util::clean_rel_path(old_path)].insert(pkg.name);
@@ -508,14 +477,11 @@ export int cmd_install(
     // 3. Staged unpack, journaled publication plan, per-package registry commit
     for (auto pkg_it = unique_to_install.begin();
          pkg_it != unique_to_install.end(); ++pkg_it) {
+        const auto t_package = std::chrono::steady_clock::now();
         auto& pkg = *pkg_it;
         const bool last_package = std::next(pkg_it) == unique_to_install.end();
         const auto identity = sage::package::package_identity(pkg);
-        auto archive_res = sage::repo::ensure_local_archive(snapshot, identity);
-        if (!archive_res) {
-            sage::util::log_error("{}", archive_res.error());
-            return 1;
-        }
+        const auto& archive_path = local_archives.at(identity);
         auto inspected_it = inspected_packages.find(identity);
         auto package_txn = db.begin_write_txn();
         if (!package_txn) {
@@ -539,15 +505,17 @@ export int cmd_install(
         std::vector<std::string> previous_paths;
         if (*previous_package) {
             previous_owner = std::format("{}:{}", pkg.name, (**previous_package).channel);
-            auto previous_paths_res = db.get_package_files(*package_txn, pkg.name);
-            if (!previous_paths_res) {
-                sage::util::log_error(
-                    "Failed to read previous files for '{}': {}",
-                    pkg.name, previous_paths_res.error());
-                return 1;
-            }
-            previous_paths = std::move(*previous_paths_res);
+            previous_paths = previous_paths_by_name.at(pkg.name);
             for (const auto& path : previous_paths) {
+                const auto released = batch_released_claims.find(
+                    sage::util::clean_rel_path(path));
+                if (released != batch_released_claims.end()
+                    && released->second.contains(pkg.name)) {
+                    // A package installed earlier in this same batch may have
+                    // already accepted this planned monolith-to-split handover.
+                    // It is no longer expected to retain the old owner's claim.
+                    continue;
+                }
                 auto owners = db.get_path_owners(*package_txn, path);
                 if (!owners) {
                     sage::util::log_error(
@@ -589,7 +557,8 @@ export int cmd_install(
             / std::filesystem::path(filesystem_transaction.relative_dir())
             / "staged";
         auto ext_res = sage::archive::extract_package(
-            *archive_res, staged_root, &pkg, &inspected_it->second);
+            archive_path, staged_root, &pkg, &inspected_it->second, nullptr,
+            sage::archive::ExtractionDurability::Batch);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -861,7 +830,8 @@ export int cmd_install(
                 : fe.type == sage::package::FileType::Symlink ? 'L' : 'F',
                 fe.path);
         }
-        journal_ctx.package_manifests_toml.push_back(installed_pkg.serialize_toml());
+        journal_ctx.package_manifests_toml.push_back(
+            installed_pkg.serialize_summary_toml());
         {
             auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
             if (spec.scope == sage::channel::ChannelScope::Toolchain
@@ -895,15 +865,11 @@ export int cmd_install(
             sage::util::log_error("Failed to register package '{}' in DB: {}", installed_pkg.name, p_res.error());
             return 1;
         }
-        auto f_res = db.register_files(
+        auto f_res = db.register_files_prechecked(
             *package_txn,
             installed_pkg.name,
             installed_pkg.channel,
-            installed_pkg.files,
-            previous_owner
-                ? std::optional<std::string_view>{*previous_owner}
-                : std::nullopt,
-            batch_released_claims);
+            installed_pkg.files);
         if (!f_res) {
             sage::util::log_error("Failed to register files for '{}': {}", installed_pkg.name, f_res.error());
             return 1;
@@ -939,7 +905,7 @@ export int cmd_install(
         std::println("[timing] staged '{}': {:.1f}s",
             installed_pkg.name,
             std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_phase0).count());
+                std::chrono::steady_clock::now() - t_package).count());
     }
 
     // Publish every staged plan and run the aggregate post-install triggers
@@ -959,7 +925,10 @@ export int cmd_install(
     }
     std::println("[timing] publish+postprocess: {:.1f}s",
         std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_resume).count());
+                std::chrono::steady_clock::now() - t_resume).count());
+    std::println("[timing] install transaction total: {:.1f}s",
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_phase0).count());
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;

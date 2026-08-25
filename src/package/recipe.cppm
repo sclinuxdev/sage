@@ -18,6 +18,62 @@ struct ExtraSource {
     std::string sha256;
 };
 
+enum class BuildSystem {
+    Legacy,
+    Autotools,
+    CMake,
+    Meson,
+    Xmake,
+    Cargo,
+    Make,
+};
+
+inline std::expected<BuildSystem, std::string> parse_build_system(std::string_view name) {
+    if (name == "autotools") return BuildSystem::Autotools;
+    if (name == "cmake") return BuildSystem::CMake;
+    if (name == "meson") return BuildSystem::Meson;
+    if (name == "xmake") return BuildSystem::Xmake;
+    if (name == "cargo") return BuildSystem::Cargo;
+    if (name == "make") return BuildSystem::Make;
+    return std::unexpected("Unsupported recipe v2 build system: " + std::string(name));
+}
+
+struct UpstreamSpec {
+    std::string url;
+    std::string version_regex;
+};
+
+struct ToolRequirement {
+    std::string family;
+    std::string package;
+    std::string minimum_version;
+};
+
+struct ManagedBuildSpec {
+    BuildSystem system{BuildSystem::Legacy};
+    std::string source_subdir;
+    std::string build_dir{"build"};
+    std::vector<std::string> configure_options;
+    std::vector<std::string> build_targets;
+    std::vector<std::string> install_targets;
+    std::vector<std::string> patches;
+    int patch_strip{1};
+    std::map<std::string, std::string> variables;
+    std::vector<std::string> allowed_compilers;
+    std::vector<std::string> allowed_linkers;
+    std::vector<std::string> cflags_env;
+    std::vector<std::string> cxxflags_env;
+    std::vector<std::string> cppflags_env;
+    std::vector<std::string> ldflags_env;
+    std::vector<std::string> rustflags_env;
+    std::vector<std::string> cc_env;
+    std::vector<std::string> cxx_env;
+    std::vector<std::string> linker_env;
+    ToolRequirement compiler;
+    ToolRequirement linker;
+    ToolRequirement rust;
+};
+
 struct Recipe {
     uint32_t schema_version{1};
     std::string name;
@@ -30,6 +86,8 @@ struct Recipe {
     std::string source_url;
     std::string source_sha256;
     std::vector<ExtraSource> extra_sources;
+    UpstreamSpec upstream;
+    ManagedBuildSpec managed_build;
     std::vector<std::string> build_deps;
     std::vector<Dependency> host_deps;
     std::vector<std::string> provides;
@@ -46,14 +104,8 @@ struct Recipe {
     std::string cflags;
     std::string cxxflags;
     // Optional per-recipe linker-flag override from the [build] table.
-    // Present-but-empty means "inject nothing" (kernel-style recipes whose
-    // link line ignores LDFLAGS must not inherit a false provenance stamp).
+    // Present-but-empty means "inject nothing" for legacy v1 recipes.
     std::optional<std::string> ldflags;
-    // Env channels the recipe itself forwards flags through -- the kernel's
-    // KCFLAGS=/KAFLAGS= passthrough and kin. Purely an annotation: stamped
-    // onto the manifest so build_cflags equality with artifact-verified
-    // switches is explainable instead of suspicious.
-    std::vector<std::string> passthrough_flags;
     // A non-empty `cc` pins the toolchain: exactly this pair is used and the
     // global fallback never runs. Core system packages (glibc, systemd) pin
     // "gcc" because they must not silently rebuild under clang.
@@ -69,6 +121,11 @@ struct Recipe {
 
         Recipe r;
         r.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
+        if (r.schema_version != 1 && r.schema_version != 2) {
+            return std::unexpected(std::format(
+                "Unsupported recipe schema_version {}; expected 1 or 2",
+                r.schema_version));
+        }
 
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             r.name = (*pkg)["name"].value_or("");
@@ -81,10 +138,22 @@ struct Recipe {
             r.license = (*pkg)["license"].value_or("");
             r.channel = (*pkg)["channel"].value_or("system");
             r.arch = (*pkg)["arch"].value_or("x86_64");
+            r.upstream.url = (*pkg)["upstream"].value_or("");
+            r.upstream.version_regex = (*pkg)["upstream_regex"].value_or("");
             auto architecture = validate_package_architecture(r.arch);
             if (!architecture) return std::unexpected(architecture.error());
         } else {
             return std::unexpected("Missing [package] section in recipe");
+        }
+
+        if (auto* upstream = tbl.get_as<vendor::toml::table>("upstream")) {
+            r.upstream.url = (*upstream)["url"].value_or(r.upstream.url);
+            r.upstream.version_regex =
+                (*upstream)["version_regex"].value_or(r.upstream.version_regex);
+        }
+        if (r.upstream.url.empty() != r.upstream.version_regex.empty()) {
+            return std::unexpected(
+                "Upstream tracking requires both url and version_regex");
         }
 
         // [source] is either one table (a single download) or an array of
@@ -196,26 +265,165 @@ struct Recipe {
             }
         };
 
-        extract_cmds("prepare", r.prepare_cmds);
-        extract_cmds("build", r.build_cmds);
-        extract_cmds("install", r.install_cmds);
+        if (r.schema_version == 1) {
+            extract_cmds("prepare", r.prepare_cmds);
+            extract_cmds("build", r.build_cmds);
+            extract_cmds("install", r.install_cmds);
 
-        // Flag overrides are presence-respecting: an explicit `cflags = ""`
-        // clears the baseline rather than falling back to it. A non-empty
-        // `cc` pins the compiler pair outright.
-        if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
-            if (auto v = (*bld)["cflags"].value<std::string_view>()) r.cflags = std::string(*v);
-            if (auto* passthrough = bld->get_as<vendor::toml::array>("passthrough_flags")) {
-                for (auto&& el : *passthrough) {
-                    if (auto s = el.value<std::string_view>(); s && !s->empty()) {
-                        r.passthrough_flags.emplace_back(*s);
-                    }
+            // v1 remains source-compatible: its commands and toolchain
+            // overrides are legacy inputs, but no longer enter manifests.
+            if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
+                if (auto v = (*bld)["cflags"].value<std::string_view>()) r.cflags = std::string(*v);
+                if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
+                if (auto v = (*bld)["cc"].value<std::string_view>()) r.cc = std::string(*v);
+                if (auto v = (*bld)["cxx"].value<std::string_view>()) r.cxx = std::string(*v);
+                if (auto v = (*bld)["ldflags"].value<std::string_view>()) r.ldflags = std::string(*v);
+            }
+        } else {
+            if (!r.source_url.empty() && r.source_sha256.empty()) {
+                return std::unexpected(
+                    "Recipe v2 requires source.sha256 when source.url is present");
+            }
+            for (const auto& source : r.extra_sources) {
+                if (source.url.empty() || source.sha256.empty()) {
+                    return std::unexpected(
+                        "Recipe v2 [[source]] entries require both url and sha256");
                 }
             }
-            if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
-            if (auto v = (*bld)["cc"].value<std::string_view>()) r.cc = std::string(*v);
-            if (auto v = (*bld)["cxx"].value<std::string_view>()) r.cxx = std::string(*v);
-            if (auto v = (*bld)["ldflags"].value<std::string_view>()) r.ldflags = std::string(*v);
+            auto* bld = tbl.get_as<vendor::toml::table>("build");
+            if (!bld) return std::unexpected("Recipe v2 requires a [build] table");
+            auto has_commands = [&](const vendor::toml::table& scope) {
+                return scope.get_as<vendor::toml::array>("prepare")
+                    || scope.get_as<vendor::toml::array>("build")
+                    || scope.get_as<vendor::toml::array>("install");
+            };
+            if (has_commands(tbl) || has_commands(*bld)) {
+                return std::unexpected(
+                    "Recipe v2 forbids prepare/build/install shell command arrays");
+            }
+            if (auto* pkg = tbl.get_as<vendor::toml::table>("package");
+                pkg && has_commands(*pkg)) {
+                return std::unexpected(
+                    "Recipe v2 forbids prepare/build/install shell command arrays");
+            }
+            for (const auto* src : src_scopes) {
+                if (has_commands(*src)) return std::unexpected(
+                    "Recipe v2 forbids prepare/build/install shell command arrays");
+            }
+            auto system = parse_build_system((*bld)["system"].value_or(""));
+            if (!system) return std::unexpected(system.error());
+            r.managed_build.system = *system;
+            r.managed_build.source_subdir = (*bld)["source_subdir"].value_or("");
+            r.managed_build.build_dir = (*bld)["build_dir"].value_or("build");
+            r.managed_build.patch_strip = static_cast<int>((*bld)["patch_strip"].value_or(1LL));
+            if (r.managed_build.patch_strip < 0 || r.managed_build.patch_strip > 9)
+                return std::unexpected("build.patch_strip must be between 0 and 9");
+            parse_strings(*bld, "configure_options", r.managed_build.configure_options);
+            parse_strings(*bld, "build_targets", r.managed_build.build_targets);
+            parse_strings(*bld, "install_targets", r.managed_build.install_targets);
+            parse_strings(*bld, "patches", r.managed_build.patches);
+            parse_strings(*bld, "allowed_compilers", r.managed_build.allowed_compilers);
+            parse_strings(*bld, "allowed_linkers", r.managed_build.allowed_linkers);
+            if (auto* vars = bld->get_as<vendor::toml::table>("variables")) {
+                for (auto&& [key, value] : *vars) {
+                    if (auto s = value.value<std::string_view>())
+                        r.managed_build.variables.emplace(std::string(key.str()), *s);
+                    else return std::unexpected("build.variables values must be strings");
+                }
+            }
+            if (auto* flags = bld->get_as<vendor::toml::table>("flag_env")) {
+                parse_strings(*flags, "cflags", r.managed_build.cflags_env);
+                parse_strings(*flags, "cxxflags", r.managed_build.cxxflags_env);
+                parse_strings(*flags, "cppflags", r.managed_build.cppflags_env);
+                parse_strings(*flags, "ldflags", r.managed_build.ldflags_env);
+                parse_strings(*flags, "rustflags", r.managed_build.rustflags_env);
+            }
+            if (auto* tools = bld->get_as<vendor::toml::table>("tool_env")) {
+                parse_strings(*tools, "cc", r.managed_build.cc_env);
+                parse_strings(*tools, "cxx", r.managed_build.cxx_env);
+                parse_strings(*tools, "linker", r.managed_build.linker_env);
+            }
+            if (auto* suite = bld->get_as<vendor::toml::table>("toolchain")) {
+                auto parse_tool = [&](std::string_view kind,
+                                      ToolRequirement& requirement,
+                                      std::initializer_list<std::string_view> families)
+                    -> std::expected<void, std::string> {
+                    auto* tool = suite->get_as<vendor::toml::table>(kind);
+                    if (!tool) return std::unexpected(std::format(
+                        "build.toolchain requires a [{}] table", kind));
+                    requirement.family = (*tool)["family"].value_or("");
+                    requirement.package = (*tool)["package"].value_or("");
+                    requirement.minimum_version =
+                        (*tool)["minimum_version"].value_or("");
+                    if (requirement.family.empty() || requirement.package.empty()
+                        || requirement.minimum_version.empty()) {
+                        return std::unexpected(std::format(
+                            "build.toolchain.{} requires family, package and minimum_version",
+                            kind));
+                    }
+                    if (!std::ranges::contains(families, requirement.family)) {
+                        return std::unexpected(std::format(
+                            "Unsupported build.toolchain.{} family '{}'", kind,
+                            requirement.family));
+                    }
+                    return {};
+                };
+                if (auto result = parse_tool("compiler", r.managed_build.compiler,
+                        {"clang", "gcc"}); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_tool("linker", r.managed_build.linker,
+                        {"lld", "mold", "ld"}); !result)
+                    return std::unexpected(result.error());
+                if (suite->contains("rust")) {
+                    if (r.managed_build.system != BuildSystem::Cargo)
+                        return std::unexpected(
+                            "build.toolchain.rust is valid only for Cargo recipes");
+                    if (auto result = parse_tool("rust", r.managed_build.rust,
+                            {"rustc"}); !result)
+                        return std::unexpected(result.error());
+                }
+
+                if (!r.managed_build.allowed_compilers.empty()
+                    && !std::ranges::contains(r.managed_build.allowed_compilers,
+                                              r.managed_build.compiler.family))
+                    return std::unexpected(
+                        "Default compiler family is absent from allowed_compilers");
+                if (!r.managed_build.allowed_linkers.empty()
+                    && !std::ranges::contains(r.managed_build.allowed_linkers,
+                                              r.managed_build.linker.family))
+                    return std::unexpected(
+                        "Default linker family is absent from allowed_linkers");
+
+                auto require_package = [&](const ToolRequirement& requirement) {
+                    const auto minimum = Version::parse(requirement.minimum_version);
+                    bool found = false;
+                    for (const auto& raw : r.build_deps) {
+                        const auto dependency = Dependency::parse(raw);
+                        if (dependency.name != requirement.package) continue;
+                        found = true;
+                        const bool strong_enough =
+                            (dependency.op == ConstraintOp::Equal
+                                || dependency.op == ConstraintOp::GreaterEqual)
+                            && dependency.version >= minimum;
+                        if (!strong_enough) return std::expected<void, std::string>(
+                            std::unexpected(std::format(
+                                "build dependency '{}' does not guarantee toolchain minimum {} >= {}",
+                                raw, requirement.package, requirement.minimum_version)));
+                    }
+                    if (!found) r.build_deps.push_back(std::format(
+                        "{} >= {}", requirement.package,
+                        requirement.minimum_version));
+                    return std::expected<void, std::string>{};
+                };
+                if (auto result = require_package(r.managed_build.compiler); !result)
+                    return std::unexpected(result.error());
+                if (auto result = require_package(r.managed_build.linker); !result)
+                    return std::unexpected(result.error());
+                if (!r.managed_build.rust.family.empty()) {
+                    if (auto result = require_package(r.managed_build.rust); !result)
+                        return std::unexpected(result.error());
+                }
+            }
         }
 
         parse_capability_hooks(tbl, r.capability_hooks);

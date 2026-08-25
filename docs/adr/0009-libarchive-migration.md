@@ -44,8 +44,7 @@ Single file `src/store/archive.cppm` — no partitions.
 1. libarchive handles tar/zstd parsing
 2. Parallel file writes via bounded worker queue
 3. No temp+rename in batch mode (fresh root writes directly)
-4. Provenance only when recipe has build phase AND fresh ELF evidence
-5. TOCTOU simplified to dev+ino+size comparison
+4. TOCTOU simplified to dev+ino+size comparison
 
 ### Security model
 

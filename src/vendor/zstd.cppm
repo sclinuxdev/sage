@@ -80,8 +80,7 @@ public:
     }
 
     // Decompressed leading slice of the framed stream read from `in`,
-    // capped at `max_bytes`: consumers such as provenance stamping need
-    // only a member's first bytes, and frames cannot be seeked into.
+    // capped at `max_bytes` for consumers inspecting framed members.
     // Malformed input is an error; the zstd buffer structs stay inside
     // this module instead of leaking past the vendor boundary.
     std::expected<std::string, std::string> decompress_lead(

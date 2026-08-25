@@ -12,6 +12,7 @@ export import sage.util;
 // Layer 2: Domain Models & Services
 export import sage.package;
 export import sage.config;
+export import sage.build;
 export import sage.service;
 export import sage.channel;
 

@@ -156,6 +156,12 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     // The ownership preflight and extraction must refer to the same payload,
     // even when a replacement archive keeps the same package identity.
     auto preflight_package = sage::archive::inspect_package(pkg_path);
+    if (!preflight_package || !preflight_package->manifest.files.empty()
+        || preflight_package->data_files.empty()) {
+        sage::util::log_error(
+            "Package inspection did not keep payload inventory exclusively in files.idx");
+        return 1;
+    }
     auto replaced_payload = temp_dir / "replaced-payload";
     std::filesystem::create_directories(replaced_payload / "usr/bin");
     std::ofstream(replaced_payload / "usr/bin/injected") << "must not extract\n";

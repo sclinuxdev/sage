@@ -53,11 +53,6 @@ export int run_database_rebuild_tests(const std::filesystem::path& temp_dir,
     escaped_manifest.conflicts.push_back(
         sage::package::Dependency::parse("legacy-metadata < 2.0"));
     escaped_manifest.conffiles = {"etc/escaped.conf"};
-    sage::package::PackageManifest::BuildProducer escaped_producer;
-    escaped_producer.name = "gcc";
-    escaped_producer.versions = {"16.2.0"};
-    escaped_producer.flags = "-O2";
-    escaped_manifest.build_producers.push_back(std::move(escaped_producer));
     sage::package::FileEntry escaped_file;
     escaped_file.path = R"(usr/lib/systemd/system/system-systemd\x2dmute.slice)";
     escaped_manifest.files.push_back(std::move(escaped_file));
@@ -71,48 +66,58 @@ export int run_database_rebuild_tests(const std::filesystem::path& temp_dir,
         || escaped_round_trip->conflicts.size() != 1
         || escaped_round_trip->conflicts.front().to_string() != "legacy-metadata < 2.0-1"
         || escaped_round_trip->conffiles != escaped_manifest.conffiles
-        || escaped_round_trip->build_producers.size() != 1
-        || escaped_round_trip->build_producers.front().name != "gcc"
-        || escaped_round_trip->build_producers.front().versions
-            != std::vector<std::string>{"16.2.0"}
-        || escaped_round_trip->build_producers.front().flags != "-O2"
         || escaped_round_trip->files.size() != 1
         || escaped_round_trip->files.front().path != escaped_manifest.files.front().path) {
         sage::util::log_error("Package metadata TOML escaping round-trip failed");
         return 1;
     }
-    // Regression: pre-0.2.3 serializers scoped package arrays under the
-    // last [[build_producers]] element instead of root/[package]. The
-    // parser must salvage those stray keys when nothing else filled the
-    // fields.
-    auto salvaged_manifest = sage::package::PackageManifest::parse_toml(R"(
+    const auto summary_text = escaped_manifest.serialize_summary_toml();
+    auto escaped_summary =
+        sage::package::PackageManifest::parse_summary_toml(summary_text);
+    if (!escaped_summary
+        || summary_text.contains("[[files]]")
+        || escaped_summary->name != escaped_manifest.name
+        || escaped_summary->version != escaped_manifest.version
+        || escaped_summary->dependencies.size() != 1
+        || escaped_summary->dependencies.front().to_string()
+            != escaped_manifest.dependencies.front().to_string()
+        || escaped_summary->provides != escaped_manifest.provides
+        || !escaped_summary->files.empty()) {
+        sage::util::log_error(
+            "Package summary serialization retained files or lost solver metadata");
+        return 1;
+    }
+
+    // Old archives may still contain the removed, inferred build-provenance
+    // model. It is deliberately ignored on read and must never be emitted
+    // again: repackaging an upstream binary cannot establish who compiled it.
+    auto legacy_build_info = sage::package::PackageManifest::parse_toml(R"(
 schema_version = 1
 [package]
-name = "legacy-scoped"
-version = "1.0-1"
-description = "legacy layout"
-license = "MIT"
+name = "rust-bin"
+version = "1.90.0"
+release = "1"
+compiler = "rustc"
+compiler_version = "1.90.0"
 
 [[build_producers]]
-name = "gcc"
-versions = ["13.2.0"]
-flags = "-O2"
-dependencies = ["zlib >= 1.2-1"]
-provides = ["legacy-scoped"]
-conflicts = ["old-legacy < 1.0-1"]
-conffiles = ["etc/legacy.conf"]
+name = "rustc"
+versions = ["1.90.0"]
+flags = "-C opt-level=3"
 )");
-    if (!salvaged_manifest
-        || salvaged_manifest->dependencies.size() != 1
-        || salvaged_manifest->dependencies.front().to_string() != "zlib >= 1.2-1"
-        || salvaged_manifest->provides != std::vector<std::string>{"legacy-scoped"}
-        || salvaged_manifest->conflicts.size() != 1
-        || salvaged_manifest->conflicts.front().to_string() != "old-legacy < 1.0-1"
-        || salvaged_manifest->conffiles != std::vector<std::string>{"etc/legacy.conf"}
-        || salvaged_manifest->build_producers.size() != 1
-        || salvaged_manifest->build_producers.front().name != "gcc") {
-        sage::util::log_error("Malformed pre-0.2.3 producer-scoped package arrays were not salvaged");
+    if (!legacy_build_info) {
+        sage::util::log_error("Legacy manifest with obsolete build information did not parse");
         return 1;
+    }
+    const auto cleaned_manifest = legacy_build_info->serialize_toml();
+    for (const auto marker : {"compiler", "build_producers", "rustc",
+                              "opt-level"}) {
+        if (cleaned_manifest.contains(marker)) {
+            sage::util::log_error(
+                "Obsolete inferred build information survived manifest serialization: {}",
+                marker);
+            return 1;
+        }
     }
 
     auto embedded_epoch_manifest = sage::package::PackageManifest::parse_toml(R"(

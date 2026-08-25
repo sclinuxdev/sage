@@ -48,6 +48,36 @@ export int run_channel_swap_tests(const std::filesystem::path& extract_root) {
     }
     sage::util::log_success("6. Sub-Channel Toolchain Slot Swapper & Profile Aggregator OK");
 
+    // Normal install/rebuild resolution must be a local-cache operation once
+    // a remote channel index has been synchronized. The deliberately invalid
+    // URL proves IndexRefresh::IfMissing does not touch the network.
+    const auto cache_root = extract_root / "var/cache/sage/channel-test";
+    const auto cached_index = cache_root / "channels/cached.toml";
+    std::filesystem::create_directories(cached_index.parent_path());
+    {
+        std::ofstream output(cached_index);
+        output << R"(schema_version = 1
+[channel]
+name = "cached"
+
+[[packages]]
+name = "cache-proof"
+version = "1.0"
+release = "1"
+arch = "any"
+)";
+    }
+    sage::channel::Channel cached_channel;
+    cached_channel.name = "cached";
+    cached_channel.url = "https://invalid.example/sage";
+    auto cached = sage::channel::ProfileManager::sync_channel(
+        cached_channel, cache_root, sage::channel::IndexRefresh::IfMissing);
+    if (!cached || cached->available_packages.size() != 1
+        || cached->available_packages.front().name != "cache-proof") {
+        sage::util::log_error("Cached remote channel index was not reused");
+        return 1;
+    }
+
     return 0;
 }
 

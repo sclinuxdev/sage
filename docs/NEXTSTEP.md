@@ -19,12 +19,12 @@ To ensure long-term stability, deterministic upgrades, and backward/forward comp
         ┌───────────────────────┬─────────────┴─────────┬────────────────────────┐
         ▼                       ▼                       ▼                        ▼
 【系统与通道配置】        【包配方与清单】          【服务与触发器】          【远程仓库索引】
-system.toml (v1)        recipe.toml (v1)        service.toml (v2)        index.toml (v1)
+system.toml (v1)        recipe.toml (v1/v2)     service.toml (v2)        index.toml (v1)
 channels.toml (v1)      manifest.toml (v1)      triggers.toml (v1)       files.idx (v1)
 ```
 
 ### 1.1 Compatibility Invariants
-* **Current Supported Versions**: `schema_version = 1` for v1 formats and `schema_version = 2` for `service.toml`.
+* **Current Supported Versions**: `recipe.toml` accepts v1 and v2; `service.toml` accepts v2; the remaining listed formats use v1.
 * **Forward Compatibility Rule**: If a Sage engine reads a file with `schema_version > CURRENT_SUPPORTED_VERSION`, it MUST fail gracefully with an explicit diagnostic message instructing the user to upgrade `sage`.
 * **Backward Compatibility Rule**: When newer schema versions are introduced (e.g. `v2`), future Sage engines MUST maintain zero-copy parsing adapters or migration handlers for older schema versions.
 

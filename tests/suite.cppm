@@ -28,8 +28,65 @@ namespace sage::tests {
 
 using sage::cli::CliOptions;
 
+// The development image need not carry the distribution's fakeroot package.
+// This adapter proves that every build command crosses Sage's fakeroot
+// execution boundary; real fakeroot behaviour remains the package's own
+// integration responsibility.
+class FakerootTestAdapter {
+    std::filesystem::path directory_;
+    std::string old_path_;
+    bool ready_{false};
+
+public:
+    FakerootTestAdapter() {
+        const char* path = sage::util::get_env("PATH");
+        old_path_ = path ? path : "";
+        directory_ = std::filesystem::temp_directory_path()
+            / std::format("sage-fakeroot-test-{}", sage::util::current_pid());
+        std::error_code ec;
+        std::filesystem::create_directories(directory_, ec);
+        if (ec) return;
+
+        const auto executable = directory_ / "fakeroot";
+        std::ofstream script(executable);
+        script << R"(#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "fakeroot test adapter 1.0"
+    exit 0
+fi
+if [ "$1" = "--" ]; then shift; fi
+export SAGE_TEST_FAKEROOT_ACTIVE=1
+exec "$@"
+)";
+        script.close();
+        if (!script) return;
+        std::filesystem::permissions(executable,
+            std::filesystem::perms::owner_read
+                | std::filesystem::perms::owner_write
+                | std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace, ec);
+        if (ec) return;
+        ready_ = sage::util::set_env(
+            "PATH", directory_.string() + ":" + old_path_);
+    }
+
+    ~FakerootTestAdapter() {
+        sage::util::set_env("PATH", old_path_);
+        std::error_code ec;
+        std::filesystem::remove_all(directory_, ec);
+    }
+
+    [[nodiscard]] bool ready() const noexcept { return ready_; }
+};
+
 export int run_all() {
     sage::util::log_info("Running Sage Master Architecture & Subsystem Integration Test Suite...");
+
+    FakerootTestAdapter fakeroot;
+    if (!fakeroot.ready()) {
+        sage::util::log_error("Cannot create the fakeroot execution adapter");
+        return 1;
+    }
 
     // Original section order: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15.
 

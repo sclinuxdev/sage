@@ -300,6 +300,31 @@ public:
     std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages(
         vendor::lmdb::MdbTxn& txn)
     {
+        return list_installed_packages_impl(txn, false);
+    }
+
+    // Package metadata without [[files]]. This is the hot-path view for the
+    // solver, service registry and trigger planner; callers that inspect or
+    // verify payloads continue to use list_installed_packages().
+    std::expected<std::vector<package::PackageManifest>, std::string>
+    list_installed_package_summaries()
+    {
+        auto txn = begin_read_txn();
+        if (!txn) return std::unexpected(
+            "Failed to open installed package summary transaction: " + txn.error());
+        return list_installed_package_summaries(*txn);
+    }
+
+    std::expected<std::vector<package::PackageManifest>, std::string>
+    list_installed_package_summaries(vendor::lmdb::MdbTxn& txn)
+    {
+        return list_installed_packages_impl(txn, true);
+    }
+
+private:
+    std::expected<std::vector<package::PackageManifest>, std::string>
+    list_installed_packages_impl(vendor::lmdb::MdbTxn& txn, bool summary_only)
+    {
         std::vector<package::PackageManifest> list;
         auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_packages_);
         if (!cur_res) return std::unexpected("Failed to open installed package cursor: " + cur_res.error());
@@ -311,7 +336,9 @@ public:
             return std::unexpected("Failed to read installed package cursor: " + entry.error());
         }
         while (*entry) {
-            auto pkg = package::PackageManifest::parse_toml(v);
+            auto pkg = summary_only
+                ? package::PackageManifest::parse_summary_toml(v)
+                : package::PackageManifest::parse_toml(v);
             if (!pkg) {
                 return std::unexpected(std::format(
                     "Failed to parse installed package '{}' metadata: {}", k, pkg.error()));
@@ -329,6 +356,8 @@ public:
         }
         return list;
     }
+
+public:
 
     // ========================================================================
     // Files Table & Conflict Detection
@@ -416,9 +445,10 @@ public:
             if (!*existing) continue;
             for (const auto owner : split_owners(**existing)) {
                 if (allowed_owner && owner == *allowed_owner) continue;
+                const std::string owner_name{owner_package(owner)};
                 const auto released = released_claims.find(cleaned);
                 if (released != released_claims.end()
-                    && released->second.contains(std::string{owner_package(owner)})) {
+                    && released->second.contains(owner_name)) {
                     continue;
                 }
                 return std::unexpected(std::format(
@@ -437,11 +467,23 @@ public:
         std::optional<std::string_view> allowed_owner = std::nullopt,
         const ReleasedClaims& released_claims = {})
     {
-        std::string owner_val = std::format("{}:{}", pkg_name, channel);
-
         auto conflict_res = check_file_conflicts(
             txn, allowed_owner, files, released_claims);
         if (!conflict_res) return conflict_res;
+
+        return register_files_prechecked(txn, pkg_name, channel, files);
+    }
+
+    // Writes claims after the caller performed check_file_conflicts() in the
+    // same write transaction. This explicit interface preserves preflight
+    // before expensive staging without repeating every LMDB lookup.
+    std::expected<void, std::string> register_files_prechecked(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view pkg_name,
+        std::string_view channel,
+        const std::vector<package::FileEntry>& files)
+    {
+        std::string owner_val = std::format("{}:{}", pkg_name, channel);
 
         // Insert file records (new owner claims file)
         for (const auto& f : files) {
@@ -463,7 +505,9 @@ public:
             std::vector<std::string_view> owners;
             if (*existing) {
                 for (const auto owner : split_owners(**existing)) {
-                    if (owner_package(owner) != pkg_name) owners.push_back(owner);
+                    const auto name = owner_package(owner);
+                    if (name == pkg_name) continue;
+                    owners.push_back(owner);
                 }
             }
             owners.push_back(owner_val);

@@ -146,11 +146,7 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
 
     return meta;
 }
-// Section-name-addressable reads for provenance: .comment carries producer
-// fingerprints and .debug_str carries DW_AT_producer strings with the exact
-// command lines when -grecord-gcc-switches / -grecord-command-line applied.
-// Reading named sections instead of blind head/tail slabs is both exact (no
-// middle-of-file blind spot on huge binaries) and cheaper on average.
+// Section-name-addressable bounded reads for ELF inspection tools.
 struct ElfSection {
     std::string bytes;
     bool truncated{false};

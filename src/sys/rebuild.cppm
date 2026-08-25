@@ -161,7 +161,7 @@ std::expected<void, std::string> run_postprocess(
         }
         trig_ctx.transaction_packages.push_back(std::move(*manifest));
     }
-    auto installed = db.list_installed_packages();
+    auto installed = db.list_installed_package_summaries();
     if (!installed) return std::unexpected(installed.error());
     trig_ctx.installed_packages = std::move(*installed);
     trig_ctx.providers = cfg->providers;
@@ -503,7 +503,7 @@ public:
             return std::unexpected(
                 "Failed to open service ownership read transaction: " + txn.error());
         }
-        auto installed = db.list_installed_packages(*txn);
+        auto installed = db.list_installed_package_summaries(*txn);
         if (!installed) {
             return std::unexpected(
                 "Installed package database is inconsistent: " + installed.error());
@@ -780,7 +780,8 @@ public:
                 sysroot / fsx.relative_dir() / "payload";
             util::log_info("Staging {} -> {}...", selected.name, sysroot.string());
             auto ext_res = archive::extract_package(
-                *archive_res, staging_root, &selected, &*inspect_res);
+                *archive_res, staging_root, &selected, &*inspect_res, nullptr,
+                archive::ExtractionDurability::Batch);
             if (!ext_res) {
                 return std::unexpected(std::format(
                     "Failed to stage package '{}': {}", selected.name, ext_res.error()));
@@ -829,7 +830,7 @@ public:
         // its script rendered into the transaction unless the package ships
         // its own native unit for the active init. Loom needs its external
         // compiler, so those stay post-publication.
-        auto installed_after = db.list_installed_packages(*wtxn);
+        auto installed_after = db.list_installed_package_summaries(*wtxn);
         if (!installed_after) {
             return std::unexpected(
                 "Installed package database is inconsistent during reconcile: " + installed_after.error());
@@ -919,7 +920,7 @@ public:
                 jctx.touched.emplace_back(package::to_string(f.type)[0],
                     util::clean_rel_path(f.path));
             }
-            jctx.package_manifests_toml.push_back(pkg.serialize_toml());
+            jctx.package_manifests_toml.push_back(pkg.serialize_summary_toml());
         }
 
         auto synced = fsx.sync_staging();

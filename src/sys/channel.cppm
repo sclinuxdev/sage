@@ -8,6 +8,11 @@ import sage.util;
 
 export namespace sage::channel {
 
+enum class IndexRefresh {
+    Always,
+    IfMissing,
+};
+
 using std::size_t;
 using std::uint32_t;
 
@@ -200,6 +205,42 @@ struct ChannelIndex {
                             if (auto str = c.value<std::string_view>()) {
                                 m.conflicts.push_back(package::Dependency::parse(*str));
                             }
+                        }
+                    }
+                    if (auto* tools = ptab->get_as<vendor::toml::array>(
+                            "managed_build_tools")) {
+                        std::set<std::string> roles;
+                        for (auto&& item : *tools) {
+                            auto* tool = item.as_table();
+                            if (!tool) return std::unexpected(
+                                "managed_build_tools index entries must be tables");
+                            package::ManagedBuildTool observed;
+                            observed.role = (*tool)["role"].value_or("");
+                            observed.executable = (*tool)["executable"].value_or("");
+                            observed.family = (*tool)["family"].value_or("");
+                            observed.version = (*tool)["version"].value_or("");
+                            const std::string version_argument =
+                                (*tool)["version_argument"].value_or("");
+                            const bool known =
+                                ((observed.role == "cc" || observed.role == "cxx")
+                                    && (observed.family == "gcc"
+                                        || observed.family == "clang"))
+                                || (observed.role == "linker"
+                                    && (observed.family == "ld"
+                                        || observed.family == "lld"
+                                        || observed.family == "mold"))
+                                || (observed.role == "rustc"
+                                    && observed.family == "rustc");
+                            if (!known || observed.executable.empty()
+                                || observed.version.empty()
+                                || version_argument != "--version") {
+                                return std::unexpected(
+                                    "Incomplete managed_build_tools entry in channel index");
+                            }
+                            if (!roles.insert(observed.role).second)
+                                return std::unexpected(
+                                    "Duplicate managed build tool role in channel index");
+                            m.managed_build_tools.push_back(std::move(observed));
                         }
                     }
                     if (!m.name.empty()) {
@@ -547,8 +588,24 @@ public:
     static std::expected<ChannelIndex, std::string> sync_channel(
         const Channel& ch,
         const std::filesystem::path& cache_dir,
+        IndexRefresh refresh = IndexRefresh::Always,
         bool persist_cache = true)
     {
+        const std::filesystem::path local_idx =
+            cache_dir / "channels" / (ch.name + ".toml");
+        const bool remote = vendor::curl::parse_local_url(ch.url).empty();
+        if (remote && refresh == IndexRefresh::IfMissing
+            && std::filesystem::exists(local_idx)) {
+            std::ifstream cached(local_idx);
+            std::stringstream text;
+            text << cached.rdbuf();
+            if (auto parsed = ChannelIndex::parse_toml(text.str()); parsed) {
+                return parsed;
+            }
+            // A corrupt/incomplete cache is never authoritative: fetch and
+            // atomically replace it below.
+        }
+
         std::string index_url = ch.url;
         if (!index_url.ends_with('/')) index_url += '/';
         index_url += "index.toml";
@@ -564,13 +621,16 @@ public:
         if (persist_cache) {
             // Cache index locally, best effort: a read-only or missing cache
             // directory must not fail the sync itself.
-            std::filesystem::path local_idx = cache_dir / "channels" / (ch.name + ".toml");
             std::error_code cache_ec;
             std::filesystem::create_directories(local_idx.parent_path(), cache_ec);
             if (!cache_ec) {
-                std::ofstream f(local_idx);
+                const auto temporary = local_idx.string() + ".part";
+                std::ofstream f(temporary, std::ios::binary | std::ios::trunc);
                 if (f.is_open()) {
                     f << *content;
+                    f.close();
+                    std::filesystem::rename(temporary, local_idx, cache_ec);
+                    if (cache_ec) std::filesystem::remove(temporary, cache_ec);
                 }
             }
         }

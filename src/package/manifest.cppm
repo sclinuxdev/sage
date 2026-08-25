@@ -30,6 +30,18 @@ struct FileEntry {
     std::string link_target;
 };
 
+// One tool Sage configured and directly probed for a managed recipe-v2
+// build. This is an execution observation, not inferred producer provenance:
+// `version` is parsed from this exact executable's `--version` output.
+struct ManagedBuildTool {
+    std::string role;       // cc | cxx | linker | rustc
+    std::string executable; // exact build.toml command/path Sage invoked
+    std::string family;     // gcc | clang | ld | lld | mold
+    std::string version;
+
+    bool operator==(const ManagedBuildTool&) const = default;
+};
+
 inline std::string_view to_string(FileType t) noexcept {
     switch (t) {
         case FileType::Directory: return "dir";
@@ -55,41 +67,6 @@ struct PackageManifest {
     uint64_t installed_size{0};
     std::string file;  // Relative path in repository (e.g. "acl/acl-2.4.0-2-x86_64.pkg.tar.zst")
 
-    // Build provenance, stamped by cmd_build after a successful build.
-    // build_compiler(_version): the primary producer by precedence, as the
-    // artifacts themselves identify it. build_cflags/cxxflags/ldflags: the
-    // environment the phase shells were invoked with (a true fact; some
-    // build systems ignore CFLAGS yet consume the same string through their
-    // own channel -- kernel KCFLAGS -- so this layer never claims
-    // consumption). Rides along through serialization -- which is also the
-    // LMDB record and the in-archive .METADATA/manifest.toml -- and is
-    // republished by the repository index. All empty for packages built
-    // before this existed.
-    std::string build_compiler;
-    std::string build_compiler_version;
-    std::string build_cflags;
-    std::string build_cxxflags;
-    std::string build_ldflags;
-    // 实际传给 rustc 的 RUSTFLAGS（仅 rust 产物且本地真实编译时非空）。
-    std::string build_rustflags;
-
-    // Every compiler family the artifacts name -- mixed rust+C++ builds get
-    // one entry each. flags = switches artifact-verified from DWARF
-    // DW_AT_producer strings (empty when the build recorded none: honesty
-    // over completeness); versions as distinct strings when several objects
-    // disagree. Empty vector for pre-0.2.1 packages.
-    struct BuildProducer {
-        std::string name;
-        std::vector<std::string> versions;
-        std::string flags;
-    };
-    std::vector<BuildProducer> build_producers;
-    // Env channels the recipe itself forwarded flags through (kernel
-    // KCFLAGS/KAFLAGS and kin). Annotation only: it explains why the injected
-    // build_cflags may equal the artifact-verified producer switches even
-    // when a build system nominally ignores CFLAGS.
-    std::vector<std::string> build_flag_passthrough;
-
     // Raw universal service definition (a full service.toml document) for
     // daemon packages: `sage rebuild` parses it and regenerates native
     // scripts for whichever init system is active. Empty for non-daemons.
@@ -105,6 +82,9 @@ struct PackageManifest {
     std::vector<FileEntry> files;
     std::vector<CapabilityHook> capability_hooks;
     std::vector<Trigger> triggers;
+    // Empty for recipe v1 and upstream-binary repackaging. Sage populates it
+    // only after a managed recipe-v2 build has completed successfully.
+    std::vector<ManagedBuildTool> managed_build_tools;
 
     // The hook this package publishes for `cap`, if any.
     [[nodiscard]] const CapabilityHook* hook_for(std::string_view cap) const {
@@ -147,14 +127,8 @@ struct PackageManifest {
             m.arch = (*pkg)["arch"].value_or("x86_64");
             auto architecture = validate_package_architecture(m.arch);
             if (!architecture) return std::unexpected(architecture.error());
-            m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
-            m.build_compiler = (*pkg)["build_compiler"].value_or("");
-            m.build_compiler_version = (*pkg)["build_compiler_version"].value_or("");
-            m.build_cflags = (*pkg)["build_cflags"].value_or("");
-            m.build_cxxflags = (*pkg)["build_cxxflags"].value_or("");
             m.service_toml = (*pkg)["service_toml"].value_or("");
-            m.build_ldflags = (*pkg)["build_ldflags"].value_or("");
-            m.build_rustflags = (*pkg)["build_rustflags"].value_or("");
+            m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
         } else {
             return std::unexpected("Missing [package] section in manifest");
         }
@@ -247,69 +221,67 @@ struct PackageManifest {
             }
         }
 
-        // [[build_producers]] -- one entry per compiler family the artifacts
-        // name. Absent entirely in pre-0.2.1 manifests.
-        // Historical quirk: these arrays may sit at root scope or nested
-        // inside [package]; accept either (mirrors the files dual-read).
-        auto producers_tbl = tbl.get_as<vendor::toml::array>("build_producers");
-        if (!producers_tbl)
-            if (auto* pkg2 = tbl.get_as<vendor::toml::table>("package"))
-                producers_tbl = pkg2->get_as<vendor::toml::array>("build_producers");
-        // Salvage for pre-0.2.3 serializers: those scoped package arrays
-        // (dependencies/provides/conflicts/conffiles) under the last
-        // [[build_producers]] element instead of root/[package], so legacy
-        // manifests carry stray keys inside producer tables. Probe each raw
-        // element and stash what turns up; adoption below only fills fields
-        // still empty after the normal reads above.
-        std::vector<Dependency> salvaged_deps;
-        std::vector<std::string> salvaged_provides;
-        std::vector<Dependency> salvaged_conflicts;
-        std::vector<std::string> salvaged_conffiles;
-        if (producers_tbl) {
-            for (auto&& el : *producers_tbl) {
-                auto* t = el.as_table();
-                if (!t) continue;
-                parse_deps(*t, "dependencies", salvaged_deps);
-                parse_strings(*t, "provides", salvaged_provides);
-                parse_deps(*t, "conflicts", salvaged_conflicts);
-                parse_strings(*t, "conffiles", salvaged_conffiles);
-                BuildProducer p;
-                p.name = (*t)["name"].value_or("");
-                if (p.name.empty()) continue;
-                if (auto* vs = t->get_as<vendor::toml::array>("versions")) {
-                    for (auto&& v : *vs) {
-                        if (auto s = v.value<std::string_view>()) {
-                            p.versions.emplace_back(*s);
-                        }
-                    }
-                }
-                p.flags = (*t)["flags"].value_or("");
-                m.build_producers.push_back(std::move(p));
-            }
-        }
-        if (m.dependencies.empty()) m.dependencies = std::move(salvaged_deps);
-        if (m.provides.empty()) m.provides = std::move(salvaged_provides);
-        if (m.conflicts.empty()) m.conflicts = std::move(salvaged_conflicts);
-        if (m.conffiles.empty()) m.conffiles = std::move(salvaged_conffiles);
-        auto pt_arr = tbl.get_as<vendor::toml::array>("build_flag_passthrough");
-        if (!pt_arr)
-            if (auto* pkg3 = tbl.get_as<vendor::toml::table>("package"))
-                pt_arr = pkg3->get_as<vendor::toml::array>("build_flag_passthrough");
-        if (pt_arr) {
-            for (auto&& el : *pt_arr) {
-                if (auto s = el.value<std::string_view>(); s && !s->empty()) {
-                    m.build_flag_passthrough.emplace_back(*s);
-                }
-            }
-        }
         parse_capability_hooks(tbl, m.capability_hooks);
         auto trig_res = parse_triggers(tbl, m.triggers);
         if (!trig_res) return std::unexpected(trig_res.error());
 
+        if (auto* tools = tbl.get_as<vendor::toml::array>("managed_build_tools")) {
+            if (m.schema_version < 2) return std::unexpected(
+                "managed_build_tools are valid only in package manifest schema v2");
+            std::set<std::string> roles;
+            for (auto&& item : *tools) {
+                auto* tool = item.as_table();
+                if (!tool) return std::unexpected(
+                    "managed_build_tools entries must be tables");
+                ManagedBuildTool observed;
+                observed.role = (*tool)["role"].value_or("");
+                observed.executable = (*tool)["executable"].value_or("");
+                observed.family = (*tool)["family"].value_or("");
+                observed.version = (*tool)["version"].value_or("");
+                const std::string version_argument =
+                    (*tool)["version_argument"].value_or("");
+                const bool known_role = observed.role == "cc"
+                    || observed.role == "cxx" || observed.role == "linker"
+                    || observed.role == "rustc";
+                const bool known_family =
+                    ((observed.role == "cc" || observed.role == "cxx")
+                        && (observed.family == "gcc" || observed.family == "clang"))
+                    || (observed.role == "linker"
+                        && (observed.family == "ld" || observed.family == "lld"
+                            || observed.family == "mold"))
+                    || (observed.role == "rustc" && observed.family == "rustc");
+                if (!known_role || observed.executable.empty()
+                    || !known_family || observed.version.empty()
+                    || version_argument != "--version") {
+                    return std::unexpected(
+                        "managed_build_tools require a unique cc/cxx/linker/rustc role, executable, family, version and version_argument='--version'");
+                }
+                if (!roles.insert(observed.role).second) return std::unexpected(
+                    "managed_build_tools contains a duplicate role: "
+                    + observed.role);
+                m.managed_build_tools.push_back(std::move(observed));
+            }
+        }
+
         return m;
     }
 
-    [[nodiscard]] std::string serialize_toml() const {
+    // LMDB stores Sage's own canonical serialization, whose [[files]] blocks
+    // are deliberately last. Solver, service and trigger planning need package
+    // metadata but not tens of thousands of file records; truncate before the
+    // TOML parser so their cost is proportional to package count, not payload
+    // file count. Archive parsing still uses parse_toml() and validates all
+    // file entries.
+    static std::expected<PackageManifest, std::string> parse_summary_toml(
+        std::string_view toml_content)
+    {
+        constexpr std::string_view marker = "[[files]]";
+        const auto files = toml_content.find(marker);
+        return parse_toml(files == std::string_view::npos
+            ? toml_content : toml_content.substr(0, files));
+    }
+
+    [[nodiscard]] std::string serialize_toml(bool include_files = true) const {
         const auto quote = [](std::string_view value) {
             return escape_toml_basic_string(value);
         };
@@ -324,26 +296,8 @@ struct PackageManifest {
         ss << "license = \"" << quote(license) << "\"\n";
         ss << "channel = \"" << quote(channel) << "\"\n";
         ss << "arch = \"" << quote(arch) << "\"\n";
-        // Provenance is omitted entirely when unknown so that packages built
-        // before it existed keep their byte-identical manifests.
-        if (!build_compiler.empty()) ss << "build_compiler = \"" << quote(build_compiler) << "\"\n";
-        if (!build_compiler_version.empty()) ss << "build_compiler_version = \"" << quote(build_compiler_version) << "\"\n";
-        if (!build_cflags.empty()) ss << "build_cflags = \"" << quote(build_cflags) << "\"\n";
-        if (!build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(build_cxxflags) << "\"\n";
-        if (!build_ldflags.empty()) ss << "build_ldflags = \"" << quote(build_ldflags) << "\"\n";
-        if (!build_rustflags.empty()) ss << "build_rustflags = \"" << quote(build_rustflags) << "\"\n";
         if (!service_toml.empty()) ss << "service_toml = \"" << quote(service_toml) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
-        // Everything below lives at the ROOT scope: [package] closed above.
-        // Flag passthrough annotations: env channels the recipe itself
-        // forwarded flags through (kernel KCFLAGS/KAFLAGS and kin).
-        if (!build_flag_passthrough.empty()) {
-            ss << "build_flag_passthrough = [\n";
-            for (const auto& channel : build_flag_passthrough) {
-                ss << "    \"" << quote(channel) << "\",\n";
-            }
-            ss << "]\n";
-        }
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {
             ss << "    \"" << quote(d.to_string()) << "\",\n";
@@ -407,39 +361,36 @@ struct PackageManifest {
             ss << "]\n\n";
         }
 
+        for (const auto& tool : managed_build_tools) {
+            ss << "[[managed_build_tools]]\n";
+            ss << "role = \"" << quote(tool.role) << "\"\n";
+            ss << "executable = \"" << quote(tool.executable) << "\"\n";
+            ss << "family = \"" << quote(tool.family) << "\"\n";
+            ss << "version = \"" << quote(tool.version) << "\"\n";
+            ss << "version_argument = \"--version\"\n\n";
+        }
+
         // Array-of-tables, not bare paths: the per-file hash and mode are what
         // make `sage query files` and integrity verification possible at all,
         // and this serialization is also the LMDB record.
-        for (const auto& f : files) {
-            ss << "[[files]]\n";
-            ss << "path = \"" << quote(f.path) << "\"\n";
-            ss << "type = \"" << to_string(f.type) << "\"\n";
-            ss << "mode = " << f.mode << "\n";
-            ss << "size = " << f.size << "\n";
-            if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
-            if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
-            ss << "\n";
-        }
-
-        // Array tables change the active TOML scope. Keep producer records
-        // last so package arrays written above cannot become fields of the
-        // final [[build_producers]] entry.
-        for (const auto& p : build_producers) {
-            if (p.name.empty()) continue;
-            ss << "[[build_producers]]\n";
-            ss << "name = \"" << quote(p.name) << "\"\n";
-            ss << "versions = [\n";
-            for (const auto& v : p.versions) {
-                ss << "    \"" << quote(v) << "\",\n";
+        if (include_files) {
+            for (const auto& f : files) {
+                ss << "[[files]]\n";
+                ss << "path = \"" << quote(f.path) << "\"\n";
+                ss << "type = \"" << to_string(f.type) << "\"\n";
+                ss << "mode = " << f.mode << "\n";
+                ss << "size = " << f.size << "\n";
+                if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
+                if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
+                ss << "\n";
             }
-            ss << "]\n";
-            if (!p.flags.empty()) {
-                ss << "flags = \"" << quote(p.flags) << "\"\n";
-            }
-            ss << "\n";
         }
 
         return ss.str();
+    }
+
+    [[nodiscard]] std::string serialize_summary_toml() const {
+        return serialize_toml(false);
     }
 };
 

@@ -6,7 +6,7 @@
 -- 版本号在这里写一遍，set_version 与注入给 C++ 的 SAGE_VERSION 都取它。
 -- 手写第二处的后果已经出现过：0.1.3 -> 0.2.0 那次 xmake.lua 升了，
 -- CLI banner 没跟上，于是 `sage --version` 与包元数据各说各的。
-local SAGE_VERSION = "0.2.3"
+local SAGE_VERSION = "0.2.4"
 
 set_project("sage")
 set_version(SAGE_VERSION)
@@ -44,16 +44,6 @@ target("sage")
     set_default(true)
 
 -- Integration suite as a separate binary, built on demand (`xmake build sage-tests`)
-target("sage-repack")
-    set_kind("binary")
-    set_default(false)
-    set_symbols("debug")
-    add_files("src/**.cppm")
-    add_files("tools/repack.cppm")
-    add_files("tools/repack_main.cppm")
-    add_files("tools/repack_entry.cpp")
-    add_links("archive", "crypto", "lmdb", "zstd", "curl", "z")
-
 target("sage-tests")
     set_kind("binary")
     set_default(false)

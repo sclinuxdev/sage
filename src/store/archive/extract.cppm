@@ -117,30 +117,21 @@ inline WritePool::WritePool(unsigned workers, size_t capacity)
     }
 }
 
-inline std::expected<void, std::string> write_regular_anchored(
-    int root_fd, std::string_view rel_path, std::string_view leaf,
+inline std::expected<void, std::string> write_regular_at(
+    int parent_fd, std::string_view rel_path, std::string_view leaf,
     uint32_t mode, uint64_t mtime, std::span<const uint8_t> payload)
 {
-    const std::filesystem::path relative(rel_path);
-    std::vector<std::string> components;
-    for (const auto& component : relative.parent_path()) {
-        if (component == ".") continue;
-        components.push_back(component.string());
-    }
-    auto parent = open_anchored_dir(root_fd, components);
-    if (!parent) return std::unexpected(parent.error());
-
     const auto leaf_bytes = std::string(leaf);
     int open_flags = O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW;
 #ifdef O_CLOEXEC
     open_flags |= O_CLOEXEC;
 #endif
-    int fd = ::openat(*parent, leaf_bytes.c_str(), open_flags, mode & 07777);
+    int fd = ::openat(parent_fd, leaf_bytes.c_str(), open_flags, mode & 07777);
     if (fd < 0) {
         // A foreign leaf symlink must never be followed: replace it, once.
         if ((errno == ELOOP || errno == EEXIST)
-            && ::unlinkat(*parent, leaf_bytes.c_str(), 0) == 0) {
-            fd = ::openat(*parent, leaf_bytes.c_str(), open_flags, mode & 07777);
+            && ::unlinkat(parent_fd, leaf_bytes.c_str(), 0) == 0) {
+            fd = ::openat(parent_fd, leaf_bytes.c_str(), open_flags, mode & 07777);
         }
         if (fd < 0) {
             return std::unexpected(std::format(
@@ -293,6 +284,28 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         64};
     std::mutex state_mutex;
     std::unordered_map<std::string, char> seen_paths;
+    // Staging is private and immutable until pool.drain(). Resolve each parent
+    // once on the decode thread and let all worker openat() calls share that
+    // descriptor. Header-heavy packages otherwise walk the same directory
+    // chain tens of thousands of times.
+    std::unordered_map<std::string, detail::UniqueFd> write_parents;
+    auto write_parent = [&](std::string_view rel_path)
+        -> std::expected<int, std::string> {
+        const auto parent_path = std::filesystem::path(rel_path).parent_path();
+        const std::string key = parent_path.generic_string();
+        if (auto found = write_parents.find(key); found != write_parents.end()) {
+            return found->second.get();
+        }
+        std::vector<std::string> components;
+        for (const auto& component : parent_path) {
+            if (component != ".") components.push_back(component.string());
+        }
+        auto opened = detail::open_anchored_dir(root_fd.get(), components);
+        if (!opened) return std::unexpected(opened.error());
+        const int fd = *opened;
+        write_parents.emplace(key, detail::UniqueFd{fd});
+        return fd;
+    };
     bool failed = false;
 
     auto record_entry = [&](package::FileEntry entry, std::string_view rel_raw,
@@ -492,11 +505,18 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         std::string leaf = std::filesystem::path(rel_path).filename().string();
         record_entry(entry, rel_path, leaf, &redirect_leaf);
         const auto write_leaf = redirect_leaf.empty() ? leaf : redirect_leaf;
+        auto parent_fd = write_parent(rel_path);
+        if (!parent_fd) {
+            failed = true;
+            pool.drain();
+            return std::unexpected(parent_fd.error());
+        }
 
-        auto write_task = [root = root_fd.get(), rel_path, write_leaf, mode = entry.mode,
+        auto write_task = [parent = *parent_fd, rel_path, write_leaf, mode = entry.mode,
                               mtime = info->mtime, payload = std::move(payload)]()
                 -> std::expected<void, std::string> {
-            return detail::write_regular_anchored(root, rel_path, write_leaf, mode, mtime, payload);
+            return detail::write_regular_at(
+                parent, rel_path, write_leaf, mode, mtime, payload);
         };
         pool.submit(std::move(write_task));
     }

@@ -74,21 +74,38 @@ inline std::string normalize_capability(std::string_view name) {
 // is warned about and ignored rather than failing every command.
 //
 // `cxxflags` left empty mirrors `cflags` at use time unless spelled out. The
-// fallback pair exists for the clang-by-default policy: when a build fails
-// under `cc`, cmd_build retries the whole recipe under `fallback_cc`.
+// fallback triple exists for the clang-by-default policy: it is selected only
+// when the primary tools cannot be probed (or v2 disallows their families).
+// A failed build is never retried under a different compiler.
 struct BuildConfig {
     uint32_t schema_version{1};
+    // Exact fakeroot executable selected by the administrator. Every recipe
+    // phase/managed build step is routed through it; Sage never silently
+    // degrades to an unvirtualized build environment.
+    std::string fakeroot{"fakeroot"};
     std::string cc{"clang"};
     std::string cxx{"clang++"};
+    std::string linker{"lld"};
     std::string fallback_cc{"gcc"};
     std::string fallback_cxx{"g++"};
+    std::string fallback_linker{"ld"};
+    std::string rustc{"rustc"};
     std::string cflags{"-O3 -march=x86-64-v3"};
     std::string cxxflags;
     std::string cppflags;
     std::string ldflags;
-    // Parallel job count injected as MAKEFLAGS/CARGO_BUILD_JOBS. 0 (the
-    // default) means auto: one job per hardware thread.
+    std::string rustflags;
+    // Sage package-operation concurrency (downloads/inspection). Historical
+    // build.toml files also used this for compilation, so compile_jobs inherits
+    // it when absent.
     int jobs{0};
+    // Parallel jobs inside one package build. Explicit 0 means one job per
+    // hardware thread; nullopt preserves the legacy `jobs` behaviour.
+    std::optional<int> compile_jobs;
+
+    [[nodiscard]] int configured_compile_jobs() const noexcept {
+        return compile_jobs.value_or(jobs);
+    }
 
     bool operator==(const BuildConfig&) const = default;
 
@@ -99,15 +116,38 @@ struct BuildConfig {
 
         BuildConfig cfg;
         cfg.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
+        if (auto v = tbl["fakeroot"].value<std::string_view>()) cfg.fakeroot = std::string(*v);
         if (auto v = tbl["cc"].value<std::string_view>()) cfg.cc = std::string(*v);
         if (auto v = tbl["cxx"].value<std::string_view>()) cfg.cxx = std::string(*v);
+        if (auto v = tbl["linker"].value<std::string_view>()) cfg.linker = std::string(*v);
         if (auto v = tbl["fallback_cc"].value<std::string_view>()) cfg.fallback_cc = std::string(*v);
         if (auto v = tbl["fallback_cxx"].value<std::string_view>()) cfg.fallback_cxx = std::string(*v);
+        if (auto v = tbl["fallback_linker"].value<std::string_view>()) cfg.fallback_linker = std::string(*v);
+        if (auto v = tbl["rustc"].value<std::string_view>()) cfg.rustc = std::string(*v);
         if (auto v = tbl["cflags"].value<std::string_view>()) cfg.cflags = std::string(*v);
         if (auto v = tbl["cxxflags"].value<std::string_view>()) cfg.cxxflags = std::string(*v);
         if (auto v = tbl["cppflags"].value<std::string_view>()) cfg.cppflags = std::string(*v);
         if (auto v = tbl["ldflags"].value<std::string_view>()) cfg.ldflags = std::string(*v);
-        cfg.jobs = static_cast<int>(tbl["jobs"].value_or(0LL));
+        if (auto v = tbl["rustflags"].value<std::string_view>()) cfg.rustflags = std::string(*v);
+        auto parse_jobs = [&](std::string_view key)
+            -> std::expected<std::optional<int>, std::string> {
+            const auto* node = tbl.get(key);
+            if (!node) return std::optional<int>{};
+            const auto value = node->value<std::int64_t>();
+            if (!value || *value < 0
+                || *value > std::numeric_limits<int>::max()) {
+                return std::unexpected(std::format(
+                    "{} must be an integer between 0 and {}",
+                    key, std::numeric_limits<int>::max()));
+            }
+            return std::optional<int>{static_cast<int>(*value)};
+        };
+        auto jobs = parse_jobs("jobs");
+        if (!jobs) return std::unexpected(jobs.error());
+        if (*jobs) cfg.jobs = **jobs;
+        auto compile_jobs = parse_jobs("compile_jobs");
+        if (!compile_jobs) return std::unexpected(compile_jobs.error());
+        cfg.compile_jobs = *compile_jobs;
         return cfg;
     }
 };

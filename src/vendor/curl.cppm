@@ -1,6 +1,7 @@
 module;
 
 #include <curl/curl.h>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -180,11 +181,15 @@ inline std::expected<void, std::string> download_file(
 
         curl.setopt(CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
             auto* c = static_cast<SingleCtx*>(userdata);
-            size_t bytes = size * nmemb;
-            ssize_t written = ::write(c->fd, ptr, bytes);
-            if (written > 0) {
-                c->downloaded += static_cast<size_t>(written);
+            const size_t bytes = size * nmemb;
+            size_t done = 0;
+            while (done < bytes) {
+                const ssize_t written = ::write(c->fd, ptr + done, bytes - done);
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) return static_cast<size_t>(0);
+                done += static_cast<size_t>(written);
             }
+            c->downloaded += done;
             return bytes;
         });
         curl.setopt(CURLOPT_WRITEDATA, &ctx);

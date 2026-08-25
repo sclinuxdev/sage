@@ -14,7 +14,7 @@ std::expected<std::optional<std::string>, std::string> find_other_declarer(
     std::string_view service_name,
     std::string_view excluding_package)
 {
-    auto installed = db.list_installed_packages(txn);
+    auto installed = db.list_installed_package_summaries(txn);
     if (!installed) return std::unexpected(installed.error());
     for (const auto& pkg : *installed) {
         if (pkg.name == excluding_package || pkg.service_toml.empty()) continue;

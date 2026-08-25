@@ -1,7 +1,3 @@
-module;
-#include <zstd.h>
-#include <zlib.h>
-
 export module sage.cli.build;
 
 // Package authoring: recipe builds and local repository indexing.
@@ -9,20 +5,22 @@ import std;
 import sage;
 
 import sage.cli;
-import sage.vendor.zstd;
 
 namespace sage::cli {
 
-// -- Build toolchain probing -------------------------------------------------
+// -- Sage-managed build toolchain probing -----------------------------------
 //
-// Existence check and version capture in one shot: run `<cc> --version` with
-// output redirected into a scratch file (this codebase speaks plain
-// std::system; popen would be its own RAII project), then take the first
-// whitespace token starting with a digit -- "clang version 19.1.7" and
-// "gcc (GCC) 15.1.1" both yield their version that way. nullopt means the
-// compiler is not usable at all.
-std::optional<std::string> probe_compiler(std::string_view cc) {
-    if (cc.empty()) return std::nullopt;
+// Probe the executable itself instead of treating its configured filename as
+// provenance: `cc` may be GCC or Clang, and a cross linker is commonly named
+// `<triple>-ld`. The name is only a conservative fallback when --version does
+// not identify a known family.
+struct ToolProbe {
+    std::string family;
+    std::string version;
+};
+
+std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) {
+    if (tool.empty()) return std::nullopt;
     std::filesystem::path out = std::filesystem::temp_directory_path()
         / std::format("sage-cc-probe-{}.txt", sage::util::current_pid());
     struct Remover {  // RAII: the scratch file cleans itself up
@@ -30,285 +28,49 @@ std::optional<std::string> probe_compiler(std::string_view cc) {
         ~Remover() { std::error_code ec; std::filesystem::remove(p, ec); }
     } remover{out};
 
-    int rc = std::system(std::format("\"{}\" --version > \"{}\" 2>&1", cc, out.string()).c_str());
+    int rc = std::system(std::format("\"{}\" --version > \"{}\" 2>&1", tool, out.string()).c_str());
     if (rc != 0) return std::nullopt;
     std::ifstream f(out);
-    std::string line;
-    if (!std::getline(f, line)) return std::nullopt;
+    std::stringstream captured;
+    captured << f.rdbuf();
+    const std::string output = captured.str();
+    if (output.empty()) return std::nullopt;
+    const std::string line = output.substr(0, output.find('\n'));
+    std::string lower = output;
+    std::ranges::transform(lower, lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::string family;
+    if (linker) {
+        if (lower.contains("mold")) family = "mold";
+        else if (lower.contains("lld")) family = "lld";
+        else if (lower.contains("gnu ld") || lower.contains("gnu binutils"))
+            family = "ld";
+    } else {
+        if (lower.contains("clang")) family = "clang";
+        else if (lower.contains("rustc")) family = "rustc";
+        else if (lower.contains("gcc")
+                 || lower.contains("free software foundation")) family = "gcc";
+    }
+    if (family.empty()) family = sage::build::tool_family(tool, linker);
+
     size_t i = 0;
     while (i < line.size()) {
         size_t j = line.find(' ', i);
         std::string_view tok(line.data() + i, (j == std::string::npos ? line.size() : j) - i);
         if (!tok.empty() && std::isdigit(static_cast<unsigned char>(tok.front()))) {
-            return std::string(tok);
+            return ToolProbe{std::move(family), std::string(tok)};
         }
         i = (j == std::string::npos) ? line.size() : j + 1;
     }
-    return std::string("unknown");
+    return ToolProbe{std::move(family), "unknown"};
 }
 
-// -- Build provenance by artifact evidence -----------------------------------
-//
-// Provenance is stamped only for packages that actually compiled something,
-// and the compiler named is the one the artifacts themselves identify --
-// never merely what CC was injected. A pure-data or script-only package
-// (os-release) stays silent, and a rust build is labeled rustc, not clang.
-struct Provenance {
-    bool compiled = false;          // any ELF / object-like file in the payload
-    // 最新的"编译产物"文件时间：用于区分本地真实编译与重分发的旧字节。
-    std::filesystem::file_time_type newest_compiled{};
-    std::set<std::string> producers;
-    // Versions per producer: linked executables embed the crt startup files'
-    // .comment too, so a clang-built package honestly carries a gcc trace --
-    // each producer keeps its own version instead of one ambiguous value.
-    std::map<std::string, std::set<std::string>> producer_versions;
-    // Actual switches per producer, extracted from DW_AT_producer strings in
-    // .debug_str (GCC records them by default via -grecord-gcc-switches;
-    // clang when -grecord-command-line is given). Empty for a producer means
-    // no artifact recorded its switches -- and then nothing is claimed.
-    std::map<std::string, std::set<std::string>> producer_switches;
-};
-
-// First dotted numeric token at/after `pos`: "clang version 22.1.8 (...)",
-// "GCC: (GNU) 15.3.0" and "rustc version 1.90.0" all yield their version.
-std::string version_after(std::string_view text, size_t pos) {
-    for (size_t i = pos; i < text.size(); ++i) {
-        if (!std::isdigit(static_cast<unsigned char>(text[i]))) continue;
-        size_t j = i;
-        while (j < text.size() && (std::isdigit(static_cast<unsigned char>(text[j])) || text[j] == '.')) ++j;
-        if (j > i + 1) return std::string(text.substr(i, j - i));  // skip lone digits
-        i = j;
-    }
-    return {};
-}
-
-// Producer fingerprints live in .comment-style strings, which sit in the
-// leading or trailing slabs of real artifacts; capping the read keeps huge
-// libraries (libLLVM) cheap to inspect without parsing section tables.
-constexpr std::streamoff kSlabBytes = 1 << 20;
-// Kernel modules ship zstd-compressed (.ko.zst), hiding their ELF image --
-// and its producer string -- behind one frame. Frames cannot be seeked
-// into, so framed members are proved from their decompressed lead alone;
-// modules sit far under this cap and their whole image is seen.
-constexpr size_t kFrameLead = 4u << 20;
-
-void scan_producers(Provenance& prov, std::string_view window) {
-    // Compiler families. Needles are runtime-assembled so spelled-out
-    // literals in sage's own .rodata cannot self-incriminate. Linker
-    // families are recognised as well: lld stamps ".comment" with
-    // "LLD <ver>"; mold/GNU ld appear on hosts configured with them.
-    static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
-        {std::string("clang vers") + "ion", "clang"},
-        {std::string("GC") + "C: (", "gcc"},
-        {std::string("rustc vers") + "ion", "rustc"},
-        {std::string("LLD "), "lld"},
-        {std::string("mold "), "mold"},
-        {std::string("GNU ld ("), "gnu-ld"},
-    };
-    const bool linker[] = {false, false, false, true, true, true};
-    for (size_t si = 0; si < SIGS.size(); ++si) {
-        const auto& [sig, name] = SIGS[si];
-        for (size_t at = window.find(sig); at != std::string_view::npos;
-             at = window.find(sig, at + sig.size())) {
-            if (linker[si]
-                && !(at == 0 || window[at - 1] == '\0' || window[at - 1] == '\n'
-                     || window[at - 1] == ' ' || window[at - 1] == '(' || window[at - 1] == '"'))
-                continue;
-            auto ver = version_after(window, at + sig.size());
-            if (linker[si] && ver.find('.') == std::string::npos) continue;
-            prov.producers.insert(std::string{name});
-            if (!ver.empty())
-                prov.producer_versions[std::string{name}].insert(std::move(ver));
-        }
-    }
-}
-
-// .debug_str variant: each DW_AT_producer string reads
-// "<sig> <version> [switches...]"; everything after the dotted version
-// token, up to the NUL that terminates the entry, is the actual switch set
-// the compiler was invoked with. Only whole-section scans may call this --
-// a truncated read must never yield partial "actuals".
-void scan_debug_switches(Provenance& prov, std::string_view window) {
-    // .debug_str producers differ from .comment ones: GCC writes
-    // "GNU C23 <ver> <switches...>" (language suffix glued to the C), and
-    // lld/mold may embed their own banners when they linked. Every match
-    // must sit at a NUL/newline/start boundary; linker needles additionally
-    // require a dotted version so binary noise cannot masquerade.
-    static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
-        {"clang vers" + std::string("ion"), "clang"},
-        {"GC" + std::string("C: ("), "gcc"},
-        {"rustc vers" + std::string("ion"), "rustc"},
-        {std::string("LLD "), "lld"},
-        {std::string("mold "), "mold"},
-        {std::string("GNU ld ("), "gnu-ld"},
-        // GNU C last-ish is fine: order does not matter, boundaries do.
-        {std::string("GNU C"), "gcc"},
-    };
-    const bool linker[] = {false, false, false, false,
-                           false, false, true};
-    for (size_t si = 0; si < SIGS.size(); ++si) {
-        const auto& [sig, name] = SIGS[si];
-        for (size_t at = window.find(sig); at != std::string_view::npos;
-             at = window.find(sig, at + 1)) {
-            if (linker[si]
-                && !(at == 0 || window[at - 1] == '\0'
-                     || window[at - 1] == '\n' || window[at - 1] == ' '
-                     || window[at - 1] == '"'))
-                continue;
-            size_t body = at + sig.size();
-            // "GNU C23"/"GNU C++13": swallow the language suffix digits/plus
-            // before reading the compiler version.
-            if (sig == "GNU C") {
-                while (body < window.size()
-                       && (std::isdigit(static_cast<unsigned char>(window[body]))
-                           || window[body] == '+'))
-                    ++body;
-            }
-            size_t vpos = body;
-            while (vpos < window.size() && window[vpos] == ' ') ++vpos;
-            auto ver = version_after(window, vpos);
-            if (ver.empty()) continue;
-
-            prov.producers.insert(std::string{name});
-            prov.producer_versions[std::string{name}].insert(
-                std::move(ver));
-
-            // Switches follow the version up to the terminating NUL -- and
-            // are captured for EVERY producer family, compilers included.
-            size_t sw = vpos + ver.size();
-            while (sw < window.size() && window[sw] == ' ') ++sw;
-            size_t e = sw;
-            while (e < window.size() && window[e] != '\0') ++e;
-            std::string_view rest(window.substr(sw, e - sw));
-            while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1);
-            while (!rest.empty() && rest.back() == ' ') rest.remove_suffix(1);
-            if (!rest.empty())
-                prov.producer_switches[std::string{name}].insert(
-                    std::string{rest});
-        }
-    }
-}
-std::string read_slabs(std::ifstream& in) {
-    in.seekg(0, std::ios::end);
-    const auto size = static_cast<std::streamoff>(in.tellg());
-    const auto head_len = std::min(size, kSlabBytes);
-    std::string window(static_cast<size_t>(head_len), '\0');
-    in.seekg(0);
-    in.read(window.data(), head_len);
-    window.resize(static_cast<size_t>(in.gcount()));
-    if (size > kSlabBytes) {  // tail slab too: markers often live near the end
-        const auto tail_len = std::min(size - kSlabBytes, kSlabBytes);
-        const auto before = window.size();
-        window.resize(before + static_cast<size_t>(tail_len));
-        in.seekg(-tail_len, std::ios::end);
-        in.read(window.data() + before, tail_len);
-        window.resize(before + static_cast<size_t>(in.gcount()));
-    }
-    return window;
-}
-
-
-
-// Exact, section-guided fingerprinting. .comment yields the producer set and
-// versions; a whole (non-truncated) .debug_str additionally yields the real
-// switch sets. Non-ELF object archives (.a) keep the legacy head/tail slab
-// scan -- ar members carry their .comment contiguously enough for the
-// signatures to be found without parsing the ar container.
-bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
-                       std::string_view base) {
-    static constexpr std::string_view ELF_MAGIC = "\x7f" "ELF";
-    static constexpr std::string_view ZSTD_FRAME = "\x28\xB5\x2F\xFD";
-    static constexpr std::string_view GZIP_MAGIC  = "\x1f\x8b";
-    static constexpr size_t kMaxImageBytes = 512u << 20;
-
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;
-    char magic[4] = {};
-    if (!in.read(magic, 4)) return false;
-    const std::string_view head(magic, 4);
-
-    std::error_code mtime_ec;
-    const auto mtime = std::filesystem::last_write_time(path, mtime_ec);
-    if (mtime_ec) return false;
-    if (mtime > prov.newest_compiled) prov.newest_compiled = mtime;
-
-    // Compressed containers: kernel modules (.ko.zst) and vmlinuz images.
-    // Inflate fully (bounded) -- kernel banners embed BOTH compiler and
-    // linker versions ("clang version X, LLD Y"), so this is where linker
-    // provenance comes from for the kernel itself.
-    if (head == ZSTD_FRAME || head == GZIP_MAGIC) {
-        in.seekg(0);
-        std::string packed(static_cast<size_t>(
-            std::filesystem::file_size(path)), '\0');
-        in.read(packed.data(), static_cast<std::streamsize>(packed.size()));
-        packed.resize(static_cast<size_t>(in.gcount()));
-
-        std::string blob;
-        if (head == ZSTD_FRAME) {
-            sage::vendor::zstd::ZstdDecompressStream ds;
-            ZSTD_inBuffer inb{packed.data(), packed.size(), 0};
-            while (true) {
-                const size_t before = blob.size();
-                blob.resize(before + (256u << 10));
-                ZSTD_outBuffer outb{blob.data() + before, blob.size() - before, 0};
-                auto rem = ds.decompress_stream(inb, outb);
-                if (!rem) return false;
-                blob.resize(before + outb.pos);
-                if (rem == 0 || (outb.pos == 0 && inb.pos == inb.size)) break;
-                if (blob.size() > kMaxImageBytes)
-                    return false;
-            }
-        } else {
-            uLongf len = kMaxImageBytes;
-            blob.resize(len);
-            if (::uncompress(reinterpret_cast<Bytef*>(blob.data()),
-                             &len, reinterpret_cast<const Bytef*>(packed.data()),
-                             static_cast<uLong>(packed.size())) != Z_OK)
-                return false;
-            blob.resize(len);
-        }
-        scan_producers(prov, blob);
-        scan_debug_switches(prov, blob);
-        return true;
-    }
-
-    const bool object = base.ends_with(".o") || base.ends_with(".a")
-                     || base.find(".so") != std::string_view::npos;
-    const bool kernel_image =
-        base.starts_with("vmlinuz") || base.starts_with("Image.");
-    if (head != ELF_MAGIC && !object && !kernel_image) return false;
-
-    if (head != ELF_MAGIC) {
-        // Uncompressed kernel image: banner sits within the first MiB.
-        std::string slab(kSlabBytes, '\0');
-        in.clear();
-        in.seekg(0);
-        in.read(slab.data(), static_cast<std::streamsize>(slab.size()));
-        slab.resize(static_cast<size_t>(in.gcount()));
-        scan_producers(prov, slab);
-        scan_debug_switches(prov, slab);
-        return true;
-    }
-
-    auto sections = sage::util::read_elf_sections(
-        path, {".comment", ".debug_str"});
-    if (!sections) {
-        // Not an ELF after all (plain .a member soup, corrupted file): fall
-        // back to the bounded slab scan so signatures are still found.
-        in.clear();
-        in.seekg(0);
-        scan_producers(prov, read_slabs(in));
-        return true;
-    }
-    if (auto comment = sections->find(".comment"); comment != sections->end())
-        scan_producers(prov, comment->second.bytes);
-    if (auto debug = sections->find(".debug_str"); debug != sections->end()
-        && !debug->second.truncated) {
-        // Truncated .debug_str stays silent: partial switches would be fake
-        // actuals.
-        scan_debug_switches(prov, debug->second.bytes);
-    }
-    return true;
+bool probe_fakeroot(std::string_view executable) {
+    if (executable.empty()) return false;
+    const auto command = sage::build::shell_quote(executable)
+        + " --version >/dev/null 2>&1";
+    return std::system(command.c_str()) == 0;
 }
 
 export int cmd_build(const CliOptions& opts) {
@@ -412,6 +174,13 @@ export int cmd_build(const CliOptions& opts) {
     // Load the build configuration up front: the phases need the compiler
     // and flags, and the DT_NEEDED check below reuses the same handle.
     const sage::config::BuildConfig& bcfg = cfg.build;
+    if (!probe_fakeroot(bcfg.fakeroot)) {
+        sage::util::log_error(
+            "Configured fakeroot executable '{}' is not usable; install fakeroot "
+            "or set fakeroot in {}",
+            bcfg.fakeroot, cfg.build_config_path.string());
+        return 1;
+    }
 
     // Per-recipe [build] overrides replace the global baseline; cxxflags
     // mirror cflags at whichever level does not spell them out.
@@ -421,57 +190,166 @@ export int cmd_build(const CliOptions& opts) {
                                    : !bcfg.cxxflags.empty() ? bcfg.cxxflags
                                    : bcfg.cflags;
 
-    // Parallelism for the phase shells: an explicit build.toml `jobs`, else
-    // one per hardware thread. MAKEFLAGS reaches make-based recipes,
-    // CARGO_BUILD_JOBS the cargo ones.
-    const unsigned jobs = bcfg.jobs > 0 ? static_cast<unsigned>(bcfg.jobs)
-                                        : std::max(1u, std::thread::hardware_concurrency());
-    const std::string jobs_makeflags = std::format("-j{}", jobs);
+    // Parallelism inside this one package build. compile_jobs is independent
+    // from Sage's multi-package I/O concurrency; when absent it inherits the
+    // historical `jobs` setting so existing build.toml files keep working.
+    const int requested_compile_jobs = bcfg.configured_compile_jobs();
+    const unsigned compile_jobs = requested_compile_jobs > 0
+        ? static_cast<unsigned>(requested_compile_jobs)
+        : std::max(1u, std::thread::hardware_concurrency());
+    const std::string jobs_makeflags = std::format("-j{}", compile_jobs);
 
     // Candidate toolchains in priority order: the configured pair first, the
     // fallback pair second. Each is probed once up front -- `<cc> --version`
-    // doubles as the existence check; what ends up stamped is derived from
-    // the built artifacts themselves, not from this probe.
+    // doubles as the existence check. Successful v2 builds preserve these
+    // direct observations in their package manifest; v1 never does.
     //
     // A recipe-level [build] cc pins the toolchain outright: exactly that
     // pair runs and the global fallback never does -- a pinned build that
     // fails must fail the recipe rather than silently produce core system
     // packages from the wrong compiler.
-    struct Toolchain { std::string cc, cxx, version; };
+    struct Toolchain {
+        std::string cc, cxx, linker, rustc;
+        std::string compiler_version, cxx_version, linker_version, rustc_version;
+        std::string compiler_family, cxx_family, linker_family, rustc_family;
+    };
     std::vector<Toolchain> candidates;
-    auto try_candidate = [&](const std::string& cc_name, const std::string& cxx_name) {
+    auto try_candidate = [&](const std::string& cc_name, const std::string& cxx_name,
+                             const std::string& linker_name) {
         if (cc_name.empty() || std::ranges::any_of(candidates, [&](const Toolchain& t) { return t.cc == cc_name; })) {
             return;
         }
-        auto ver = probe_compiler(cc_name);
-        if (!ver) {
+        auto compiler = probe_tool(cc_name);
+        if (!compiler) {
             sage::util::log_warn("Compiler '{}' not usable, skipping", cc_name);
             return;
         }
-        candidates.push_back({cc_name, cxx_name, std::move(*ver)});
+        ToolProbe cxx;
+        ToolProbe linker;
+        ToolProbe rustc;
+        if (r.schema_version == 2) {
+            const auto& spec = r.managed_build;
+            const auto& cf = compiler->family;
+            auto probed_linker = probe_tool(linker_name, true);
+            if (!probed_linker) {
+                sage::util::log_warn("Linker '{}' not usable, skipping toolchain", linker_name);
+                return;
+            }
+            linker = std::move(*probed_linker);
+            const auto& lf = linker.family;
+            if ((!spec.allowed_compilers.empty()
+                 && !std::ranges::contains(spec.allowed_compilers, cf))
+                || (!spec.allowed_linkers.empty()
+                    && !std::ranges::contains(spec.allowed_linkers, lf))) return;
+            auto probed_cxx = probe_tool(cxx_name);
+            if (!probed_cxx) {
+                sage::util::log_warn("C++ compiler '{}' not usable, skipping toolchain", cxx_name);
+                return;
+            }
+            cxx = std::move(*probed_cxx);
+            if (cxx.family != compiler->family) {
+                if (opts.verbose) sage::util::log_info(
+                    "Skipping mixed compiler suite: CC '{}' is {}, CXX '{}' is {}",
+                    cc_name, compiler->family, cxx_name, cxx.family);
+                return;
+            }
+            if (spec.system == sage::package::BuildSystem::Cargo) {
+                auto probed_rustc = probe_tool(bcfg.rustc);
+                if (!probed_rustc || probed_rustc->family != "rustc"
+                    || probed_rustc->version == "unknown") {
+                    sage::util::log_warn(
+                        "Rust compiler '{}' is not usable or has no parseable --version output",
+                        bcfg.rustc);
+                    return;
+                }
+                rustc = std::move(*probed_rustc);
+            }
+            if (compiler->version == "unknown" || cxx.version == "unknown"
+                || linker.version == "unknown") {
+                if (opts.verbose) sage::util::log_info(
+                    "Skipping toolchain whose --version output cannot be parsed: CC='{}' CXX='{}' LD='{}'",
+                    cc_name, cxx_name, linker_name);
+                return;
+            }
+            auto requirement = sage::build::validate_toolchain(r,
+                {.cc = cc_name, .cxx = cxx_name, .linker = linker_name,
+                 .rustc = spec.system == sage::package::BuildSystem::Cargo
+                    ? bcfg.rustc : "",
+                 .compiler_version = compiler->version,
+                 .cxx_version = cxx.version,
+                 .linker_version = linker.version,
+                 .rustc_version = rustc.version,
+                 .compiler_family = compiler->family,
+                 .cxx_family = cxx.family,
+                 .linker_family = linker.family,
+                 .rustc_family = rustc.family});
+            if (!requirement) {
+                if (opts.verbose) sage::util::log_info(
+                    "Skipping configured toolchain: {}", requirement.error());
+                return;
+            }
+        }
+        candidates.push_back(Toolchain{
+            .cc = cc_name, .cxx = cxx_name,
+            .linker = r.schema_version == 2 ? linker_name : "",
+            .rustc = r.managed_build.system == sage::package::BuildSystem::Cargo
+                ? bcfg.rustc : "",
+            .compiler_version = std::move(compiler->version),
+            .cxx_version = std::move(cxx.version),
+            .linker_version = std::move(linker.version),
+            .rustc_version = std::move(rustc.version),
+            .compiler_family = std::move(compiler->family),
+            .cxx_family = std::move(cxx.family),
+            .linker_family = std::move(linker.family),
+            .rustc_family = std::move(rustc.family)});
     };
     if (!r.cc.empty()) {
         // Pinned: exactly this pair, no fallback. A pinned build that cannot
         // even probe its compiler fails the recipe outright.
         const std::string pin_cxx = r.cxx.empty() ? bcfg.cxx : r.cxx;
-        auto ver = probe_compiler(r.cc);
-        if (!ver) {
+        auto compiler = probe_tool(r.cc);
+        if (!compiler) {
             sage::util::log_error("Recipe pins compiler '{}' but it is not usable", r.cc);
             return 1;
         }
-        candidates.push_back({r.cc, pin_cxx, std::move(*ver)});
-        sage::util::log_info("Using pinned compiler: {} ({})", r.cc, candidates.front().version);
+        candidates.push_back(Toolchain{
+            .cc = r.cc, .cxx = pin_cxx, .linker = "", .rustc = "",
+            .compiler_version = std::move(compiler->version),
+            .cxx_version = "", .linker_version = "", .rustc_version = "",
+            .compiler_family = std::move(compiler->family),
+            .cxx_family = "", .linker_family = "", .rustc_family = ""});
     } else {
-        try_candidate(bcfg.cc, bcfg.cxx);
-        try_candidate(bcfg.fallback_cc, bcfg.fallback_cxx);
+        try_candidate(bcfg.cc, bcfg.cxx, bcfg.linker);
+        try_candidate(bcfg.fallback_cc, bcfg.fallback_cxx, bcfg.fallback_linker);
     }
     if (candidates.empty()) {
-        // Script-only recipes must keep building on hosts without any
-        // probeable compiler: run unlabeled, stamping nothing.
-        sage::util::log_warn("No usable C compiler found; building without CC/CXX injection");
-        candidates.push_back({bcfg.cc, bcfg.cxx, ""});
+        // Script-only v1 recipes must keep building on hosts without any
+        // probeable compiler: preserve their historical environment.
+        if (r.schema_version == 2) {
+            sage::util::log_warn(
+                "No usable C compiler found; managed build cannot continue");
+            const auto& compiler = r.managed_build.compiler;
+            const auto& linker = r.managed_build.linker;
+            if (!compiler.family.empty()) sage::util::log_error(
+                "Recipe defaults to compiler package '{}' family '{}' >= {} and linker package '{}' family '{}' >= {}, but no configured Sage toolchain satisfies it",
+                compiler.package, compiler.family, compiler.minimum_version,
+                linker.package, linker.family, linker.minimum_version);
+            sage::util::log_error("No Sage-managed compiler/linker pair satisfies recipe v2");
+            return 1;
+        }
+        candidates.push_back(Toolchain{
+            .cc = bcfg.cc, .cxx = bcfg.cxx, .linker = "", .rustc = "",
+            .compiler_version = "", .cxx_version = "", .linker_version = "",
+            .rustc_version = "", .compiler_family = "", .cxx_family = "",
+            .linker_family = "", .rustc_family = ""});
     } else {
-        sage::util::log_info("Using compiler: {} ({})", candidates.front().cc, candidates.front().version);
+        if (r.schema_version == 2) {
+            sage::util::log_info("Using managed toolchain: CC='{}' ({}) CXX='{}' ({}) LD='{}' ({})",
+                candidates.front().cc, candidates.front().compiler_version,
+                candidates.front().cxx, candidates.front().cxx_version,
+                candidates.front().linker,
+                candidates.front().linker_version);
+        }
     }
 
     std::filesystem::path dist_dir = recipe_dir / "distfiles";
@@ -542,9 +420,6 @@ export int cmd_build(const CliOptions& opts) {
     // compiler would manufacture a package nobody asked for: sage stops and
     // says what ran instead. The fallback pair still exists at probe time
     // (an absent primary is skipped before any compilation starts).
-    Toolchain used;
-    const auto build_started = std::filesystem::file_time_type::clock::now()
-        - std::chrono::seconds(90);   // 容忍时钟粒度/复制延迟
     {
         const Toolchain& cand = candidates.front();
 
@@ -600,7 +475,10 @@ export int cmd_build(const CliOptions& opts) {
                 }
             }
         }
-        std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;
+        // A local project (notably Cargo) legitimately has recipe_dir/src/;
+        // that directory is source code, not Sage's extracted-source root.
+        // Only a primary source archive makes recipe_dir/src the work root.
+        std::filesystem::path work_dir = !r.source_url.empty() ? src_dir : recipe_dir;
 
         auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
             if (cmds.empty()) return true;
@@ -611,12 +489,14 @@ export int cmd_build(const CliOptions& opts) {
                     "MAKEFLAGS=\"{}\" CARGO_BUILD_JOBS=\"{}\" "
                     "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}",
                     cand.cc, cand.cxx, bcfg.cppflags, eff_cflags, eff_cxxflags, bcfg.ldflags,
-                    jobs_makeflags, jobs,
+                    jobs_makeflags, compile_jobs,
                     pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(),
                     work_dir.string(), cmd_line);
+                const auto fakeroot_cmd = sage::build::fakeroot_command(
+                    bcfg.fakeroot, full_cmd);
                 if (opts.verbose)
-                    sage::util::log_info("CMD: {}", full_cmd);
-                int ret = std::system(full_cmd.c_str());
+                    sage::util::log_info("CMD: {}", fakeroot_cmd);
+                int ret = std::system(fakeroot_cmd.c_str());
                 if (ret != 0) {
                     sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
                     return false;
@@ -625,27 +505,88 @@ export int cmd_build(const CliOptions& opts) {
             return true;
         };
 
-        if (!run_phase("prepare", r.prepare_cmds)
-            || !run_phase("build", r.build_cmds)
-            || !run_phase("install", r.install_cmds)) {
-            // Stop-and-prompt: a failed phase names the toolchain and the exact
-            // flags it ran under. No second compiler is tried behind the user's
-            // back -- the failure may be exactly about that compiler or those
-            // flags, and a silent swap would manufacture an unrequested variant.
-            sage::util::log_error(
-                "Build failed under {} {} (CXX='{}') with CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" CPPFLAGS=\"{}\"",
-                cand.cc, cand.version, cand.cxx, eff_cflags, eff_cxxflags,
-                bcfg.ldflags, bcfg.cppflags);
-            sage::util::log_error(
-                "Stopping instead of retrying another compiler. Pin [build] cc in "
-                "the recipe to force one, adjust cflags/cxxflags in build.toml or "
-                "the recipe, then rebuild.");
+        bool phases_ok = true;
+        std::string ran_cflags = eff_cflags;
+        std::string ran_cxxflags = eff_cxxflags;
+        std::string ran_cppflags = bcfg.cppflags;
+        std::string ran_ldflags = bcfg.ldflags;
+        std::string ran_rustflags;
+        if (r.schema_version == 1) {
+            phases_ok = run_phase("prepare", r.prepare_cmds)
+                && run_phase("build", r.build_cmds)
+                && run_phase("install", r.install_cmds);
+        } else {
+            auto plan = sage::build::plan_v2(
+                r, bcfg, {.source = work_dir, .package = pkg_dir},
+                {.cc = cand.cc, .cxx = cand.cxx, .linker = cand.linker,
+                 .rustc = cand.rustc,
+                 .compiler_version = cand.compiler_version,
+                 .cxx_version = cand.cxx_version,
+                 .linker_version = cand.linker_version,
+                 .rustc_version = cand.rustc_version,
+                 .compiler_family = cand.compiler_family,
+                 .cxx_family = cand.cxx_family,
+                 .linker_family = cand.linker_family,
+                 .rustc_family = cand.rustc_family}, compile_jobs);
+            if (!plan) {
+                sage::util::log_error("Cannot plan recipe v2 build: {}", plan.error());
+                return 1;
+            }
+            ran_cflags = plan->environment.at("CFLAGS");
+            ran_cxxflags = plan->environment.at("CXXFLAGS");
+            ran_cppflags = plan->environment.at("CPPFLAGS");
+            ran_ldflags = plan->environment.at("LDFLAGS");
+            ran_rustflags = plan->environment.at("RUSTFLAGS");
+            plan->environment["RECIPE_DIR"] = recipe_dir.string();
+            plan->environment["SRCDIR"] = work_dir.string();
+            plan->environment["PKGDIR"] = pkg_dir.string();
+            std::string exports;
+            for (const auto& [name, value] : plan->environment) {
+                exports += std::format("export {}={}; ", name,
+                    sage::build::shell_quote(value));
+            }
+            for (const auto& step : plan->steps) {
+                sage::util::log_info("Executing managed {} step...", step.name);
+                const auto full_cmd = exports + "cd "
+                    + sage::build::shell_quote(step.work_dir.string())
+                    + " && " + step.command;
+                const auto fakeroot_cmd = sage::build::fakeroot_command(
+                    bcfg.fakeroot, full_cmd);
+                if (opts.verbose) sage::util::log_info("CMD: {}", fakeroot_cmd);
+                if (std::system(fakeroot_cmd.c_str()) != 0) {
+                    sage::util::log_error("Managed {} step failed: {}",
+                        step.name, step.command);
+                    phases_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!phases_ok) {
+            // Never retry a failed recipe under a different environment. V2
+            // can truthfully report the managed toolchain it executed; opaque
+            // v1 shell phases cannot establish compiler provenance.
+            if (r.schema_version == 1) {
+                sage::util::log_error(
+                    "Legacy recipe phase failed; no compiler provenance is inferred from its environment");
+                sage::util::log_error(
+                    "Stopping without retrying under a different build environment");
+            } else {
+                sage::util::log_error(
+                    "Managed build failed under CC='{}' {} CXX='{}' {} LD='{}' {} with CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" CPPFLAGS=\"{}\" RUSTFLAGS=\"{}\"",
+                    cand.cc, cand.compiler_version, cand.cxx, cand.cxx_version, cand.linker,
+                    cand.linker_version, ran_cflags, ran_cxxflags, ran_ldflags,
+                    ran_cppflags, ran_rustflags);
+                sage::util::log_error(
+                    "The v2 toolchain is controlled by Sage; adjust build.toml or "
+                    "the recipe's allowed tool families, then rebuild.");
+            }
             return 1;
         }
-        used = cand;
     }
     // 3. Automated ELF Scanner for DT_SONAME & DT_NEEDED
     sage::package::PackageManifest manifest;
+    manifest.schema_version = r.schema_version;
     manifest.name = r.name;
     manifest.version = r.version;
     manifest.description = r.description;
@@ -657,6 +598,22 @@ export int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;
+    if (r.schema_version == 2) {
+        const auto& tools = candidates.front();
+        manifest.managed_build_tools = {
+            {.role = "cc", .executable = tools.cc,
+             .family = tools.compiler_family, .version = tools.compiler_version},
+            {.role = "cxx", .executable = tools.cxx,
+             .family = tools.cxx_family, .version = tools.cxx_version},
+            {.role = "linker", .executable = tools.linker,
+             .family = tools.linker_family, .version = tools.linker_version},
+        };
+        if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
+            manifest.managed_build_tools.push_back(
+                {.role = "rustc", .executable = tools.rustc,
+                 .family = tools.rustc_family, .version = tools.rustc_version});
+        }
+    }
 
     // A service.toml beside the recipe declares a daemon: validated here,
     // then carried verbatim on the manifest so `sage rebuild` can regenerate
@@ -674,11 +631,6 @@ export int cmd_build(const CliOptions& opts) {
         }
         manifest.service_toml = svc_buf.str();
     }
-
-    // Stamp build provenance from what the payload proves (filled below):
-    // nothing compiled -> nothing claimed; compiled -> the producers the
-    // artifacts identify, plus the flags the recipe shell really saw.
-    Provenance provenance;
 
     // Every soname this package satisfies by itself, and every soname it still
     // needs from elsewhere -- remembering which file asked, so a failure can
@@ -710,12 +662,6 @@ export int cmd_build(const CliOptions& opts) {
                 self_sonames.insert(base);
             }
 
-            // Compiled-artifact evidence for provenance, with the proving
-            // bytes fingerprinted for their producer string while we are
-            // already walking every file.
-            if (compiled_artifact(provenance, entry.path(), base))
-                provenance.compiled = true;
-
             auto elf_res = sage::util::scan_elf(entry.path());
             if (!elf_res) continue;
             if (!elf_res->soname.empty()) {
@@ -731,83 +677,6 @@ export int cmd_build(const CliOptions& opts) {
     for (const auto& soname : self_sonames) {
         manifest.provides.push_back("so:" + soname);
     }
-
-    // The provenance verdict, now that every payload file has been seen.
-    //
-    // 真实性规则：只有本地确实执行了编译相位（build 非空）才记录溯源；
-    // 二进制重分发包（mold、rust-bin 这类 build=[] 的重打包）即便载荷是
-    // ELF 也一律不写 compiler/flags——.comment 只能证明"字节是谁产的"，
-    // 不能证明"是我们用这些参数编的"。
-    // 只有当载荷里存在"本次构建期间新生成"的编译产物时才记录溯源；
-    // 重分发（mold/rust-bin 这类 cp -a 的上游二进制）保留其原始 mtime，
-    // 从而被判定为非本地编译，manifest 不写任何 build_* 字段。
-    provenance.compiled = provenance.compiled
-        && provenance.newest_compiled >= build_started;
-    if (provenance.compiled) {
-        // One compiler, the one that actually produced the objects. Every
-        // clang- or rustc-linked binary also carries a gcc trace in its crt
-        // startup files' .comment, so a producer *set* is disambiguated by
-        // toolchain precedence rather than joined: gcc only wins when it is
-        // all there is (i.e. gcc really did build it).
-        static constexpr std::array<std::string_view, 3> PRECEDENCE{"rustc", "clang", "gcc"};
-        for (const auto& want : PRECEDENCE) {
-            if (!provenance.producers.contains(std::string{want})) continue;
-            manifest.build_compiler = std::string{want};
-            if (auto it = provenance.producer_versions.find(std::string{want});
-                it != provenance.producer_versions.end() && !it->second.empty()) {
-                std::string versions;
-                for (const auto& v : it->second)
-                    versions += (versions.empty() ? "" : "+") + v;
-                manifest.build_compiler_version = std::move(versions);
-            }
-            break;
-        }
-        // build_cflags/cxxflags/ldflags record the environment the phase
-        // shells were actually invoked with -- a true fact about the build.
-        // Deliberately separate from what artifacts prove was consumed (that
-        // lives in build_producers below): some build systems ignore CFLAGS
-        // yet consume the very same string through their own channel -- the
-        // kernel's KCFLAGS= passthrough is the canonical case -- so equality
-        // between the two layers is legitimate, not double-counting.
-        if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
-        if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
-        const std::string eff_ldflags = r.ldflags.value_or(bcfg.ldflags);
-        if (!eff_ldflags.empty()) manifest.build_ldflags = eff_ldflags;
-
-        // Complete producer record, mixed projects included: every producer
-        // the artifacts name gets an entry with its versions and its
-        // artifact-verified switches (from .debug_str DW_AT_producer strings
-        // when the build recorded them; a -g-less or shim-silent build stays
-        // honest with an empty flags field instead of claiming the injected
-        // values were consumed). A rustc entry additionally carries RUSTFLAGS,
-        // which cargo/rustc consume by contract.
-        for (const auto& producer : provenance.producers) {
-            sage::package::PackageManifest::BuildProducer entry;
-            entry.name = producer;
-            if (auto vit = provenance.producer_versions.find(producer);
-                vit != provenance.producer_versions.end()) {
-                entry.versions.assign(vit->second.begin(), vit->second.end());
-            }
-            if (producer == "rustc") {
-                if (const char* rf = std::getenv("RUSTFLAGS"); rf && *rf != '\0')
-                    entry.flags = rf;
-            } else if (auto sit = provenance.producer_switches.find(producer);
-                       sit != provenance.producer_switches.end()) {
-                std::string joined;
-                for (const auto& sw : sit->second)
-                    joined += (joined.empty() ? "" : " ") + sw;
-                entry.flags = std::move(joined);
-            }
-            manifest.build_producers.push_back(std::move(entry));
-    }
-
-
-    }
-
-    // Passthrough annotations ride along even for script-only packages:
-    // they document the recipe's own flag-forwarding intent.
-    manifest.build_flag_passthrough = r.passthrough_flags;
-
 
     // A package does not depend on itself: a soname it installs is not an
     // external constraint, and emitting it as one makes the solver chase a

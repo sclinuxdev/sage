@@ -31,6 +31,7 @@ graph TD
 
     subgraph Layer4["Layer 4: System Engines (src/sys/, src/svc/)"]
         CONFIG["sage.config<br/>(system.toml parser & provider configuration)"]
+        BUILD["sage.build<br/>(recipe v2 managed build planner)"]
         CHAN["sage.channel<br/>(Channel scopes, target roots, FHS profile aggregator)"]
         SVC["sage.service<br/>(Universal service.toml -> Loom/OpenRC/Runit/Systemd/Dinit/s6)"]
         REPO["sage.repo<br/>(Channel pool snapshot & local archive resolution)"]
@@ -61,6 +62,8 @@ graph TD
     PKG --> SOLVER
     PKG --> TRIGGERS
     CONFIG --> REPO
+    CONFIG --> BUILD
+    PKG --> BUILD
     CHAN --> REPO
     ARCH --> REBUILD
     DB --> SOLVER
@@ -69,6 +72,7 @@ graph TD
     TRIGGERS --> REBUILD
     SOLVER --> REBUILD
     REBUILD --> ROOT
+    BUILD --> ROOT
     ROOT --> CLI
     TESTS --> CLI
 ```
@@ -120,6 +124,7 @@ LMDB-backed registry: packages, files ownership index, provides index, system pr
 
 * **`sage.config`** — parses `/etc/sage/system.toml`: channels, capability providers (exclusive vs shared), build defaults.
 * **`sage.channel`** — multi-layer channel model (`system/runtime/toolchain/user`), sub-channel specs, FHS profile symlink aggregation.
+* **`sage.build`** — deep recipe-v2 planning module; owns build-system adapters, toolchain policy application, linker-driver flags, and non-standard flag-channel mapping.
 * **`sage.repo`** — builds the solver pool from all enabled channels and resolves each candidate to a readable local archive (downloading remote payloads on demand).
 * **`sage.solver`** — PubGrub/CDCL dependency resolution with human-readable conflict cause trees.
 * **`sage.triggers`** — post-transaction trigger engine: built-in triggers (ldconfig, initramfs, bootloader...) plus package-declared ones, resolved through capability hooks.

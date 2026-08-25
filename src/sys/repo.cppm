@@ -50,7 +50,7 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
         ch.priority = ch_cfg.priority;
 
         auto idx_res = channel::ProfileManager::sync_channel(
-            ch, cfg.cache_dir, persist_cache);
+            ch, cfg.cache_dir, channel::IndexRefresh::IfMissing, persist_cache);
         if (!idx_res) continue;
 
         std::filesystem::path dir_base;

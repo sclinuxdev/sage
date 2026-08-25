@@ -139,7 +139,13 @@ inline std::expected<void, std::string> create_package(
     // 2. Metadata section must lead the archive: install-time inspection stops
     // after reading exactly these members.
     final_manifest.installed_size = total_size;
-    std::string manifest_toml = final_manifest.serialize_toml();
+    // files.idx is the canonical, compact payload inventory used by ownership
+    // preflight. Duplicating tens of thousands of entries as [[files]] TOML
+    // made every install parse the same inventory twice before extraction.
+    // Readers still accept legacy full manifests; newly packed archives keep
+    // manifest.toml metadata-only and reconstruct installed files from the
+    // verified extraction result.
+    std::string manifest_toml = final_manifest.serialize_summary_toml();
     if (auto res = add_file_entry(".METADATA/manifest.toml",
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(manifest_toml.data()),
                 manifest_toml.size())); !res) return res;
@@ -251,12 +257,6 @@ inline std::expected<void, std::string> generate_repo_index(
         ss << "arch = \"" << quote(m.arch) << "\"\n";
         ss << "installed_size = " << m.installed_size << "\n";
         ss << "file = \"" << quote(rel_path) << "\"\n";
-        if (!m.build_compiler.empty()) ss << "build_compiler = \"" << quote(m.build_compiler) << "\"\n";
-        if (!m.build_compiler_version.empty()) ss << "build_compiler_version = \"" << quote(m.build_compiler_version) << "\"\n";
-        if (!m.build_cflags.empty()) ss << "build_cflags = \"" << quote(m.build_cflags) << "\"\n";
-        if (!m.build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(m.build_cxxflags) << "\"\n";
-        if (!m.build_ldflags.empty()) ss << "build_ldflags = \"" << quote(m.build_ldflags) << "\"\n";
-        if (!m.build_rustflags.empty()) ss << "build_rustflags = \"" << quote(m.build_rustflags) << "\"\n";
         ss << "dependencies = [\n";
         for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
         ss << "]\n";
@@ -267,6 +267,14 @@ inline std::expected<void, std::string> generate_repo_index(
             ss << "conffiles = [\n";
             for (const auto& c : m.conffiles) ss << "    \"" << quote(c) << "\",\n";
             ss << "]\n";
+        }
+        for (const auto& tool : m.managed_build_tools) {
+            ss << "[[packages.managed_build_tools]]\n";
+            ss << "role = \"" << quote(tool.role) << "\"\n";
+            ss << "executable = \"" << quote(tool.executable) << "\"\n";
+            ss << "family = \"" << quote(tool.family) << "\"\n";
+            ss << "version = \"" << quote(tool.version) << "\"\n";
+            ss << "version_argument = \"--version\"\n";
         }
         ss << "\n";
     }
