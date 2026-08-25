@@ -148,8 +148,8 @@ struct SystemConfig {
 
     static SystemConfig default_config() {
         SystemConfig cfg;
-        cfg.providers["virtual/init"] = "openrc";
-        cfg.providers["virtual/udev"] = "eudev";
+        cfg.providers["virtual/init"] = "systemd";
+        cfg.providers["virtual/udev"] = "systemd-udev";
         cfg.providers["virtual/libc"] = "glibc";
         // Core userland is exclusive like libc: every implementation claims
         // /usr/bin/ls, so exactly one may own the system at a time.
@@ -164,13 +164,8 @@ struct SystemConfig {
         cfg.capabilities["virtual/libc"] = CapabilityKind::Exclusive;
         cfg.capabilities["virtual/coreutils"] = CapabilityKind::Exclusive;
 
-        ChannelConfig core;
-        core.name = "core";
-        core.url = "https://pkg.sage-linux.org/core";
-        core.scope = "system";
-        core.priority = 100;
-        core.enabled = true;
-        cfg.channels.push_back(std::move(core));
+        // Channels are never defaulted: an unconfigured system has zero
+        // channels, never a URL nobody owns.
 
         return cfg;
     }

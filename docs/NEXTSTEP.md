@@ -48,8 +48,8 @@ architecture = "amd64" # Target package architecture; also supports "aarch64"
 
 [providers]
 # Core mutually exclusive system structural components
-init = "openrc"        # Options: loom, openrc, systemd, runit, dinit, s6
-udev = "eudev"         # Options: eudev, systemd-udev, mdev-ng
+init = "systemd"       # Options: systemd, loom, openrc, runit, dinit, s6
+udev = "systemd-udev"  # Options: systemd-udev, eudev, mdev-ng
 libc = "glibc"         # Options: glibc, musl
 ```
 
@@ -63,7 +63,7 @@ schema_version = 1
 # Core OS Base Channel (System Root)
 [[channels]]
 name = "core"
-url = "https://pkg.sage-linux.org/core"
+url = "https://channels.example.invalid/core"
 scope = "system"
 priority = 100
 enabled = true
@@ -71,7 +71,7 @@ enabled = true
 # Isolated Toolchain Sub-Channels
 [[channels]]
 name = "toolchain/llvm:22"
-url = "https://pkg.sage-linux.org/core"
+url = "https://channels.example.invalid/core"
 scope = "toolchain"
 category = "llvm"
 slot = "22"
@@ -82,7 +82,7 @@ active = true          # Active profile symlinked into /etc/sage/profiles/defaul
 
 [[channels]]
 name = "toolchain/gcc:15"
-url = "https://pkg.sage-linux.org/core"
+url = "https://channels.example.invalid/core"
 scope = "toolchain"
 category = "gcc"
 slot = "15"
@@ -94,7 +94,7 @@ active = false
 # Isolated Runtime Sub-Channels
 [[channels]]
 name = "runtime/python:3.12"
-url = "https://pkg.sage-linux.org/core"
+url = "https://channels.example.invalid/core"
 scope = "runtime"
 category = "python"
 slot = "3.12"

@@ -1,5 +1,6 @@
 module;
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <cerrno>
 #include <cstring>
@@ -121,6 +122,259 @@ inline std::expected<int, std::string> open_anchored_dir(
     }
     return current;
 }
+inline std::expected<void, std::string> fsync_fd(int fd) {
+    while (::fsync(fd) != 0) {
+        if (errno == EINTR) continue;
+        return std::unexpected(std::string(std::strerror(errno)));
+    }
+    return {};
+}
+
+inline std::expected<void, std::string> write_fd_all(int fd, std::string_view data) {
+    size_t done = 0;
+    while (done < data.size()) {
+        ssize_t written = ::write(fd, data.data() + done, data.size() - done);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0)
+            return std::unexpected(std::string(std::strerror(errno)));
+        done += static_cast<size_t>(written);
+    }
+    return {};
+}
+
+// Split a validated relative path into its components; "." and empty pieces
+// (duplicated slashes, trailing slash) vanish. ".." must be rejected by the
+// caller beforehand (normalize_data_path).
+inline std::vector<std::string> rel_components(std::string_view relative) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= relative.size()) {
+        const auto slash = relative.find('/', start);
+        const auto piece = relative.substr(
+            start, slash == std::string_view::npos ? std::string_view::npos : slash - start);
+        if (!piece.empty() && piece != ".") out.emplace_back(piece);
+        if (slash == std::string_view::npos) break;
+        start = slash + 1;
+    }
+    return out;
+}
+
+inline std::expected<std::string, std::string> random_hex(size_t byte_count) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::random_device device;
+    std::string out;
+    out.reserve(byte_count * 2);
+    for (size_t i = 0; i < byte_count; ++i) {
+        const auto value = static_cast<unsigned>(device());
+        out.push_back(hex[(value >> 4) & 0xf]);
+        out.push_back(hex[value & 0xf]);
+    }
+    return out;
+}
+
+inline std::expected<std::vector<std::string>, std::string> list_dir_names(int dir_fd) {
+    const int duplicate = ::fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) return std::unexpected(std::string(std::strerror(errno)));
+    DIR* dir = ::fdopendir(duplicate);
+    if (!dir) {
+        ::close(duplicate);
+        return std::unexpected(std::string(std::strerror(errno)));
+    }
+    std::vector<std::string> names;
+    while (const auto* entry = ::readdir(dir)) {
+        const std::string_view name = entry->d_name;
+        if (name == "." || name == "..") continue;
+        names.emplace_back(entry->d_name);
+    }
+    ::closedir(dir);
+    return names;
+}
+
+// Same anchored walk as open_anchored_dir but never creates anything: used
+// where existence itself is part of the contract (attach, journal reads).
+inline std::expected<UniqueFd, std::string> open_anchored_dir_strict(
+    int root_fd, const std::vector<std::string>& components) {
+    int duplicated = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicated < 0)
+        return std::unexpected("Cannot duplicate root descriptor");
+    UniqueFd current(duplicated);
+    for (const auto& name : components) {
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int next = ::openat(current.get(), name.c_str(), flags);
+        if (next < 0) {
+            return std::unexpected(std::format(
+                "Cannot anchor directory '{}': {}", name, std::strerror(errno)));
+        }
+        current = UniqueFd(next);
+    }
+    return current;
+}
+
+// Anchored mkdir -p: descends without ever following a symlink, creates
+// missing components with `mode`, and fsyncs each parent immediately after a
+// new component materializes so the chain survives power loss.
+inline std::expected<UniqueFd, std::string> create_anchored_dir_chain(
+    int root_fd, std::string_view relative, uint32_t mode = 0755) {
+    const auto components = rel_components(relative);
+    int duplicated = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicated < 0)
+        return std::unexpected("Cannot duplicate root descriptor");
+    UniqueFd current(duplicated);
+    for (const auto& name : components) {
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int next = ::openat(current.get(), name.c_str(), flags);
+        if (next < 0 && errno == ENOENT) {
+            if (::mkdirat(current.get(), name.c_str(), mode & 07777) != 0
+                && errno != EEXIST) {
+                return std::unexpected(std::format(
+                    "Cannot create directory '{}': {}", name, std::strerror(errno)));
+            }
+            // A fresh component's directory entry must reach storage before
+            // anything is placed inside it.
+            if (auto synced = fsync_fd(current.get()); !synced)
+                return std::unexpected(synced.error());
+            next = ::openat(current.get(), name.c_str(), flags);
+        }
+        if (next < 0) {
+            return std::unexpected(std::format(
+                "Cannot anchor directory '{}': {}", name, std::strerror(errno)));
+        }
+        current = UniqueFd(next);
+    }
+    return current;
+}
+
+// Stream-copy exactly `expected_size` bytes from one fd to another. Prefers
+// in-kernel copy_file_range() (reflink-friendly on btrfs/XFS); falls back to
+// a bounded user-space buffer on ENOSYS/EINVAL/EXDEV/EOPNOTSUPP. EINTR is
+// retried, short transfers loop, and the final total length is verified.
+inline std::expected<void, std::string> copy_fd_exact(
+    int source_fd, int dest_fd, uint64_t expected_size) {
+    uint64_t copied = 0;
+#ifdef SYS_copy_file_range
+    while (copied < expected_size) {
+        const ssize_t moved = ::syscall(SYS_copy_file_range, source_fd,
+            static_cast<off_t*>(nullptr), dest_fd, static_cast<off_t*>(nullptr),
+            static_cast<size_t>(expected_size - copied), 0u);
+        if (moved < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ENOSYS || errno == EINVAL || errno == EXDEV
+                || errno == EOPNOTSUPP || errno == EBADF)
+                break; // kernel or filesystem cannot help: buffered fallback,
+                       // resuming from wherever the fast path stopped
+            return std::unexpected(
+                std::format("copy_file_range failed: {}", std::strerror(errno)));
+        }
+        if (moved == 0)
+            return std::unexpected(std::string("Source ended prematurely during copy"));
+        copied += static_cast<uint64_t>(moved);
+    }
+    if (copied == expected_size) return {};
+#else
+    (void)copied;
+#endif
+    std::array<uint8_t, 256 * 1024> buffer{};
+    while (copied < expected_size) {
+        const auto wanted = static_cast<size_t>(
+            std::min<uint64_t>(buffer.size(), expected_size - copied));
+        ssize_t received = ::read(source_fd, buffer.data(), wanted);
+        if (received < 0 && errno == EINTR) continue;
+        if (received < 0)
+            return std::unexpected(std::format("Read failed: {}", std::strerror(errno)));
+        if (received == 0)
+            return std::unexpected(std::string("Source ended prematurely during copy"));
+        size_t written = 0;
+        while (written < static_cast<size_t>(received)) {
+            ssize_t sent = ::write(dest_fd, buffer.data() + written,
+                static_cast<size_t>(received) - written);
+            if (sent < 0 && errno == EINTR) continue;
+            if (sent <= 0)
+                return std::unexpected(std::format("Write failed: {}", std::strerror(errno)));
+            written += static_cast<size_t>(sent);
+        }
+        copied += static_cast<uint64_t>(received);
+    }
+    return {};
+}
+
+// fsync every regular file and every directory of an anchored subtree,
+// children strictly before their parent; `dir_fd` itself syncs last.
+inline std::expected<void, std::string> sync_tree_anchored(int dir_fd) {
+    auto names = list_dir_names(dir_fd);
+    if (!names) return std::unexpected(names.error());
+    for (const auto& name : *names) {
+        struct stat status {};
+        if (::fstatat(dir_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+            return std::unexpected(std::format(
+                "Cannot stat '{}': {}", name, std::strerror(errno)));
+        }
+        if (S_ISDIR(status.st_mode)) {
+            int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+            UniqueFd sub(::openat(dir_fd, name.c_str(), flags));
+            if (sub.get() < 0) {
+                return std::unexpected(std::format(
+                    "Cannot open '{}': {}", name, std::strerror(errno)));
+            }
+            if (auto synced = sync_tree_anchored(sub.get()); !synced) return synced;
+        } else if (S_ISREG(status.st_mode)) {
+            int flags = O_RDONLY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+            UniqueFd file(::openat(dir_fd, name.c_str(), flags));
+            if (file.get() < 0) {
+                return std::unexpected(std::format(
+                    "Cannot open '{}': {}", name, std::strerror(errno)));
+            }
+            if (auto synced = fsync_fd(file.get()); !synced)
+                return std::unexpected(name + ": " + synced.error());
+        }
+    }
+    return fsync_fd(dir_fd);
+}
+
+// Anchored rm -rf of one named child below `parent_fd`; missing names are
+// already gone and therefore success.
+inline std::expected<void, std::string> remove_tree_anchored(
+    int parent_fd, const std::string& name) {
+    struct stat status {};
+    if (::fstatat(parent_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return {};
+        return std::unexpected(std::string(std::strerror(errno)));
+    }
+    if (S_ISDIR(status.st_mode)) {
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        UniqueFd sub(::openat(parent_fd, name.c_str(), flags));
+        if (sub.get() >= 0) {
+            auto names = list_dir_names(sub.get());
+            if (!names) return std::unexpected(names.error());
+            for (const auto& child : *names) {
+                if (auto removed = remove_tree_anchored(sub.get(), child); !removed)
+                    return removed;
+            }
+        } else if (errno != ENOENT) {
+            return std::unexpected(std::string(std::strerror(errno)));
+        }
+        if (::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) != 0 && errno != ENOENT)
+            return std::unexpected(std::string(std::strerror(errno)));
+    } else if (::unlinkat(parent_fd, name.c_str(), 0) != 0 && errno != ENOENT) {
+        return std::unexpected(std::string(std::strerror(errno)));
+    }
+    return {};
+}
+
 
 } // namespace detail
 
@@ -279,4 +533,139 @@ inline std::expected<void, std::string> validate_payload_path(
 }
 
 } // namespace detail
+// A private, same-filesystem copy of a package archive under
+// `<target_root>/var/lib/sage/tmp`, immune to concurrent rewrites of the
+// repository cache between inspection and extraction.
+//
+// Why the target root and not /tmp: the snapshot must share the target
+// root's filesystem so downstream staging can flip files into place with
+// renameat(2) -- a cross-filesystem copy would turn every publication into
+// EXDEV, and a host tmpfs would silently drop that guarantee while also
+// making `--root` depend on host state. Creation is fully anchored
+// (openat/mkdirat/O_NOFOLLOW -- never path-based create_directories/mkdtemp,
+// which would follow symlinks planted at <root>/var), the copy prefers
+// copy_file_range(), and the snapshot file is fsynced before it may be
+// consumed: a reader must never see a name whose bytes are not yet durable.
+// Destruction removes every trace of the snapshot directory.
+class PrivateArchiveSnapshot {
+public:
+    PrivateArchiveSnapshot(const PrivateArchiveSnapshot&) = delete;
+    PrivateArchiveSnapshot& operator=(const PrivateArchiveSnapshot&) = delete;
+
+    PrivateArchiveSnapshot(PrivateArchiveSnapshot&& other) noexcept
+        : parent_fd_(std::move(other.parent_fd_)),
+          dir_fd_(std::move(other.dir_fd_)),
+          directory_name_(std::exchange(other.directory_name_, {})),
+          archive_path_(std::move(other.archive_path_)) {}
+
+    ~PrivateArchiveSnapshot() noexcept {
+        if (dir_fd_.get() >= 0)
+            (void)::unlinkat(dir_fd_.get(), snapshot_leaf, 0);
+        if (parent_fd_.get() >= 0 && !directory_name_.empty())
+            (void)::unlinkat(
+                parent_fd_.get(), directory_name_.c_str(), AT_REMOVEDIR);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return archive_path_;
+    }
+
+    static std::expected<PrivateArchiveSnapshot, std::string> create(
+        const std::filesystem::path& source_path,
+        const std::filesystem::path& target_root)
+    {
+        int source_flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        source_flags |= O_CLOEXEC;
+#endif
+        detail::UniqueFd source(::open(source_path.c_str(), source_flags));
+        if (source.get() < 0) {
+            return std::unexpected(
+                "Cannot open package archive: " + source_path.string());
+        }
+
+        struct stat source_status {};
+        if (::fstat(source.get(), &source_status) != 0) {
+            return std::unexpected("Cannot stat package archive: "
+                + std::string(std::strerror(errno)));
+        }
+        if (!S_ISREG(source_status.st_mode) || source_status.st_size < 0) {
+            return std::unexpected("Package archive is not a regular file");
+        }
+
+        detail::UniqueFd root(detail::open_root_fd(target_root));
+        if (root.get() < 0) {
+            return std::unexpected("Cannot securely open target root: "
+                + std::string(std::strerror(errno)));
+        }
+
+        auto tmp = detail::create_anchored_dir_chain(
+            root.get(), "var/lib/sage/tmp", 0700);
+        if (!tmp) return std::unexpected(tmp.error());
+
+        auto suffix = detail::random_hex(8);
+        if (!suffix) return std::unexpected(suffix.error());
+        const std::string directory_name =
+            std::string(temp_file_prefix) + "archive-" + *suffix;
+        if (::mkdirat(tmp->get(), directory_name.c_str(), 0700) != 0) {
+            return std::unexpected("Cannot create private archive directory: "
+                + std::string(std::strerror(errno)));
+        }
+        if (auto synced = detail::fsync_fd(tmp->get()); !synced)
+            return std::unexpected(synced.error());
+
+        int dir_flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        dir_flags |= O_CLOEXEC;
+#endif
+        detail::UniqueFd dir(::openat(tmp->get(), directory_name.c_str(), dir_flags));
+        if (dir.get() < 0) {
+            return std::unexpected("Cannot reopen private archive directory: "
+                + std::string(std::strerror(errno)));
+        }
+
+        // Owns the directories from here on: any failure below cleans up.
+        PrivateArchiveSnapshot snapshot{
+            std::move(*tmp), std::move(dir), directory_name,
+            target_root / "var/lib/sage/tmp" / directory_name / snapshot_leaf};
+
+        int dest_flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        dest_flags |= O_CLOEXEC;
+#endif
+        detail::UniqueFd destination(
+            ::openat(snapshot.dir_fd_.get(), snapshot_leaf, dest_flags, 0600));
+        if (destination.get() < 0) {
+            return std::unexpected("Cannot create private archive snapshot: "
+                + std::string(std::strerror(errno)));
+        }
+
+        auto copied = detail::copy_fd_exact(source.get(), destination.get(),
+            static_cast<uint64_t>(source_status.st_size));
+        if (!copied) return std::unexpected(copied.error());
+        // Durability before consumption: a reader must never observe a file
+        // name whose contents are still in page-cache limbo.
+        if (auto synced = detail::fsync_fd(destination.get()); !synced) {
+            return std::unexpected(
+                "Cannot sync private archive snapshot: " + synced.error());
+        }
+        return snapshot;
+    }
+
+private:
+    PrivateArchiveSnapshot(detail::UniqueFd parent, detail::UniqueFd dir,
+        std::string directory_name, std::filesystem::path archive_path)
+        : parent_fd_(std::move(parent)),
+          dir_fd_(std::move(dir)),
+          directory_name_(std::move(directory_name)),
+          archive_path_(std::move(archive_path)) {}
+
+    static constexpr const char* snapshot_leaf = "archive.pkg.tar.zst";
+
+    detail::UniqueFd parent_fd_{-1}; // var/lib/sage/tmp, for dir removal
+    detail::UniqueFd dir_fd_{-1};    // the private snapshot directory itself
+    std::string directory_name_;
+    std::filesystem::path archive_path_;
+};
+
 } // namespace sage::archive

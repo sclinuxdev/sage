@@ -44,6 +44,7 @@ locks, or cache state. The root-only ephemeral host coordination state under
 ### `sage install <PKG...>`
 Resolves dependencies via PubGrub SAT solver, unpacks `*.pkg.tar.zst` streams to target channel scope, writes LMDB state records, and executes triggers.
 Archive writes are anchored to the target root without following parent symlinks. If the installed identity changes concurrently after dependency resolution, the command exits without applying the stale package migration. Fresh non-conflicting batches inspect and extract in parallel; `/etc/sage/build.toml` `jobs` controls concurrency and `0` uses the online CPU count. Upgrades and path-conflict cases preserve ordered installation.
+Conflicts are evaluated against the ownership map the whole transaction will produce: a file moving from one package to another inside the same install batch (e.g. a monolithic `foo` splitting into `foo` + `foo-libs`) is a handover, not a conflict, while any path claimed by two packages that both keep it is still rejected before extraction.
 ```bash
 # Install packages into system channel (root)
 sage install ripgrep neovim
@@ -79,8 +80,8 @@ Manages multi-layer Channel sources, scopes, and priorities.
 sage channel list
 
 # Add a remote channel repository
-sage channel add core https://pkg.sage-linux.org/core --scope system --priority 100
-sage channel add rust-nightly https://pkg.sage-linux.org/rust --scope toolchain --priority 50
+sage channel add core https://channels.example.invalid/core --scope system --priority 100
+sage channel add rust-nightly https://channels.example.invalid/rust --scope toolchain --priority 50
 
 # Sync channel metadata indexes
 sage channel sync

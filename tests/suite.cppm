@@ -1,6 +1,6 @@
 module;
-
 #include <sys/stat.h>
+#include <unistd.h>
 
 export module sage.tests;
 
@@ -126,11 +126,19 @@ export int run_all() {
         builtin_triggers, [](const auto& trigger) { return trigger.name == "ldconfig"; });
     auto certificates_trigger = std::ranges::find_if(
         builtin_triggers, [](const auto& trigger) { return trigger.name == "ca-certificates"; });
+    auto mime_trigger = std::ranges::find_if(
+        builtin_triggers, [](const auto& trigger) { return trigger.name == "mime-database"; });
     if (ldconfig_trigger == builtin_triggers.end()
         || ldconfig_trigger->exec != "/usr/bin/ldconfig"
+        || !ldconfig_trigger->required
         || certificates_trigger == builtin_triggers.end()
-        || certificates_trigger->exec != "/usr/bin/update-ca-certificates") {
-        sage::util::log_error("Built-in triggers do not use canonical usr-merge paths");
+        || certificates_trigger->exec != "/usr/bin/update-ca-certificates"
+        || certificates_trigger->required
+        || mime_trigger == builtin_triggers.end()
+        || mime_trigger->exec != "/usr/bin/update-mime-database"
+        || mime_trigger->required) {
+        sage::util::log_error(
+            "Built-in triggers do not use canonical usr-merge paths or the required/optional policy");
         return 1;
     }
 
@@ -158,12 +166,26 @@ export int run_all() {
         return 1;
     }
     failing_trigger_package.triggers.front().name = "missing-trigger";
+    failing_trigger_package.triggers.front().required = true;
     failing_trigger_package.triggers.front().exec = "/usr/bin/sage-missing-trigger";
     failing_trigger_context.installed_packages = {failing_trigger_package};
     auto missing_trigger_result = sage::triggers::TriggerEngine::run(failing_trigger_context);
     if (missing_trigger_result
         || missing_trigger_result.error().find("Required executable") == std::string::npos) {
         sage::util::log_error("Missing required trigger executable was treated as success");
+        return 1;
+    }
+    // An optional trigger whose exec is absent only warns -- the transaction
+    // must still succeed (issue #18: every package committed, yet exit 1).
+    failing_trigger_package.triggers.front().name = "optional-missing-trigger";
+    failing_trigger_package.triggers.front().required = false;
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    if (auto optional_missing_result =
+            sage::triggers::TriggerEngine::run(failing_trigger_context);
+        !optional_missing_result) {
+        sage::util::log_error(
+            "Optional trigger with a missing executable failed the transaction: {}",
+            optional_missing_result.error());
         return 1;
     }
 
@@ -195,6 +217,7 @@ export int run_all() {
         }
     }
     failing_trigger_package.triggers.front().name = "dangling-sysroot-trigger";
+    failing_trigger_package.triggers.front().required = true;
     failing_trigger_package.triggers.front().exec = "/usr/bin/dangling-trigger";
     failing_trigger_context.installed_packages = {failing_trigger_package};
     auto dangling_trigger_result = sage::triggers::TriggerEngine::run(failing_trigger_context);
@@ -1291,6 +1314,99 @@ release = "10"
         sage::util::log_error("Rejected stale migration changed the concurrent package state");
         return 1;
     }
+    // Split-package upgrades hand files between package identities inside a
+    // single install transaction (issue #26): when foo-libs claims the
+    // library, the monolithic foo's claim is still on record. The projected
+    // transaction ownership tolerates exactly that handover, while every
+    // owner that survives the transaction stays fatal.
+    {
+        auto handover_db = sage::db::Database::open(temp_dir / "split-handover-db");
+        if (!handover_db) {
+            sage::util::log_error("Failed to create split handover database");
+            return 1;
+        }
+        sage::package::FileEntry handover_bin;
+        handover_bin.path = "usr/bin/handover";
+        sage::package::FileEntry handover_lib;
+        handover_lib.path = "usr/lib/libhandover.so";
+        sage::package::PackageManifest handover_monolith;
+        handover_monolith.name = "handover";
+        handover_monolith.version = sage::package::Version::parse("1.0.0-1");
+        handover_monolith.channel = "system";
+        handover_monolith.files = {handover_bin, handover_lib};
+        {
+            auto setup_txn = handover_db->begin_write_txn();
+            if (!setup_txn
+                || !handover_db->put_package(*setup_txn, handover_monolith)
+                || !handover_db->register_files(
+                    *setup_txn, handover_monolith.name,
+                    handover_monolith.channel, handover_monolith.files)
+                || !setup_txn->commit()) {
+                sage::util::log_error("Failed to populate split handover fixture");
+                return 1;
+            }
+        }
+        const std::string monolith_owner = "handover:system";
+        bool strict_claim_rejected = false;
+        bool wrong_releasor_rejected = false;
+        bool handover_accepted = false;
+        bool kept_path_allowed = false;
+        bool surviving_owner_fatal = false;
+        {
+            auto txn = handover_db->begin_write_txn();
+            if (!txn) {
+                sage::util::log_error("Failed to open split handover transaction");
+                return 1;
+            }
+            // Without handover context the previous owner's claim is fatal...
+            strict_claim_rejected = !handover_db->register_files(
+                *txn, "handover-libs", "system", {handover_lib});
+            // ...a release attributed to a bystander opens no door either...
+            wrong_releasor_rejected = !handover_db->register_files(
+                *txn, "handover-libs", "system", {handover_lib},
+                std::nullopt,
+                sage::db::ReleasedClaims{
+                    {std::string{handover_lib.path}, {"bystander"}}});
+            // ...and the genuine handover goes through, reowning the path.
+            auto handover_registration = handover_db->register_files(
+                *txn, "handover-libs", "system", {handover_lib},
+                std::nullopt,
+                sage::db::ReleasedClaims{
+                    {std::string{handover_lib.path}, {"handover"}}});
+            handover_accepted = handover_registration.has_value();
+            if (!handover_accepted || !txn->commit()) {
+                sage::util::log_error("Failed to commit split handover registration");
+                return 1;
+            }
+        }
+        if (!strict_claim_rejected || !wrong_releasor_rejected || !handover_accepted
+            || sole_owner(*handover_db, handover_lib.path) != "handover-libs:system") {
+            sage::util::log_error("In-transaction file handover conflict semantics were wrong");
+            return 1;
+        }
+        {
+            auto txn = handover_db->begin_write_txn();
+            if (!txn) {
+                sage::util::log_error("Failed to reopen split handover transaction");
+                return 1;
+            }
+            // The upgrading monolith keeps its own remaining paths through the
+            // allowed-owner rule, but a path the new owner holds is still fatal.
+            kept_path_allowed = handover_db->check_file_conflicts(
+                *txn,
+                std::optional<std::string_view>{monolith_owner},
+                {handover_bin}).has_value();
+            surviving_owner_fatal = !handover_db->check_file_conflicts(
+                *txn,
+                std::optional<std::string_view>{monolith_owner},
+                {handover_lib}).has_value();
+        }
+        if (!kept_path_allowed || !surviving_owner_fatal
+            || sole_owner(*handover_db, handover_bin.path) != monolith_owner) {
+            sage::util::log_error("Allowed-owner rule broke during the handover regression");
+            return 1;
+        }
+    }
 
     auto corrupt_target = temp_dir / "corrupt-target";
     auto corrupt_db_dir = corrupt_target / "var/lib/sage";
@@ -1938,6 +2054,288 @@ release = "10"
         sage::util::log_error("File conflict changed the first package or its ownership record");
         return 1;
     }
+    // Issue #26 end-to-end: splitting a monolithic package must install --
+    // foo -> foo + foo-fw moves usr/lib/firmware/foo/fw.bin between
+    // identities inside one transaction instead of colliding with the old
+    // revision. (A .so payload would drag in the host ldconfig trigger.)
+    auto handover_repo = temp_dir / "split-repo";
+    auto foo_monolith_data = temp_dir / "split-monolith-data";
+    auto foo_split_bin_data = temp_dir / "split-bin-data";
+    auto foo_split_fw_data = temp_dir / "split-fw-data";
+    std::filesystem::create_directories(handover_repo);
+    std::filesystem::create_directories(foo_monolith_data / "usr/bin");
+    std::filesystem::create_directories(foo_monolith_data / "usr/lib/firmware/foo");
+    std::filesystem::create_directories(foo_split_bin_data / "usr/bin");
+    std::filesystem::create_directories(foo_split_fw_data / "usr/lib/firmware/foo");
+    std::ofstream(foo_monolith_data / "usr/bin/foo") << "foo 1\n";
+    std::ofstream(foo_monolith_data / "usr/lib/firmware/foo/fw.bin") << "fw 1\n";
+    std::ofstream(foo_split_bin_data / "usr/bin/foo") << "foo 2\n";
+    std::ofstream(foo_split_fw_data / "usr/lib/firmware/foo/fw.bin") << "fw 2 fw-pkg\n";
+    sage::package::PackageManifest foo_monolith;
+    foo_monolith.name = "foo";
+    foo_monolith.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::PackageManifest foo_split = foo_monolith;
+    foo_split.version = sage::package::Version::parse("2.0.0-1");
+    foo_split.dependencies.push_back(
+        sage::package::Dependency::parse("foo-fw >= 2.0.0"));
+    sage::package::PackageManifest foo_fw;
+    foo_fw.name = "foo-fw";
+    foo_fw.version = sage::package::Version::parse("2.0.0-1");
+    if (!sage::archive::create_package(
+            foo_monolith, foo_monolith_data, handover_repo / "foo-1.0.0-1-x86_64.pkg.tar.zst")
+        || !sage::archive::generate_repo_index(handover_repo, "core")) {
+        sage::util::log_error("Failed to create monolithic pre-split fixture");
+        return 1;
+    }
+    auto handover_target = temp_dir / "split-target";
+    if (!write_test_channel(handover_target, handover_repo)) {
+        sage::util::log_error("Failed to write split handover channel");
+        return 1;
+    }
+    CliOptions handover_install;
+    handover_install.target_root = handover_target;
+    handover_install.args = {"foo"};
+    if (cmd_install(handover_install) != 0
+        || read_test_file(handover_target / "usr/bin/foo") != "foo 1\n") {
+        sage::util::log_error("Monolithic pre-split fixture failed to install");
+        return 1;
+    }
+    if (!sage::archive::create_package(
+            foo_split, foo_split_bin_data, handover_repo / "foo-2.0.0-1-x86_64.pkg.tar.zst")
+        || !sage::archive::create_package(
+            foo_fw, foo_split_fw_data,
+            handover_repo / "foo-fw-2.0.0-1-x86_64.pkg.tar.zst")
+        || !sage::archive::generate_repo_index(handover_repo, "core")) {
+        sage::util::log_error("Failed to create split upgrade fixtures");
+        return 1;
+    }
+    if (cmd_install(handover_install) != 0
+        || read_test_file(handover_target / "usr/bin/foo") != "foo 2\n"
+        || read_test_file(handover_target / "usr/lib/firmware/foo/fw.bin")
+            != "fw 2 fw-pkg\n") {
+        sage::util::log_error("Split-package upgrade rejected an in-transaction file handover");
+        return 1;
+    }
+    {
+        auto handover_db = sage::db::Database::open(
+            handover_target / "var/lib/sage/data.mdb", true);
+        if (!handover_db
+            || sole_owner(*handover_db, "usr/bin/foo") != "foo:system"
+            || sole_owner(*handover_db, "usr/lib/firmware/foo/fw.bin")
+                != "foo-fw:system") {
+            sage::util::log_error("Split upgrade recorded wrong file ownership");
+            return 1;
+        }
+    }
+    sage::util::log_success("   Split-Package Transactional Handover Upgrade OK");
+    // ---- Issue #9 durable state machine: crash-boundary coverage ---------
+    // Invariants under test: a committed operation is always recoverable
+    // (journal fsynced before the LMDB commit, replay idempotent), orphaned
+    // staging is garbage-collected at the next entry, and abandon is the only
+    // destructive exit.
+    {
+        auto recovery_root = temp_dir / "recovery-root";
+        std::filesystem::create_directories(recovery_root);
+        auto recovery_db_res = sage::db::Database::open(
+            recovery_root / "var/lib/sage/data.mdb");
+        if (!recovery_db_res) {
+            sage::util::log_error("Failed to create recovery fixture database: {}",
+                recovery_db_res.error());
+            return 1;
+        }
+        auto& recovery_db = *recovery_db_res;
+
+        // Stage a one-file install and persist its journal WITHOUT publishing,
+        // then commit the operation record. This is the exact on-disk shape
+        // left by a hard kill between the LMDB commit and the publish step.
+        auto make_pending = [&](std::string_view id, std::string_view leaf) -> std::expected<void, std::string> {
+            auto txn = sage::archive::FilesystemTransaction::create(recovery_root);
+            if (!txn) return std::unexpected(txn.error());
+            const std::string stage_rel =
+                std::format("staged/usr/bin/{}", leaf);
+            auto fd = txn->open_staged_file(stage_rel, 0600);
+            if (!fd) return std::unexpected(fd.error());
+            std::string payload = std::format("{} payload\n", leaf);
+            if (::write(*fd, payload.data(), payload.size())
+                != static_cast<ssize_t>(payload.size())) {
+                return std::unexpected(std::format("short staged write for {}", leaf));
+            }
+            ::close(*fd);
+            txn->plan_ensure_dir("usr/bin");
+            txn->plan_put_file(
+                std::format("usr/bin/{}", leaf), stage_rel, 0755);
+            if (auto synced = txn->sync_staging(); !synced) return synced;
+            sage::archive::JournalContext ctx;
+            ctx.kind = "install";
+            ctx.final = true;
+            ctx.sysroot = recovery_root.string();
+            auto sha = txn->persist_journal(
+                sage::archive::render_journal(ctx, txn->journal_entries()));
+            if (!sha) return std::unexpected(sha.error());
+            auto wtxn = recovery_db.begin_write_txn();
+            if (!wtxn) return std::unexpected("recovery fixture write txn failed");
+            auto put = recovery_db.put_operation(*wtxn,
+                {std::string{id}, "install",
+                 std::string{sage::db::phase_filesystem_pending},
+                 txn->relative_dir(), *sha});
+            if (!put) return put;
+            // The instance dies here after persist_journal(): the destructor
+            // must preserve the evidence directory for recovery.
+            if (!wtxn->commit()) return std::unexpected("recovery fixture commit failed");
+            return {};
+        };
+        const std::string recoverable_id(32, 'a');
+        const std::string abandoned_id(32, 'b');
+        if (auto made = make_pending(recoverable_id, "tool-a"); !made) {
+            sage::util::log_error("Failed to stage recoverable fixture: {}", made.error());
+            return 1;
+        }
+
+        // Resume publishes the journal and finalizes: live tree has the file
+        // with its real mode, the record is gone, the staging dir retired.
+        auto resumed = sage::rebuild::resume_pending_operations(recovery_db, recovery_root);
+        if (!resumed || resumed->finalized != 1) {
+            sage::util::log_error("Pending operation was not recovered: {}",
+                resumed ? std::format("finalized {}", resumed->finalized) : resumed.error());
+            return 1;
+        }
+        auto tool_path = recovery_root / "usr/bin/tool-a";
+        std::error_code mode_ec;
+        const bool executable = (std::filesystem::status(tool_path, mode_ec).permissions()
+            & std::filesystem::perms::owner_exec) != std::filesystem::perms::none;
+        if (mode_ec || read_test_file(tool_path) != "tool-a payload\n" || !executable) {
+            sage::util::log_error("Recovered publish lost content or mode of usr/bin/tool-a");
+            return 1;
+        }
+        // Read probes run inside a scoped txn: an open reader must never
+        // overlap the next resume call's own transactions.
+        {
+            auto settled_txn = recovery_db.begin_read_txn();
+            auto record_after = settled_txn
+                ? recovery_db.get_operation(*settled_txn, recoverable_id)
+                : std::expected<std::optional<sage::db::FilesystemOperationRecord>, std::string>(
+                    std::unexpected("read txn failed"));
+            if (!record_after || record_after->has_value()
+                || !sage::archive::list_transaction_dirs(recovery_root).empty()) {
+                sage::util::log_error("Finalized operation left a record or staging behind");
+                return 1;
+            }
+        }
+
+        // Replay is idempotent: resuming again finds nothing to do.
+        auto again = sage::rebuild::resume_pending_operations(recovery_db, recovery_root);
+        if (!again || again->finalized != 0) {
+            sage::util::log_error("Second resume was not idempotent: {}",
+                again ? std::format("finalized {}", again->finalized) : again.error());
+            return 1;
+        }
+
+        // A transaction directory with no LMDB record is an orphan from a
+        // pre-commit crash: silently collected at the next entry.
+        {
+            auto orphan = sage::archive::FilesystemTransaction::create(recovery_root);
+            if (!orphan) {
+                sage::util::log_error("Failed to create orphan fixture: {}", orphan.error());
+                return 1;
+            }
+            sage::archive::JournalContext ctx;
+            ctx.kind = "remove";
+            if (auto persisted = orphan->persist_journal(
+                    sage::archive::render_journal(ctx, {}));
+                !persisted) {
+                sage::util::log_error("Failed to persist orphan journal: {}", persisted.error());
+                return 1;
+            }
+        }
+        auto gc = sage::rebuild::resume_pending_operations(recovery_db, recovery_root);
+        if (!gc || !sage::archive::list_transaction_dirs(recovery_root).empty()) {
+            sage::util::log_error("Orphan transaction directory survived recovery GC");
+            return 1;
+        }
+
+        // Abandon is the explicit destructive escape: the record disappears,
+        // the evidence directory retires, and nothing reaches the live tree.
+        if (auto made = make_pending(abandoned_id, "tool-b"); !made) {
+            sage::util::log_error("Failed to stage abandon fixture: {}", made.error());
+            return 1;
+        }
+        auto abandoned = sage::rebuild::resume_pending_operations(
+            recovery_db, recovery_root, abandoned_id);
+        auto abandoned_txn = recovery_db.begin_read_txn();
+        auto abandoned_record = abandoned_txn
+            ? recovery_db.get_operation(*abandoned_txn, abandoned_id)
+            : std::expected<std::optional<sage::db::FilesystemOperationRecord>, std::string>(
+                std::unexpected("read txn failed"));
+        if (!abandoned || abandoned->finalized != 0
+            || std::filesystem::exists(recovery_root / "usr/bin/tool-b")
+            || !abandoned_record || abandoned_record->has_value()
+            || !sage::archive::list_transaction_dirs(recovery_root).empty()) {
+            sage::util::log_error("Abandon path did not retire the stuck operation cleanly");
+            return 1;
+        }
+        sage::util::log_success("   Durable Operation Recovery & Orphan GC OK");
+    }
+
+    // Issue #9 repro: the old revision owns usr/lib/foo/ and the admin dropped
+    // foreign state inside it; the new payload drops that subtree. The staged
+    // protocol preserves the non-empty directory while the upgrade succeeds --
+    // the pre-protocol code failed here with ENOTEMPTY and forked DB from disk.
+    {
+        auto fork_repo = temp_dir / "fork-repo";
+        auto fork_v1_data = temp_dir / "fork-v1-data";
+        auto fork_v2_data = temp_dir / "fork-v2-data";
+        std::filesystem::create_directories(fork_repo);
+        std::filesystem::create_directories(fork_v1_data / "usr/bin");
+        std::filesystem::create_directories(fork_v1_data / "usr/lib/foo");
+        std::filesystem::create_directories(fork_v2_data / "usr/bin");
+        std::ofstream(fork_v1_data / "usr/bin/foo") << "foo v1\n";
+        std::ofstream(fork_v1_data / "usr/lib/foo/plugin.dat") << "plugin\n";
+        std::ofstream(fork_v2_data / "usr/bin/foo") << "foo v2\n";
+        sage::package::PackageManifest fork_old;
+        fork_old.name = "foo";
+        fork_old.version = sage::package::Version::parse("1.0.0-1");
+        sage::package::PackageManifest fork_new = fork_old;
+        fork_new.version = sage::package::Version::parse("2.0.0-1");
+        if (!sage::archive::create_package(
+                fork_old, fork_v1_data, fork_repo / "foo-1.0.0-1-x86_64.pkg.tar.zst")
+            || !sage::archive::generate_repo_index(fork_repo, "core")) {
+            sage::util::log_error("Failed to create fork-scenario monolith fixture");
+            return 1;
+        }
+        auto fork_target = temp_dir / "fork-target";
+        if (!write_test_channel(fork_target, fork_repo)) {
+            sage::util::log_error("Failed to write fork-scenario channel");
+            return 1;
+        }
+        CliOptions fork_install;
+        fork_install.target_root = fork_target;
+        fork_install.args = {"foo"};
+        if (cmd_install(fork_install) != 0
+            || read_test_file(fork_target / "usr/lib/foo/plugin.dat") != "plugin\n") {
+            sage::util::log_error("Fork-scenario monolith failed to install");
+            return 1;
+        }
+        // Foreign state appears inside the package-owned directory.
+        std::ofstream(fork_target / "usr/lib/foo/user.conf") << "admin state\n";
+        if (!sage::archive::create_package(
+                fork_new, fork_v2_data, fork_repo / "foo-2.0.0-1-x86_64.pkg.tar.zst")
+            || !sage::archive::generate_repo_index(fork_repo, "core")) {
+            sage::util::log_error("Failed to create fork-scenario upgrade fixture");
+            return 1;
+        }
+        auto fork_db = sage::db::Database::open(
+            fork_target / "var/lib/sage/data.mdb", true);
+        if (cmd_install(fork_install) != 0
+            || read_test_file(fork_target / "usr/bin/foo") != "foo v2\n"
+            || read_test_file(fork_target / "usr/lib/foo/user.conf") != "admin state\n"
+            || std::filesystem::exists(fork_target / "usr/lib/foo/plugin.dat")
+            || !fork_db
+            || sole_owner(*fork_db, "usr/lib/foo")) {
+            sage::util::log_error("Non-empty stale directory forked the upgrade or disk state");
+            return 1;
+        }
+        sage::util::log_success("   Non-Empty Stale Directory Upgrade Survival OK");
+    }
 
     auto transaction_repo = temp_dir / "transaction-repo";
     auto transaction_a_data = temp_dir / "transaction-a-data";
@@ -2032,6 +2430,95 @@ release = "10"
         return 1;
     }
 
+    // Issue #18 end-to-end: a fixed-exec trigger pointing at an executable
+    // the target root does not have must not fail an install when optional
+    // -- every package is committed, so only a warning is warranted -- while
+    // a required trigger still aborts. The round-trip through
+    // serialize_triggers_toml -> .METADATA/triggers.toml -> parse keeps the
+    // required flag visible in the installed manifest.
+    auto policy_repo = temp_dir / "trigger-policy-repo";
+    auto optional_policy_data = temp_dir / "trigger-optional-data";
+    auto required_policy_data = temp_dir / "trigger-required-data";
+    auto policy_target = temp_dir / "trigger-policy-target";
+    std::filesystem::create_directories(policy_repo);
+    std::filesystem::create_directories(optional_policy_data / "usr/share/trigger-policy");
+    std::filesystem::create_directories(required_policy_data / "usr/share/trigger-policy");
+    std::ofstream(optional_policy_data / "usr/share/trigger-policy/payload") << "optional\n";
+    std::ofstream(required_policy_data / "usr/share/trigger-policy/payload") << "required\n";
+
+    sage::package::PackageManifest optional_policy_pkg;
+    optional_policy_pkg.name = "optional-trigger-pkg";
+    optional_policy_pkg.version = sage::package::Version::parse("1.0.0-1");
+    optional_policy_pkg.triggers.push_back(sage::package::Trigger{
+        .name = "optional-missing-exec",
+        .on_paths = {"usr/share/trigger-policy/"},
+        .on_capability = {},
+        .required = false,
+        .exec = "/usr/bin/sage-no-such-post-transaction-tool",
+        .args = {},
+        .run_capability = {},
+    });
+    sage::package::PackageManifest required_policy_pkg = optional_policy_pkg;
+    required_policy_pkg.name = "required-trigger-pkg";
+    required_policy_pkg.triggers.front().name = "required-missing-exec";
+    required_policy_pkg.triggers.front().required = true;
+
+    auto optional_policy_archive =
+        policy_repo / "optional-trigger-pkg-1.0.0-1-x86_64.pkg.tar.zst";
+    auto required_policy_archive =
+        policy_repo / "required-trigger-pkg-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            optional_policy_pkg, optional_policy_data, optional_policy_archive)
+        || !sage::archive::create_package(
+            required_policy_pkg, required_policy_data, required_policy_archive)
+        || !sage::archive::generate_repo_index(policy_repo, "core")) {
+        sage::util::log_error("Failed to create trigger policy fixtures");
+        return 1;
+    }
+    std::filesystem::create_directories(policy_target / "etc/sage");
+    std::ofstream policy_channels(policy_target / "etc/sage/channels.toml");
+    policy_channels
+        << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://"
+        << policy_repo.string()
+        << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    policy_channels.close();
+
+    CliOptions optional_policy_install;
+    optional_policy_install.target_root = policy_target;
+    optional_policy_install.args = {"optional-trigger-pkg"};
+    if (cmd_install(optional_policy_install, "/") != 0) {
+        sage::util::log_error("Optional trigger with a missing executable failed the install");
+        return 1;
+    }
+    {
+        auto policy_db = sage::db::Database::open(
+            policy_target / "var/lib/sage/data.mdb", true);
+        if (!policy_db) {
+            sage::util::log_error("Failed to inspect trigger policy database");
+            return 1;
+        }
+        auto optional_record = policy_db->get_package("optional-trigger-pkg");
+        if (!optional_record || !*optional_record
+            || (**optional_record).triggers.size() != 1
+            || (**optional_record).triggers.front().required
+            || (**optional_record).triggers.front().exec
+                != "/usr/bin/sage-no-such-post-transaction-tool"
+            || !std::filesystem::exists(policy_target / "usr/share/trigger-policy/payload")) {
+            sage::util::log_error(
+                "Optional-missing-exec trigger did not survive packaging or the install diverged");
+            return 1;
+        }
+    }
+
+    CliOptions required_policy_install;
+    required_policy_install.target_root = policy_target;
+    required_policy_install.args = {"required-trigger-pkg"};
+    if (cmd_install(required_policy_install, "/") == 0) {
+        sage::util::log_error("Required trigger with a missing executable did not fail the install");
+        return 1;
+    }
+    sage::util::log_success("   Trigger Required/Optional Exec Policy OK");
+
     // Split packages in one toolchain slot must refresh activation as each
     // package commits. The dependency installs libraries first; the compiler
     // package that follows is what makes the cc alias possible. Aggregate
@@ -2093,6 +2580,7 @@ release = "10"
     sage::package::Trigger failed_remove_trigger;
     failed_remove_trigger.name = "failed-remove-trigger";
     failed_remove_trigger.on_paths = {"opt/channels/llvm/77/bin/"};
+    failed_remove_trigger.required = true; // must hard-fail removal's trigger pass
     failed_remove_trigger.exec = "/usr/bin/sage-missing-remove-trigger";
     split_guard.triggers = {failed_remove_trigger};
 

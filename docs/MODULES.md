@@ -26,7 +26,7 @@ graph TD
 
     subgraph Layer3["Layer 3: Storage & Archives (src/store/)"]
         DB["sage.db<br/>(LMDB zero-copy ACID state & file ownership engine)"]
-        ARCH["sage.archive<br/>(partitions :core :idx :detail :inspect :extract :pack)"]
+        ARCH["sage.archive<br/>(partitions :core :idx :detail :transaction :inspect :extract :pack)"]
     end
 
     subgraph Layer4["Layer 4: System Engines (src/sys/, src/svc/)"]
@@ -103,17 +103,18 @@ Dependency direction inside the domain: `version -> deps -> trigger -> manifest/
 ## 4. Storage & Archive Engine (src/store/)
 
 ### `sage.db`
-LMDB-backed registry: packages, files ownership index, provides index, system provider locks. Copy-on-Write transactions with automatic abort on destruction.
+LMDB-backed registry: packages, files ownership index, provides index, system provider locks, and durable `operations` records (staged package operations with their journal hash, resumed by the next write command). Copy-on-Write transactions with automatic abort on destruction.
 
 ### `sage.archive` (partitions in src/store/archive/)
 | Partition | Responsibility |
 |---|---|
 | `:core` | Shared constants + `InspectedPackage` / `ExtractedPackage` result structs |
 | `:idx` | `.METADATA/files.idx` per-file integrity index serialize/parse |
-| `:detail` | Anchored path vocabulary: normalize data paths, `openat`-based dir walking, anchored removal, conffile modification detection, payload path validation |
+| `:detail` | Anchored path vocabulary: normalize data paths, `openat`-based dir walking, anchored removal, conffile modification detection, payload path validation; anchored directory chains with per-level `fsync`, private same-fs archive snapshots via `copy_file_range` |
 | `:inspect` | Constant-cost inspection: reads only the leading `.METADATA` members of an archive |
 | `:extract` | One decompression pass over the payload with parallel anchored writes (`WritePool`), batch vs immediate durability |
 | `:pack` | Reproducible package creation (inventory + hash pass, single streaming write) and repository `index.toml` generation |
+| `:transaction` | Durable filesystem transactions: staged payloads under `var/lib/sage/transactions/txn-<id>`, versioned operation journal (render/parse), bottom-up `fsync`, idempotent publish (`P F/P L/P D/R F/R D`), orphan listing |
 
 ## 5. System Engines (src/sys/, src/svc/)
 

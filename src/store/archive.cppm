@@ -4,8 +4,8 @@ export module sage.archive;
 //   :core     shared constants + inspection/extraction result structs
 //   :idx      .METADATA/files.idx per-file integrity index I/O
 //   :detail   anchored path safety (never escape the target root) + removal
+//   :transaction durable filesystem transaction dirs (stage/journal/publish)
 //   :inspect  leading-.METADATA reader + constant-cost package inspection
-//   :extract  one decompression pass, parallel anchored writes
 //   :pack     reproducible package creation + repository index generation
 // The primary interface re-exports every partition so callers keep a single
 // `import sage.archive;`.
@@ -16,3 +16,4 @@ export import :detail;
 export import :inspect;
 export import :extract;
 export import :pack;
+export import :transaction;

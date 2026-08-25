@@ -126,8 +126,12 @@ only while the `pkg_name:channel_name` owner recorded by that transaction is
 still present in the path's ownership set; a concurrent package or provider
 change aborts the stale operation. Shared directories release one claim per
 removal and are deleted only when the last owner lets go. LMDB state
-updates are transactional, but filesystem extraction/removal is not journaled
-for rollback if a later step fails.
+updates are transactional. Filesystem payloads are staged under the target
+root, journalled, and committed together with a durable pending-operation
+record; publication replays that journal idempotently (every entry tolerates
+a previous partial run), so an interrupted install, removal, or reconcile is
+detected and rolled forward by the next write command instead of leaving the
+registry and the tree silently forked.
 
 ---
 

@@ -372,6 +372,75 @@ export int cmd_status(const CliOptions& opts) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
         }
     }
+
+    // Read-only peek at the transaction protocol state. Recovery is never
+    // attempted here -- only a mutating command may drive pending
+    // operations to their terminal state.
+    std::println("");
+    auto pending = sage::rebuild::pending_operations(*db_res);
+    if (!pending) {
+        std::println("Pending Operations: (unavailable)");
+    } else if (pending->empty()) {
+        std::println("Pending Operations: 0");
+    } else {
+        std::println("Pending Operations: {}", pending->size());
+        for (const auto& op : *pending) {
+            std::println("  • {:<34} {:<12} {}", op.id, op.kind, op.phase);
+        }
+        std::println("  (run 'sage rebuild' to resume; use its --abandon escape if stuck)");
+    }
+    return 0;
+}
+// Explicit escape hatch for the staged-transaction state machine: drives every
+// pending operation to its terminal state (publish -> postprocess -> retire),
+// or -- with --abandon <ID> -- retires one stuck operation after a loud
+// warning. This is the only command whose job is recovery itself; install,
+// remove and rebuild run the same driver implicitly at entry.
+export int cmd_recover(const CliOptions& opts) {
+    std::optional<std::string> abandon;
+    for (size_t i = 0; i < opts.args.size(); ++i) {
+        if (opts.args[i] == "--abandon") {
+            if (i + 1 >= opts.args.size()) {
+                sage::util::log_error("--abandon requires an operation id (see 'sage status')");
+                return 1;
+            }
+            abandon = opts.args[++i];
+        } else {
+            sage::util::log_error("Unknown argument for recover: '{}'", opts.args[i]);
+            return 1;
+        }
+    }
+
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    auto db_res = sage::db::Database::open(cfg_res->db_path);
+    if (!db_res) {
+        sage::util::log_error(
+            "Failed to open database at {}: {}", cfg_res->db_path.string(), db_res.error());
+        return 1;
+    }
+
+    auto resumed = sage::rebuild::resume_pending_operations(
+        *db_res, opts.target_root,
+        abandon ? std::optional<std::string_view>{*abandon} : std::nullopt);
+    if (!resumed) {
+        sage::util::log_error("Recovery failed: {}", resumed.error());
+        sage::util::log_error(
+            "State is left untouched for retry; 'sage recover --abandon <ID>' "
+            "is the last resort.");
+        return 1;
+    }
+    if (abandon) {
+        sage::util::log_warn(
+            "Operation '{}' was abandoned. Database and filesystem may be "
+            "inconsistent; verify with 'sage verify'.",
+            *abandon);
+    }
+    sage::util::log_success(
+        "Recovery finalized {} operation(s).", resumed->finalized);
     return 0;
 }
 } // namespace sage::cli

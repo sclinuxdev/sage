@@ -44,10 +44,15 @@ public:
     static std::vector<package::Trigger> builtin_triggers() {
         std::vector<package::Trigger> t;
 
+        // The only required built-in: a stale dynamic linker cache leaves the
+        // root broken. Every other built-in tool is one the admin may
+        // legitimately not have installed (shared-mime-info, ca-certs, ...),
+        // so those stay optional and only warn when their exec is missing.
         t.push_back(package::Trigger{
             .name = "ldconfig",
             .on_paths = {"usr/lib/", "lib/"},
             .exec = "/usr/bin/ldconfig",
+            .required = true,
             .priority = 10,
         });
         t.push_back(package::Trigger{
@@ -111,7 +116,7 @@ public:
             if (!cmd) continue;
 
             if (!already_run.insert(*cmd).second) continue;
-            auto result = execute(*cmd, trig.name, ctx);
+            auto result = execute(*cmd, trig.name, trig.required, ctx);
             if (!result) return result;
         }
         return {};
@@ -198,6 +203,7 @@ private:
     static std::expected<void, std::string> execute(
         const std::string& cmd,
         std::string_view trigger_name,
+        bool required,
         const TriggerContext& ctx)
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
@@ -235,6 +241,12 @@ private:
             ? std::filesystem::exists(exec_path)
             : within_root(exec_path);
         if (!executable_exists) {
+            if (!required) {
+                util::log_warn(
+                    "Optional trigger '{}': executable '{}' is missing -- skipping",
+                    trigger_name, exec_path);
+                return {};
+            }
             return std::unexpected(std::format(
                 "Required executable '{}' for trigger '{}' is missing",
                 exec_path, trigger_name));

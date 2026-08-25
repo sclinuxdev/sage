@@ -6,7 +6,6 @@ import std;
 import sage;
 
 import sage.cli;
-import sage.triggers;
 
 namespace sage::cli {
 
@@ -276,7 +275,24 @@ export int cmd_remove(
         }
     }
 
-    std::vector<sage::package::FileEntry> removed_files;
+    auto transaction_res =
+        sage::archive::FilesystemTransaction::create(opts.target_root);
+    if (!transaction_res) {
+        sage::util::log_error(
+            "Failed to create filesystem transaction: {}", transaction_res.error());
+        return 1;
+    }
+    auto& filesystem_transaction = *transaction_res;
+
+    // One remove command is one journaled operation: the entire deletion plan
+    // is prepared up front, committed together with the metadata deregistration
+    // in a single LMDB transaction, and only then published by the shared
+    // recovery/resume driver (which also runs the post-remove triggers).
+    sage::archive::JournalContext journal_ctx;
+    journal_ctx.kind = "remove";
+    journal_ctx.final = true;
+    journal_ctx.sysroot = opts.target_root.string();
+    journal_ctx.regenerate_profile = true;
 
     for (const auto& pkg_name : to_remove_set) {
         const auto& pkg = installed_map.at(pkg_name);
@@ -286,10 +302,10 @@ export int cmd_remove(
             sage::util::log_info("Auto-removing orphaned dependency '{}' (version {})...", pkg_name, pkg.version.to_string());
         }
 
-        // Delete physical files. The LMDB files table is the authoritative owner
-        // registry: merge the installed manifest's file list with all files still
-        // registered to this package (a previous version's leftovers may not be
-        // present in the current manifest), so stale ownership records are purged.
+        // The LMDB files table is the authoritative owner registry: merge the
+        // installed manifest's file list with all files still registered to
+        // this package (a previous version's leftovers may not be present in
+        // the current manifest), so stale ownership records are purged.
         std::unordered_map<std::string, sage::package::FileType> declared_types;
         for (const auto& f : pkg.files) {
             declared_types.emplace(sage::util::clean_rel_path(f.path), f.type);
@@ -356,26 +372,47 @@ export int cmd_remove(
                 return 1;
             }
 
-            // Unregistered debris is removed best-effort; a declared directory
-            // may legitimately have gained foreign files since install.
             const auto normalized = relative_path.generic_string();
-            const bool declared_directory =
-                declared_types.contains(normalized)
-                && declared_types.at(normalized) == sage::package::FileType::Directory;
-            auto remove_res = sage::archive::remove_path_anchored(
-                opts.target_root,
-                normalized,
-                owners->empty() || declared_directory);
-            if (!remove_res) {
-                sage::util::log_error(
-                    "Failed to remove '{}' from package '{}': {}",
-                    normalized, pkg_name, remove_res.error());
-                return 1;
+            // Journaled removal instead of immediate physical deletion. The
+            // live node decides R F vs R D. Alias-spelled claims (usr/sbin vs
+            // usr/bin) release the registry claim without touching the
+            // physical file, like remove_path_anchored did.
+            auto canonical = sage::archive::canonicalize_merge_claim(normalized);
+            if (canonical && *canonical == normalized) {
+                std::error_code status_ec;
+                const auto live = std::filesystem::symlink_status(
+                    opts.target_root / std::filesystem::path(normalized), status_ec);
+                if (!status_ec && std::filesystem::is_directory(live)) {
+                    // remove_path_anchored semantics, checked at plan time:
+                    // a sole claim on an undeclared directory that has since
+                    // gained contents was a hard removal error -- it must
+                    // abort HERE, before the single metadata transaction
+                    // commits, so the package records stay intact. Declared
+                    // or unowned directories tolerate foreign leftovers via
+                    // R D's ENOTEMPTY-preserve rule.
+                    const bool declared_directory =
+                        declared_types.contains(normalized)
+                        && declared_types.at(normalized)
+                            == sage::package::FileType::Directory;
+                    const bool ignore_nonempty = owners->empty() || declared_directory;
+                    std::error_code empty_ec;
+                    if (!ignore_nonempty && !std::filesystem::is_empty(
+                            opts.target_root / std::filesystem::path(normalized),
+                            empty_ec)) {
+                        sage::util::log_error(
+                            "Failed to remove '{}' from package '{}': Directory not empty",
+                            normalized, pkg_name);
+                        return 1;
+                    }
+                    filesystem_transaction.plan_remove_dir(normalized);
+                } else {
+                    filesystem_transaction.plan_remove_file(normalized);
+                }
             }
-
-            auto removed_entry = file_entry;
-            removed_entry.path = normalized;
-            removed_files.push_back(std::move(removed_entry));
+            journal_ctx.touched.emplace_back(
+                file_entry.type == sage::package::FileType::Directory ? 'D'
+                : file_entry.type == sage::package::FileType::Symlink ? 'L' : 'F',
+                normalized);
         }
 
         auto unregister_files = db.unregister_files(*wtxn, files_to_delete, my_owner);
@@ -387,8 +424,7 @@ export int cmd_remove(
         auto unregister_provides = db.unregister_provides(*wtxn, pkg.provides);
         if (!unregister_provides) {
             sage::util::log_error(
-                "Failed to unregister provides for '{}': {}",
-                pkg_name, unregister_provides.error());
+                "Failed to unregister provides for '{}': {}", pkg_name, unregister_provides.error());
             return 1;
         }
         auto delete_package = db.del_package(*wtxn, pkg_name);
@@ -398,48 +434,50 @@ export int cmd_remove(
                 pkg_name, delete_package.error());
             return 1;
         }
+
+        // The removed manifests become the trigger context's transaction
+        // packages: it is their capabilities that make kernel triggers fire.
+        journal_ctx.package_manifests_toml.push_back(pkg.serialize_toml());
+    }
+
+    // Evidence first: the journal (fsynced) must exist before the operation
+    // record becomes visible in LMDB.
+    const auto journal_text = sage::archive::render_journal(
+        journal_ctx, filesystem_transaction.journal_entries());
+    auto journal_hash = filesystem_transaction.persist_journal(journal_text);
+    if (!journal_hash) {
+        sage::util::log_error(
+            "Failed to persist removal journal: {}", journal_hash.error());
+        return 1;
+    }
+
+    sage::db::FilesystemOperationRecord operation;
+    operation.id = filesystem_transaction.id();
+    operation.kind = "remove";
+    operation.phase = std::string(sage::db::phase_filesystem_pending);
+    operation.transaction_dir = filesystem_transaction.relative_dir();
+    operation.journal_sha256 = *journal_hash;
+    auto op_res = db.put_operation(*wtxn, operation);
+    if (!op_res) {
+        sage::util::log_error(
+            "Failed to record removal operation: {}", op_res.error());
+        return 1;
     }
 
     auto commit_res = wtxn->commit();
-    if (!commit_res) return 1;
-
-    // The filesystem and package database are committed at this point, so the
-    // generated profile must reflect the new state even when a post-remove
-    // trigger fails below.
-    std::vector<sage::channel::Channel> active_channels;
-    for (const auto& ch_cfg : cfg.channels) {
-        sage::channel::Channel ch;
-        ch.name = ch_cfg.name;
-        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
-        ch.enabled = ch_cfg.enabled;
-        active_channels.push_back(std::move(ch));
-    }
-    (void)sage::channel::ProfileManager::regenerate_fhs_profile(
-        opts.target_root, active_channels);
-
-    // Removing a kernel is as much a reason to regenerate the initramfs and
-    // the bootloader entries as installing one, so removal runs the same
-    // triggers -- with the removed packages as the transaction set, since it
-    // is their capabilities that make the kernel triggers fire.
-    sage::triggers::TriggerContext trig_ctx;
-    trig_ctx.sysroot = opts.target_root;
-    trig_ctx.touched_files = removed_files;
-    auto remaining_packages = db.list_installed_packages();
-    if (!remaining_packages) {
+    if (!commit_res) {
         sage::util::log_error(
-            "Cannot run post-remove triggers: {}", remaining_packages.error());
+            "Failed to commit removal transaction: {}", commit_res.error());
         return 1;
     }
-    trig_ctx.installed_packages = std::move(*remaining_packages);
-    trig_ctx.providers = cfg.providers;
-    trig_ctx.dry_run = opts.dry_run;
-    for (const auto& [name, pkg] : installed_map) {
-        if (to_remove_set.contains(name)) trig_ctx.transaction_packages.push_back(pkg);
-    }
-    auto trigger_result = sage::triggers::TriggerEngine::run(trig_ctx);
-    if (!trigger_result) {
+
+    // Publish the removals and run post-remove processing through the shared
+    // driver: profile regeneration, triggers, record deletion and transaction
+    // retirement on success.
+    auto resumed = sage::rebuild::resume_pending_operations(db, opts.target_root);
+    if (!resumed) {
         sage::util::log_error(
-            "Post-remove trigger failed: {}", trigger_result.error());
+            "Failed to complete pending filesystem operations: {}", resumed.error());
         return 1;
     }
 

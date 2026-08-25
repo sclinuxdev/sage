@@ -6,7 +6,6 @@ import sage;
 
 import sage.cli;
 import sage.repo;
-import sage.triggers;
 
 namespace sage::cli {
 
@@ -124,6 +123,18 @@ export int cmd_install(
             return 1;
         }
         installed_packages = std::move(*installed_res);
+    }
+
+    // Recovery-first: finish any interrupted operation from a previous run
+    // (publish committed plans, run their post-processing, retire their
+    // transaction directories) before solving against the registry state.
+    if (!opts.dry_run) {
+        auto recovered = sage::rebuild::resume_pending_operations(db, opts.target_root);
+        if (!recovered) {
+            sage::util::log_error(
+                "Failed to recover pending filesystem operations: {}", recovered.error());
+            return 1;
+        }
     }
 
     // 1. Gather Available Package Pool from Channels and Local Repos
@@ -356,249 +367,149 @@ export int cmd_install(
         sage::util::log_info("  ~ pruned {} orphaned file registration(s)", *pruned);
     }
 
-    std::vector<sage::channel::Channel> active_channels;
-    for (const auto& ch_cfg : cfg.channels) {
-        sage::channel::Channel ch;
-        ch.name = ch_cfg.name;
-        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
-        ch.enabled = ch_cfg.enabled;
-        active_channels.push_back(std::move(ch));
+    // Staged transaction protocol (issue #9). State machine per operation:
+    // no record -> `filesystem_pending` -> `postprocess_pending` -> no record.
+    // The whole command is ONE operation sharing one on-disk transaction
+    // directory: each package stages its payload there, appends its plan to
+    // the accumulated journal, and enters the `filesystem_pending` phase by
+    // committing registry changes + the record (journal sha256) in one LMDB
+    // write transaction. Only the final package sets `final true` -- the
+    // resume driver publishes every plan entry idempotently but runs the
+    // expensive aggregate post-processing (toolchain switches, FHS profile,
+    // triggers) once, for `final` journals only. A crash anywhere leaves the
+    // committed prefix in a consistent registry state whose publication is
+    // completed by the next command's entry-point resume; uncommitted
+    // staging is RAII-discarded or orphan-GCed.
+    auto transaction_res =
+        sage::archive::FilesystemTransaction::create(opts.target_root);
+    if (!transaction_res) {
+        sage::util::log_error(
+            "Failed to create filesystem transaction: {}", transaction_res.error());
+        return 1;
     }
-    std::vector<sage::package::FileEntry> all_touched_files;
-    std::vector<sage::package::PackageManifest> committed_packages;
+    auto& filesystem_transaction = *transaction_res;
+
+    sage::archive::JournalContext journal_ctx;
+    journal_ctx.kind = "install";
+    journal_ctx.sysroot = trigger_sysroot.value_or(opts.target_root).string();
+    journal_ctx.regenerate_profile = true;
     bool any_package_committed = false;
-    bool aggregate_done = false;
-
-    auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg,
-                                           bool regenerate_profile) {
-        auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
-        if (spec.scope == sage::channel::ChannelScope::Toolchain
-            && !spec.category.empty() && !spec.slot.empty()) {
-            auto act_res = sage::channel::ProfileManager::switch_active_toolchain(
-                opts.target_root, spec.category, spec.slot);
-            if (!act_res) {
+    // Failure path. The batch is aborted for good, but a committed prefix
+    // must not stay stranded at `filesystem_pending`: the journal is
+    // rewritten with `final true` (record hash refreshed in a short write
+    // transaction) and the resume driver takes the committed prefix to its
+    // terminal state -- publish, post-process, retire -- mirroring what the
+    // old scope-exit trigger guard guaranteed. Declared BEFORE the rewind
+    // guard so destruction rewinds a torn journal first and finalization
+    // then validates against evidence matching the committed record hash.
+    struct FinalizePrefixGuard {
+        sage::db::Database* db;
+        const std::filesystem::path* target_root;
+        sage::archive::FilesystemTransaction* transaction;
+        sage::archive::JournalContext* journal;
+        const bool* committed;
+        bool disarmed{false};
+        ~FinalizePrefixGuard() {
+            if (disarmed || !*committed) return;
+            journal->final = true;
+            const auto text =
+                sage::archive::render_journal(*journal, transaction->journal_entries());
+            auto hash = transaction->persist_journal(text);
+            if (!hash) {
                 sage::util::log_warn(
-                    "Failed to activate toolchain '{}:{}': {}",
-                    spec.category, spec.slot, act_res.error());
+                    "Could not finalize journal after failed install: {}", hash.error());
+                return;
+            }
+            auto txn = db->begin_write_txn();
+            if (!txn) {
+                sage::util::log_warn(
+                    "Could not refresh operation record after failed install: {}",
+                    txn.error());
+                return;
+            }
+            auto existing = db->get_operation(*txn, transaction->id());
+            if (!existing || !*existing) {
+                sage::util::log_warn("Operation record vanished during abort handling");
+                return;
+            }
+            (**existing).journal_sha256 = *hash;
+            if (auto put = db->put_operation(*txn, **existing); !put) {
+                sage::util::log_warn(
+                    "Could not refresh operation record after failed install: {}",
+                    put.error());
+                return;
+            }
+            if (auto commit = txn->commit(); !commit) {
+                sage::util::log_warn(
+                    "Could not commit operation record refresh: {}", commit.error());
+                return;
+            }
+            if (auto resumed = sage::rebuild::resume_pending_operations(*db, *target_root);
+                !resumed) {
+                sage::util::log_warn(
+                    "Committed packages stay pending after failed install: {}",
+                    resumed.error());
             }
         }
-        if (regenerate_profile) {
-            (void)sage::channel::ProfileManager::regenerate_fhs_profile(
-                opts.target_root, active_channels);
-        }
-    };
+    } finalize_prefix_guard{
+        &db, &opts.target_root, &filesystem_transaction, &journal_ctx,
+        &any_package_committed};
 
-    auto run_aggregate_triggers = [&]() -> bool {
-        sage::triggers::TriggerContext trig_ctx;
-        trig_ctx.sysroot = trigger_sysroot.value_or(opts.target_root);
-        trig_ctx.touched_files = all_touched_files;
-        trig_ctx.transaction_packages = committed_packages;
-        auto current_packages = db.list_installed_packages();
-        if (!current_packages) {
-            sage::util::log_error(
-                "Cannot run aggregate triggers: {}", current_packages.error());
-            return false;
+    // Journal text matching the currently COMMITTED operation record. The
+    // window between persist_journal(N) and the LMDB commit of package N is
+    // a clean-error hazard: the journal would describe one package more than
+    // the record's sha256 attests, and resume verifies hash-vs-record before
+    // publishing, so recovery would refuse to run. Arming this guard across
+    // exactly that window rewinds the journal file on error return. A hard
+    // crash inside the window remains possible (contract-accepted); it only
+    // costs an explicit abandon, never silent corruption.
+    std::string committed_journal_text;
+    struct JournalRewindGuard {
+        sage::archive::FilesystemTransaction* transaction;
+        const std::string* text;
+        bool armed{false};
+        ~JournalRewindGuard() {
+            if (armed) (void)transaction->persist_journal(*text);
         }
-        trig_ctx.installed_packages = std::move(*current_packages);
-        trig_ctx.providers = cfg.providers;
-        trig_ctx.dry_run = opts.dry_run;
-        auto trigger_result = sage::triggers::TriggerEngine::run(trig_ctx);
-        if (!trigger_result) {
-            sage::util::log_error(
-                "Aggregate post-install trigger failed: {}", trigger_result.error());
-            return false;
-        }
-        return true;
-    };
-
-    struct TriggerGuard {
-        std::function<void()> action;
-        ~TriggerGuard() {
-            if (action) action();
-        }
-    } trigger_guard{[&] {
-        if (any_package_committed && !aggregate_done) {
-            (void)run_aggregate_triggers();
-        }
-    }};
-
-    bool batch_has_payload_conflict = false;
-    bool batch_has_unsafe_replacement = false;
-    std::unordered_map<std::string, bool> batch_path_types;
-    for (const auto& pkg : unique_to_install) {
-        const auto& inspected = inspected_packages.at(
-            sage::package::package_identity(pkg));
-        for (const auto& file : inspected.data_files) {
-            const auto path = sage::util::clean_rel_path(file.path);
-            if (path == "usr/share/info/dir" || path.ends_with("/info/dir")) continue;
-            const bool directory = file.type == sage::package::FileType::Directory;
-            if (!directory) {
-                std::error_code status_error;
-                const auto existing = std::filesystem::symlink_status(
-                    opts.target_root / path, status_error);
-                if (!status_error
-                    && std::filesystem::exists(existing)
-                    && std::filesystem::is_directory(existing)) {
-                    batch_has_unsafe_replacement = true;
-                    break;
-                }
-            }
-            auto [existing, inserted] = batch_path_types.emplace(path, directory);
-            if (!inserted && (!directory || !existing->second)) {
-                batch_has_payload_conflict = true;
-                break;
-            }
-        }
-        if (batch_has_payload_conflict || batch_has_unsafe_replacement) break;
-    }
+    } journal_rewind{&filesystem_transaction, &committed_journal_text};
 
     const auto t_phase0 = std::chrono::steady_clock::now();
-    // A fresh root has no upgrade/conffile cleanup ordering to preserve. Reserve
-    // every ownership claim in one uncommitted LMDB transaction, extract
-    // independent package payloads concurrently, flush the filesystem once,
-    // then commit the registry. A crash can leave unregistered payload files,
-    // but can never publish registry state ahead of durable files.
-    // 并行 + syncfs 批量路径适用于“纯新增”事务：事务内没有任何包是
-    // 已安装版本的升级（否则需要串行路径的 conffile 迁移与升级顺序）。
-    bool transaction_all_new = true;
+
+    // Projected-ownership conflict detection. A file moving between two
+    // packages inside this transaction -- the classic monolithic -> split
+    // upgrade (foo -> foo + foo-libs + foo-dev) -- must not be judged
+    // against the pre-transaction database: when foo-libs is checked, the
+    // library is still registered to the old monolithic foo. Record every
+    // path each upgrading package gives up (its registered files minus what
+    // its new payload still ships, compared after usr/sbin-style merge
+    // canonicalization exactly like the stale-claim cleanup below) so the
+    // ownership checks tolerate precisely those in-transaction handovers.
+    sage::db::ReleasedClaims batch_released_claims;
     for (const auto& pkg : unique_to_install) {
-        auto existing = db.get_package(pkg.name);
-        if (!existing || *existing) {
-            // 已有同名包（升级或同身份重装）都需要串行路径的 conffile
-            // 迁移与 stale 声明清理；只有纯新增才允许批量快速路径。
-            transaction_all_new = false;
-            break;
+        if (!installed_by_name.contains(pkg.name)) continue;
+        std::unordered_set<std::string> kept_paths;
+        for (const auto& f :
+            inspected_packages.at(sage::package::package_identity(pkg)).data_files) {
+            kept_paths.insert(sage::util::clean_rel_path(f.path));
+        }
+        auto previous_paths = db.get_package_files(pkg.name);
+        if (!previous_paths) {
+            sage::util::log_error(
+                "Failed to read previous files for '{}': {}",
+                pkg.name, previous_paths.error());
+            return 1;
+        }
+        for (const auto& old_path : *previous_paths) {
+            auto canonical_old = sage::archive::canonicalize_merge_claim(old_path);
+            if (!canonical_old || kept_paths.contains(*canonical_old)) continue;
+            batch_released_claims[sage::util::clean_rel_path(old_path)].insert(pkg.name);
         }
     }
-    if (transaction_all_new
-        && !batch_has_payload_conflict
-        && !batch_has_unsafe_replacement) {
-        auto batch_txn = db.begin_write_txn();
-        if (!batch_txn) {
-            sage::util::log_error(
-                "Failed to open batch database transaction: {}", batch_txn.error());
-            return 1;
-        }
-        std::vector<sage::package::PackageManifest> batch_manifests;
-        batch_manifests.reserve(unique_to_install.size());
-        for (const auto& pkg : unique_to_install) {
-            const auto identity = sage::package::package_identity(pkg);
-            const auto& inspected = inspected_packages.at(identity);
-            auto installed_pkg = pkg;
-            installed_pkg.files = inspected.data_files;
-            installed_pkg.capability_hooks = inspected.manifest.capability_hooks;
-            installed_pkg.triggers = inspected.manifest.triggers;
-            installed_pkg.conffiles = inspected.manifest.conffiles;
-            auto files = db.register_files(
-                *batch_txn, installed_pkg.name, installed_pkg.channel,
-                installed_pkg.files);
-            if (!files) {
-                sage::util::log_error(
-                    "Cannot reserve files for '{}': {}", pkg.name, files.error());
-                return 1;
-            }
-            auto package = db.put_package(*batch_txn, installed_pkg);
-            if (!package) {
-                sage::util::log_error(
-                    "Cannot stage package '{}': {}", pkg.name, package.error());
-                return 1;
-            }
-            auto provides = db.register_provides(
-                *batch_txn, installed_pkg.name, installed_pkg.provides);
-            if (!provides) {
-                sage::util::log_error(
-                    "Cannot stage provides for '{}': {}", pkg.name, provides.error());
-                return 1;
-            }
-            batch_manifests.push_back(std::move(installed_pkg));
-        }
-
-        std::println("[timing] pre-extract(solve+fetch+inspect+stage): {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_phase0).count());
-        auto extracted = collect_parallel<sage::archive::ExtractedPackage>(
-            unique_to_install.size(), cfg.build.jobs, [&](size_t index)
-                -> std::expected<sage::archive::ExtractedPackage, std::string> {
-                const auto& pkg = unique_to_install[index];
-                const auto& inspected = inspected_packages.at(
-                    sage::package::package_identity(pkg));
-                auto result = sage::archive::extract_package(
-                    archive_paths[index], opts.target_root, &pkg, &inspected,
-                    nullptr, sage::archive::ExtractionDurability::Batch);
-                if (!result) {
-                    return std::unexpected(std::format(
-                        "Failed to extract package '{}': {}", pkg.name, result.error()));
-                }
-                return std::move(*result);
-            });
-        if (!extracted) {
-            sage::util::log_error("{}", extracted.error());
-            return 1;
-        }
-        const auto t_sync0 = std::chrono::steady_clock::now();
-        std::println("[timing] extract+collect: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_phase0).count());
-        // 与 pacman 一致：不做全盘 syncfs，依赖内核 writeback 异步落盘。
-        // 这是标准做法——强制 syncfs 在大量小文件场景下代价极高且不提供
-        // 比内核 writeback 更强的崩溃一致性保证。
-        for (size_t index = 0; index < batch_manifests.size(); ++index) {
-            batch_manifests[index].files = std::move((*extracted)[index].extracted_files);
-            auto package = db.put_package(*batch_txn, batch_manifests[index]);
-            if (!package) {
-                sage::util::log_error(
-                    "Cannot finalize package '{}': {}",
-                    batch_manifests[index].name, package.error());
-                return 1;
-            }
-        }
-        std::println("[timing] lmdb-stage: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_sync0).count());
-        const auto t_commit0 = std::chrono::steady_clock::now();
-        std::println("[timing] pre-commit: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_sync0).count());
-        auto committed = batch_txn->commit();
-        const auto t_commit1 = std::chrono::steady_clock::now();
-        std::println("[timing] commit: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_commit1).count());
-        if (!committed) {
-            sage::util::log_error(
-                "Failed to commit package batch: {}", committed.error());
-            return 1;
-        }
-        const auto t_post = std::chrono::steady_clock::now();
-        for (auto& installed_pkg : batch_manifests) {
-            all_touched_files.insert(
-                all_touched_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
-            run_package_postprocessing(installed_pkg, false);
-            committed_packages.push_back(std::move(installed_pkg));
-        }
-        std::println("[timing] postprocess: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_post).count());
-        any_package_committed = true;
-        (void)sage::channel::ProfileManager::regenerate_fhs_profile(
-            opts.target_root, active_channels);
-        const auto t_agg = std::chrono::steady_clock::now();
-        if (!run_aggregate_triggers()) {
-            aggregate_done = true;
-            return 1;
-        }
-        aggregate_done = true;
-        std::println("[timing] aggregate-triggers: {:.1f}s",
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_agg).count());
-        sage::util::log_success(
-            "Successfully installed {} packages into {}",
-            unique_to_install.size(), opts.target_root.string());
-        return 0;
-    }
-
-    // 3. Streaming Unpack & LMDB State Registration
-    for (const auto& pkg : unique_to_install) {
+    // 3. Staged unpack, journaled publication plan, per-package registry commit
+    for (auto pkg_it = unique_to_install.begin();
+         pkg_it != unique_to_install.end(); ++pkg_it) {
+        auto& pkg = *pkg_it;
+        const bool last_package = std::next(pkg_it) == unique_to_install.end();
         const auto identity = sage::package::package_identity(pkg);
         auto archive_res = sage::repo::ensure_local_archive(snapshot, identity);
         if (!archive_res) {
@@ -662,19 +573,23 @@ export int cmd_install(
             previous_owner
                 ? std::optional<std::string_view>{*previous_owner}
                 : std::nullopt,
-            inspected_it->second.data_files);
+            inspected_it->second.data_files,
+            batch_released_claims);
         if (!conflict_res) {
             sage::util::log_error(
                 "Cannot install package '{}': {}", pkg.name, conflict_res.error());
             return 1;
         }
 
-        // Archives always contain paths relative to sysroot (e.g. usr/bin/bash or
-        // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
-        sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
+        // Stage the payload inside the transaction directory; the live tree
+        // is only ever touched later, by the idempotent publish pass.
+        sage::util::log_info(
+            "Staging {} -> {}...", pkg.name, filesystem_transaction.relative_dir());
+        const auto staged_root = opts.target_root
+            / std::filesystem::path(filesystem_transaction.relative_dir())
+            / "staged";
         auto ext_res = sage::archive::extract_package(
-            *archive_res, opts.target_root, &pkg, &inspected_it->second,
-            *previous_package ? &**previous_package : nullptr);
+            *archive_res, staged_root, &pkg, &inspected_it->second);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -695,13 +610,115 @@ export int cmd_install(
         // stale-claim cleanup below can honor them even if the channel index
         // predates the declaration.
         installed_pkg.conffiles = ext_res->manifest.conffiles;
+
+        // Conffile protection under staging: extraction cannot compare against
+        // the live tree (its fifth parameter would probe the empty staging
+        // root), so redirect locally modified configs to "<path>.new" here,
+        // exactly as extract_package used to do inline against the live tree.
+        if (*previous_package && !installed_pkg.conffiles.empty()) {
+            for (auto& file_entry : installed_pkg.files) {
+                if (file_entry.type == sage::package::FileType::Directory) continue;
+                const auto key = sage::util::clean_rel_path(file_entry.path);
+                const bool declared = std::ranges::find(
+                    installed_pkg.conffiles, key,
+                    [](const std::string& candidate) {
+                        return sage::util::clean_rel_path(candidate);
+                    }) != installed_pkg.conffiles.end();
+                if (!declared
+                    || !sage::archive::conffile_modified(
+                        opts.target_root, key, installed_pkg.conffiles,
+                        &**previous_package)) {
+                    continue;
+                }
+                std::error_code rename_ec;
+                std::filesystem::rename(
+                    staged_root / std::filesystem::path(key),
+                    staged_root / std::filesystem::path(key + ".new"), rename_ec);
+                if (rename_ec) {
+                    sage::util::log_error(
+                        "Failed to protect modified config '{}' for '{}': {}",
+                        key, pkg.name, rename_ec.message());
+                    return 1;
+                }
+                file_entry.path = key + ".new";
+                sage::util::log_warn(
+                    "Protecting modified config '{}': new version saved as '{}.new'",
+                    key, key);
+            }
+        }
         auto package_touched_files = installed_pkg.files;
+
+        // Publication plan: ancestors first (the publisher resolves target
+        // parents strictly), then payloads with their real final modes.
+        std::set<std::string> ensured_dirs;
+        for (const auto& file_entry : installed_pkg.files) {
+            const auto rel = sage::util::clean_rel_path(file_entry.path);
+            if (file_entry.type == sage::package::FileType::Directory) {
+                ensured_dirs.insert(std::string(rel));
+                continue;
+            }
+            for (auto ancestor = std::filesystem::path(rel).parent_path();
+                 !ancestor.empty() && ancestor != ".";
+                 ancestor = ancestor.parent_path()) {
+                ensured_dirs.insert(ancestor.generic_string());
+            }
+        }
+
+        // Prepare-time compatibility against the LIVE tree: staging never
+        // touches it, so clashes that extraction used to hit physically must
+        // be caught before this package's entries join the shared journal and
+        // its registry commit -- a rejected package leaves no trace in
+        // database or journal. A payload file/symlink may replace another
+        // file or symlink but never an existing directory; an ensure-dir
+        // target must not be an existing non-directory.
+        for (const auto& dir : ensured_dirs) {
+            std::error_code status_ec;
+            const auto existing = std::filesystem::symlink_status(
+                opts.target_root / std::filesystem::path(dir), status_ec);
+            if (!status_ec && std::filesystem::exists(existing)
+                && !std::filesystem::is_directory(existing)) {
+                sage::util::log_error(
+                    "Cannot install package '{}': directory '{}' collides with an existing non-directory",
+                    pkg.name, dir);
+                return 1;
+            }
+        }
+        for (const auto& file_entry : installed_pkg.files) {
+            if (file_entry.type == sage::package::FileType::Directory) continue;
+            const auto rel = sage::util::clean_rel_path(file_entry.path);
+            std::error_code status_ec;
+            const auto existing = std::filesystem::symlink_status(
+                opts.target_root / std::filesystem::path(rel), status_ec);
+            if (!status_ec && std::filesystem::is_directory(existing)) {
+                sage::util::log_error(
+                    "Cannot install package '{}': payload '{}' would replace an existing directory",
+                    pkg.name, rel);
+                return 1;
+            }
+        }
+        for (const auto& dir : ensured_dirs)
+            filesystem_transaction.plan_ensure_dir(dir);
+        for (const auto& file_entry : installed_pkg.files) {
+            const auto rel = sage::util::clean_rel_path(file_entry.path);
+            switch (file_entry.type) {
+            case sage::package::FileType::Regular:
+                filesystem_transaction.plan_put_file(
+                    rel, std::format("staged/{}", rel), file_entry.mode);
+                break;
+            case sage::package::FileType::Symlink:
+                filesystem_transaction.plan_put_symlink(
+                    rel, std::format("staged/{}", rel));
+                break;
+            case sage::package::FileType::Directory:
+                break;
+            }
+        }
 
         // Reinstall/upgrade cleanup: release ownership of paths the new payload
         // dropped so they can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
         // Shared directories keep their remaining owners and stay on disk; sole
-        // claims are physically removed here.
+        // claims become journaled removals executed by the publish pass.
         std::vector<sage::package::FileEntry> stale_claims;
         size_t stale_removed = 0;
         if (*previous_package) {
@@ -718,8 +735,7 @@ export int cmd_install(
                 // Compare in the canonicalized domain: a legacy claim spelled
                 // usr/sbin/iconvconfig denotes the same physical file the new
                 // payload installs as usr/bin/iconvconfig. Such claims are
-                // released from the registry but their (freshly extracted)
-                // files stay put.
+                // released from the registry but their files stay put.
                 auto canonical_old = sage::archive::canonicalize_merge_claim(old_path);
                 if (!canonical_old || new_paths.contains(*canonical_old)) {
                     sage::package::FileEntry fe;
@@ -760,15 +776,26 @@ export int cmd_install(
                     // admin has since edited: release the claim, keep the file.
                     sage::util::log_info("  ~ keeping locally modified config '{}'", old_path);
                 } else {
-                    auto remove_res = sage::archive::remove_path_anchored(
-                        opts.target_root, old_path, declared_directory);
-                    if (!remove_res) {
-                        sage::util::log_error(
-                            "Failed to remove stale file '{}' for '{}': {}",
-                            old_path, pkg.name, remove_res.error());
-                        return 1;
+                    // Physical removal becomes a journaled R F/R D entry for
+                    // the publish pass. Alias-spelled claims (usr/sbin vs
+                    // usr/bin) denote the merged domain: release the registry
+                    // claim but leave the physical file alone, exactly like
+                    // the old remove_path_anchored alias skip.
+                    const auto clean_old = sage::util::clean_rel_path(old_path);
+                    if (*canonical_old == clean_old) {
+                        std::error_code status_ec;
+                        const auto live = std::filesystem::symlink_status(
+                            opts.target_root / std::filesystem::path(clean_old),
+                            status_ec);
+                        const bool live_directory =
+                            !status_ec && std::filesystem::is_directory(live);
+                        if (live_directory || declared_directory) {
+                            filesystem_transaction.plan_remove_dir(clean_old);
+                        } else {
+                            filesystem_transaction.plan_remove_file(clean_old);
+                        }
+                        ++stale_removed;
                     }
-                    ++stale_removed;
                 }
                 sage::package::FileEntry fe;
                 fe.path = old_path;
@@ -791,6 +818,43 @@ export int cmd_install(
             }
         }
 
+        // Accumulate the journal context for this package: touched files,
+        // committed manifest, and toolchain activations (the switch itself is
+        for (const auto& fe : package_touched_files) {
+            journal_ctx.touched.emplace_back(
+                fe.type == sage::package::FileType::Directory ? 'D'
+                : fe.type == sage::package::FileType::Symlink ? 'L' : 'F',
+                fe.path);
+        }
+        journal_ctx.package_manifests_toml.push_back(installed_pkg.serialize_toml());
+        {
+            auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
+            if (spec.scope == sage::channel::ChannelScope::Toolchain
+                && !spec.category.empty() && !spec.slot.empty()) {
+                journal_ctx.toolchain_activations.push_back(
+                    std::format("{}:{}", spec.category, spec.slot));
+            }
+        }
+        if (last_package) journal_ctx.final = true;
+
+        // Evidence before commitment: the durable journal (payload already
+        // fsynced by sync_staging below) must exist before the operation
+        // record becomes visible in LMDB.
+        if (auto synced = filesystem_transaction.sync_staging(); !synced) {
+            sage::util::log_error(
+                "Failed to sync staged payload for '{}': {}", pkg.name, synced.error());
+            return 1;
+        }
+        const auto journal_text = sage::archive::render_journal(
+            journal_ctx, filesystem_transaction.journal_entries());
+        auto journal_hash = filesystem_transaction.persist_journal(journal_text);
+        if (!journal_hash) {
+            sage::util::log_error(
+                "Failed to persist journal for '{}': {}", pkg.name, journal_hash.error());
+            return 1;
+        }
+        journal_rewind.armed = true;
+
         auto p_res = db.put_package(*package_txn, installed_pkg);
         if (!p_res) {
             sage::util::log_error("Failed to register package '{}' in DB: {}", installed_pkg.name, p_res.error());
@@ -803,7 +867,8 @@ export int cmd_install(
             installed_pkg.files,
             previous_owner
                 ? std::optional<std::string_view>{*previous_owner}
-                : std::nullopt);
+                : std::nullopt,
+            batch_released_claims);
         if (!f_res) {
             sage::util::log_error("Failed to register files for '{}': {}", installed_pkg.name, f_res.error());
             return 1;
@@ -814,43 +879,49 @@ export int cmd_install(
             return 1;
         }
 
+        sage::db::FilesystemOperationRecord operation;
+        operation.id = filesystem_transaction.id();
+        operation.kind = "install";
+        operation.phase = std::string(sage::db::phase_filesystem_pending);
+        operation.transaction_dir = filesystem_transaction.relative_dir();
+        operation.journal_sha256 = *journal_hash;
+        auto op_res = db.put_operation(*package_txn, operation);
+        if (!op_res) {
+            sage::util::log_error(
+                "Failed to record operation for '{}': {}", installed_pkg.name, op_res.error());
+            return 1;
+        }
+
         auto package_commit = package_txn->commit();
         if (!package_commit) {
             sage::util::log_error("Failed to commit package '{}': {}", installed_pkg.name, package_commit.error());
             return 1;
         }
-
-        committed_packages.push_back(installed_pkg);
-        all_touched_files.insert(
-            all_touched_files.end(),
-            package_touched_files.begin(), package_touched_files.end());
+        journal_rewind.armed = false;
+        committed_journal_text = journal_text;
         any_package_committed = true;
 
-        // Toolchain activation and profile generation are needed immediately:
-        // a later package may depend on the aliases created for this commit.
-        const auto t_post0 = std::chrono::steady_clock::now();
-        run_package_postprocessing(installed_pkg, true);
-        std::println("[timing] postprocess(per-pkg): {:.1f}s",
+        std::println("[timing] staged '{}': {:.1f}s",
+            installed_pkg.name,
             std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_post0).count());
+                std::chrono::steady_clock::now() - t_phase0).count());
     }
 
-    // Run triggers once after the complete install set.
-    const auto t_trig = std::chrono::steady_clock::now();
-    // Run triggers once after the complete install set. This happens after
-    // toolchain activation so freshly written
-    // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig, and
-    // after the DB commit so a capability installed in this very transaction
-    // (mkinitcpio arriving alongside the kernel that needs it) is already
-    // visible when the initramfs trigger looks for its provider.
-    if (!run_aggregate_triggers()) {
-        aggregate_done = true;
+    // Publish every staged plan and run the aggregate post-install triggers
+    // through the shared recovery/resume driver: toolchain switches, FHS
+    // profile regeneration, triggers, record deletion, txn retirement.
+    // Normal path: the explicit resume below supersedes the failure guard.
+    finalize_prefix_guard.disarmed = true;
+    const auto t_resume = std::chrono::steady_clock::now();
+    auto resumed = sage::rebuild::resume_pending_operations(db, opts.target_root);
+    if (!resumed) {
+        sage::util::log_error(
+            "Failed to complete pending filesystem operations: {}", resumed.error());
         return 1;
     }
-    aggregate_done = true;
-    std::println("[timing] aggregate-triggers: {:.1f}s",
+    std::println("[timing] publish+postprocess: {:.1f}s",
         std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_trig).count());
+            std::chrono::steady_clock::now() - t_resume).count());
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;

@@ -74,6 +74,7 @@ struct Trigger {
     std::string name;
     std::vector<std::string> on_paths;
     std::vector<std::string> on_capability;
+    bool required{false};             // missing exec: hard error vs. warn+skip
     std::string exec;                 // absolute path inside the target root
     std::vector<std::string> args;
     std::string run_capability;       // resolved via the provider's hook
@@ -146,6 +147,7 @@ inline std::expected<void, std::string> parse_triggers(const vendor::toml::table
             tr.name = (*t)["name"].value_or("");
             tr.exec = (*t)["exec"].value_or("");
             tr.run_capability = (*t)["run_capability"].value_or("");
+            tr.required = (*t)["required"].value_or(false);
             tr.priority = static_cast<int>((*t)["priority"].value_or(50LL));
             read_strings(*t, "on_paths", tr.on_paths);
             read_strings(*t, "on_capability", tr.on_capability);
@@ -206,6 +208,7 @@ inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers)
         if (!t.exec.empty()) {
             ss << "exec = \"" << quote(t.exec) << "\"\n";
         }
+        if (t.required) ss << "required = true\n";
         ss << "priority = " << t.priority << "\n";
         if (!t.args.empty()) {
             ss << "args = [";

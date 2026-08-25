@@ -56,6 +56,7 @@ Commands:
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
   verify [PKG...]          Check installed files against the recorded files.idx hashes
   status [--full]          Show declared providers, channels, and database state
+  recover [--abandon <ID>] Resume interrupted operations; --abandon retires one (data may be inconsistent)
 
 Global Options:
   --root, --sysroot <DIR>  Operate on target root directory (default: /)
@@ -162,7 +163,7 @@ inline std::expected<void, std::string> validate_operation_user(
 {
     if (effective_uid == 0) return {};
     return std::unexpected(
-        "install, remove, and rebuild operations require root privileges");
+        "install, remove, rebuild, and recover operations require root privileges");
 }
 
 inline std::expected<bool, std::string> probe_package_database(

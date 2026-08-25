@@ -296,6 +296,35 @@ inline std::expected<std::filesystem::path, std::string> service_destination(
     }
 }
 
+inline std::expected<std::string, std::string> render_service(
+    const ServiceSpec& spec,
+    InitType init_type)
+{
+    switch (init_type) {
+        case InitType::OpenRC:  return spec.render_openrc();
+        case InitType::Systemd: return spec.render_systemd();
+        case InitType::Runit:   return spec.render_runit();
+        case InitType::Dinit:   return spec.render_dinit();
+        case InitType::S6:      return spec.render_s6();
+        case InitType::Loom:
+            return std::unexpected(
+                "Loom generation requires the original Sage service document");
+        default:
+            return std::unexpected("Unsupported init system");
+    }
+}
+
+inline bool script_is_executable(InitType init_type) noexcept {
+    switch (init_type) {
+        case InitType::OpenRC:
+        case InitType::Runit:
+        case InitType::S6:
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline std::expected<std::filesystem::path, std::string> generate_service(
     const ServiceSpec& spec,
     InitType init_type,
@@ -303,38 +332,10 @@ inline std::expected<std::filesystem::path, std::string> generate_service(
 {
     auto dest_res = service_destination(spec.name, init_type, sysroot);
     if (!dest_res) return std::unexpected(dest_res.error());
-    std::filesystem::path dest = std::move(*dest_res);
-    std::string content;
-    bool is_executable = false;
+    auto content_res = render_service(spec, init_type);
+    if (!content_res) return std::unexpected(content_res.error());
 
-    switch (init_type) {
-        case InitType::OpenRC:
-            content = spec.render_openrc();
-            is_executable = true;
-            break;
-        case InitType::Systemd:
-            content = spec.render_systemd();
-            is_executable = false;
-            break;
-        case InitType::Runit:
-            content = spec.render_runit();
-            is_executable = true;
-            break;
-        case InitType::Dinit:
-            content = spec.render_dinit();
-            is_executable = false;
-            break;
-        case InitType::S6:
-            content = spec.render_s6();
-            is_executable = true;
-            break;
-        case InitType::Loom:
-            return std::unexpected(
-                "Loom generation requires the original Sage service document");
-        default:
-            return std::unexpected("Unsupported init system");
-    }
-
+    const std::filesystem::path dest = std::move(*dest_res);
     if (auto parent = dest.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
     }
@@ -343,14 +344,10 @@ inline std::expected<std::filesystem::path, std::string> generate_service(
     if (!out.is_open()) {
         return std::unexpected("Failed to write service file: " + dest.string());
     }
-    out << content;
+    out << *content_res;
     out.close();
 
-    if (is_executable) {
-        ::chmod(dest.c_str(), 0755);
-    } else {
-        ::chmod(dest.c_str(), 0644);
-    }
+    ::chmod(dest.c_str(), script_is_executable(init_type) ? 0755 : 0644);
 
     return dest;
 }

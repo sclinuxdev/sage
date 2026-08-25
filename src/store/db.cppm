@@ -2,6 +2,7 @@ export module sage.db;
 
 import std;
 import sage.vendor.lmdb;
+import sage.vendor.toml;
 import sage.package;
 import sage.util;
 
@@ -52,6 +53,102 @@ std::string_view owner_package(std::string_view owner) {
     const auto colon = owner.find(':');
     return colon == std::string_view::npos ? owner : owner.substr(0, colon);
 }
+// A committed package operation lives in two places at once: an LMDB record
+// here and a transaction directory on disk (journal + staged payload). The
+// phase field is the crash-recovery state machine; the record's absence is
+// itself a state:
+//
+//   no record              -> nothing committed (staging is RAII/孤儿 GC territory)
+//   filesystem_pending     -> package/provider/file metadata AND this record
+//                             were committed atomically in one write txn;
+//                             journal+payload were fsynced *before* that
+//                             commit, so the record can never point at
+//                             half-persisted evidence. Recovery: verify
+//                             journal hash, publish to live tree.
+//   postprocess_pending    -> filesystem publish done, post-processing
+//                             (triggers/profile/toolchains) not. Recovery:
+//                             rerun post-processing from journal context.
+//   no record again        -> everything finished; only then may the record
+//                             be deleted and the txn directory retired.
+//
+// Every failure keeps the record and evidence untouched so the next run
+// retries from the same phase.
+inline constexpr std::string_view phase_filesystem_pending = "filesystem_pending";
+inline constexpr std::string_view phase_postprocess_pending = "postprocess_pending";
+
+inline constexpr auto operation_schema_version = 1;
+
+struct FilesystemOperationRecord {
+    std::string id, kind, phase, transaction_dir, journal_sha256;
+};
+
+// The value is TOML per contract §3, but written by hand: toml++'s stream
+// serializer cannot cross the sage.vendor.toml module boundary (only its
+// parser is re-exported), and manifest.cppm already established this exact
+// manual-writer pattern for DB values.
+std::string serialize_operation(const FilesystemOperationRecord& record) {
+    const auto quote = [](std::string_view value) {
+        return '"' + package::escape_toml_basic_string(value) + '"';
+    };
+    std::ostringstream ss;
+    ss << "schema_version = " << operation_schema_version << "\n\n";
+    ss << "id = " << quote(record.id) << "\n";
+    ss << "kind = " << quote(record.kind) << "\n";
+    ss << "phase = " << quote(record.phase) << "\n";
+    ss << "transaction_dir = " << quote(record.transaction_dir) << "\n";
+    ss << "journal_sha256 = " << quote(record.journal_sha256) << "\n";
+    return ss.str();
+}
+
+std::expected<FilesystemOperationRecord, std::string> parse_operation(
+    std::string_view id,
+    std::string_view value)
+{
+    auto parsed = vendor::toml::parse_string(value);
+    if (!parsed) {
+        return std::unexpected(std::format(
+            "Failed to parse operation '{}' record: {}", id, parsed.error()));
+    }
+    const auto& tbl = *parsed;
+
+    // Unknown future schema versions must fail loudly rather than be
+    // half-understood by a recovery driver that would then delete or
+    // republish evidence on wrong assumptions.
+    const auto* schema_version = tbl["schema_version"].as_integer();
+    if (!schema_version) {
+        return std::unexpected(std::format(
+            "Operation '{}' record has no integer schema_version", id));
+    }
+    if (schema_version->get() != operation_schema_version) {
+        return std::unexpected(std::format(
+            "Operation '{}' record uses unsupported schema version {}", id, schema_version->get()));
+    }
+
+    FilesystemOperationRecord record;
+    for (const auto& [key, target] : {
+        std::pair{std::string_view{"id"}, &record.id},
+        std::pair{std::string_view{"kind"}, &record.kind},
+        std::pair{std::string_view{"phase"}, &record.phase},
+        std::pair{std::string_view{"transaction_dir"}, &record.transaction_dir},
+        std::pair{std::string_view{"journal_sha256"}, &record.journal_sha256},
+    }) {
+        if (auto v = tbl[key].value<std::string_view>()) *target = std::string(*v);
+        else return std::unexpected(std::format(
+            "Operation '{}' record is missing string field '{}'", id, key));
+    }
+    return record;
+}
+
+
+// Ownership claims retired by the running transaction itself: cleaned path
+// -> names of the packages whose previous revisions give that path up during
+// this very transaction. A split-package upgrade moves files between package
+// identities inside one install run -- when the new owner is checked, the
+// old owner's claim is still on record -- so conflict detection must
+// tolerate exactly these in-flight handovers instead of rejecting every
+// foreign claim against the pre-transaction database state.
+using ReleasedClaims =
+    std::unordered_map<std::string, std::unordered_set<std::string>>;
 
 class Database {
 public:
@@ -123,6 +220,10 @@ private:
         auto dbi_sys = vendor::lmdb::MdbDbi::open(txn, "system", dbi_flags);
         if (!dbi_sys) return std::unexpected("Failed to open system table: " + dbi_sys.error());
         db.dbi_system_ = *dbi_sys;
+
+        auto dbi_ops = vendor::lmdb::MdbDbi::open(txn, "operations", dbi_flags);
+        if (!dbi_ops) return std::unexpected("Failed to open operations table: " + dbi_ops.error());
+        db.dbi_operations_ = *dbi_ops;
 
         auto commit_res = txn.commit();
         if (!commit_res) return std::unexpected(commit_res.error());
@@ -293,10 +394,14 @@ public:
     }
 
     // Register package files into LMDB with atomic conflict checking
+    // allowed_owner repeats the caller's own previous identity;
+    // released_claims lists the foreign owners giving their paths up inside
+    // the same transaction. A path conflicts only when an owner survives it.
     std::expected<void, std::string> check_file_conflicts(
         vendor::lmdb::MdbTxn& txn,
         std::optional<std::string_view> allowed_owner,
-        const std::vector<package::FileEntry>& files)
+        const std::vector<package::FileEntry>& files,
+        const ReleasedClaims& released_claims = {})
     {
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
@@ -308,7 +413,14 @@ public:
                 return std::unexpected(std::format(
                     "Failed to check ownership for '{}': {}", cleaned, existing.error()));
             }
-            if (*existing && (!allowed_owner || **existing != *allowed_owner)) {
+            if (!*existing) continue;
+            for (const auto owner : split_owners(**existing)) {
+                if (allowed_owner && owner == *allowed_owner) continue;
+                const auto released = released_claims.find(cleaned);
+                if (released != released_claims.end()
+                    && released->second.contains(std::string{owner_package(owner)})) {
+                    continue;
+                }
                 return std::unexpected(std::format(
                     "File conflict: '{}' is already owned by '{}'",
                     cleaned, **existing));
@@ -322,11 +434,13 @@ public:
         std::string_view pkg_name,
         std::string_view channel,
         const std::vector<package::FileEntry>& files,
-        std::optional<std::string_view> allowed_owner = std::nullopt)
+        std::optional<std::string_view> allowed_owner = std::nullopt,
+        const ReleasedClaims& released_claims = {})
     {
         std::string owner_val = std::format("{}:{}", pkg_name, channel);
 
-        auto conflict_res = check_file_conflicts(txn, allowed_owner, files);
+        auto conflict_res = check_file_conflicts(
+            txn, allowed_owner, files, released_claims);
         if (!conflict_res) return conflict_res;
 
         // Insert file records (new owner claims file)
@@ -548,6 +662,93 @@ public:
         return res;
     }
 
+    // ========================================================================
+    // Operations Table (filesystem transaction recovery records)
+    // ========================================================================
+
+    // The caller must put/update the record inside the SAME write transaction
+    // as the package/provider/file metadata: that single LMDB commit is what
+    // makes "metadata visible" and "operation resumable" indivisible. A record
+    // committed without its metadata would send recovery after an install
+    // whose packages do not exist; the reverse would strand published files.
+    std::expected<void, std::string> put_operation(
+        vendor::lmdb::MdbTxn& txn,
+        const FilesystemOperationRecord& record)
+    {
+        return dbi_operations_.put(txn, record.id, serialize_operation(record));
+    }
+
+    std::expected<std::optional<FilesystemOperationRecord>, std::string> get_operation(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view id)
+    {
+        auto val = dbi_operations_.get_checked(txn, id);
+        if (!val) {
+            return std::unexpected(std::format("Failed to read operation '{}' record: {}", id, val.error()));
+        }
+        if (!*val) return std::optional<FilesystemOperationRecord>{};
+        auto parsed = parse_operation(id, **val);
+        if (!parsed) return std::unexpected(parsed.error());
+        return std::optional<FilesystemOperationRecord>{std::move(*parsed)};
+    }
+
+    std::expected<std::vector<FilesystemOperationRecord>, std::string> list_operations() {
+        auto txn = begin_read_txn();
+        if (!txn) return std::unexpected("Failed to open operation read transaction: " + txn.error());
+        return list_operations(*txn);
+    }
+
+    std::expected<std::vector<FilesystemOperationRecord>, std::string> list_operations(
+        vendor::lmdb::MdbTxn& txn)
+    {
+        std::vector<FilesystemOperationRecord> list;
+        auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_operations_);
+        if (!cur_res) return std::unexpected("Failed to open operation cursor: " + cur_res.error());
+        auto& cursor = *cur_res;
+
+        std::string_view k, v;
+        auto entry = cursor.first(k, v);
+        if (!entry) return std::unexpected("Failed to read operation cursor: " + entry.error());
+        while (*entry) {
+            auto parsed = parse_operation(k, v);
+            if (!parsed) return std::unexpected(parsed.error());
+            list.push_back(std::move(*parsed));
+
+            entry = cursor.next(k, v);
+            if (!entry) return std::unexpected("Failed to advance operation cursor: " + entry.error());
+        }
+        return list;
+    }
+
+    // Rewrites the stored value with only the phase changed; the journal
+    // hash and transaction dir must survive so recovery evidence stays intact.
+    std::expected<void, std::string> update_operation_phase(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view id,
+        std::string_view phase)
+    {
+        auto existing = get_operation(txn, id);
+        if (!existing) return std::unexpected(existing.error());
+        if (!*existing) {
+            return std::unexpected(std::format(
+                "Cannot update phase of unknown operation '{}'", id));
+        }
+        (*existing)->phase = std::string(phase);
+        return put_operation(txn, **existing);
+    }
+
+    // Only reached once publish AND post-processing have fully succeeded --
+    // deleting earlier would turn a crash into silent partial state, since a
+    // missing record reads as "nothing pending". abandon_id is the only path
+    // that may delete a non-finished record.
+    std::expected<void, std::string> delete_operation(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view id)
+    {
+        return dbi_operations_.del(txn, id);
+    }
+
+
 private:
     vendor::lmdb::MdbEnv env_;
     vendor::lmdb::MdbDbi dbi_packages_;
@@ -555,6 +756,7 @@ private:
     vendor::lmdb::MdbDbi dbi_provides_;
     vendor::lmdb::MdbDbi dbi_channels_;
     vendor::lmdb::MdbDbi dbi_system_;
+    vendor::lmdb::MdbDbi dbi_operations_;
 };
 
 } // namespace sage::db

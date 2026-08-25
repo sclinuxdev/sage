@@ -312,6 +312,7 @@ struct PackageManifest {
             ss << "]\n";
             ss << "run_capability = \"" << quote(t.run_capability) << "\"\n";
             ss << "exec = \"" << quote(t.exec) << "\"\n";
+            if (t.required) ss << "required = true\n";
             ss << "priority = " << t.priority << "\n";
             ss << "args = [";
             for (size_t i = 0; i < t.args.size(); ++i) {

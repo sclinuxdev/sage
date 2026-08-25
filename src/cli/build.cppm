@@ -212,8 +212,10 @@ export int cmd_build(const CliOptions& opts) {
     const auto& cfg = *cfg_res;
     std::uint64_t highest_published_release = 0;
     bool has_published_release = false;
+    std::size_t active_channels = 0;
     for (const auto& configured : cfg.channels) {
         if (!configured.enabled || configured.url.empty()) continue;
+        ++active_channels;
         sage::channel::Channel channel;
         channel.name = configured.name;
         channel.url = configured.url;
@@ -222,9 +224,13 @@ export int cmd_build(const CliOptions& opts) {
         channel.enabled = true;
         auto published = sage::channel::ProfileManager::sync_channel(channel, cfg.cache_dir);
         if (!published) {
-            sage::util::log_error("Cannot determine published releases from Recipedia channel '{}': {}",
-                                  configured.name, published.error());
-            return 1;
+            // A dead or offline channel must not kill the build: the recipe
+            // declares its own release, so degrade to a warning and let that
+            // value stand instead of failing every offline invocation.
+            sage::util::log_warn("Cannot determine published releases from Recipedia channel '{}': {}; "
+                                 "using the recipe-declared release",
+                                 configured.name, published.error());
+            continue;
         }
         for (const auto& package : published->available_packages) {
             if (package.name != r.name
@@ -236,6 +242,9 @@ export int cmd_build(const CliOptions& opts) {
             highest_published_release = std::max(highest_published_release, *release);
             has_published_release = true;
         }
+    }
+    if (active_channels == 0) {
+        sage::util::log_info("No channels configured; release uses the recipe-declared value");
     }
     if (has_published_release) {
         if (highest_published_release == std::numeric_limits<std::uint64_t>::max()) {
