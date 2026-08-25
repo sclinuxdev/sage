@@ -3897,6 +3897,7 @@ install = [
 name = "svcanary"
 version = "1.0.0"
 release = "1"
+arch = "any"
 description = "service manifest canary"
 license = "MIT"
 channel = "system"
@@ -3919,7 +3920,7 @@ after = ["net"]
 )";
         }
         auto svcpkg = build_with_root(svc_dir, canary_root, temp_dir / "bcfg-svc-x",
-                                      "svcanary-1.0.0-1-x86_64.pkg.tar.zst");
+                                      "svcanary-1.0.0-1-any.pkg.tar.zst");
         if (!svcpkg || svcpkg->service_toml.empty()) {
             sage::util::log_error("service.toml did not ride the built manifest");
             return 1;
@@ -3929,6 +3930,84 @@ after = ["net"]
             || spec_back->exec_start != "/usr/bin/svcanary --foreground"
             || spec_back->after.size() != 1 || spec_back->after[0] != "net") {
             sage::util::log_error("Manifest service_toml failed to round-trip through serialization");
+            return 1;
+        }
+
+        // Riding the manifest is only half the journey. The reconcile pass
+        // renders init scripts from what LMDB holds, so the definition has to
+        // survive installation, and a reconcile that finds no provider change
+        // still has to generate what is missing -- otherwise a daemon is only
+        // ever wired up by an unrelated swap happening to come along.
+        auto svc_root = temp_dir / "bcfg-svc-root";
+        std::filesystem::create_directories(svc_root / "etc/sage");
+        {
+            // No [providers] table on purpose. Declaring one on a root whose
+            // LMDB has no provider bindings yet would make the planner see
+            // every exclusive capability as needing a swap, and the plan under
+            // test here is specifically the one with nothing to swap. Absent
+            // providers leave the planner with no exclusive interfaces to
+            // compare and target_init falling back to systemd.
+            std::ofstream f(svc_root / "etc/sage/system.toml");
+            f << "schema_version = 1\n";
+        }
+        CliOptions svc_install;
+        svc_install.target_root = svc_root;
+        svc_install.args = {
+            (svc_dir / "svcanary-1.0.0-1-any.pkg.tar.zst").string()
+        };
+        if (cmd_install(svc_install, "/") != 0) {
+            sage::util::log_error("Failed to install the service manifest canary");
+            return 1;
+        }
+        auto svc_db = sage::db::Database::open(svc_root / "var/lib/sage/data.mdb", true);
+        if (!svc_db) {
+            sage::util::log_error("Failed to open the service canary database");
+            return 1;
+        }
+        auto installed_svc = svc_db->get_package("svcanary");
+        if (!installed_svc || !*installed_svc
+            || (**installed_svc).service_toml != svcpkg->service_toml) {
+            sage::util::log_error("Installed package database lost service.toml");
+            return 1;
+        }
+        const auto svc_unit = svc_root / "usr/lib/systemd/system/svcanary.service";
+        if (std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Install rendered a service unit it was not supposed to");
+            return 1;
+        }
+        auto svc_cfg = sage::config::SystemConfig::load_from_root(svc_root);
+        if (!svc_cfg) {
+            sage::util::log_error("Failed to load the service canary system config");
+            return 1;
+        }
+        // Planned, not hand-built: this must exercise the real no-change plan,
+        // which is exactly the path that used to return before generating.
+        auto svc_plan = sage::rebuild::ReconcileEngine::calculate_diff(*svc_db, *svc_cfg, false);
+        if (!svc_plan || svc_plan->has_changes
+            || svc_plan->target_init != sage::service::InitType::Systemd) {
+            sage::util::log_error(
+                "Service canary reconcile should have planned no change against systemd");
+            return 1;
+        }
+        auto svc_exec = sage::rebuild::ReconcileEngine::execute(
+            *svc_db, *svc_plan, svc_root, false, svc_cfg->providers);
+        if (!svc_exec || !std::filesystem::exists(svc_unit)) {
+            sage::util::log_error(
+                "Reconcile without provider changes did not generate the service definition: {}",
+                svc_exec.error_or("unit missing"));
+            return 1;
+        }
+        // ... and having generated it, the next reconcile has nothing left to
+        // do: the cheap pending check must not drag a staging transaction into
+        // every subsequent rebuild.
+        auto svc_plan_again = sage::rebuild::ReconcileEngine::calculate_diff(*svc_db, *svc_cfg, false);
+        auto svc_exec_again = svc_plan_again
+            ? sage::rebuild::ReconcileEngine::execute(
+                  *svc_db, *svc_plan_again, svc_root, false, svc_cfg->providers)
+            : std::expected<void, std::string>(std::unexpected("plan failed"));
+        if (!svc_exec_again) {
+            sage::util::log_error("Second reconcile over a settled root failed: {}",
+                svc_exec_again.error());
             return 1;
         }
 

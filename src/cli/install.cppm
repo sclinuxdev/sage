@@ -610,6 +610,11 @@ export int cmd_install(
         // stale-claim cleanup below can honor them even if the channel index
         // predates the declaration.
         installed_pkg.conffiles = ext_res->manifest.conffiles;
+        // And the universal service definition, for the same reason: the
+        // reconcile pass renders init scripts from what the database holds,
+        // so a daemon whose service.toml never reaches LMDB is a daemon no
+        // init system will ever be told about.
+        installed_pkg.service_toml = ext_res->manifest.service_toml;
 
         // Conffile protection under staging: extraction cannot compare against
         // the live tree (its fifth parameter would probe the empty staging

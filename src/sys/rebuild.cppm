@@ -483,6 +483,37 @@ public:
         return plan;
     }
 
+    // True when some installed package declares a service that has no
+    // definition on disk yet. Packages shipping their own native unit are not
+    // pending: the reconcile pass lets package data win over the generated
+    // form, so a present owner means there is nothing to generate. Unparsable
+    // service.toml is not pending either -- the reconcile pass warns about
+    // those and skips them, and waking a whole transaction to repeat a warning
+    // helps nobody.
+    static std::expected<bool, std::string> services_awaiting_generation(
+        db::Database& db,
+        service::InitType target_init,
+        const std::filesystem::path& sysroot)
+    {
+        auto installed = db.list_installed_packages();
+        if (!installed) {
+            return std::unexpected(
+                "Installed package database is inconsistent: " + installed.error());
+        }
+        for (const auto& pkg : *installed) {
+            if (pkg.service_toml.empty()) continue;
+            auto spec = service::ServiceSpec::parse_toml(pkg.service_toml);
+            if (!spec) continue;
+            auto dest = service::service_destination(spec->name, target_init, sysroot);
+            if (!dest) continue;
+            auto owners = db.get_path_owners(dest->string());
+            if (owners && !owners->empty()) continue;
+            std::error_code ec;
+            if (!std::filesystem::exists(*dest, ec)) return true;
+        }
+        return false;
+    }
+
     static std::expected<void, std::string> execute(
         db::Database& db,
         const ReconcilePlan& plan,
@@ -491,8 +522,24 @@ public:
         const std::map<std::string, std::string>& providers = {})
     {
         if (!plan.has_changes) {
-            util::log_info("System state matches desired configuration. No reconcile needed.");
-            return {};
+            // Providers already match, but that is not the only reason to
+            // reconcile: nothing in the install path renders service scripts,
+            // so a package carrying a service.toml has no definition on disk
+            // until a reconcile runs. Returning here unconditionally meant
+            // such a daemon was never wired up unless an unrelated provider
+            // swap happened to come along.
+            //
+            // The check stays cheap deliberately. Entering the body now costs
+            // a staging transaction, a journal and an fsync, so a genuine
+            // no-op must still cost nothing.
+            auto pending = services_awaiting_generation(db, plan.target_init, sysroot);
+            if (!pending) return std::unexpected(pending.error());
+            if (!*pending) {
+                util::log_info("System state matches desired configuration. No reconcile needed.");
+                return {};
+            }
+            util::log_info(
+                "System providers already match; generating missing service definitions.");
         }
 
         util::log_info("Executing Declarative System Reconcile (Target Init: {})...", service::to_string(plan.target_init));
@@ -699,6 +746,11 @@ public:
             installed_pkg.files = std::move(ext_res->extracted_files);
             installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
             installed_pkg.triggers = ext_res->manifest.triggers;
+            // Same archive-only metadata the install path adopts: the channel
+            // index carries neither, and the service pass below reads the
+            // service definition back out of the database.
+            installed_pkg.conffiles = ext_res->manifest.conffiles;
+            installed_pkg.service_toml = ext_res->manifest.service_toml;
 
             auto p_res = db.put_package(*wtxn, installed_pkg);
             if (!p_res) return std::unexpected(p_res.error());
