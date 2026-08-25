@@ -8,6 +8,33 @@ import std;
 
 export namespace sage::vendor::zstd {
 
+// One-shot decompression of a whole frame whose uncompressed size is known
+// up front (ELF SHF_COMPRESSED sections carry it in their Chdr). Output is
+// capped: oversized frames come back truncated with the flag set so callers
+// stay honest about completeness.
+struct BufferDecompress {
+    std::string bytes;
+    bool truncated{false};
+};
+
+inline std::expected<BufferDecompress, std::string>
+decompress_buffer(std::string_view src, size_t uncompressed_size, size_t cap) {
+    BufferDecompress out;
+    out.truncated = uncompressed_size > cap;
+    const auto take = out.truncated ? cap : uncompressed_size;
+    out.bytes.resize(take);
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) return std::unexpected("zstd: cannot create DCtx");
+    const size_t rc = ZSTD_decompressDCtx(
+        dctx, out.bytes.data(), take, src.data(), src.size());
+    ZSTD_freeDCtx(dctx);
+    if (ZSTD_isError(rc)) {
+        return std::unexpected(std::string("zstd: ") + ZSTD_getErrorName(rc));
+    }
+    out.bytes.resize(rc);
+    return out;
+}
+
 class ZstdDecompressStream {
 public:
     ZstdDecompressStream() noexcept : dctx_(ZSTD_createDCtx()) {}

@@ -220,6 +220,21 @@ export int cmd_query(const CliOptions& opts) {
             std::println("License:     {}", pkg.license);
             std::println("Description: {}", pkg.description);
             std::println("Provides:    {}", sage::util::join(pkg.provides, ", "));
+            if (!pkg.build_producers.empty()) {
+                std::println("Build Producers:");
+                for (const auto& p : pkg.build_producers) {
+                    auto versions = sage::util::join(p.versions, "+");
+                    std::println("  • {:<10} {}", p.name,
+                        versions.empty() ? "(version unknown)" : versions);
+                    if (!p.flags.empty()) {
+                        std::println("      flags (artifact-verified): {}", p.flags);
+                    }
+                }
+                if (!pkg.build_flag_passthrough.empty()) {
+                    std::println("  Flag passthrough channels: {}",
+                        sage::util::join(pkg.build_flag_passthrough, ", "));
+                }
+            }
         } else {
             sage::util::log_error("Package '{}' is not installed", pkg_name);
             return 1;

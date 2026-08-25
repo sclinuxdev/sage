@@ -6,7 +6,7 @@
 -- 版本号在这里写一遍，set_version 与注入给 C++ 的 SAGE_VERSION 都取它。
 -- 手写第二处的后果已经出现过：0.1.3 -> 0.2.0 那次 xmake.lua 升了，
 -- CLI banner 没跟上，于是 `sage --version` 与包元数据各说各的。
-local SAGE_VERSION = "0.2.0"
+local SAGE_VERSION = "0.2.1"
 
 set_project("sage")
 set_version(SAGE_VERSION)
@@ -19,7 +19,8 @@ set_warnings("all", "extra")
 -- Enable optimization for release mode
 if is_mode("release") then
     set_optimize("fastest")
-    set_strip("all")
+    -- TEMP-DIAG: strip disabled to symbolize the cmd_build segfault core.
+    -- set_strip("all")
 elseif is_mode("debug") then
     set_symbols("debug")
     set_optimize("none")
@@ -38,7 +39,7 @@ target("sage")
     add_defines("SAGE_VERSION=\"" .. SAGE_VERSION .. "\"")
     add_files("src/**.cppm")
     add_files("src/main.cpp")
-    add_links("archive", "crypto", "lmdb", "zstd", "curl")
+    add_links("archive", "crypto", "lmdb", "zstd", "curl", "z")
     add_cxxflags("-msha", "-msse4.1", "-mssse3", "-maes", "-mpclmul")
     set_default(true)
 
@@ -50,5 +51,5 @@ target("sage-tests")
     add_files("src/**.cppm")
     add_files("tests/**.cppm")
     add_files("tests/main.cpp")
-    add_links("archive", "crypto", "lmdb", "zstd", "curl")
+    add_links("archive", "crypto", "lmdb", "zstd", "curl", "z")
     add_cxxflags("-msha", "-msse4.1", "-mssse3", "-maes", "-mpclmul")

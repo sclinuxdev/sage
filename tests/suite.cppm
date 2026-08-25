@@ -3932,6 +3932,213 @@ after = ["net"]
             return 1;
         }
 
+
+        // (h) Artifact-verified switches: compiling with -g makes GCC record
+        // its exact command line in DW_AT_producer (.debug_str), so the
+        // manifest must carry the REAL switches (-O2, -DFOO=7), not merely
+        // the injected environment.
+        auto vflags_dir = temp_dir / "bcfg-vflags";
+        if (!write_canary_recipe(vflags_dir, R"(schema_version = 1
+[package]
+name = "vflagcanary"
+version = "1.0.0"
+release = "1"
+description = "verified-switch canary"
+license = "MIT"
+channel = "system"
+
+[build]
+cflags = "-g -O2 -DFOO=7"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "int sage_vflag;\n" > vflag.c',
+    '$CC -c $CFLAGS vflag.c -o "$DESTDIR/usr/share/vflag.o"',
+]
+)")) {
+            sage::util::log_error("Failed to create verified-switch fixture");
+            return 1;
+        }
+        auto vflag_pkg = build_with_root(vflags_dir, canary_root,
+                                         temp_dir / "bcfg-vflags-x",
+                                         "vflagcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        {
+            bool verified = false;
+            if (vflag_pkg) {
+                for (const auto& p : vflag_pkg->build_producers) {
+                    // GCC's -grecord-gcc-switches deliberately omits -D
+                    // defines, so -O2/-g are the honest assertions here.
+                    if (p.flags.find("-O2") != std::string::npos
+                        && p.flags.find("-g") != std::string::npos) {
+                        verified = true;
+                    }
+                }
+            }
+            if (!verified) {
+                sage::util::log_error(
+                    "DW_AT_producer switches were not recorded as verified flags");
+                return 1;
+            }
+        }
+
+        // (i) Mixed producers: a payload naming TWO compiler families must
+        // yield one build_producers entry per family. A second .comment is
+        // spliced in with objcopy so the test does not depend on which
+        // compilers the host ships.
+        if (std::system("command -v objcopy >/dev/null 2>&1") == 0) {
+            auto mix_dir = temp_dir / "bcfg-mix";
+            if (!write_canary_recipe(mix_dir, R"(schema_version = 1
+[package]
+name = "mixcanary"
+version = "1.0.0"
+release = "1"
+description = "mixed-producer canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "int sage_mix;\n" > mix.c',
+    '$CC -c mix.c -o "$DESTDIR/usr/share/mix.o"',
+]
+)")) {
+                sage::util::log_error("Failed to create mixed-producer fixture");
+                return 1;
+            }
+            if (!build_with_root(mix_dir, canary_root, temp_dir / "bcfg-mix-x",
+                                 "mixcanary-1.0.0-1-x86_64.pkg.tar.zst")) {
+                sage::util::log_error("Mixed-producer base build failed");
+                return 1;
+            }
+            const auto inject_dir = temp_dir / "bcfg-mix-inject";
+            std::filesystem::create_directories(inject_dir);
+            // Splice a second producer fingerprint by overwriting the GCC
+            // .comment bytes in place (same length keeps the ELF valid) --
+            // no external tools, fully deterministic.
+            {
+                const auto mix_obj_src = temp_dir / "bcfg-mix-x/usr/share/mix.o";
+                std::ifstream in(mix_obj_src, std::ios::binary);
+                std::string bytes((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+                in.close();
+                const size_t at = bytes.find("GCC: (");
+                if (at == std::string::npos) {
+                    sage::util::log_error("No GCC fingerprint to overwrite in mix.o");
+                    return 1;
+                }
+                const std::string inject = "rustc version 9.9.9";
+                for (size_t k = 0; k < inject.size(); ++k) bytes[at + k] = inject[k];
+                std::filesystem::create_directories(inject_dir);
+                std::ofstream outb(mix_dir / "rust.o", std::ios::binary);
+                outb.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            }
+            // Keep both producer assets beside the recipe; phase shells get
+            // RECIPE_DIR injected, making the copy source explicit.
+            std::filesystem::copy_file(
+                temp_dir / "bcfg-mix-x/usr/share/mix.o", mix_dir / "native.o",
+                std::filesystem::copy_options::overwrite_existing);
+            if (!write_canary_recipe(mix_dir, R"(schema_version = 1
+[package]
+name = "mixcanary"
+version = "1.0.0"
+release = "2"
+description = "mixed-producer canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'mkdir -p "$DESTDIR/usr/share"',
+    'cp "$RECIPE_DIR/native.o" "$DESTDIR/usr/share/mix.o"',
+    'cp "$RECIPE_DIR/rust.o" "$DESTDIR/usr/share/mix-rust.o"',
+]
+)")) {
+                sage::util::log_error("Failed to rewrite mixed-producer recipe");
+                return 1;
+            }
+            auto mixed = build_with_root(mix_dir, canary_root, temp_dir / "bcfg-mix-x",
+                                         "mixcanary-1.0.0-2-x86_64.pkg.tar.zst");
+            bool has_rustc = false;
+            bool has_native = false;
+            if (mixed) {
+                for (const auto& p : mixed->build_producers) {
+                    if (p.name == "rustc") {
+                        for (const auto& v : p.versions)
+                            if (v.starts_with("9.9.9")) has_rustc = true;
+                    } else if (p.name == "gcc" || p.name == "clang") {
+                        has_native = true;
+                    }
+                }
+            }
+            if (!has_rustc || !has_native) {
+                sage::util::log_error(
+                    "Mixed rustc+C-family build did not produce one producer entry per family");
+                return 1;
+            }
+        }
+
+        // (j) Flag passthrough annotation round-trips: kernel-style recipes
+        // forward the very same flags through KCFLAGS/KAFLAGS, and the
+        // manifest must say so instead of leaving the coincidence suspicious.
+        auto pass_dir = temp_dir / "bcfg-passthrough";
+        if (!write_canary_recipe(pass_dir, R"(schema_version = 1
+[package]
+name = "passcanary"
+version = "1.0.0"
+release = "1"
+description = "passthrough annotation canary"
+license = "MIT"
+channel = "system"
+
+[build]
+passthrough_flags = ["KCFLAGS", "KAFLAGS"]
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf ok > "$DESTDIR/usr/share/done.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create passthrough annotation fixture");
+            return 1;
+        }
+        auto passpkg = build_with_root(pass_dir, canary_root, temp_dir / "bcfg-pass-x",
+                                       "passcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!passpkg || passpkg->build_flag_passthrough.size() != 2
+            || passpkg->build_flag_passthrough[0] != "KCFLAGS"
+            || passpkg->build_flag_passthrough[1] != "KAFLAGS") {
+            sage::util::log_error("Passthrough channel annotation failed to round-trip");
+            return 1;
+        }
+
+        // (k) A failing phase stops the build under the toolchain that ran --
+        // no silent retry under another compiler may manufacture a package.
+        auto stop_dir = temp_dir / "bcfg-stop";
+        if (!write_canary_recipe(stop_dir, R"(schema_version = 1
+[package]
+name = "stopcanary"
+version = "1.0.0"
+release = "1"
+description = "failure-stop canary"
+license = "MIT"
+channel = "system"
+install = [
+    'false',
+]
+)")) {
+            sage::util::log_error("Failed to create failure-stop fixture");
+            return 1;
+        }
+        {
+            CliOptions stop_opts;
+            stop_opts.args = {stop_dir.string()};
+            stop_opts.target_root = canary_root;
+            const int rc = cmd_build(stop_opts);
+            const auto archive_after =
+                canary_dir / "stopcanary-1.0.0-1-x86_64.pkg.tar.zst";
+            if (rc == 0 || std::filesystem::exists(archive_after)) {
+                sage::util::log_error(
+                    "A failing install phase must stop without an archive");
+                return 1;
+            }
+        }
+
+
         sage::util::log_success("13. Build Config Injection, Recipe Override & Compiler Fallback OK");
     }
 

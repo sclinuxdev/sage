@@ -55,11 +55,16 @@ struct PackageManifest {
     uint64_t installed_size{0};
     std::string file;  // Relative path in repository (e.g. "acl/acl-2.4.0-2-x86_64.pkg.tar.zst")
 
-    // Build provenance, stamped by cmd_build after a successful build: the
-    // compiler actually used (after any fallback) and the effective flags.
-    // Rides along through serialization -- which is also the LMDB record and
-    // the in-archive .METADATA/manifest.toml -- and is republished by the
-    // repository index. All empty for packages built before this existed.
+    // Build provenance, stamped by cmd_build after a successful build.
+    // build_compiler(_version): the primary producer by precedence, as the
+    // artifacts themselves identify it. build_cflags/cxxflags/ldflags: the
+    // environment the phase shells were invoked with (a true fact; some
+    // build systems ignore CFLAGS yet consume the same string through their
+    // own channel -- kernel KCFLAGS -- so this layer never claims
+    // consumption). Rides along through serialization -- which is also the
+    // LMDB record and the in-archive .METADATA/manifest.toml -- and is
+    // republished by the repository index. All empty for packages built
+    // before this existed.
     std::string build_compiler;
     std::string build_compiler_version;
     std::string build_cflags;
@@ -67,6 +72,23 @@ struct PackageManifest {
     std::string build_ldflags;
     // 实际传给 rustc 的 RUSTFLAGS（仅 rust 产物且本地真实编译时非空）。
     std::string build_rustflags;
+
+    // Every compiler family the artifacts name -- mixed rust+C++ builds get
+    // one entry each. flags = switches artifact-verified from DWARF
+    // DW_AT_producer strings (empty when the build recorded none: honesty
+    // over completeness); versions as distinct strings when several objects
+    // disagree. Empty vector for pre-0.2.1 packages.
+    struct BuildProducer {
+        std::string name;
+        std::vector<std::string> versions;
+        std::string flags;
+    };
+    std::vector<BuildProducer> build_producers;
+    // Env channels the recipe itself forwarded flags through (kernel
+    // KCFLAGS/KAFLAGS and kin). Annotation only: it explains why the injected
+    // build_cflags may equal the artifact-verified producer switches even
+    // when a build system nominally ignores CFLAGS.
+    std::vector<std::string> build_flag_passthrough;
 
     // Raw universal service definition (a full service.toml document) for
     // daemon packages: `sage rebuild` parses it and regenerates native
@@ -225,6 +247,43 @@ struct PackageManifest {
             }
         }
 
+        // [[build_producers]] -- one entry per compiler family the artifacts
+        // name. Absent entirely in pre-0.2.1 manifests.
+        // Historical quirk: these arrays may sit at root scope or nested
+        // inside [package]; accept either (mirrors the files dual-read).
+        auto producers_tbl = tbl.get_as<vendor::toml::array>("build_producers");
+        if (!producers_tbl)
+            if (auto* pkg2 = tbl.get_as<vendor::toml::table>("package"))
+                producers_tbl = pkg2->get_as<vendor::toml::array>("build_producers");
+        if (producers_tbl) {
+            for (auto&& el : *producers_tbl) {
+                auto* t = el.as_table();
+                if (!t) continue;
+                BuildProducer p;
+                p.name = (*t)["name"].value_or("");
+                if (p.name.empty()) continue;
+                if (auto* vs = t->get_as<vendor::toml::array>("versions")) {
+                    for (auto&& v : *vs) {
+                        if (auto s = v.value<std::string_view>()) {
+                            p.versions.emplace_back(*s);
+                        }
+                    }
+                }
+                p.flags = (*t)["flags"].value_or("");
+                m.build_producers.push_back(std::move(p));
+            }
+        }
+        auto pt_arr = tbl.get_as<vendor::toml::array>("build_flag_passthrough");
+        if (!pt_arr)
+            if (auto* pkg3 = tbl.get_as<vendor::toml::table>("package"))
+                pt_arr = pkg3->get_as<vendor::toml::array>("build_flag_passthrough");
+        if (pt_arr) {
+            for (auto&& el : *pt_arr) {
+                if (auto s = el.value<std::string_view>(); s && !s->empty()) {
+                    m.build_flag_passthrough.emplace_back(*s);
+                }
+            }
+        }
         parse_capability_hooks(tbl, m.capability_hooks);
         auto trig_res = parse_triggers(tbl, m.triggers);
         if (!trig_res) return std::unexpected(trig_res.error());
@@ -257,6 +316,32 @@ struct PackageManifest {
         if (!build_rustflags.empty()) ss << "build_rustflags = \"" << quote(build_rustflags) << "\"\n";
         if (!service_toml.empty()) ss << "service_toml = \"" << quote(service_toml) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
+        // Everything below lives at the ROOT scope: [package] closed above.
+        // Flag passthrough annotations: env channels the recipe itself
+        // forwarded flags through (kernel KCFLAGS/KAFLAGS and kin).
+        if (!build_flag_passthrough.empty()) {
+            ss << "build_flag_passthrough = [\n";
+            for (const auto& channel : build_flag_passthrough) {
+                ss << "    \"" << quote(channel) << "\",\n";
+            }
+            ss << "]\n";
+        }
+        // Same omission rule: [[build_producers]] appears only for packages
+        // whose artifacts named a producer.
+        for (const auto& p : build_producers) {
+            if (p.name.empty()) continue;
+            ss << "[[build_producers]]\n";
+            ss << "name = \"" << quote(p.name) << "\"\n";
+            ss << "versions = [\n";
+            for (const auto& v : p.versions) {
+                ss << "    \"" << quote(v) << "\",\n";
+            }
+            ss << "]\n";
+            if (!p.flags.empty()) {
+                ss << "flags = \"" << quote(p.flags) << "\"\n";
+            }
+            ss << "\n";
+        }
 
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {

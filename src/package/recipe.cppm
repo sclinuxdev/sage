@@ -49,6 +49,11 @@ struct Recipe {
     // Present-but-empty means "inject nothing" (kernel-style recipes whose
     // link line ignores LDFLAGS must not inherit a false provenance stamp).
     std::optional<std::string> ldflags;
+    // Env channels the recipe itself forwards flags through -- the kernel's
+    // KCFLAGS=/KAFLAGS= passthrough and kin. Purely an annotation: stamped
+    // onto the manifest so build_cflags equality with artifact-verified
+    // switches is explainable instead of suspicious.
+    std::vector<std::string> passthrough_flags;
     // A non-empty `cc` pins the toolchain: exactly this pair is used and the
     // global fallback never runs. Core system packages (glibc, systemd) pin
     // "gcc" because they must not silently rebuild under clang.
@@ -200,6 +205,13 @@ struct Recipe {
         // `cc` pins the compiler pair outright.
         if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
             if (auto v = (*bld)["cflags"].value<std::string_view>()) r.cflags = std::string(*v);
+            if (auto* passthrough = bld->get_as<vendor::toml::array>("passthrough_flags")) {
+                for (auto&& el : *passthrough) {
+                    if (auto s = el.value<std::string_view>(); s && !s->empty()) {
+                        r.passthrough_flags.emplace_back(*s);
+                    }
+                }
+            }
             if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
             if (auto v = (*bld)["cc"].value<std::string_view>()) r.cc = std::string(*v);
             if (auto v = (*bld)["cxx"].value<std::string_view>()) r.cxx = std::string(*v);

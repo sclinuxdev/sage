@@ -58,6 +58,11 @@ struct Provenance {
     // .comment too, so a clang-built package honestly carries a gcc trace --
     // each producer keeps its own version instead of one ambiguous value.
     std::map<std::string, std::set<std::string>> producer_versions;
+    // Actual switches per producer, extracted from DW_AT_producer strings in
+    // .debug_str (GCC records them by default via -grecord-gcc-switches;
+    // clang when -grecord-command-line is given). Empty for a producer means
+    // no artifact recorded its switches -- and then nothing is claimed.
+    std::map<std::string, std::set<std::string>> producer_switches;
 };
 
 // First dotted numeric token at/after `pos`: "clang version 22.1.8 (...)",
@@ -105,6 +110,49 @@ void scan_producers(Provenance& prov, std::string_view window) {
     }
 }
 
+// .debug_str variant: each DW_AT_producer string reads
+// "<sig> <version> [switches...]"; everything after the dotted version
+// token, up to the NUL that terminates the entry, is the actual switch set
+// the compiler was invoked with. Only whole-section scans may call this --
+// a truncated read must never yield partial "actuals".
+void scan_debug_switches(Provenance& prov, std::string_view window) {
+    // .debug_str producers differ from .comment ones: GCC writes
+    // "GNU C17"/"GNU C23"/"GNU C++ <ver> <switches...>" (no parenthesised
+    // form), so a dedicated "GNU C" needle is required to catch them.
+    static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
+        {std::string("GNU C"), "gcc"},
+        {std::string("clang vers") + "ion", "clang"},
+        {std::string("rustc vers") + "ion", "rustc"},
+    };
+    for (const auto& [sig, name] : SIGS) {
+        for (size_t at = window.find(sig); at != std::string_view::npos;
+             at = window.find(sig, at + 1)) {
+            const size_t body = at + sig.size();
+            auto skip_space = [&](size_t pos) {
+                while (pos < window.size() && window[pos] == ' ') ++pos;
+                return pos;
+            };
+            const size_t ver_begin = skip_space(body);
+            auto ver = version_after(window, ver_begin);
+            if (ver.empty()) continue;
+            size_t sw = ver_begin + ver.size();
+            while (sw < window.size()
+                   && (window[sw] == ' ' || window[sw] == '\0')) {
+                if (window[sw] == '\0') break;
+                ++sw;
+            }
+            size_t end = sw;
+            while (end < window.size() && window[end] != '\0') ++end;
+            std::string_view switches(window.substr(sw, end - sw));
+            while (!switches.empty() && switches.back() == ' ') switches.remove_suffix(1);
+            prov.producers.insert(std::string{name});
+            if (!switches.empty()) {
+                prov.producer_switches[std::string{name}].insert(
+                    std::string{switches});
+            }
+        }
+    }
+}
 std::string read_slabs(std::ifstream& in) {
     in.seekg(0, std::ios::end);
     const auto size = static_cast<std::streamoff>(in.tellg());
@@ -124,11 +172,13 @@ std::string read_slabs(std::ifstream& in) {
     return window;
 }
 
-// True when a payload file proves compilation, fingerprinting whatever
-// proves it. Plain files qualify by ELF magic or an object-archive suffix
-// and are scanned head+tail; zstd-framed ones (.ko.zst) only when the ELF
-// image inside their decompressed lead says so -- compressed data alone is
-// no evidence of anything.
+
+
+// Exact, section-guided fingerprinting. .comment yields the producer set and
+// versions; a whole (non-truncated) .debug_str additionally yields the real
+// switch sets. Non-ELF object archives (.a) keep the legacy head/tail slab
+// scan -- ar members carry their .comment contiguously enough for the
+// signatures to be found without parsing the ar container.
 bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
                        std::string_view base) {
     static constexpr std::string_view ELF_MAGIC = "\x7f" "ELF";
@@ -150,6 +200,8 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
         auto lead = sage::vendor::zstd::ZstdDecompressStream{}.decompress_lead(in, kFrameLead);
         if (!lead || lead->empty()
             || !std::string_view(*lead).starts_with(ELF_MAGIC)) return false;
+        // Compressed frames cannot be seeked into sections; the decompressed
+        // lead alone proves the producer (modules sit far under the cap).
         scan_producers(prov, *lead);
         return true;
     }
@@ -157,7 +209,30 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
     const bool object = base.ends_with(".o") || base.ends_with(".a")
                      || base.find(".so") != std::string_view::npos;
     if (head != ELF_MAGIC && !object) return false;
-    scan_producers(prov, read_slabs(in));
+
+    auto sections = sage::util::read_elf_sections(
+        path, {".comment", ".debug_str"});
+    if (!sections) {
+        // Not an ELF after all (plain .a member soup, corrupted file): fall
+        // back to the bounded slab scan so signatures are still found.
+        in.clear();
+        in.seekg(0);
+        scan_producers(prov, read_slabs(in));
+        return true;
+    }
+    for (auto& [k, v] : *sections)
+        std::cerr << " [" << k << "] trunc=" << v.truncated
+                  << " bytes=" << v.bytes.size()
+                  << " head='" << v.bytes.substr(0, 24) << "'";
+    std::cerr << "\n";
+    if (auto comment = sections->find(".comment"); comment != sections->end())
+        scan_producers(prov, comment->second.bytes);
+    if (auto debug = sections->find(".debug_str"); debug != sections->end()
+        && !debug->second.truncated) {
+        // Truncated .debug_str stays silent: partial switches would be fake
+        // actuals.
+        scan_debug_switches(prov, debug->second.bytes);
+    }
     return true;
 }
 
@@ -386,19 +461,17 @@ export int cmd_build(const CliOptions& opts) {
         if (!fetch_source(extra.url, extra.sha256, path)) return 1;
     }
 
-    // 2. Prepare, Build & Install Phases -- retried whole-hog per candidate
-    // toolchain. Every attempt starts from a pristine tree: a half-built src/
-    // left behind by a failed pass would poison the next candidate.
+    // 2. Prepare, Build & Install Phases -- exactly one toolchain, the first
+    // usable candidate. A build failure is caused by the compiler or the
+    // configured flags often enough that silently retrying under another
+    // compiler would manufacture a package nobody asked for: sage stops and
+    // says what ran instead. The fallback pair still exists at probe time
+    // (an absent primary is skipped before any compilation starts).
     Toolchain used;
-    bool built = false;
     const auto build_started = std::filesystem::file_time_type::clock::now()
         - std::chrono::seconds(90);   // 容忍时钟粒度/复制延迟
-    for (size_t attempt = 0; attempt < candidates.size(); ++attempt) {
-        const Toolchain& cand = candidates[attempt];
-        if (candidates.size() > 1) {
-            sage::util::log_info("Build attempt {} of {} with {} {}...",
-                attempt + 1, candidates.size(), cand.cc, cand.version);
-        }
+    {
+        const Toolchain& cand = candidates.front();
 
         std::error_code ec;
         std::filesystem::remove_all(pkg_dir, ec);
@@ -477,22 +550,25 @@ export int cmd_build(const CliOptions& opts) {
             return true;
         };
 
-        built = run_phase("prepare", r.prepare_cmds)
-             && run_phase("build", r.build_cmds)
-             && run_phase("install", r.install_cmds);
-        if (built) {
-            used = cand;
-            break;
+        if (!run_phase("prepare", r.prepare_cmds)
+            || !run_phase("build", r.build_cmds)
+            || !run_phase("install", r.install_cmds)) {
+            // Stop-and-prompt: a failed phase names the toolchain and the exact
+            // flags it ran under. No second compiler is tried behind the user's
+            // back -- the failure may be exactly about that compiler or those
+            // flags, and a silent swap would manufacture an unrequested variant.
+            sage::util::log_error(
+                "Build failed under {} {} (CXX='{}') with CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" CPPFLAGS=\"{}\"",
+                cand.cc, cand.version, cand.cxx, eff_cflags, eff_cxxflags,
+                bcfg.ldflags, bcfg.cppflags);
+            sage::util::log_error(
+                "Stopping instead of retrying another compiler. Pin [build] cc in "
+                "the recipe to force one, adjust cflags/cxxflags in build.toml or "
+                "the recipe, then rebuild.");
+            return 1;
         }
-        if (attempt + 1 < candidates.size()) {
-            sage::util::log_warn("{} build failed; falling back to {}", cand.cc, candidates[attempt + 1].cc);
-        }
+        used = cand;
     }
-    if (!built) {
-        sage::util::log_error("Build failed under every configured compiler ({} tried)", candidates.size());
-        return 1;
-    }
-
     // 3. Automated ELF Scanner for DT_SONAME & DT_NEEDED
     sage::package::PackageManifest manifest;
     manifest.name = r.name;
@@ -522,6 +598,7 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
         manifest.service_toml = svc_buf.str();
+        std::cerr << "MARK-svc size=" << manifest.service_toml.size() << "\n";
     }
 
     // Stamp build provenance from what the payload proves (filled below):
@@ -611,22 +688,54 @@ export int cmd_build(const CliOptions& opts) {
             }
             break;
         }
-        // rust 产物：只记 rustc 与实际生效的 RUSTFLAGS；C/C++ 产物：记录
-        // 注入到相位 shell 且真实生效的 CFLAGS/CXXFLAGS/LDFLAGS。
-        if (manifest.build_compiler == "rustc") {
-            if (const char* rf = std::getenv("RUSTFLAGS");
-                rf && *rf != '\0') {
-                manifest.build_rustflags = rf;
+        // build_cflags/cxxflags/ldflags record the environment the phase
+        // shells were actually invoked with -- a true fact about the build.
+        // Deliberately separate from what artifacts prove was consumed (that
+        // lives in build_producers below): some build systems ignore CFLAGS
+        // yet consume the very same string through their own channel -- the
+        // kernel's KCFLAGS= passthrough is the canonical case -- so equality
+        // between the two layers is legitimate, not double-counting.
+        if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
+        if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
+        const std::string eff_ldflags = r.ldflags.value_or(bcfg.ldflags);
+        if (!eff_ldflags.empty()) manifest.build_ldflags = eff_ldflags;
+
+        // Complete producer record, mixed projects included: every producer
+        // the artifacts name gets an entry with its versions and its
+        // artifact-verified switches (from .debug_str DW_AT_producer strings
+        // when the build recorded them; a -g-less or shim-silent build stays
+        // honest with an empty flags field instead of claiming the injected
+        // values were consumed). A rustc entry additionally carries RUSTFLAGS,
+        // which cargo/rustc consume by contract.
+        for (const auto& producer : provenance.producers) {
+            sage::package::PackageManifest::BuildProducer entry;
+            entry.name = producer;
+            if (auto vit = provenance.producer_versions.find(producer);
+                vit != provenance.producer_versions.end()) {
+                entry.versions.assign(vit->second.begin(), vit->second.end());
             }
-        } else {
-            if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
-            if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
-            // ldflags 同样以 recipe 覆盖优先（如 kernel 显式置空以声明
-            // 注入的 LDFLAGS 与真实链接行为无关）。
-            const std::string eff_ldflags = r.ldflags.value_or(bcfg.ldflags);
-            if (!eff_ldflags.empty()) manifest.build_ldflags = eff_ldflags;
-        }
+            if (producer == "rustc") {
+                if (const char* rf = std::getenv("RUSTFLAGS"); rf && *rf != '\0')
+                    entry.flags = rf;
+            } else if (auto sit = provenance.producer_switches.find(producer);
+                       sit != provenance.producer_switches.end()) {
+                std::string joined;
+                for (const auto& sw : sit->second)
+                    joined += (joined.empty() ? "" : " ") + sw;
+                entry.flags = std::move(joined);
+            }
+            manifest.build_producers.push_back(std::move(entry));
     }
+
+
+    }
+
+    // Passthrough annotations ride along even for script-only packages:
+    // they document the recipe's own flag-forwarding intent.
+    manifest.build_flag_passthrough = r.passthrough_flags;
+    std::cerr << "MARK-pt n=" << r.passthrough_flags.size()
+              << " manifest=" << manifest.build_flag_passthrough.size() << "\n";
+
 
     // A package does not depend on itself: a soname it installs is not an
     // external constraint, and emitting it as one makes the solver chase a
