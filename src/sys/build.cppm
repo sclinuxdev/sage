@@ -385,16 +385,19 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             }
             if (!spec.install_targets.empty()) return std::unexpected(
                 "Xmake install does not accept build.install_targets");
-            step("configure", source, "xmake f -m release" +
+            // fakeroot deliberately reports uid 0. Xmake refuses every
+            // invocation in that environment unless --root is explicit, so
+            // Sage owns this backend requirement on all three steps.
+            step("configure", source, "xmake f --root -m release" +
                 (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(tools.cc) +
                 " --cxx=" + shell_quote(tools.cxx) + " --ld=" +
                 shell_quote(tools.linker) + " --cflags=" + shell_quote(cfg.cflags) +
                 " --cxflags=" + shell_quote(cfg.cppflags) +
                 " --cxxflags=" + shell_quote(cxxflags) +
                 " --ldflags=" + shell_quote(ldflags));
-            step("build", source, "xmake -j " + std::to_string(jobs) +
+            step("build", source, "xmake -j " + std::to_string(jobs) + " --root" +
                 (build_targets.empty() ? "" : " " + build_targets));
-            step("install", source, "xmake install -o " +
+            step("install", source, "xmake install --root -o " +
                 shell_quote((paths.package / "usr").string()));
             break;
         case package::BuildSystem::Cargo:

@@ -1,0 +1,20 @@
+# Sage build execution, toolchain and parallelism policy.
+schema_version = 1
+fakeroot = "fakeroot"
+
+cc = "clang"
+cxx = "clang++"
+linker = "lld"
+fallback_cc = "gcc"
+fallback_cxx = "g++"
+fallback_linker = "ld"
+rustc = "rustc"
+
+cflags = "-O3 -march=x86-64-v3"
+cxxflags = ""
+cppflags = ""
+ldflags = ""
+rustflags = ""
+
+jobs = 0
+compile_jobs = 0

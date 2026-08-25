@@ -468,7 +468,11 @@ minimum_version = "1.90"
                 || (system == sage::package::BuildSystem::Meson
                     && !build_step->command.contains(" -j 8"))
                 || (system == sage::package::BuildSystem::Xmake
-                    && !build_step->command.contains("xmake -j 8"))) {
+                    && (!build_step->command.contains("xmake -j 8")
+                        || !std::ranges::all_of(variant_plan->steps,
+                            [](const auto& step) {
+                                return step.command.contains("--root");
+                            })))) {
                 sage::util::log_error(
                     "Managed recipe v2 backend lost its explicit job count");
                 return 1;

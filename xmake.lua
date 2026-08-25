@@ -39,6 +39,9 @@ target("sage")
     add_defines("SAGE_VERSION=\"" .. SAGE_VERSION .. "\"")
     add_files("src/**.cppm")
     add_files("src/main.cpp")
+    -- `xmake install -o <pkg>/usr` places this one level above the prefix so
+    -- Sage's system configuration remains /etc/sage/build.toml.
+    add_installfiles("config/build.toml", {prefixdir = "../etc/sage"})
     add_links("archive", "crypto", "lmdb", "zstd", "curl", "z")
     add_cxxflags("-msha", "-msse4.1", "-mssse3", "-maes", "-mpclmul")
     set_default(true)
