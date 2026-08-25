@@ -1,3 +1,7 @@
+module;
+#include <zstd.h>
+#include <zlib.h>
+
 export module sage.cli.build;
 
 // Package authoring: recipe builds and local repository indexing.
@@ -89,24 +93,33 @@ constexpr std::streamoff kSlabBytes = 1 << 20;
 constexpr size_t kFrameLead = 4u << 20;
 
 void scan_producers(Provenance& prov, std::string_view window) {
-    // The needles assemble at runtime: a spelled-out "clang version" literal
-    // would live in sage's own .rodata, and scanning a sage binary would
-    // then prove sage was built by clang, gcc AND rustc at once.
+    // Compiler families. Needles are runtime-assembled so spelled-out
+    // literals in sage's own .rodata cannot self-incriminate. Linker
+    // families are recognised as well: lld stamps ".comment" with
+    // "LLD <ver>"; mold/GNU ld appear on hosts configured with them.
     static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
         {std::string("clang vers") + "ion", "clang"},
         {std::string("GC") + "C: (", "gcc"},
         {std::string("rustc vers") + "ion", "rustc"},
+        {std::string("LLD "), "lld"},
+        {std::string("mold "), "mold"},
+        {std::string("GNU ld ("), "gnu-ld"},
     };
-    for (const auto& [sig, name] : SIGS) {
-        const size_t at = window.find(sig);
-        if (at == std::string_view::npos) continue;
-        std::string producer{name};
-        prov.producers.insert(producer);
-        // "GCC: (GNU) 15.3.0" and distro variants alike carry the first
-        // dotted token after the signature; a failed parse just means the
-        // producer is listed without a version.
-        if (auto ver = version_after(window, at + sig.size()); !ver.empty())
-            prov.producer_versions[std::move(producer)].insert(std::move(ver));
+    const bool linker[] = {false, false, false, true, true, true};
+    for (size_t si = 0; si < SIGS.size(); ++si) {
+        const auto& [sig, name] = SIGS[si];
+        for (size_t at = window.find(sig); at != std::string_view::npos;
+             at = window.find(sig, at + sig.size())) {
+            if (linker[si]
+                && !(at == 0 || window[at - 1] == '\0' || window[at - 1] == '\n'
+                     || window[at - 1] == ' ' || window[at - 1] == '(' || window[at - 1] == '"'))
+                continue;
+            auto ver = version_after(window, at + sig.size());
+            if (linker[si] && ver.find('.') == std::string::npos) continue;
+            prov.producers.insert(std::string{name});
+            if (!ver.empty())
+                prov.producer_versions[std::string{name}].insert(std::move(ver));
+        }
     }
 }
 
@@ -117,39 +130,61 @@ void scan_producers(Provenance& prov, std::string_view window) {
 // a truncated read must never yield partial "actuals".
 void scan_debug_switches(Provenance& prov, std::string_view window) {
     // .debug_str producers differ from .comment ones: GCC writes
-    // "GNU C17"/"GNU C23"/"GNU C++ <ver> <switches...>" (no parenthesised
-    // form), so a dedicated "GNU C" needle is required to catch them.
+    // "GNU C23 <ver> <switches...>" (language suffix glued to the C), and
+    // lld/mold may embed their own banners when they linked. Every match
+    // must sit at a NUL/newline/start boundary; linker needles additionally
+    // require a dotted version so binary noise cannot masquerade.
     static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
+        {"clang vers" + std::string("ion"), "clang"},
+        {"GC" + std::string("C: ("), "gcc"},
+        {"rustc vers" + std::string("ion"), "rustc"},
+        {std::string("LLD "), "lld"},
+        {std::string("mold "), "mold"},
+        {std::string("GNU ld ("), "gnu-ld"},
+        // GNU C last-ish is fine: order does not matter, boundaries do.
         {std::string("GNU C"), "gcc"},
-        {std::string("clang vers") + "ion", "clang"},
-        {std::string("rustc vers") + "ion", "rustc"},
     };
-    for (const auto& [sig, name] : SIGS) {
+    const bool linker[] = {false, false, false, false,
+                           false, false, true};
+    for (size_t si = 0; si < SIGS.size(); ++si) {
+        const auto& [sig, name] = SIGS[si];
         for (size_t at = window.find(sig); at != std::string_view::npos;
              at = window.find(sig, at + 1)) {
-            const size_t body = at + sig.size();
-            auto skip_space = [&](size_t pos) {
-                while (pos < window.size() && window[pos] == ' ') ++pos;
-                return pos;
-            };
-            const size_t ver_begin = skip_space(body);
-            auto ver = version_after(window, ver_begin);
+            if (linker[si]
+                && !(at == 0 || window[at - 1] == '\0'
+                     || window[at - 1] == '\n' || window[at - 1] == ' '
+                     || window[at - 1] == '"'))
+                continue;
+            size_t body = at + sig.size();
+            // "GNU C23"/"GNU C++13": swallow the language suffix digits/plus
+            // before reading the compiler version.
+            if (sig == "GNU C") {
+                while (body < window.size()
+                       && (std::isdigit(static_cast<unsigned char>(window[body]))
+                           || window[body] == '+'))
+                    ++body;
+            }
+            size_t vpos = body;
+            while (vpos < window.size() && window[vpos] == ' ') ++vpos;
+            auto ver = version_after(window, vpos);
             if (ver.empty()) continue;
-            size_t sw = ver_begin + ver.size();
-            while (sw < window.size()
-                   && (window[sw] == ' ' || window[sw] == '\0')) {
-                if (window[sw] == '\0') break;
-                ++sw;
-            }
-            size_t end = sw;
-            while (end < window.size() && window[end] != '\0') ++end;
-            std::string_view switches(window.substr(sw, end - sw));
-            while (!switches.empty() && switches.back() == ' ') switches.remove_suffix(1);
+
             prov.producers.insert(std::string{name});
-            if (!switches.empty()) {
+            prov.producer_versions[std::string{name}].insert(
+                std::move(ver));
+
+            // Switches follow the version up to the terminating NUL -- and
+            // are captured for EVERY producer family, compilers included.
+            size_t sw = vpos + ver.size();
+            while (sw < window.size() && window[sw] == ' ') ++sw;
+            size_t e = sw;
+            while (e < window.size() && window[e] != '\0') ++e;
+            std::string_view rest(window.substr(sw, e - sw));
+            while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1);
+            while (!rest.empty() && rest.back() == ' ') rest.remove_suffix(1);
+            if (!rest.empty())
                 prov.producer_switches[std::string{name}].insert(
-                    std::string{switches});
-            }
+                    std::string{rest});
         }
     }
 }
@@ -183,6 +218,9 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
                        std::string_view base) {
     static constexpr std::string_view ELF_MAGIC = "\x7f" "ELF";
     static constexpr std::string_view ZSTD_FRAME = "\x28\xB5\x2F\xFD";
+    static constexpr std::string_view GZIP_MAGIC  = "\x1f\x8b";
+    static constexpr size_t kMaxImageBytes = 512u << 20;
+
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     char magic[4] = {};
@@ -194,21 +232,63 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
     if (mtime_ec) return false;
     if (mtime > prov.newest_compiled) prov.newest_compiled = mtime;
 
-    if (head == ZSTD_FRAME) {
-        in.clear();
+    // Compressed containers: kernel modules (.ko.zst) and vmlinuz images.
+    // Inflate fully (bounded) -- kernel banners embed BOTH compiler and
+    // linker versions ("clang version X, LLD Y"), so this is where linker
+    // provenance comes from for the kernel itself.
+    if (head == ZSTD_FRAME || head == GZIP_MAGIC) {
         in.seekg(0);
-        auto lead = sage::vendor::zstd::ZstdDecompressStream{}.decompress_lead(in, kFrameLead);
-        if (!lead || lead->empty()
-            || !std::string_view(*lead).starts_with(ELF_MAGIC)) return false;
-        // Compressed frames cannot be seeked into sections; the decompressed
-        // lead alone proves the producer (modules sit far under the cap).
-        scan_producers(prov, *lead);
+        std::string packed(static_cast<size_t>(
+            std::filesystem::file_size(path)), '\0');
+        in.read(packed.data(), static_cast<std::streamsize>(packed.size()));
+        packed.resize(static_cast<size_t>(in.gcount()));
+
+        std::string blob;
+        if (head == ZSTD_FRAME) {
+            sage::vendor::zstd::ZstdDecompressStream ds;
+            ZSTD_inBuffer inb{packed.data(), packed.size(), 0};
+            while (true) {
+                const size_t before = blob.size();
+                blob.resize(before + (256u << 10));
+                ZSTD_outBuffer outb{blob.data() + before, blob.size() - before, 0};
+                auto rem = ds.decompress_stream(inb, outb);
+                if (!rem) return false;
+                blob.resize(before + outb.pos);
+                if (rem == 0 || (outb.pos == 0 && inb.pos == inb.size)) break;
+                if (blob.size() > kMaxImageBytes)
+                    return false;
+            }
+        } else {
+            uLongf len = kMaxImageBytes;
+            blob.resize(len);
+            if (::uncompress(reinterpret_cast<Bytef*>(blob.data()),
+                             &len, reinterpret_cast<const Bytef*>(packed.data()),
+                             static_cast<uLong>(packed.size())) != Z_OK)
+                return false;
+            blob.resize(len);
+        }
+        scan_producers(prov, blob);
+        scan_debug_switches(prov, blob);
         return true;
     }
 
     const bool object = base.ends_with(".o") || base.ends_with(".a")
                      || base.find(".so") != std::string_view::npos;
-    if (head != ELF_MAGIC && !object) return false;
+    const bool kernel_image =
+        base.starts_with("vmlinuz") || base.starts_with("Image.");
+    if (head != ELF_MAGIC && !object && !kernel_image) return false;
+
+    if (head != ELF_MAGIC) {
+        // Uncompressed kernel image: banner sits within the first MiB.
+        std::string slab(kSlabBytes, '\0');
+        in.clear();
+        in.seekg(0);
+        in.read(slab.data(), static_cast<std::streamsize>(slab.size()));
+        slab.resize(static_cast<size_t>(in.gcount()));
+        scan_producers(prov, slab);
+        scan_debug_switches(prov, slab);
+        return true;
+    }
 
     auto sections = sage::util::read_elf_sections(
         path, {".comment", ".debug_str"});
@@ -220,11 +300,6 @@ bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
         scan_producers(prov, read_slabs(in));
         return true;
     }
-    for (auto& [k, v] : *sections)
-        std::cerr << " [" << k << "] trunc=" << v.truncated
-                  << " bytes=" << v.bytes.size()
-                  << " head='" << v.bytes.substr(0, 24) << "'";
-    std::cerr << "\n";
     if (auto comment = sections->find(".comment"); comment != sections->end())
         scan_producers(prov, comment->second.bytes);
     if (auto debug = sections->find(".debug_str"); debug != sections->end()
@@ -598,7 +673,6 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
         manifest.service_toml = svc_buf.str();
-        std::cerr << "MARK-svc size=" << manifest.service_toml.size() << "\n";
     }
 
     // Stamp build provenance from what the payload proves (filled below):
@@ -733,8 +807,6 @@ export int cmd_build(const CliOptions& opts) {
     // Passthrough annotations ride along even for script-only packages:
     // they document the recipe's own flag-forwarding intent.
     manifest.build_flag_passthrough = r.passthrough_flags;
-    std::cerr << "MARK-pt n=" << r.passthrough_flags.size()
-              << " manifest=" << manifest.build_flag_passthrough.size() << "\n";
 
 
     // A package does not depend on itself: a soname it installs is not an

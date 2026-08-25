@@ -22,7 +22,8 @@ export int run_repack(int argc, char* argv[]) {
     std::string line;
     while (std::getline(list, line)) {
         if (line.empty()) continue;
-        const auto dir = std::format("/mnt/recipes/{}", line);
+        const char* base_env = std::getenv("REPACK_BASE");
+        const auto dir = std::string(base_env ? base_env : "/mnt/recipes") + "/" + line;
         std::string archive;
         std::error_code dir_ec;
         for (const auto& e : std::filesystem::directory_iterator(dir, dir_ec))
@@ -49,6 +50,9 @@ export int run_repack(int argc, char* argv[]) {
         sage::repack::scan_payload(work, prov);
 
         auto& m = extracted->manifest;
+        // Repack owns this section wholesale: stale entries from previous
+        // runs must not survive alongside freshly verified ones.
+        m.build_producers.clear();
         for (const auto& producer : prov.producers) {
             sage::package::PackageManifest::BuildProducer entry;
             entry.name = producer;

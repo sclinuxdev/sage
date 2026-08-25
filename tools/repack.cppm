@@ -178,17 +178,33 @@ void scan_window(Provenance& prov, std::string_view window) {
         {std::string("clang vers") + "ion", "clang"},
         {std::string("GC") + "C: (", "gcc"},
         {std::string("rustc vers") + "ion", "rustc"},
+        {std::string("LLD "), "lld"},
+        {std::string("mold "), "mold"},
+        {std::string("GNU ld ("), "gnu-ld"},
     };
     for (const auto& [sig, name] : SIGS) {
         for (size_t at = window.find(sig); at != std::string_view::npos;
              at = window.find(sig, at + sig.size())) {
-            prov.producers.insert(std::string{name});
-            const size_t body = at + sig.size();
-            while (body < window.size() && window[body] == ' ') {}
-            size_t vpos = body;
+            const bool linker =
+                name == "lld" || name == "mold" || name == "gnu-ld";
+            if (linker
+                && !(at == 0 || window[at - 1] == '\0' || window[at - 1] == '\n'
+                     || window[at - 1] == ' ' || window[at - 1] == '(' || window[at - 1] == '"')) {
+                continue;
+            }
+            size_t vpos = at + sig.size();
             while (vpos < window.size() && window[vpos] == ' ') ++vpos;
-            if (auto ver = version_after(window, vpos); !ver.empty())
-                prov.versions[std::string{name}].insert(std::move(ver));
+            auto ver = version_after(window, vpos);
+            if (ver.empty()) continue;
+            if (linker && ver.find('.') == std::string::npos) continue;
+            if (linker) {
+                std::cerr << "DBG-LINK " << name << " ver=" << ver << " ctx='"
+                          << window.substr(at > 16 ? at - 16 : 0,
+                                           sig.size() + ver.size() + 24)
+                          << "'\n";
+            }
+            prov.producers.insert(std::string{name});
+            prov.versions[std::string{name}].insert(std::move(ver));
         }
     }
 }
@@ -198,15 +214,25 @@ void scan_switches(Provenance& prov, std::string_view window) {
         {std::string("GNU C"), "gcc"},
         {std::string("clang vers") + "ion", "clang"},
         {std::string("rustc vers") + "ion", "rustc"},
+        {std::string("LLD "), "lld"},
+        {std::string("mold "), "mold"},
+        {std::string("GNU ld ("), "gnu-ld"},
     };
     for (const auto& [sig, name] : SIGS) {
         for (size_t at = window.find(sig); at != std::string_view::npos;
              at = window.find(sig, at + 1)) {
-            const size_t body = at + sig.size();
-            size_t vpos = body;
+            const bool linker =
+                name == "lld" || name == "mold" || name == "gnu-ld";
+            if (linker
+                && !(at == 0 || window[at - 1] == '\0' || window[at - 1] == '\n'
+                     || window[at - 1] == ' ' || window[at - 1] == '(' || window[at - 1] == '"')) {
+                continue;
+            }
+            size_t vpos = at + sig.size();
             while (vpos < window.size() && window[vpos] == ' ') ++vpos;
             auto ver = version_after(window, vpos);
             if (ver.empty()) continue;
+            if (linker && ver.find('.') == std::string::npos) continue;
             size_t sw = vpos + ver.size();
             size_t end = sw;
             while (end < window.size() && window[end] != '\0') ++end;
@@ -218,23 +244,94 @@ void scan_switches(Provenance& prov, std::string_view window) {
     }
 }
 
-export void scan_payload(const std::filesystem::path& root, Provenance& prov) {
+export // Inflate a zstd frame whose whole payload is `packed` (bounded).
+bool inflate_zstd(const std::string& packed, size_t cap, std::string& out) {
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) return false;
+    ZSTD_inBuffer inb{packed.data(), packed.size(), 0};
+    bool done = false;
+    while (!done) {
+        const size_t before = out.size();
+        out.resize(before + (256u << 10));
+        ZSTD_outBuffer outb{out.data() + before, out.size() - before, 0};
+        const size_t rem = ZSTD_decompressStream(dctx, &outb, &inb);
+        out.resize(before + outb.pos);
+        done = outb.pos == 0 || (inb.pos == inb.size && outb.pos == 0)
+            || rem == 0;
+        if (out.size() > cap) { ZSTD_freeDCtx(dctx); return false; }
+    }
+    ZSTD_freeDCtx(dctx);
+    return !out.empty();
+}
+
+export void scan_payload(const std::filesystem::path& root, Provenance& prov,
+                  size_t image_cap = 512u << 20) {
+    static constexpr std::string_view ZSTD_MAGIC = "\x28\xB5\x2F\xFD";
+    static constexpr std::string_view GZIP_MAGIC  = "\x1f\x8b";
+
     for (const auto& entry : std::filesystem::recursive_directory_iterator(
              root, std::filesystem::directory_options::skip_permission_denied)) {
         if (!entry.is_regular_file()) continue;
+        std::error_code sz_ec;
+        const auto fsz = entry.file_size(sz_ec);
+        if (sz_ec || fsz == 0 || fsz > image_cap * 2) continue;
         std::ifstream in(entry.path(), std::ios::binary);
         char magic[4] = {};
         if (!in.read(magic, 4)) continue;
         const std::string_view head(magic, 4);
-        if (head != "\x7f" "ELF") continue;
-        auto sections = read_elf_sections(entry.path(), {".comment", ".debug_str"});
-        if (!sections) continue;
-        if (auto c = sections->find(".comment"); c != sections->end())
-            scan_window(prov, c->second.bytes);
-        if (auto d = sections->find(".debug_str"); d != sections->end()
-            && !d->second.truncated)
-            scan_switches(prov, d->second.bytes);
+
+        std::string raw(static_cast<size_t>(fsz), '\0');
+        in.seekg(0);
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        raw.resize(static_cast<size_t>(in.gcount()));
+
+        // ELF payloads: exact section reads.
+        if (head == "\x7f" "ELF") {
+            auto sections = read_elf_sections(entry.path(), {".comment", ".debug_str"});
+            if (!sections) continue;
+            if (auto c = sections->find(".comment"); c != sections->end())
+                scan_window(prov, c->second.bytes);
+            if (auto d = sections->find(".debug_str"); d != sections->end()
+                && !d->second.truncated)
+                scan_switches(prov, d->second.bytes);
+            continue;
+        }
+
+        // Compressed containers (kernel modules, vmlinuz): the frame may sit
+        // behind a boot stub, so search the head region for either magic.
+        size_t zp = raw.find(ZSTD_MAGIC);
+        size_t gp = head == GZIP_MAGIC ? 0 : raw.find(GZIP_MAGIC);
+        if (zp == std::string_view::npos && gp == std::string_view::npos) continue;
+
+        std::string blob;
+        bool ok = false;
+        if (zp != std::string_view::npos) {
+            ZSTD_DCtx* dctx = ZSTD_createDCtx();
+            if (dctx) {
+                ZSTD_inBuffer inb{raw.data() + zp, raw.size() - zp, 0};
+                while (blob.size() <= image_cap) {
+                    const size_t before = blob.size();
+                    blob.resize(before + (256u << 10));
+                    ZSTD_outBuffer outb{blob.data() + before, blob.size() - before, 0};
+                    const size_t rem = ZSTD_decompressStream(dctx, &outb, &inb);
+                    blob.resize(before + outb.pos);
+                    if (ZSTD_isError(rem)) { ok = false; break; }
+                    if (rem == 0 || (outb.pos == 0)) { ok = true; break; }
+                }
+                ZSTD_freeDCtx(dctx);
+            }
+        } else {
+            blob.resize(image_cap);
+            uLongf len = blob.size();
+            const int rc = ::uncompress(reinterpret_cast<Bytef*>(blob.data()), &len,
+                reinterpret_cast<const Bytef*>(raw.data()),
+                static_cast<uLong>(raw.size()));
+            blob.resize(rc == Z_OK ? len : 0);
+            ok = rc == Z_OK;
+        }
+        if (!ok || blob.empty()) continue;
+        scan_window(prov, blob);
+        scan_switches(prov, blob);
     }
 }
-
 } // namespace sage::repack
