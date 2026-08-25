@@ -304,8 +304,8 @@ export int cmd_remove(
         if (!pkg.service_toml.empty()) {
             auto service = sage::service::ServiceSpec::parse_toml(pkg.service_toml);
             if (service) {
-                auto retired = sage::rebuild::plan_remove_service_scripts(
-                    db, *wtxn, filesystem_transaction, service->name);
+                auto retired = sage::service_registry::plan_remove_scripts(
+                    db, *wtxn, filesystem_transaction, service->name, pkg_name);
                 if (!retired) {
                     sage::util::log_error(
                         "Cannot retire generated service paths for '{}': {}",

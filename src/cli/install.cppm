@@ -615,14 +615,22 @@ export int cmd_install(
         // so a daemon whose service.toml never reaches LMDB is a daemon no
         // init system will ever be told about.
         installed_pkg.service_toml = ext_res->manifest.service_toml;
+        auto service_registration = sage::service_registry::validate_unique(
+            db, *package_txn, installed_pkg.name, installed_pkg.service_toml);
+        if (!service_registration) {
+            sage::util::log_error(
+                "Cannot install package '{}': {}", pkg.name, service_registration.error());
+            return 1;
+        }
         if (*previous_package
             && (**previous_package).service_toml != installed_pkg.service_toml
             && !(**previous_package).service_toml.empty()) {
             auto old_service = sage::service::ServiceSpec::parse_toml(
                 (**previous_package).service_toml);
             if (old_service) {
-                auto retired = sage::rebuild::plan_remove_service_scripts(
-                    db, *package_txn, filesystem_transaction, old_service->name);
+                auto retired = sage::service_registry::plan_remove_scripts(
+                    db, *package_txn, filesystem_transaction,
+                    old_service->name, pkg.name);
                 if (!retired) {
                     sage::util::log_error(
                         "Cannot retire generated service paths for '{}': {}",

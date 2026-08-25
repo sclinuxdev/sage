@@ -81,6 +81,18 @@ inline std::string_view to_string(InitType t) noexcept {
     }
 }
 
+inline std::expected<void, std::string> validate_service_name(std::string_view name) {
+    const bool unsafe = name.empty() || name == "." || name == ".."
+        || std::ranges::any_of(name, [](unsigned char c) {
+            return c == '/' || c == '\\' || c < 0x20 || c == 0x7f;
+        });
+    if (unsafe) {
+        return std::unexpected(
+            "Service name must be a safe, non-empty path component");
+    }
+    return {};
+}
+
 struct ServiceSpec {
     uint32_t schema_version{1};
     std::string name;
@@ -163,7 +175,9 @@ struct ServiceSpec {
             return std::unexpected("Missing [service] section in service.toml");
         }
 
-        if (s.name.empty() || s.exec_start.empty()) {
+        auto valid_name = validate_service_name(s.name);
+        if (!valid_name) return std::unexpected(valid_name.error());
+        if (s.exec_start.empty()) {
             return std::unexpected(s.schema_version == 2
                 ? "Service 'name' and non-empty 'command' are required"
                 : "Service 'name' and 'exec_start' are required");
@@ -285,6 +299,8 @@ inline std::expected<std::filesystem::path, std::string> service_destination(
     InitType init_type,
     const std::filesystem::path& sysroot = "/")
 {
+    auto valid_name = validate_service_name(name);
+    if (!valid_name) return std::unexpected(valid_name.error());
     switch (init_type) {
         case InitType::OpenRC:  return sysroot / "etc/init.d" / name;
         case InitType::Systemd: return sysroot / "usr/lib/systemd/system" / (std::string(name) + ".service");

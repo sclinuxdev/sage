@@ -984,6 +984,19 @@ exec_start = "/usr/bin/openrc"
         sage::util::log_error("Service generation test failed");
         return 1;
     }
+    for (const auto invalid_name : {"/tmp/host-file", "../escape", "nested/name"}) {
+        const auto document = std::format(R"(schema_version = 1
+[service]
+name = "{}"
+exec_start = "/usr/bin/false"
+)", invalid_name);
+        if (sage::service::ServiceSpec::parse_toml(document)
+            || sage::service::service_destination(
+                invalid_name, sage::service::InitType::Systemd, extract_root)) {
+            sage::util::log_error("Unsafe service name '{}' was accepted", invalid_name);
+            return 1;
+        }
+    }
     auto loom_destination = sage::service::service_destination(
         "sshd", sage::service::InitType::Loom, extract_root);
     auto schema_two = sage::service::ServiceSpec::parse_toml(R"(
@@ -4034,6 +4047,30 @@ after = ["net"]
             return 1;
         }
 
+        // Executable backends are settled only when both content and mode
+        // match. Losing an execute bit must make the read-only preflight enter
+        // reconcile and restore the generated script to 0755.
+        auto openrc_plan = *svc_plan_again;
+        openrc_plan.target_init = sage::service::InitType::OpenRC;
+        const auto openrc_script = svc_root / "etc/init.d/svcanary";
+        auto openrc_first = sage::rebuild::ReconcileEngine::execute(
+            *svc_db, openrc_plan, svc_root, false, svc_cfg->providers);
+        if (!openrc_first || ::chmod(openrc_script.c_str(), 0644) != 0) {
+            sage::util::log_error("Failed to prepare OpenRC mode-drift fixture");
+            return 1;
+        }
+        auto openrc_repaired = sage::rebuild::ReconcileEngine::execute(
+            *svc_db, openrc_plan, svc_root, false, svc_cfg->providers);
+        std::error_code openrc_mode_ec;
+        const auto openrc_mode = std::filesystem::status(
+            openrc_script, openrc_mode_ec).permissions();
+        if (!openrc_repaired || openrc_mode_ec
+            || (openrc_mode & std::filesystem::perms::mask)
+                != static_cast<std::filesystem::perms>(0755)) {
+            sage::util::log_error("Reconcile did not repair generated OpenRC mode drift");
+            return 1;
+        }
+
         auto build_service_revision = [&](int release, std::string_view description,
                                            std::string_view exec_start,
                                            bool with_service) -> decltype(svcpkg) {
@@ -4084,6 +4121,54 @@ after = ["net"]
             text << f.rdbuf();
             return text.str();
         };
+
+        // Service names are global identities, just like their generated
+        // destination paths. A second package may not register the same name.
+        auto duplicate_dir = temp_dir / "bcfg-svc-duplicate";
+        if (!write_canary_recipe(duplicate_dir, R"(schema_version = 1
+[package]
+name = "svcduplicate"
+version = "1.0.0"
+release = "1"
+arch = "any"
+description = "duplicate service identity canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/bin"',
+    'printf "#!/bin/sh\n" > "$DESTDIR/usr/bin/svcduplicate"',
+]
+)")) {
+            sage::util::log_error("Failed to create duplicate service recipe");
+            return 1;
+        }
+        {
+            std::ofstream f(duplicate_dir / "service.toml");
+            f << R"(schema_version = 1
+[service]
+name = "svcanary"
+exec_start = "/usr/bin/svcduplicate"
+)";
+        }
+        auto duplicate_pkg = build_with_root(
+            duplicate_dir, canary_root, temp_dir / "bcfg-svc-duplicate-x",
+            "svcduplicate-1.0.0-1-any.pkg.tar.zst");
+        svc_install.args = {
+            (duplicate_dir / "svcduplicate-1.0.0-1-any.pkg.tar.zst").string()
+        };
+        close_service_db();
+        if (!duplicate_pkg || cmd_install(svc_install, "/") == 0
+            || !reopen_service_db()) {
+            sage::util::log_error("Duplicate service name was accepted");
+            return 1;
+        }
+        auto duplicate_record = svc_db->get_package("svcduplicate");
+        if (!duplicate_record || *duplicate_record
+            || read_service_unit().find("ExecStart=/usr/bin/svcanary --foreground")
+                == std::string::npos) {
+            sage::util::log_error("Rejected duplicate service changed installed state");
+            return 1;
+        }
 
         // Updating the universal definition withdraws the old generated unit
         // during install. The next no-provider-change reconcile must render
@@ -4159,12 +4244,32 @@ after = ["net"]
             sage::util::log_error("Failed to prepare the service removal canary");
             return 1;
         }
+        // Defensive compatibility for a database created before service names
+        // became unique: removing one declarer must keep the generated unit
+        // until the final declarer goes away.
+        {
+            auto txn = svc_db->begin_write_txn();
+            sage::package::PackageManifest legacy_alias;
+            legacy_alias.name = "svcanary-legacy-alias";
+            legacy_alias.version = sage::package::Version::parse("1.0.0-1");
+            legacy_alias.channel = "system";
+            legacy_alias.service_toml = svcpkg_v4->service_toml;
+            if (!txn || !svc_db->put_package(*txn, legacy_alias) || !txn->commit()) {
+                sage::util::log_error("Failed to register legacy duplicate service fixture");
+                return 1;
+            }
+        }
         CliOptions svc_remove;
         svc_remove.target_root = svc_root;
         svc_remove.args = {"svcanary"};
         close_service_db();
+        if (cmd_remove(svc_remove) != 0 || !std::filesystem::exists(svc_unit)) {
+            sage::util::log_error("Removing one legacy declarer retired a shared unit");
+            return 1;
+        }
+        svc_remove.args = {"svcanary-legacy-alias"};
         if (cmd_remove(svc_remove) != 0 || std::filesystem::exists(svc_unit)) {
-            sage::util::log_error("Package removal left a generated unit behind");
+            sage::util::log_error("Removing the final service declarer left its unit behind");
             return 1;
         }
 

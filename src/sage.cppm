@@ -23,4 +23,5 @@ export import sage.archive;
 export import sage.solver;
 export import sage.repo;
 export import sage.triggers;
+export import sage.service_registry;
 export import sage.rebuild;

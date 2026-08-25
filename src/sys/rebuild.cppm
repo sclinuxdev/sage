@@ -22,6 +22,7 @@ import sage.config;
 import sage.package;
 import sage.repo;
 import sage.service;
+import sage.service_registry;
 import sage.db;
 import sage.solver;
 import sage.triggers;
@@ -176,9 +177,10 @@ std::expected<void, std::string> run_postprocess(
 std::expected<void, std::string> stage_text(
     archive::FilesystemTransaction& fsx,
     std::string_view stage_rel,
-    std::string_view content)
+    std::string_view content,
+    std::uint32_t mode)
 {
-    auto fd = fsx.open_staged_file(stage_rel);
+    auto fd = fsx.open_staged_file(stage_rel, mode);
     if (!fd) return std::unexpected(fd.error());
     size_t written = 0;
     while (written < content.size()) {
@@ -198,37 +200,6 @@ std::expected<void, std::string> stage_text(
 } // namespace detail
 
 using namespace detail; // unexported helpers, called from the API below
-
-// Plan retirement only for generated, unowned service artifacts. A path
-// registered to any package is a native unit and package data must win.
-std::expected<std::vector<std::pair<char, std::string>>, std::string>
-plan_remove_service_scripts(
-    db::Database& db,
-    vendor::lmdb::MdbTxn& txn,
-    archive::FilesystemTransaction& fsx,
-    std::string_view name)
-{
-    const std::array<std::pair<std::string, bool>, 8> paths{{
-        {std::format("etc/init.d/{}", name), false},
-        {std::format("usr/lib/systemd/system/{}.service", name), false},
-        {std::format("etc/dinit.d/{}", name), false},
-        {std::format("usr/lib/loom/services/{}.toml", name), false},
-        {std::format("etc/sv/{}/run", name), false},
-        {std::format("etc/sv/{}", name), true},
-        {std::format("etc/s6/services/{}/run", name), false},
-        {std::format("etc/s6/services/{}", name), true},
-    }};
-    std::vector<std::pair<char, std::string>> touched;
-    for (const auto& [path, directory] : paths) {
-        auto owners = db.get_path_owners(txn, path);
-        if (!owners) return std::unexpected(owners.error());
-        if (!owners->empty()) continue;
-        if (directory) fsx.plan_remove_dir(path);
-        else fsx.plan_remove_file(path);
-        touched.emplace_back(directory ? 'D' : 'F', path);
-    }
-    return touched;
-}
 
 // Read-only peek at the pending-operation table for status/query surfaces.
 // Never attempts recovery.
@@ -556,6 +527,10 @@ public:
             std::error_code ec;
             if (!std::filesystem::exists(*dest, ec)) return true;
             if (target_init == service::InitType::Loom) continue;
+            const auto expected_mode = static_cast<std::filesystem::perms>(
+                service::script_is_executable(target_init) ? 0755 : 0644);
+            const auto actual_mode = std::filesystem::status(*dest, ec).permissions();
+            if (ec || (actual_mode & std::filesystem::perms::mask) != expected_mode) return true;
             auto expected = service::render_service(*spec, target_init);
             if (!expected) continue;
             std::ifstream current(*dest);
@@ -684,8 +659,8 @@ public:
                     auto old_service = service::ServiceSpec::parse_toml(
                         old_manifest.service_toml);
                     if (old_service) {
-                        auto retired = plan_remove_service_scripts(
-                            db, *wtxn, fsx, old_service->name);
+                        auto retired = service_registry::plan_remove_scripts(
+                            db, *wtxn, fsx, old_service->name, old_manifest.name);
                         if (!retired) return std::unexpected(retired.error());
                         service_touched.insert(
                             service_touched.end(), retired->begin(), retired->end());
@@ -780,14 +755,17 @@ public:
                 return std::unexpected(std::format(
                     "Archive identity does not match selected package '{}'", selected.name));
             }
+            auto service_registration = service_registry::validate_unique(
+                db, *wtxn, selected.name, inspect_res->manifest.service_toml);
+            if (!service_registration) return std::unexpected(service_registration.error());
             if (*existing
                 && (**existing).service_toml != inspect_res->manifest.service_toml
                 && !(**existing).service_toml.empty()) {
                 auto old_service = service::ServiceSpec::parse_toml(
                     (**existing).service_toml);
                 if (old_service) {
-                    auto retired = plan_remove_service_scripts(
-                        db, *wtxn, fsx, old_service->name);
+                    auto retired = service_registry::plan_remove_scripts(
+                        db, *wtxn, fsx, old_service->name, selected.name);
                     if (!retired) return std::unexpected(retired.error());
                     service_touched.insert(
                         service_touched.end(), retired->begin(), retired->end());
@@ -906,7 +884,9 @@ public:
                 continue;
             }
             const std::string stage_rel = std::format("service-{}", staged_scripts++);
-            auto staged = stage_text(fsx, stage_rel, *content);
+            const std::uint32_t script_mode =
+                service::script_is_executable(plan.target_init) ? 0755 : 0644;
+            auto staged = stage_text(fsx, stage_rel, *content, script_mode);
             if (!staged) {
                 util::log_warn("Cannot stage {} script for '{}': {}",
                     service::to_string(plan.target_init), pkg.name, staged.error());
@@ -922,8 +902,7 @@ public:
                 fsx.plan_ensure_dir(parent->generic_string());
             }
             fsx.plan_put_file(
-                target_path.generic_string(), stage_rel,
-                service::script_is_executable(plan.target_init) ? 0755 : 0644);
+                target_path.generic_string(), stage_rel, script_mode);
             service_touched.emplace_back('F', target_path.generic_string());
             gen_count++;
         }
