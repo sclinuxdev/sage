@@ -942,6 +942,12 @@ install = [
     openrc_pkg.name = "openrc";
     openrc_pkg.version = sage::package::Version::parse("0.54.0-1");
     openrc_pkg.provides = {"openrc", "virtual/init"};
+    openrc_pkg.service_toml = R"(schema_version = 1
+[service]
+name = "openrc"
+description = "OpenRC native-unit ownership canary"
+exec_start = "/usr/bin/openrc"
+)";
 
     repo_pool.push_back(libfoo);
     repo_pool.push_back(gcc15);
@@ -1469,15 +1475,23 @@ release = "10"
     sys_cfg.providers["virtual/init"] = "openrc";
     sys_cfg.capabilities["virtual/init"] = sage::config::CapabilityKind::Exclusive;
     sys_cfg.cache_dir = temp_dir / "cache";
+    auto read_reconcile_file = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(
+            std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
 
     // Reconcile installs provider packages for real now, so back it with a
     // local file:// channel whose openrc archive carries an actual payload.
     auto reconcile_repo = temp_dir / "reconcile-repo";
     auto openrc_pkg_dir = temp_dir / "openrc-pkg";
     std::filesystem::create_directories(openrc_pkg_dir / "usr/bin");
+    std::filesystem::create_directories(openrc_pkg_dir / "etc/init.d");
     {
         std::ofstream openrc_bin(openrc_pkg_dir / "usr/bin/openrc");
         openrc_bin << "#!/bin/sh\nexit 0\n";
+        std::ofstream openrc_init(openrc_pkg_dir / "etc/init.d/openrc");
+        openrc_init << "#!/bin/sh\n# native openrc fixture\n";
     }
     std::filesystem::create_directories(reconcile_repo);
     if (!sage::archive::create_package(openrc_pkg, openrc_pkg_dir,
@@ -1504,7 +1518,9 @@ release = "10"
         return 1;
     }
     auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, extract_root, false);
-    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")) {
+    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")
+        || read_reconcile_file(extract_root / "etc/init.d/openrc")
+            != "#!/bin/sh\n# native openrc fixture\n") {
         sage::util::log_error("Reconcile execute did not install the new provider payload: {}",
             exec_res.error_or("payload missing"));
         return 1;
@@ -4195,6 +4211,7 @@ after = ["net"]
         };
         close_service_db();
         if (cmd_install(svc_install, "/") != 0 || !reopen_service_db()
+            || !reconcile_service()
             || read_service_unit() != "native split-package unit\n") {
             sage::util::log_error("Service update removed a separately owned native unit");
             return 1;

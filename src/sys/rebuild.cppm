@@ -527,7 +527,12 @@ public:
         service::InitType target_init,
         const std::filesystem::path& sysroot)
     {
-        auto installed = db.list_installed_packages();
+        auto txn = db.begin_read_txn();
+        if (!txn) {
+            return std::unexpected(
+                "Failed to open service ownership read transaction: " + txn.error());
+        }
+        auto installed = db.list_installed_packages(*txn);
         if (!installed) {
             return std::unexpected(
                 "Installed package database is inconsistent: " + installed.error());
@@ -544,8 +549,10 @@ public:
                 if (target_init == service::InitType::Loom) return true;
                 continue;
             }
-            auto owners = db.get_path_owners(dest->string());
-            if (owners && !owners->empty()) continue;
+            const auto target = dest->lexically_relative(sysroot).generic_string();
+            auto owners = db.get_path_owners(*txn, target);
+            if (!owners) return std::unexpected(owners.error());
+            if (!owners->empty()) continue;
             std::error_code ec;
             if (!std::filesystem::exists(*dest, ec)) return true;
             if (target_init == service::InitType::Loom) continue;
@@ -884,8 +891,10 @@ public:
             // A package may ship its own native script for this init (the
             // systemd split packages keep their upstream units): package data
             // wins over the generated form.
-            auto owners = db.get_path_owners(dest->string());
-            if (owners && !owners->empty()) {
+            const auto target = dest->lexically_relative(sysroot).generic_string();
+            auto owners = db.get_path_owners(*wtxn, target);
+            if (!owners) return std::unexpected(owners.error());
+            if (!owners->empty()) {
                 util::log_info("  · {:<20} ships its own {} script", spec->name,
                     service::to_string(plan.target_init));
                 continue;
@@ -903,9 +912,9 @@ public:
                     service::to_string(plan.target_init), pkg.name, staged.error());
                 continue;
             }
-            const auto target = dest->lexically_relative(sysroot);
+            const auto target_path = dest->lexically_relative(sysroot);
             std::vector<std::filesystem::path> parents;
-            for (auto parent = target.parent_path(); !parent.empty() && parent != ".";
+            for (auto parent = target_path.parent_path(); !parent.empty() && parent != ".";
                  parent = parent.parent_path()) {
                 parents.push_back(parent);
             }
@@ -913,9 +922,9 @@ public:
                 fsx.plan_ensure_dir(parent->generic_string());
             }
             fsx.plan_put_file(
-                target.generic_string(), stage_rel,
+                target_path.generic_string(), stage_rel,
                 service::script_is_executable(plan.target_init) ? 0755 : 0644);
-            service_touched.emplace_back('F', target.generic_string());
+            service_touched.emplace_back('F', target_path.generic_string());
             gen_count++;
         }
 
