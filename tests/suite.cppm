@@ -2363,6 +2363,58 @@ release = "10"
         sage::util::log_success("   Durable Operation Recovery & Orphan GC OK");
     }
 
+    // Issue #28 repro: a failed plan entry used to be swallowed because the
+    // failure sentinel was a default-constructed std::expected<void, E> --
+    // which holds a value -- so both `if (failure)` checks ran inverted and
+    // publish() fell through to the parent-flush result. Publish a journal
+    // whose only entry targets a parent no EnsureDir created; publication
+    // must fail instead of reporting success while nothing reached the tree.
+    {
+        auto sentinel_root = temp_dir / "sentinel-root";
+        std::filesystem::create_directories(sentinel_root);
+        auto sentinel_txn = sage::archive::FilesystemTransaction::create(sentinel_root);
+        if (!sentinel_txn) {
+            sage::util::log_error("Failed to create sentinel fixture: {}",
+                sentinel_txn.error());
+            return 1;
+        }
+        const std::string orphan_stage = "staged/orphan.bin";
+        auto staged_fd = sentinel_txn->open_staged_file(orphan_stage, 0644);
+        if (!staged_fd) {
+            sage::util::log_error("Failed to open staged file: {}", staged_fd.error());
+            return 1;
+        }
+        std::string payload = "orphan payload\n";
+        if (::write(*staged_fd, payload.data(), payload.size())
+            != static_cast<ssize_t>(payload.size())) {
+            return 1;
+        }
+        ::close(*staged_fd);
+        // Deliberately NO plan_ensure_dir("opt/orphan"): resolve_target must
+        // reject the entry, and that rejection must reach the caller.
+        sentinel_txn->plan_put_file("opt/orphan/bin", orphan_stage, 0644);
+        if (auto synced = sentinel_txn->sync_staging(); !synced) {
+            sage::util::log_error("Failed to sync staging: {}", synced.error());
+            return 1;
+        }
+        sage::archive::JournalContext ctx;
+        ctx.kind = "install";
+        ctx.final = true;
+        ctx.sysroot = sentinel_root.string();
+        auto published = sentinel_txn->publish(
+            sage::archive::render_journal(ctx, sentinel_txn->journal_entries()));
+        if (published) {
+            sage::util::log_error(
+                "Publication of a parentless PutFile was reported as success");
+            return 1;
+        }
+        if (std::filesystem::exists(sentinel_root / "opt/orphan/bin")) {
+            sage::util::log_error("Failed publication materialized its target");
+            return 1;
+        }
+        sage::util::log_success("   Transaction Publication Failure Propagation OK");
+    }
+
     // Issue #9 repro: the old revision owns usr/lib/foo/ and the admin dropped
     // foreign state inside it; the new payload drops that subtree. The staged
     // protocol preserves the non-empty directory while the upgrade succeeds --

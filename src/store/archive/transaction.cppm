@@ -98,12 +98,13 @@ public:
     // whole plan applied -- and on the error path too, so an interrupted run
     // still leaves its committed prefix durable.
     std::expected<void, std::string> flush() {
-        std::expected<void, std::string> first_failure;
+        std::optional<std::string> first_failure;
         for (auto& [key, fd] : cache_) {
             if (auto synced = detail::fsync_fd(fd.get()); !synced && !first_failure)
-                first_failure = synced;
+                first_failure = synced.error();
         }
-        return first_failure;
+        if (first_failure) return std::unexpected(std::move(*first_failure));
+        return {};
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return cache_.size(); }
@@ -578,7 +579,7 @@ public:
                 + std::string(std::strerror(errno)));
         }
         txn::ParentSyncBatch parents(root.get(), device_);
-        std::expected<void, std::string> failure;
+        std::optional<std::string> failure;
         for (const auto& entry : parsed->plan) {
             std::expected<void, std::string> outcome = std::unexpected(
                 std::string("Unhandled plan entry"));
@@ -604,7 +605,7 @@ public:
                 outcome = txn::publish_remove_dir(parents, entry);
             }
             if (!outcome) {
-                failure = outcome;
+                failure = outcome.error();
                 break; // stop at first failure; evidence kept
             }
         }
@@ -623,7 +624,7 @@ public:
             parents.size(),
             parents.misses(),
             std::chrono::duration<double>(t_done - t_loop).count());
-        if (failure) return failure;
+        if (failure) return std::unexpected(std::move(*failure));
         return flushed;
     }
 
