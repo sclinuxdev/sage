@@ -469,6 +469,8 @@ minimum_version = "1.90"
                     && !build_step->command.contains(" -j 8"))
                 || (system == sage::package::BuildSystem::Xmake
                     && (!build_step->command.contains("xmake -j 8")
+                        || !variant_plan->steps.front().command.contains(
+                            "--ld='clang++'")
                         || !std::ranges::all_of(variant_plan->steps,
                             [](const auto& step) {
                                 return step.command.contains("--root");

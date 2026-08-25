@@ -391,7 +391,11 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("configure", source, "xmake f --root -m release" +
                 (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(tools.cc) +
                 " --cxx=" + shell_quote(tools.cxx) + " --ld=" +
-                shell_quote(tools.linker) + " --cflags=" + shell_quote(cfg.cflags) +
+                // Xmake's ld slot is a compiler driver: a raw GNU ld cannot
+                // consume driver options such as -m64 or linked libraries.
+                // The probed linker is still selected truthfully by the
+                // Sage-owned -fuse-ld flag carried in ldflags.
+                shell_quote(tools.cxx) + " --cflags=" + shell_quote(cfg.cflags) +
                 " --cxflags=" + shell_quote(cfg.cppflags) +
                 " --cxxflags=" + shell_quote(cxxflags) +
                 " --ldflags=" + shell_quote(ldflags));
