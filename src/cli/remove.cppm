@@ -499,6 +499,14 @@ export int cmd_remove(
             "Failed to complete pending filesystem operations: {}", resumed.error());
         return 1;
     }
+    auto repaired_services = sage::rebuild::ReconcileEngine::repair_missing_services(
+        db, opts.target_root);
+    if (!repaired_services) {
+        sage::util::log_error(
+            "Package removal completed, but service repair failed: {}",
+            repaired_services.error());
+        return 1;
+    }
 
     sage::util::log_success("Successfully removed {} packages (including orphaned dependencies) from {}",
         to_remove_set.size(), opts.target_root.string());

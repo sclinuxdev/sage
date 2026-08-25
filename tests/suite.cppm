@@ -985,7 +985,8 @@ exec_start = "/usr/bin/openrc"
         sage::util::log_error("Service generation test failed");
         return 1;
     }
-    for (const auto invalid_name : {"/tmp/host-file", "../escape", "nested/name"}) {
+    for (const auto invalid_name : {
+            "/tmp/host-file", "../escape", "nested/name", "space name"}) {
         const auto document = std::format(R"(schema_version = 1
 [service]
 name = "{}"

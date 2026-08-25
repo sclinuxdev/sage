@@ -84,7 +84,7 @@ inline std::string_view to_string(InitType t) noexcept {
 inline std::expected<void, std::string> validate_service_name(std::string_view name) {
     const bool unsafe = name.empty() || name == "." || name == ".."
         || std::ranges::any_of(name, [](unsigned char c) {
-            return c == '/' || c == '\\' || c < 0x20 || c == 0x7f;
+            return c == '/' || c == '\\' || c <= 0x20 || c == 0x7f;
         });
     if (unsafe) {
         return std::unexpected(

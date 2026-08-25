@@ -492,6 +492,25 @@ exec_start = "/usr/bin/svcduplicate"
         return 1;
     }
 
+    // Removing the split native-unit package leaves the daemon declaration
+    // installed. The remove command must repair the now-missing generated
+    // fallback without waiting for a manual rebuild.
+    CliOptions native_remove;
+    native_remove.target_root = svc_root;
+    native_remove.args = {"svcanary-native-unit"};
+    close_service_db();
+    if (cmd_remove(native_remove) != 0 || !reopen_service_db()
+        || read_service_unit().find("ExecStart=/usr/bin/svcanary --v5")
+            == std::string::npos) {
+        sage::util::log_error("Removing a native-unit owner did not generate a fallback");
+        return 1;
+    }
+    auto removed_native = svc_db->get_package("svcanary-native-unit");
+    if (!removed_native || *removed_native) {
+        sage::util::log_error("Native-unit owner remained installed after removal");
+        return 1;
+    }
+
 
 
     return 0;

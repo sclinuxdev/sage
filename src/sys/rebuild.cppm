@@ -124,13 +124,13 @@ std::expected<void, std::string> run_postprocess(
         if (!regen) return std::unexpected(regen.error());
     }
 
-    const bool systemd_units_changed = std::ranges::any_of(
+    const bool systemd_unit_tree_changed = std::ranges::any_of(
         parsed.ctx.touched, [](const auto& touched) {
             const auto& path = touched.second;
             return path.starts_with("usr/lib/systemd/system/")
-                && path.ends_with(".service");
+                || path.starts_with("etc/systemd/system/");
         });
-    if (systemd_units_changed && target_root == "/"
+    if (systemd_unit_tree_changed && target_root == "/"
         && std::filesystem::is_directory("/run/systemd/system")) {
         const int status = std::system("/usr/bin/systemctl daemon-reload");
         if (status != 0) {
@@ -967,6 +967,32 @@ public:
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}",
             gen_count, service::to_string(plan.target_init));
         return {};
+    }
+
+    // A package removal can withdraw a native unit owned separately from the
+    // daemon that declares it. Repair only the now-missing generated form; a
+    // pending provider transition remains an explicit `sage rebuild` action.
+    static std::expected<void, std::string> repair_missing_services(
+        db::Database& db,
+        const std::filesystem::path& sysroot)
+    {
+        auto cfg = config::SystemConfig::load_from_root(sysroot);
+        if (!cfg) return std::unexpected(cfg.error());
+        auto current = db.get_all_system_providers();
+        if (!current) return std::unexpected(current.error());
+        for (const auto& [iface, desired] : cfg->exclusive_providers()) {
+            const auto installed = current->contains(iface) ? current->at(iface) : "";
+            if (installed != desired) return {};
+        }
+        const auto init_provider = cfg->providers.contains("virtual/init")
+            ? cfg->providers.at("virtual/init") : "systemd";
+        ReconcilePlan plan;
+        plan.target_init = service::parse_init_type(init_provider);
+        if (plan.target_init == service::InitType::Unknown) {
+            return std::unexpected(std::format(
+                "Unsupported virtual/init provider '{}'", init_provider));
+        }
+        return execute(db, plan, sysroot, false, cfg->providers);
     }
 };
 
