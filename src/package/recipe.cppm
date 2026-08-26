@@ -99,6 +99,11 @@ struct InstallOutput {
 
 struct ManagedBuildSpec {
     BuildSystem system{BuildSystem::Legacy};
+    // Kbuild-compatible Make project. Sage derives kernel-specific channels
+    // from the selected toolchain: clang enables LLVM=1, while the global
+    // flag classes are mapped to KCFLAGS/KCPPFLAGS/KBUILD_LDFLAGS/KRUSTFLAGS.
+    // The recipe therefore never needs to name a compiler or force LLVM.
+    bool kernel{false};
     std::string source_subdir;
     // Empty means in-tree for Autotools/Make/Xmake/Cargo. CMake and Meson
     // receive a backend-specific `build` default in the parser below.
@@ -385,6 +390,14 @@ struct Recipe {
             auto system = parse_build_system((*bld)["system"].value_or(""));
             if (!system) return std::unexpected(system.error());
             r.managed_build.system = *system;
+            if (auto value = (*bld)["kernel"].value<bool>())
+                r.managed_build.kernel = *value;
+            else if (bld->contains("kernel"))
+                return std::unexpected("build.kernel must be a boolean");
+            if (r.managed_build.kernel
+                && r.managed_build.system != BuildSystem::Make)
+                return std::unexpected(
+                    "build.kernel=true requires system = \"make\"");
             r.managed_build.source_subdir = (*bld)["source_subdir"].value_or("");
             r.managed_build.build_dir = (*bld)["build_dir"].value_or(
                 *system == BuildSystem::CMake || *system == BuildSystem::Meson

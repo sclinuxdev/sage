@@ -193,6 +193,9 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     const auto& spec = recipe.managed_build;
     if (auto requirement = validate_toolchain(recipe, tools); !requirement)
         return std::unexpected(requirement.error());
+    if (spec.kernel && spec.system != package::BuildSystem::Make)
+        return std::unexpected(
+            "build.kernel=true requires the Make/Kbuild backend");
     if (spec.system == package::BuildSystem::Cargo
         && (tools.rustc.empty() || tools.rustc_family != "rustc"
             || tools.rustc_version.empty() || tools.rustc_version == "unknown")) {
@@ -271,6 +274,17 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         {"TERM", "dumb"}, {"SHELL", "/bin/sh"},
         {"USER", "builder"}, {"LOGNAME", "builder"}, {"PAGER", "cat"},
     };
+    if (spec.kernel) {
+        // Kbuild has its own flag channels. Keep the source of truth in
+        // build.toml: compiler flags become KCFLAGS (and the corresponding
+        // preprocessor/linker/Rust channels), while LLVM=1 is derived only
+        // from the compiler Sage actually selected and probed.
+        plan.environment["KCFLAGS"] = cfg.cflags;
+        plan.environment["KCPPFLAGS"] = cfg.cppflags;
+        plan.environment["KBUILD_LDFLAGS"] = cfg.ldflags;
+        plan.environment["KRUSTFLAGS"] = cfg.rustflags;
+        if (compiler == "clang") plan.environment["LLVM"] = "1";
+    }
     if (!paths.home.empty()) plan.environment["HOME"] = paths.home.string();
     if (!paths.temp.empty()) plan.environment["TMPDIR"] = paths.temp.string();
     if (!paths.home.empty()) {
@@ -321,6 +335,13 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             "CARGO_HOME", "RUSTUP_HOME", "XDG_CONFIG_HOME",
         };
         if (spec.system == package::BuildSystem::Cargo) names.insert("RUSTC");
+        if (spec.kernel) {
+            names.insert("LLVM");
+            names.insert("KCFLAGS");
+            names.insert("KCPPFLAGS");
+            names.insert("KBUILD_LDFLAGS");
+            names.insert("KRUSTFLAGS");
+        }
         names.insert("PATH");
         for (const auto* aliases : {&spec.cflags_env, &spec.cxxflags_env,
                                     &spec.cppflags_env, &spec.ldflags_env,
@@ -401,14 +422,25 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         make_vars += std::format(" {}={}", key, shell_quote(value));
     }
     std::string make_managed_vars;
+    std::set<std::string> emitted_make_channels;
     const auto make_channel = [&](std::string_view name) {
+        if (!emitted_make_channels.insert(std::string(name)).second) return;
+        const auto value = plan.environment.find(std::string(name));
+        if (value == plan.environment.end()) return;
         make_managed_vars += std::format(" {}={}", name,
-            shell_quote(plan.environment.at(std::string(name))));
+            shell_quote(value->second));
     };
     for (const auto name : {"CC", "CXX", "LD", "CPPFLAGS", "CFLAGS",
                             "CXXFLAGS", "LDFLAGS", "RUSTFLAGS", "DESTDIR",
                             "PREFIX"})
         make_channel(name);
+    if (spec.kernel) {
+        make_channel("LLVM");
+        make_channel("KCFLAGS");
+        make_channel("KCPPFLAGS");
+        make_channel("KBUILD_LDFLAGS");
+        make_channel("KRUSTFLAGS");
+    }
     for (const auto* names : {&spec.cflags_env, &spec.cxxflags_env,
                               &spec.cppflags_env, &spec.ldflags_env,
                               &spec.rustflags_env, &spec.cc_env,

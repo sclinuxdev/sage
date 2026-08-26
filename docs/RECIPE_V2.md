@@ -124,6 +124,7 @@ patch_strip = 1
 ```toml
 [build]
 system = "cmake"               # autotools | cmake | meson | xmake | cargo | make | script
+kernel = false                  # true for Linux Kbuild projects using the Make backend
 source_subdir = "src"          # optional, relative to unpacked source root
 build_dir = "build"            # cmake/meson build directory
 configure_options = []         # project feature choices, never compiler flags
@@ -454,19 +455,13 @@ sha256 = "..."
 
 [build]
 system = "make"
+kernel = true
 build_targets = ["all"]
 install_targets = ["modules_install", "install"]
-allowed_compilers = ["clang", "gcc"]
-allowed_linkers = ["lld", "mold", "ld"]
 
 [build.variables]
 INSTALL_MOD_PATH = "{destdir}"
 INSTALL_PATH = "{destdir}/boot"
-
-[build.flag_env]
-cflags = ["KCFLAGS"]
-cppflags = ["KCPPFLAGS"]
-ldflags = ["KBUILD_LDFLAGS"]
 
 [build.tool_env]
 cc = ["HOSTCC"]
@@ -474,8 +469,15 @@ cxx = ["HOSTCXX"]
 linker = ["HOSTLD"]
 ```
 
-The same `flag_env` facility covers any project with custom flag variable
-names. Tool aliases work the same way:
+With `kernel = true`, Sage recognizes the Make project as Linux Kbuild. It
+derives `LLVM = "1"` only when the Sage-selected and probed C compiler is
+Clang; GCC builds leave `LLVM` unset. The global build configuration is mapped
+to Kbuild's native channels automatically: `cflags` → `KCFLAGS`, `cppflags` →
+`KCPPFLAGS`, `ldflags` → `KBUILD_LDFLAGS`, and `rustflags` → `KRUSTFLAGS`.
+Therefore a kernel recipe should not name a compiler/linker, force `LLVM`, or
+repeat these mappings. The same `flag_env` facility remains available for
+non-kernel projects with custom flag variable names. Tool aliases work the
+same way:
 
 ```toml
 [build.tool_env]

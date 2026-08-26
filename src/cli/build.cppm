@@ -1752,6 +1752,15 @@ export int cmd_build(const CliOptions& opts) {
                     capture_parameter(managed_cxx_parameters, name);
                 for (const auto& name : r.managed_build.ldflags_env)
                     capture_parameter(managed_linker_parameters, name);
+                if (r.managed_build.kernel) {
+                    // Kbuild receives the same Sage policy through its native
+                    // channels. Preserve those channels in the observed
+                    // record so a kernel build cannot be mistaken for one
+                    // that only exported generic CFLAGS/LDFLAGS.
+                    capture_parameter(managed_cc_parameters, "KCFLAGS");
+                    capture_parameter(managed_cc_parameters, "KCPPFLAGS");
+                    capture_parameter(managed_linker_parameters, "KBUILD_LDFLAGS");
+                }
             }
             plan->environment["RECIPE_DIR"] = recipe_dir.string();
             plan->environment["SRCDIR"] = work_dir.string();

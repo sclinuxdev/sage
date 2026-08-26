@@ -553,6 +553,82 @@ configure_options = ["--exec-prefix=/tmp/escape"]
             sage::util::log_error("Recipe v2 CMake plan is incomplete");
             return 1;
         }
+        auto kernel_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "linux"
+version = "6.18.1"
+release = "1"
+[build]
+system = "make"
+kernel = true
+install_files = ["boot/vmlinuz-*"]
+)");
+        auto bad_kernel_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "not-kernel"
+version = "1.0.0"
+release = "1"
+[build]
+system = "cmake"
+kernel = true
+install_files = ["usr/bin/tool"]
+)");
+        if (!kernel_recipe || !kernel_recipe->managed_build.kernel
+            || bad_kernel_recipe) {
+            sage::util::log_error("Recipe v2 kernel marker validation failed");
+            return 1;
+        }
+        auto kernel_cfg = managed_cfg;
+        kernel_cfg.cflags = "-DKERNEL_C=1";
+        kernel_cfg.cppflags = "-DKERNEL_CPP=1";
+        kernel_cfg.ldflags = "-z relro";
+        kernel_cfg.rustflags = "-C opt-level=2";
+        const auto kernel_tools = sage::build::Toolchain{
+            .cc = "clang", .cxx = "clang++", .linker = "lld", .rustc = "rustc",
+            .compiler_version = "22.1.8", .cxx_version = "22.1.8",
+            .linker_version = "22.1.8", .rustc_version = "1.90.0",
+            .compiler_family = "clang", .cxx_family = "clang",
+            .linker_family = "lld", .rustc_family = "rustc"};
+        auto kernel_plan = sage::build::plan_v2(
+            *kernel_recipe, kernel_cfg,
+            {.source = "/tmp/sage-kernel-src", .package = "/tmp/sage-kernel-pkg"},
+            kernel_tools, 8);
+        const auto kernel_build = kernel_plan
+            ? std::ranges::find(kernel_plan->steps, "build",
+                &sage::build::BuildStep::name)
+            : std::vector<sage::build::BuildStep>::iterator{};
+        if (!kernel_plan || !kernel_plan->environment.contains("LLVM")
+            || kernel_plan->environment.at("LLVM") != "1"
+            || kernel_plan->environment.at("KCFLAGS") != kernel_cfg.cflags
+            || kernel_plan->environment.at("KCPPFLAGS") != kernel_cfg.cppflags
+            || kernel_plan->environment.at("KBUILD_LDFLAGS") != kernel_cfg.ldflags
+            || kernel_plan->environment.at("KRUSTFLAGS") != kernel_cfg.rustflags
+            || kernel_build == kernel_plan->steps.end()
+            || !kernel_build->command.contains("LLVM='1'")
+            || !kernel_build->command.contains("KCFLAGS='-DKERNEL_C=1'")) {
+            sage::util::log_error(
+                "Kernel Make plan did not derive LLVM/Kbuild flag channels from Sage config");
+            return 1;
+        }
+        auto gcc_kernel_tools = kernel_tools;
+        gcc_kernel_tools.cc = "gcc";
+        gcc_kernel_tools.cxx = "g++";
+        gcc_kernel_tools.linker = "ld";
+        gcc_kernel_tools.compiler_family = "gcc";
+        gcc_kernel_tools.cxx_family = "gcc";
+        gcc_kernel_tools.linker_family = "ld";
+        auto gcc_kernel_plan = sage::build::plan_v2(
+            *kernel_recipe, kernel_cfg,
+            {.source = "/tmp/sage-kernel-gcc-src", .package = "/tmp/sage-kernel-gcc-pkg"},
+            gcc_kernel_tools, 8);
+        if (!gcc_kernel_plan || gcc_kernel_plan->environment.contains("LLVM")
+            || gcc_kernel_plan->environment.at("KCFLAGS") != kernel_cfg.cflags) {
+            sage::util::log_error(
+                "Kernel Make plan forced LLVM or lost KCFLAGS for a GCC configuration");
+            return 1;
+        }
         auto out_of_tree = *managed;
         out_of_tree.managed_build.system = sage::package::BuildSystem::Autotools;
         out_of_tree.managed_build.build_dir = "build";
