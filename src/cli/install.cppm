@@ -575,6 +575,8 @@ export int cmd_install(
         // very trigger that has to run it.
         installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
         installed_pkg.triggers = ext_res->manifest.triggers;
+        installed_pkg.sysusers = ext_res->manifest.sysusers;
+        installed_pkg.alternatives = ext_res->manifest.alternatives;
         // Conffile declarations likewise ride in the archive manifest, so the
         // stale-claim cleanup below can honor them even if the channel index
         // predates the declaration.

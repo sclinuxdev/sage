@@ -4,6 +4,12 @@ Recipe v2 describes the project; Sage owns the build. It removes arbitrary
 phase commands and never records guessed compiler provenance in package
 manifests. Recipe v1 build execution remains compatible for existing recipes.
 
+**Scope.** Recipe v2 currently targets **native amd64 builds** (plus `arch =
+"any"` payloads). Cross compilation stays a v1 capability; the v2 attestation
+fields `target_triplet`/`target_arch` record the native target, and a v2
+recipe whose architecture differs from the builder is rejected instead of
+being silently cross-built.
+
 Upstream prebuilt archives such as `rust-bin` are repackaging inputs, not Sage
 compilations. They must not declare `[build.toolchain]`, and their package
 manifest/index contains no compiler, linker, version, or flag claim. Finding a
@@ -181,7 +187,7 @@ has exactly one effective SHA-256 before the `patch` command runs.
 
 ```toml
 [build]
-system = "cmake"               # autotools | cmake | meson | xmake | cargo | make | script
+system = "cmake"               # autotools | cmake | meson | xmake | cargo | go | make | script
 payload = "all"                 # required payload boundary
 kernel = false                  # true for Linux Kbuild projects using the Make backend
 source_subdir = "src"          # optional, relative to unpacked source root
@@ -201,6 +207,21 @@ patches = []
 patch_strip = 1
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
+tools = false                # script only: opt into the managed C/C++ toolchain
+network = false              # opt-in network for the build sandbox (default off)
+# [build.flag_policy] and [build.content] are documented in their own sections.
+```
+
+`file_permissions` entries accept either numeric `uid`/`gid` or symbolic
+`user`/`group` names (resolved at build time, mutually exclusive with the
+numeric form):
+
+```toml
+[[build.file_permissions]]
+path = "usr/bin/foo"
+mode = 4755
+user = "root"
+group = "shadow"
 ```
 
 Recipe v2 rejects `prepare = [...]`, `build = [...]`, and `install = [...]`
@@ -501,6 +522,185 @@ upstream-binary repackaging intentionally retain no compiler provenance.
 When limits are configured, the ptrace supervisor itself enters the cgroups
 v2 scope before the first command. The scope is recreated for the
 reproducibility pass, so a second pass cannot accidentally run unbounded.
+
+## Go
+
+```toml
+[build]
+system = "go"
+payload = "all"
+build_targets = []          # extra `go build` arguments (optional)
+install_targets = []        # package patterns for `go install`; default "./..."
+```
+
+Sage runs `go build`/`go install` from the module root with `GOBIN` pointed at
+the private staging `usr/bin`, `GOTOOLCHAIN=local` (so `go` never fetches a
+different toolchain), and private `GOPATH`/`GOCACHE`/`GOMODCACHE` under the
+hermetic HOME. `go -C`, `-mod` and `-overlay` arguments are Sage-managed and
+rejected in the target arrays. A recipe may pin the toolchain with
+`[build.toolchain.go]` (`family = "go"`); the probed `go` executable and its
+observed executions are recorded in `[[managed_build_tools]]` with
+`version_argument = "version"`.
+
+**Module dependencies.** By default the build sandbox has no network, so Go
+module dependencies must be build inputs: either a committed `vendor/` tree
+(Sage sets `GOFLAGS=-mod=vendor` automatically when it exists), or a module
+cache staged from `[[source]]` entries by a `prepare` step. `GOPROXY=off`
+fails fast instead of hanging on a dead network. A recipe that genuinely
+needs to fetch modules during the build declares it:
+
+```toml
+[build]
+system = "go"
+network = true         # opt-in network for the build sandbox
+
+[[build.steps]]
+name = "fetch-deps"
+phase = "prepare"
+cwd = "source"
+command = "go mod download"
+```
+
+`network = true` is the only way to reach the network from a v2 build; it is
+per-recipe and off by default, so the hermetic boundary remains the default
+for everything else. It merely drops the sandbox's `--unshare-net` and stops
+forcing `GOPROXY=off` — the read-only sysroot, private `/tmp` and the tool
+audit fence all stay. It does **not** make a build reproducible by itself: a
+networked Go build must still pin every module version in `go.sum` (and
+Cargo in `Cargo.lock`) for the reproducibility pass and for reviewer
+confidence.
+
+The same vendored-input convention applies to Cargo: crates are `[[source]]`
+entries staged into `vendor/` by a prepare step, or a committed vendor tree; a
+`network = true` Cargo recipe may instead fetch from crates.io and rely on
+`Cargo.lock`.
+
+## Script recipes that need a toolchain
+
+The `script` backend normally forbids compiler execution. A language runtime
+or package whose build genuinely needs the managed C/C++ toolchain (for
+example a Python package with native extensions) may declare:
+
+```toml
+[build]
+system = "script"
+tools = true
+```
+
+Such a recipe is audited exactly like a managed backend: the build.toml
+toolchain is selected, fenced and provenance-recorded, and the compiler must
+actually execute. Repackaging-only recipes stay `tools`-free.
+
+## Flag downgrade
+
+A recipe may not add flags, but a package that genuinely cannot take the
+global policy may name the flag classes Sage must remove from every managed
+channel (`CFLAGS`/`CXXFLAGS`/`CPPFLAGS`/`LDFLAGS`/`RUSTFLAGS`, their
+`flag_env` aliases, and the Kbuild channels):
+
+```toml
+[build.flag_policy]
+lto = false        # drop -flto* / -ffat-lto-*
+march = false      # drop -march= / -mtune= / -mcpu= (and -C target-cpu=)
+as-needed = false  # drop -Wl,--as-needed
+```
+
+Only `false` is accepted; the keys declare downgrades, never upgrades. The
+effective (filtered) flags are what the plan exports and what the manifest's
+tool parameters record.
+
+## Content policy
+
+Deterministic payload post-processing, applied to the staged install tree
+after the backend install and the declarative transforms, before ELF scanning
+and packing. Every output view inherits the processed tree.
+
+```toml
+[build.content]
+strip = "unneeded"        # none (default) | unneeded | debug
+man_compress = "gzip"     # none (default) | gzip (gzip -n, deterministic)
+shebangs = "absolute"     # rewrite `#!/usr/bin/env X` to `#!/usr/bin/X` for
+                          # sh, bash, python3, perl, awk; unknown interpreters
+                          # are a build error
+locales = ["en", "zh_CN"] # prune every other usr/share/locale subtree
+```
+
+## System users
+
+A package never runs `useradd` itself. It declares the accounts it needs and
+Sage applies them inside the target root at install time (and ships a
+sysusers.d fragment in the payload, injected after the payload filter so a
+split package cannot drop its own declaration):
+
+```toml
+[[sysusers]]
+type = "user"
+name = "dbus"
+id = 81
+description = "System D-Bus"
+home = "/var/run/dbus"
+shell = "/usr/bin/nologin"
+
+[[sysusers]]
+type = "group"
+name = "dbus"
+id = 81
+```
+
+`id` is optional (system-allocated). Users may reference a primary `group` by
+name; groups are created first. The entries travel on the package manifest
+and are re-applied by the post-transaction pass.
+
+## Alternatives
+
+Multiple packages may offer the same symlink path (editors, `cc`, awk).
+Sage arbitrates at install/remove time: the link always points at the
+installed provider with the highest priority (package name breaks ties), and
+a link whose last provider left is removed. The link path must stay free in
+the payload -- a package occupying its own alternative path is a build error.
+
+```toml
+[[alternatives]]
+link = "usr/bin/vi"
+target = "vim"
+priority = 10
+```
+
+## Versioned provides
+
+`provides` entries may carry a version. The version participates in
+dependency satisfaction: a request `virtual/libc >= 2.38` is satisfied only by
+a provider whose provides entry for `virtual/libc` meets the constraint.
+
+```toml
+provides = ["virtual/libc = 2.44", "so:libc.so.6"]
+```
+
+Entries must parse as `name` or `name <op> version`; `=` is the canonical
+form for a versioned provides.
+
+## Trigger policy
+
+Post-transaction regeneration is split between Sage built-ins and
+package-declared `[[triggers]]`:
+
+* **Built-in, always on** (warn+skip when the tool is absent, except
+  ldconfig which is required): `ldconfig` (`usr/lib`, `.so`), `ca-certificates`,
+  `mime-database`, `glib-schemas` (`usr/share/glib-2.0/schemas`),
+  `desktop-database` (`usr/share/applications`), `icon-cache`
+  (`usr/share/icons`, hicolor), `font-cache` (`usr/share/fonts`), `initramfs`
+  and `bootloader` (capability-driven).
+* **Built-in, capability-driven**: `depmod` runs once per touched
+  `usr/lib/modules/<version>/` directory and resolves the executable through
+  the installed provider of `virtual/depmod` (kmod publishes a
+  `[[capability_hooks]]` entry for it). Kernel module compression is a
+  packaging choice in the recipe's install steps, not a trigger concern.
+* **Recipe-declared**: anything project-specific, via `[[triggers]]`
+  (`on_paths`/`on_capability`, fixed `exec` or `run_capability`).
+
+Recipes therefore never declare the standard caches; declaring them again is
+redundant, and forgetting them is harmless because Sage infers them from the
+transaction's touched paths.
 
 ## Make and non-standard projects
 

@@ -25,6 +25,7 @@ enum class BuildSystem {
     Meson,
     Xmake,
     Cargo,
+    Go,
     Make,
     Script,
 };
@@ -35,6 +36,7 @@ inline std::expected<BuildSystem, std::string> parse_build_system(std::string_vi
     if (name == "meson") return BuildSystem::Meson;
     if (name == "xmake") return BuildSystem::Xmake;
     if (name == "cargo") return BuildSystem::Cargo;
+    if (name == "go") return BuildSystem::Go;
     if (name == "make") return BuildSystem::Make;
     if (name == "script") return BuildSystem::Script;
     return std::unexpected("Unsupported recipe v2 build system: " + std::string(name));
@@ -51,6 +53,61 @@ struct FilePermission {
     uint32_t uid{0};
     uint32_t gid{0};
     std::string caps;
+    // Symbolic owner spellings resolved at build time: "root", "dbus", ...
+    // Mutually exclusive with the numeric uid/gid fields.
+    std::string user;
+    std::string group;
+};
+
+// Per-recipe flag downgrade. A recipe cannot inject flags, but a package that
+// genuinely cannot take the global optimization policy may name the flag
+// classes Sage must remove from every managed channel (CFLAGS/CXXFLAGS/
+// LDFLAGS/RUSTFLAGS and their aliases, including the Kbuild ones).
+struct FlagPolicy {
+    bool no_lto{false};
+    bool no_march{false};
+    bool no_as_needed{false};
+
+    [[nodiscard]] bool empty() const noexcept {
+        return !no_lto && !no_march && !no_as_needed;
+    }
+};
+
+// Deterministic payload post-processing applied to the staged install tree
+// after the backend install and transforms, before ELF scanning and packing.
+struct ContentPolicy {
+    std::string strip{"none"};        // none | unneeded | debug
+    std::string man_compress{"none"}; // none | gzip
+    std::string shebangs;             // "" | "absolute"
+    // Locale keep-list for usr/share/locale: empty keeps every locale.
+    std::vector<std::string> locales;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return strip == "none" && man_compress == "none" && shebangs.empty()
+            && locales.empty();
+    }
+};
+
+// Declarative system user/group request. Sage ships the equivalent
+// sysusers.d fragment inside the payload and applies it at install time; a
+// recipe never runs useradd itself.
+struct SysUserEntry {
+    std::string type;     // user | group
+    std::string name;
+    std::optional<uint32_t> id;  // numeric uid/gid; absent = system-allocated
+    std::string description;
+    std::string home;     // users only
+    std::string shell;    // users only
+    std::string group;    // primary group name, users only
+};
+
+// Cross-package symlink arbitration. Multiple installed packages may offer
+// the same link path; Sage points it at the provider with the highest
+// priority (name breaks ties) and re-points it when that provider leaves.
+struct AlternativeEntry {
+    std::string link;     // payload-relative link path, e.g. "usr/bin/vi"
+    std::string target;   // symlink value, e.g. "vim"
+    int priority{50};
 };
 
 struct CMakeBackendSpec {
@@ -233,6 +290,17 @@ struct ManagedBuildSpec {
     ToolRequirement compiler;
     ToolRequirement linker;
     ToolRequirement rust;
+    ToolRequirement go;
+    // Script-only escape hatch: the recipe's steps need the managed C/C++
+    // toolchain (language runtimes with native extensions). Sage then audits
+    // the build exactly like any managed backend instead of rejecting it.
+    bool script_managed_tools{false};
+    // Opt-in network for the build sandbox. Default false keeps the hermetic
+    // no-network boundary; declaring true is what lets a Go/Cargo recipe fetch
+    // its module dependencies during the build.
+    bool network{false};
+    FlagPolicy flag_policy;
+    ContentPolicy content;
     std::optional<CMakeBackendSpec> cmake;
     std::optional<MesonBackendSpec> meson;
     std::optional<CargoBackendSpec> cargo;
@@ -284,6 +352,10 @@ struct Recipe {
     std::string cxx;
     std::vector<CapabilityHook> capability_hooks;
     std::vector<Trigger> triggers;
+    // System user/group requests (v2, root [[sysusers]] array).
+    std::vector<SysUserEntry> sysusers;
+    // Cross-package symlink arbitration (v2, root [[alternatives]] array).
+    std::vector<AlternativeEntry> alternatives;
 
     static std::expected<Recipe, std::string> parse_toml(std::string_view toml_content) {
         auto tbl_res = vendor::toml::parse_string(toml_content);
@@ -335,7 +407,8 @@ struct Recipe {
         if (r.schema_version == 2) {
             if (auto result = reject_unknown(tbl,
                     {"schema_version", "package", "upstream", "source",
-                     "build", "capability_hooks", "triggers"}, "recipe"); !result)
+                     "build", "capability_hooks", "triggers", "sysusers",
+                     "alternatives"}, "recipe"); !result)
                 return std::unexpected(result.error());
         }
 
@@ -651,6 +724,116 @@ struct Recipe {
             if (auto result = parse_string_array_strict(*pkg, "conffiles",
                     "package", r.conffiles); !result)
                 return std::unexpected(result.error());
+            // Provides entries may carry a version ("virtual/libc = 2.44").
+            // Validate them as dependency strings so the solver's versioned
+            // provider matching never sees a malformed entry.
+            for (const auto& prov : r.provides) {
+                auto entry = Dependency::parse(prov);
+                const auto well_formed = !entry.name.empty()
+                    && entry.name != "." && entry.name != ".."
+                    && entry.name.find_first_of(" \t") == std::string::npos;
+                if (!well_formed)
+                    return std::unexpected(
+                        "package.provides entries must be names or 'name <op> version': "
+                        + prov);
+            }
+            // Root [[sysusers]]: declarative system user/group requests. Sage
+            // ships the sysusers.d fragment and applies it at install time.
+            if (tbl.contains("sysusers")
+                && !tbl.get_as<vendor::toml::array>("sysusers"))
+                return std::unexpected("sysusers must be an array of tables");
+            if (auto* arr = tbl.get_as<vendor::toml::array>("sysusers")) {
+                for (auto&& element : *arr) {
+                    auto* item = element.as_table();
+                    if (!item) return std::unexpected(
+                        "sysusers entries must be inline tables");
+                    if (auto result = reject_unknown(*item,
+                            {"type", "name", "id", "description", "home", "shell",
+                             "group"}, "sysusers[]"); !result)
+                        return std::unexpected(result.error());
+                    auto type = (*item)["type"].value<std::string_view>();
+                    auto name = (*item)["name"].value<std::string_view>();
+                    if (!type || (*type != "user" && *type != "group"))
+                        return std::unexpected(
+                            "sysusers entries require type = \"user\" or \"group\"");
+                    if (!name || name->empty() || name->find('/') != std::string::npos
+                        || *name == "." || *name == "..")
+                        return std::unexpected(
+                            "sysusers entries require a simple non-empty name");
+                    SysUserEntry entry;
+                    entry.type = std::string(*type);
+                    entry.name = std::string(*name);
+                    if (item->contains("id")) {
+                        auto id = (*item)["id"].value<std::int64_t>();
+                        if (!id || *id <= 0 || *id > 0x7FFFFFFF)
+                            return std::unexpected(std::format(
+                                "sysusers id for '{}' must be a positive integer "
+                                "system uid/gid", entry.name));
+                        entry.id = static_cast<uint32_t>(*id);
+                    }
+                    entry.description = (*item)["description"].value_or("");
+                    entry.home = (*item)["home"].value_or("");
+                    entry.shell = (*item)["shell"].value_or("");
+                    entry.group = (*item)["group"].value_or("");
+                    if (entry.type == "group"
+                        && (!entry.home.empty() || !entry.shell.empty()
+                            || !entry.group.empty()))
+                        return std::unexpected(std::format(
+                            "sysusers group entry '{}' cannot declare home, shell or group",
+                            entry.name));
+                    r.sysusers.push_back(std::move(entry));
+                }
+                std::set<std::string> sysuser_names;
+                for (const auto& entry : r.sysusers) {
+                    if (!sysuser_names.insert(entry.name).second)
+                        return std::unexpected(
+                            "sysusers declares the same name more than once: "
+                            + entry.name);
+                }
+            }
+            // Root [[alternatives]]: cross-package symlink arbitration.
+            if (tbl.contains("alternatives")
+                && !tbl.get_as<vendor::toml::array>("alternatives"))
+                return std::unexpected("alternatives must be an array of tables");
+            if (auto* arr = tbl.get_as<vendor::toml::array>("alternatives")) {
+                for (auto&& element : *arr) {
+                    auto* item = element.as_table();
+                    if (!item) return std::unexpected(
+                        "alternatives entries must be inline tables");
+                    if (auto result = reject_unknown(*item,
+                            {"link", "target", "priority"}, "alternatives[]"); !result)
+                        return std::unexpected(result.error());
+                    auto link = (*item)["link"].value<std::string_view>();
+                    auto target = (*item)["target"].value<std::string_view>();
+                    if (!link || link->empty() || link->starts_with('/')
+                        || std::ranges::any_of(std::filesystem::path(std::string(*link)),
+                            [](const auto& part) { return part == ".."; }))
+                        return std::unexpected(
+                            "alternatives entries require a relative link path");
+                    if (!target || target->empty() || target->starts_with('/'))
+                        return std::unexpected(
+                            "alternatives entries require a relative target");
+                    int priority = 50;
+                    if (item->contains("priority")) {
+                        auto value = (*item)["priority"].value<std::int64_t>();
+                        if (!value || *value < 0 || *value > 1000)
+                            return std::unexpected(
+                                "alternatives priority must be between 0 and 1000");
+                        priority = static_cast<int>(*value);
+                    }
+                    r.alternatives.push_back(AlternativeEntry{
+                        .link = std::string(*link),
+                        .target = std::string(*target),
+                        .priority = priority});
+                }
+                std::set<std::string> alternative_links;
+                for (const auto& alt : r.alternatives) {
+                    if (!alternative_links.insert(alt.link).second)
+                        return std::unexpected(
+                            "alternatives declares the same link more than once: "
+                            + alt.link);
+                }
+            }
             const auto valid_sha256 = [](std::string_view value) {
                 return value.size() == 64 && std::ranges::all_of(value, [](char c) {
                     return std::isxdigit(static_cast<unsigned char>(c));
@@ -676,8 +859,10 @@ struct Recipe {
                      "install_removes", "install_generates", "file_permissions",
                      "outputs", "steps", "patches", "patch_checksums", "patch_strip",
                      "allowed_compilers", "allowed_linkers", "variables", "flag_env",
-                     "tool_env", "toolchain", "cmake", "meson", "cargo",
-                     "autotools", "make", "xmake"}, "build"); !result)
+                     "tool_env", "toolchain", "tools", "flag_policy", "content",
+                     "network",
+                     "cmake", "meson", "cargo", "autotools", "make", "xmake"},
+                    "build"); !result)
                 return std::unexpected(result.error());
             auto has_commands = [&](const vendor::toml::table& scope) {
                 return scope.get_as<vendor::toml::array>("prepare")
@@ -718,6 +903,93 @@ struct Recipe {
                 && r.managed_build.system != BuildSystem::Make)
                 return std::unexpected(
                     "build.kernel=true requires system = \"make\"");
+            if (bld->contains("tools")) {
+                auto tools = (*bld)["tools"].value<bool>();
+                if (!tools) return std::unexpected(
+                    "build.tools must be a boolean");
+                if (*tools) {
+                    if (r.managed_build.system != BuildSystem::Script)
+                        return std::unexpected(
+                            "build.tools=true is valid only for script recipes");
+                    r.managed_build.script_managed_tools = true;
+                }
+            }
+            if (bld->contains("network")) {
+                auto network = (*bld)["network"].value<bool>();
+                if (!network) return std::unexpected(
+                    "build.network must be a boolean");
+                r.managed_build.network = *network;
+            }
+            if (bld->contains("flag_policy")
+                && !bld->get_as<vendor::toml::table>("flag_policy"))
+                return std::unexpected("build.flag_policy must be a table");
+            if (auto* policy = bld->get_as<vendor::toml::table>("flag_policy")) {
+                if (auto result = reject_unknown(*policy,
+                        {"lto", "march", "as-needed"}, "build.flag_policy"); !result)
+                    return std::unexpected(result.error());
+                const auto parse_downgrade =
+                    [&](const char* key, bool& target)
+                    -> std::expected<void, std::string> {
+                    if (!policy->contains(key)) return {};
+                    auto value = (*policy)[key].value<bool>();
+                    if (!value) return std::unexpected(std::format(
+                        "build.flag_policy.{} must be a boolean", key));
+                    if (!*value) target = true;
+                    else return std::unexpected(std::format(
+                        "build.flag_policy.{} = true is the default and cannot "
+                        "weaken a recipe; flag_policy declares downgrades only", key));
+                    return {};
+                };
+                if (auto result = parse_downgrade("lto",
+                        r.managed_build.flag_policy.no_lto); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_downgrade("march",
+                        r.managed_build.flag_policy.no_march); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_downgrade("as-needed",
+                        r.managed_build.flag_policy.no_as_needed); !result)
+                    return std::unexpected(result.error());
+            }
+            if (bld->contains("content")
+                && !bld->get_as<vendor::toml::table>("content"))
+                return std::unexpected("build.content must be a table");
+            if (auto* content = bld->get_as<vendor::toml::table>("content")) {
+                if (auto result = reject_unknown(*content,
+                        {"strip", "man_compress", "shebangs", "locales"},
+                        "build.content"); !result)
+                    return std::unexpected(result.error());
+                if (content->contains("strip")) {
+                    auto value = (*content)["strip"].value<std::string_view>();
+                    if (!value || (*value != "none" && *value != "unneeded"
+                                   && *value != "debug"))
+                        return std::unexpected(
+                            "build.content.strip must be none, unneeded, or debug");
+                    r.managed_build.content.strip = std::string(*value);
+                }
+                if (content->contains("man_compress")) {
+                    auto value = (*content)["man_compress"].value<std::string_view>();
+                    if (!value || (*value != "none" && *value != "gzip"))
+                        return std::unexpected(
+                            "build.content.man_compress must be none or gzip");
+                    r.managed_build.content.man_compress = std::string(*value);
+                }
+                if (content->contains("shebangs")) {
+                    auto value = (*content)["shebangs"].value<std::string_view>();
+                    if (!value || *value != "absolute")
+                        return std::unexpected(
+                            "build.content.shebangs must be \"absolute\"");
+                    r.managed_build.content.shebangs = std::string(*value);
+                }
+                if (auto result = parse_string_array_strict(*content, "locales",
+                        "build.content", r.managed_build.content.locales); !result)
+                    return std::unexpected(result.error());
+                for (const auto& locale : r.managed_build.content.locales) {
+                    if (locale.empty() || locale.find('/') != std::string::npos
+                        || locale == "." || locale == "..")
+                        return std::unexpected(
+                            "build.content.locales entries must be plain locale names");
+                }
+            }
             auto source_subdir = require_string(*bld, "source_subdir", "build", false);
             auto build_dir = require_string(*bld, "build_dir", "build", false);
             if (!source_subdir || !build_dir)
@@ -910,7 +1182,8 @@ struct Recipe {
                         if (!item) return std::unexpected(std::format(
                             "{}.{} entries must be inline tables", scope_name, key));
                         if (auto result = reject_unknown(*item,
-                                {"path", "mode", "uid", "gid", "caps"},
+                                {"path", "mode", "uid", "gid", "caps", "user",
+                                 "group"},
                                 std::format("{}.{}[]", scope_name, key)); !result)
                             return std::unexpected(result.error());
                         auto path = (*item)["path"].value<std::string_view>();
@@ -925,11 +1198,31 @@ struct Recipe {
                         if (item->contains("gid") && !(*item)["gid"].value<std::int64_t>())
                             return std::unexpected(std::format(
                                 "{}.{}.gid must be an integer", scope_name, key));
+                        if (item->contains("user")
+                            && !(*item)["user"].value<std::string_view>())
+                            return std::unexpected(std::format(
+                                "{}.{}.user must be a string", scope_name, key));
+                        if (item->contains("group")
+                            && !(*item)["group"].value<std::string_view>())
+                            return std::unexpected(std::format(
+                                "{}.{}.group must be a string", scope_name, key));
+                        if (item->contains("uid") && item->contains("user"))
+                            return std::unexpected(std::format(
+                                "{}.{} entries cannot set both uid and user",
+                                scope_name, key));
+                        if (item->contains("gid") && item->contains("group"))
+                            return std::unexpected(std::format(
+                                "{}.{} entries cannot set both gid and group",
+                                scope_name, key));
                         auto mode = (*item)["mode"].value<std::int64_t>().value_or(0644);
                         auto uid = (*item)["uid"].value<std::int64_t>().value_or(0);
                         auto gid = (*item)["gid"].value<std::int64_t>().value_or(0);
                         auto caps = (*item)["caps"].value<std::string_view>().value_or("");
-                        if (mode < 0 || mode > 07777 || uid < 0 || gid < 0)
+                        auto user = (*item)["user"].value<std::string_view>().value_or("");
+                        auto group = (*item)["group"].value<std::string_view>().value_or("");
+                        if (mode < 0 || mode > 07777 || uid < 0 || gid < 0
+                            || user.find('/') != std::string::npos
+                            || group.find('/') != std::string::npos)
                             return std::unexpected(std::format(
                                 "{}.{} entries require valid mode, uid and gid", scope_name, key));
                         target.push_back(FilePermission{
@@ -938,6 +1231,8 @@ struct Recipe {
                             .uid = static_cast<uint32_t>(uid),
                             .gid = static_cast<uint32_t>(gid),
                             .caps = std::string(caps),
+                            .user = std::string(user),
+                            .group = std::string(group),
                         });
                     }
                 }
@@ -1204,6 +1499,15 @@ struct Recipe {
                         if (auto result = parse_string_array_strict(*item, "provides",
                                 "build.outputs[]", *output.provides); !result)
                             return std::unexpected(result.error());
+                        for (const auto& prov : *output.provides) {
+                            auto entry = Dependency::parse(prov);
+                            if (entry.name.empty() || entry.name == "."
+                                || entry.name == ".."
+                                || entry.name.find_first_of(" \t") != std::string::npos)
+                                return std::unexpected(
+                                    "build.outputs.provides entries must be names or "
+                                    "'name <op> version': " + prov);
+                        }
                     }
                     if (item->contains("conffiles")) {
                         output.conffiles.emplace();
@@ -1636,7 +1940,7 @@ struct Recipe {
                 return std::unexpected("build.toolchain must be a table");
             if (auto* suite = bld->get_as<vendor::toml::table>("toolchain")) {
                 if (auto result = reject_unknown(*suite,
-                        {"compiler", "linker", "rust"}, "build.toolchain"); !result)
+                        {"compiler", "linker", "rust", "go"}, "build.toolchain"); !result)
                     return std::unexpected(result.error());
                 auto parse_tool = [&](std::string_view kind,
                         ToolRequirement& requirement,
@@ -1681,6 +1985,14 @@ struct Recipe {
                             "build.toolchain.rust is valid only for Cargo recipes");
                     if (auto result = parse_tool("rust", r.managed_build.rust,
                             {"rustc"}); !result)
+                        return std::unexpected(result.error());
+                }
+                if (suite->contains("go")) {
+                    if (r.managed_build.system != BuildSystem::Go)
+                        return std::unexpected(
+                            "build.toolchain.go is valid only for Go recipes");
+                    if (auto result = parse_tool("go", r.managed_build.go,
+                            {"go"}); !result)
                         return std::unexpected(result.error());
                 }
 
@@ -1728,6 +2040,10 @@ struct Recipe {
                 }
                 if (!r.managed_build.rust.family.empty()) {
                     if (auto result = require_package(r.managed_build.rust); !result)
+                        return std::unexpected(result.error());
+                }
+                if (!r.managed_build.go.family.empty()) {
+                    if (auto result = require_package(r.managed_build.go); !result)
                         return std::unexpected(result.error());
                 }
             }

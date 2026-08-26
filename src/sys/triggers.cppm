@@ -68,6 +68,37 @@ public:
             .args = {"/usr/share/mime"},
             .priority = 20,
         });
+        // Standard desktop-stack caches. Every one of them is optional tooling
+        // the admin may not have installed, so they warn and skip when their
+        // executable is missing instead of failing the transaction.
+        t.push_back(package::Trigger{
+            .name = "glib-schemas",
+            .on_paths = {"usr/share/glib-2.0/schemas/"},
+            .exec = "/usr/bin/glib-compile-schemas",
+            .args = {"/usr/share/glib-2.0/schemas"},
+            .priority = 30,
+        });
+        t.push_back(package::Trigger{
+            .name = "desktop-database",
+            .on_paths = {"usr/share/applications/"},
+            .exec = "/usr/bin/update-desktop-database",
+            .args = {"/usr/share/applications"},
+            .priority = 30,
+        });
+        t.push_back(package::Trigger{
+            .name = "icon-cache",
+            .on_paths = {"usr/share/icons/"},
+            .exec = "/usr/bin/gtk-update-icon-cache",
+            .args = {"-q", "-t", "-f", "/usr/share/icons/hicolor"},
+            .priority = 30,
+        });
+        t.push_back(package::Trigger{
+            .name = "font-cache",
+            .on_paths = {"usr/share/fonts/"},
+            .exec = "/usr/bin/fc-cache",
+            .args = {"-f"},
+            .priority = 30,
+        });
         // Kernel installed -> rebuild the initramfs, then point the bootloader
         // at it. Both resolve through whichever package currently provides the
         // capability; if nothing does, they silently do not fire.
@@ -109,6 +140,44 @@ public:
         // triggers and however many touched files ask for it.
         std::set<std::string> already_run;
 
+        // Declarative system users, before anything that may want to run as
+        // them. The recipe declares [[sysusers]]; sage applies them through
+        // the standard shadow utilities inside the target root.
+        if (auto result = apply_sysusers(ctx); !result) return result;
+
+        // Cross-package symlink arbitration ([[alternatives]]): point each
+        // link at the highest-priority installed provider.
+        if (auto result = apply_alternatives(ctx); !result) return result;
+
+        // depmod must run once per kernel version, and the version is only
+        // known from the touched module paths, so it cannot be a fixed
+        // command line. It resolves through the installed provider of
+        // virtual/depmod (kmod) and runs before the initramfs trigger so the
+        // module dependency index exists when the initramfs is assembled.
+        std::set<std::string> module_versions;
+        for (const auto& f : ctx.touched_files) {
+            constexpr std::string_view prefix = "usr/lib/modules/";
+            if (!f.path.starts_with(prefix)) continue;
+            const auto rest = std::string_view(f.path).substr(prefix.size());
+            const auto slash = rest.find('/');
+            if (slash == std::string_view::npos || slash == 0) continue;
+            module_versions.insert(std::string(rest.substr(0, slash)));
+        }
+        if (!module_versions.empty()) {
+            const package::CapabilityHook* hook = nullptr;
+            for (const auto& pkg : ctx.installed_packages) {
+                if (auto* h = pkg.hook_for("virtual/depmod")) { hook = h; break; }
+            }
+            if (hook) {
+                for (const auto& version : module_versions) {
+                    const auto cmd = hook->exec + " -a " + version;
+                    if (!already_run.insert(cmd).second) continue;
+                    auto result = execute(cmd, "depmod", false, ctx);
+                    if (!result) return result;
+                }
+            }
+        }
+
         for (const auto& trig : candidates) {
             if (!fires(trig, ctx, txn_capabilities)) continue;
 
@@ -123,6 +192,171 @@ public:
     }
 
 private:
+    static std::expected<void, std::string> apply_sysusers(const TriggerContext& ctx) {
+        const bool any_declared = std::ranges::any_of(
+            ctx.transaction_packages, [](const package::PackageManifest& pkg) {
+                return !pkg.sysusers.empty();
+            });
+        if (!any_declared) return {};
+
+        // Read the target root's account databases directly: the builder host
+        // may share nothing with the system being assembled.
+        std::set<std::string> existing_users;
+        std::set<std::string> existing_groups;
+        {
+            std::ifstream passwd(ctx.sysroot / "etc/passwd");
+            std::string line;
+            while (std::getline(passwd, line)) {
+                const auto colon = line.find(':');
+                if (colon != std::string::npos)
+                    existing_users.insert(line.substr(0, colon));
+            }
+            std::ifstream group(ctx.sysroot / "etc/group");
+            while (std::getline(group, line)) {
+                const auto colon = line.find(':');
+                if (colon != std::string::npos)
+                    existing_groups.insert(line.substr(0, colon));
+            }
+        }
+
+        const auto ensure_group = [&](const package::SysUserEntry& entry)
+            -> std::expected<bool, std::string> {
+            if (existing_groups.contains(entry.name)) return false;
+            if (ctx.dry_run) {
+                util::log_info("Would create system group '{}'", entry.name);
+                return true;
+            }
+            std::string cmd = "groupadd -r";
+            if (entry.id) cmd += " -g " + std::to_string(*entry.id);
+            cmd += " " + entry.name;
+            auto result = execute(cmd, "sysusers-group(" + entry.name + ")", false, ctx);
+            if (!result) return std::unexpected(result.error());
+            existing_groups.insert(entry.name);
+            return true;
+        };
+
+        // Groups first so user entries can reference them as primary groups.
+        for (const auto& pkg : ctx.transaction_packages) {
+            for (const auto& entry : pkg.sysusers) {
+                if (entry.type != "group") continue;
+                if (auto created = ensure_group(entry); !created)
+                    return std::unexpected(created.error());
+            }
+        }
+        for (const auto& pkg : ctx.transaction_packages) {
+            for (const auto& entry : pkg.sysusers) {
+                if (entry.type != "user") continue;
+                if (existing_users.contains(entry.name)) continue;
+                if (!entry.group.empty() && entry.group != entry.name) {
+                    if (!existing_groups.contains(entry.group)) {
+                        package::SysUserEntry primary;
+                        primary.type = "group";
+                        primary.name = entry.group;
+                        primary.id = entry.id;
+                        if (auto created = ensure_group(primary); !created)
+                            return std::unexpected(created.error());
+                    }
+                }
+                if (ctx.dry_run) {
+                    util::log_info("Would create system user '{}'", entry.name);
+                    continue;
+                }
+                std::string cmd = "useradd -r -M";
+                if (entry.id) cmd += " -u " + std::to_string(*entry.id);
+                if (!entry.group.empty()) cmd += " -g " + entry.group;
+                if (!entry.description.empty())
+                    cmd += " -c \"" + entry.description + "\"";
+                cmd += " -d " + (entry.home.empty() ? "/" : entry.home);
+                cmd += " -s " + (entry.shell.empty()
+                    ? std::string("/usr/bin/nologin") : entry.shell);
+                cmd += " " + entry.name;
+                auto result = execute(cmd, "sysusers-user(" + entry.name + ")", false, ctx);
+                if (!result) return std::unexpected(result.error());
+                existing_users.insert(entry.name);
+            }
+        }
+        return {};
+    }
+
+    static std::expected<void, std::string> apply_alternatives(const TriggerContext& ctx) {
+        struct Offer {
+            std::string package;
+            const package::AlternativeEntry* entry;
+        };
+        std::map<std::string, std::vector<Offer>> offers;
+        for (const auto& pkg : ctx.installed_packages) {
+            for (const auto& alt : pkg.alternatives) {
+                offers[alt.link].push_back({pkg.name, &alt});
+            }
+        }
+        for (const auto& [link, candidates] : offers) {
+            const package::AlternativeEntry* winner = nullptr;
+            std::string winner_package;
+            for (const auto& offer : candidates) {
+                if (!winner
+                    || offer.entry->priority > winner->priority
+                    || (offer.entry->priority == winner->priority
+                        && offer.package < winner_package)) {
+                    winner = offer.entry;
+                    winner_package = offer.package;
+                }
+            }
+            if (!winner) continue;
+            const auto live = ctx.sysroot / std::filesystem::path(link);
+            std::error_code ec;
+            const auto status = std::filesystem::symlink_status(live, ec);
+            if (!ec && std::filesystem::exists(status)
+                && !std::filesystem::is_symlink(status)) {
+                util::log_warn(
+                    "Alternative '{}': '{}' occupies the path with a real file; "
+                    "leaving it alone", link, winner_package);
+                continue;
+            }
+            std::string current;
+            if (status.type() == std::filesystem::file_type::symlink) {
+                auto target = std::filesystem::read_symlink(live, ec);
+                if (!ec) {
+                    current = target.generic_string();
+                    if (current == winner->target) continue;
+                }
+            }
+            if (ctx.dry_run) {
+                util::log_info("Would point alternative '{}' at '{}' (package '{}')",
+                    link, winner->target, winner_package);
+                continue;
+            }
+            if (std::filesystem::is_symlink(live, ec)) {
+                std::filesystem::remove(live, ec);
+                if (ec) return std::unexpected(std::format(
+                    "Cannot replace alternative symlink '{}': {}", link, ec.message()));
+            }
+            std::filesystem::create_symlink(winner->target, live, ec);
+            if (ec) return std::unexpected(std::format(
+                "Cannot create alternative symlink '{}': {}", link, ec.message()));
+            util::log_info("Alternative '{}': '{}' (package '{}', priority {})",
+                link, winner->target, winner_package, winner->priority);
+        }
+        // A link whose every provider left: drop the dangling symlink.
+        for (const auto& pkg : ctx.transaction_packages) {
+            for (const auto& alt : pkg.alternatives) {
+                if (offers.contains(alt.link)) continue;
+                const auto live = ctx.sysroot / std::filesystem::path(alt.link);
+                std::error_code ec;
+                const auto status = std::filesystem::symlink_status(live, ec);
+                if (!ec && std::filesystem::is_symlink(status)) {
+                    if (ctx.dry_run) {
+                        util::log_info("Would remove dangling alternative '{}'", alt.link);
+                        continue;
+                    }
+                    std::filesystem::remove(live, ec);
+                    if (!ec)
+                        util::log_info("Removed dangling alternative '{}'", alt.link);
+                }
+            }
+        }
+        return {};
+    }
+
     static bool fires(const package::Trigger& trig,
                       const TriggerContext& ctx,
                       const std::set<std::string>& txn_capabilities)

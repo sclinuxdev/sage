@@ -5,6 +5,7 @@ import sage.vendor.toml;
 import :version;
 import :deps;
 import :trigger;
+import :recipe;
 
 export namespace sage::package {
 
@@ -367,6 +368,10 @@ struct PackageManifest {
     std::vector<FileEntry> files;
     std::vector<CapabilityHook> capability_hooks;
     std::vector<Trigger> triggers;
+    // System user/group requests declared by the recipe (recipe v2).
+    std::vector<SysUserEntry> sysusers;
+    // Cross-package symlink arbitration declared by the recipe (recipe v2).
+    std::vector<AlternativeEntry> alternatives;
     // Empty for recipe v1 and upstream-binary repackaging. Sage populates it
     // only after a managed recipe-v2 build has completed successfully.
     std::vector<ManagedBuildTool> managed_build_tools;
@@ -516,6 +521,46 @@ struct PackageManifest {
         auto trig_res = parse_triggers(tbl, m.triggers);
         if (!trig_res) return std::unexpected(trig_res.error());
 
+        // System user/group requests and cross-package symlink arbitration
+        // travel verbatim from recipe v2 to the installed-package record.
+        if (auto* arr = tbl.get_as<vendor::toml::array>("sysusers")) {
+            for (auto&& element : *arr) {
+                auto* item = element.as_table();
+                if (!item) return std::unexpected(
+                    "sysusers entries must be tables");
+                SysUserEntry entry;
+                entry.type = (*item)["type"].value_or("");
+                entry.name = (*item)["name"].value_or("");
+                if ((entry.type != "user" && entry.type != "group")
+                    || entry.name.empty())
+                    return std::unexpected(
+                        "sysusers entries require type = user|group and a name");
+                if (auto id = (*item)["id"].value<std::int64_t>())
+                    entry.id = static_cast<uint32_t>(*id);
+                entry.description = (*item)["description"].value_or("");
+                entry.home = (*item)["home"].value_or("");
+                entry.shell = (*item)["shell"].value_or("");
+                entry.group = (*item)["group"].value_or("");
+                m.sysusers.push_back(std::move(entry));
+            }
+        }
+        if (auto* arr = tbl.get_as<vendor::toml::array>("alternatives")) {
+            for (auto&& element : *arr) {
+                auto* item = element.as_table();
+                if (!item) return std::unexpected(
+                    "alternatives entries must be tables");
+                AlternativeEntry entry;
+                entry.link = (*item)["link"].value_or("");
+                entry.target = (*item)["target"].value_or("");
+                entry.priority = static_cast<int>(
+                    (*item)["priority"].value_or(50LL));
+                if (entry.link.empty() || entry.target.empty())
+                    return std::unexpected(
+                        "alternatives entries require link and target");
+                m.alternatives.push_back(std::move(entry));
+            }
+        }
+
         if (auto* tools = tbl.get_as<vendor::toml::array>("managed_build_tools")) {
             if (m.schema_version < 2) return std::unexpected(
                 "managed_build_tools are valid only in package manifest schema v2");
@@ -545,7 +590,8 @@ struct PackageManifest {
                 const bool known_role = observed.role == "cc"
                     || observed.role == "cxx" || observed.role == "linker-driver"
                     || observed.role == "linker"
-                    || observed.role == "rustc";
+                    || observed.role == "rustc"
+                    || observed.role == "go";
                 const bool known_family =
                     ((observed.role == "cc" || observed.role == "cxx")
                         && (observed.family == "gcc" || observed.family == "clang"))
@@ -554,11 +600,13 @@ struct PackageManifest {
                     || (observed.role == "linker"
                         && (observed.family == "ld" || observed.family == "lld"
                             || observed.family == "mold"))
-                    || (observed.role == "rustc" && observed.family == "rustc");
+                    || (observed.role == "rustc" && observed.family == "rustc")
+                    || (observed.role == "go" && observed.family == "go");
                 if (!known_role || observed.executable.empty()
                     || !known_family || observed.version.empty()
                     || observed.executions == 0
-                    || version_argument != "--version") {
+                    || (version_argument != "--version"
+                        && !(observed.role == "go" && version_argument == "version"))) {
                     return std::unexpected(
                         "managed_build_tools require an actually executed role, executable, family, version, executions and version_argument='--version'");
                 }
@@ -705,6 +753,26 @@ struct PackageManifest {
             ss << "]\n\n";
         }
 
+        for (const auto& u : sysusers) {
+            ss << "[[sysusers]]\n";
+            ss << "type = \"" << quote(u.type) << "\"\n";
+            ss << "name = \"" << quote(u.name) << "\"\n";
+            if (u.id) ss << "id = " << *u.id << "\n";
+            if (!u.description.empty())
+                ss << "description = \"" << quote(u.description) << "\"\n";
+            if (!u.home.empty()) ss << "home = \"" << quote(u.home) << "\"\n";
+            if (!u.shell.empty()) ss << "shell = \"" << quote(u.shell) << "\"\n";
+            if (!u.group.empty()) ss << "group = \"" << quote(u.group) << "\"\n";
+            ss << "\n";
+        }
+
+        for (const auto& a : alternatives) {
+            ss << "[[alternatives]]\n";
+            ss << "link = \"" << quote(a.link) << "\"\n";
+            ss << "target = \"" << quote(a.target) << "\"\n";
+            ss << "priority = " << a.priority << "\n\n";
+        }
+
         if (!managed_build_commands.empty()) {
             ss << "managed_build_commands = [";
             for (size_t i = 0; i < managed_build_commands.size(); ++i)
@@ -719,7 +787,8 @@ struct PackageManifest {
             ss << "family = \"" << quote(tool.family) << "\"\n";
             ss << "version = \"" << quote(tool.version) << "\"\n";
             ss << "executions = " << tool.executions << "\n";
-            ss << "version_argument = \"--version\"\n";
+            ss << "version_argument = \""
+               << (tool.role == "go" ? "version" : "--version") << "\"\n";
             if (!tool.parameters.empty()) {
                 ss << "parameters = [";
                 for (size_t i = 0; i < tool.parameters.size(); ++i) {

@@ -11,6 +11,7 @@ struct Toolchain {
     std::string cxx;
     std::string linker;
     std::string rustc;
+    std::string go;
     std::string target_triplet;
     // The first four fields are the canonical executables Sage probed.  The
     // *_for_build fields are deliberately separate: during a build Sage may
@@ -29,10 +30,12 @@ struct Toolchain {
     std::string cxx_version;
     std::string linker_version;
     std::string rustc_version;
+    std::string go_version;
     std::string compiler_family;
     std::string cxx_family;
     std::string linker_family;
     std::string rustc_family;
+    std::string go_family;
 };
 
 struct BuildPaths {
@@ -143,6 +146,55 @@ inline std::string replace_all(std::string value, std::string_view from,
     return value;
 }
 
+// Apply the recipe's declared flag downgrade to one flag class. Only removal
+// is expressible: a recipe may state that it cannot take LTO, the global
+// -march baseline or --as-needed, and Sage drops those tokens from every
+// managed channel. Nothing can be added.
+inline std::string apply_flag_policy(std::string flags,
+                                     const package::FlagPolicy& policy) {
+    if (policy.empty() || flags.empty()) return flags;
+    std::string out;
+    std::vector<std::string_view> tokens;
+    for (std::size_t at = 0; at <= flags.size();) {
+        const auto end = flags.find(' ', at);
+        const auto token = std::string_view(flags).substr(
+            at, end == std::string::npos ? std::string::npos : end - at);
+        if (!token.empty()) tokens.push_back(token);
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    const auto drop_c = [&](std::string_view token) {
+        if (policy.no_lto && (token.starts_with("-flto")
+                              || token.starts_with("-ffat-lto"))) return true;
+        if (policy.no_march && (token.starts_with("-march=")
+                                || token.starts_with("-mtune=")
+                                || token.starts_with("-mcpu="))) return true;
+        if (policy.no_as_needed && token == "-Wl,--as-needed") return true;
+        return false;
+    };
+    const auto drop_rust = [&](std::string_view token) {
+        if (token == "-C") return false;
+        if (policy.no_lto && (token.starts_with("lto")
+                              || token.starts_with("-Clto"))) return true;
+        if (policy.no_march && (token.starts_with("target-cpu=")
+                                || token.starts_with("-Ctarget-cpu"))) return true;
+        if (policy.no_as_needed && token.contains("--as-needed")) return true;
+        return false;
+    };
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        bool drop = drop_c(tokens[i]) || drop_rust(tokens[i]);
+        // RUSTFLAGS spellings put "-C" and its argument in separate tokens.
+        if (!drop && tokens[i] == "-C" && i + 1 < tokens.size()
+            && drop_rust(tokens[i + 1])) {
+            ++i;
+            continue;
+        }
+        if (drop) continue;
+        out += out.empty() ? std::string(tokens[i]) : " " + std::string(tokens[i]);
+    }
+    return out;
+}
+
 inline std::expected<void, std::string> validate_toolchain(
     const package::Recipe& recipe, const Toolchain& tools)
 {
@@ -182,10 +234,16 @@ inline std::expected<void, std::string> validate_toolchain(
                                              : tools.linker_family,
                  tools.linker_version, "linker"); !result)
         return result;
-    return check(spec.rust,
+    if (auto result = check(spec.rust,
                  tools.rustc_family.empty() ? tool_family(tools.rustc)
                                             : tools.rustc_family,
-                 tools.rustc_version, "Rust compiler");
+                 tools.rustc_version, "Rust compiler"); !result)
+        return result;
+    if (auto result = check(spec.go, tools.go_family.empty()
+            ? std::string{"go"} : tools.go_family, tools.go_version,
+            "Go toolchain"); !result)
+        return result;
+    return {};
 }
 
 inline std::expected<BuildPlan, std::string> plan_v2(
@@ -206,6 +264,15 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             || tools.rustc_version.empty() || tools.rustc_version == "unknown")) {
         return std::unexpected(
             "Cargo recipes require a Sage-configured rustc with a parseable --version result");
+    }
+    if (spec.system == package::BuildSystem::Go) {
+        if (!spec.configure_options.empty()) return std::unexpected(
+            "Go has no configure step; use build_targets/install_targets");
+        if (!spec.build_dir.empty()) return std::unexpected(
+            "Go builds run from the module root; build.build_dir must stay empty");
+        if (tools.go_version.empty() || tools.go_version == "unknown")
+            return std::unexpected(
+                "Go recipes require a go toolchain with a parseable 'go version' result");
     }
     auto safe_relative = [](const std::filesystem::path& path) {
         return !path.is_absolute() && std::ranges::none_of(path, [](const auto& part) {
@@ -275,11 +342,15 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         0, tools.path_for_build.find(':'));
     const std::string audit_prefix = tools.path_for_build.empty()
         ? "" : " -B" + audit_root;
-    const std::string cxxflags = cfg.cxxflags.empty() ? cfg.cflags : cfg.cxxflags;
-    const std::string ldflags = cfg.ldflags +
-        (fuse.empty() ? "" : (cfg.ldflags.empty() ? "" : " ") + fuse)
+    const std::string cxxflags = apply_flag_policy(
+        cfg.cxxflags.empty() ? cfg.cflags : cfg.cxxflags, spec.flag_policy);
+    const std::string cflags = apply_flag_policy(cfg.cflags, spec.flag_policy);
+    const std::string cppflags = apply_flag_policy(cfg.cppflags, spec.flag_policy);
+    const std::string ldflags_base = apply_flag_policy(cfg.ldflags, spec.flag_policy);
+    const std::string ldflags = ldflags_base
+        + (fuse.empty() ? "" : (ldflags_base.empty() ? "" : " ") + fuse)
         + audit_prefix;
-    const std::string rustflags = cfg.rustflags
+    const std::string rustflags = apply_flag_policy(cfg.rustflags, spec.flag_policy)
         + (cfg.rustflags.empty() ? "" : " ")
         + "-C linker=" + cc_driver_exec
         + (fuse.empty() ? "" : " -C link-arg=" + fuse)
@@ -288,7 +359,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
 
     plan.environment = {
         {"CC", cc_exec}, {"CXX", cxx_exec}, {"LD", linker_exec},
-        {"CPPFLAGS", cfg.cppflags}, {"CFLAGS", cfg.cflags},
+        {"CPPFLAGS", cppflags}, {"CFLAGS", cflags},
         {"CXXFLAGS", cxxflags}, {"LDFLAGS", ldflags},
         {"RUSTFLAGS", rustflags}, {"DESTDIR", paths.package.string()},
         {"PREFIX", "/usr"}, {"MAKEFLAGS", std::format("-j{}", jobs)},
@@ -303,15 +374,27 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         {"TERM", "dumb"}, {"SHELL", "/bin/sh"},
         {"USER", "builder"}, {"LOGNAME", "builder"}, {"PAGER", "cat"},
     };
+    if (spec.system == package::BuildSystem::Go) {
+        // A Go recipe has its own toolchain and no C/C++/Rust plan channels.
+        // Keep only the common hermetic variables plus the Go channels added
+        // below, so cgo packages never inherit a stray RUSTFLAGS/LDFLAGS shim
+        // meant for a C-family backend.
+        for (const auto* name : {"CC", "CXX", "LD", "CPPFLAGS", "CFLAGS",
+                                 "CXXFLAGS", "LDFLAGS", "RUSTFLAGS",
+                                 "ARFLAGS", "MAKEFLAGS", "CARGO_BUILD_JOBS",
+                                 "CARGO_INCREMENTAL", "CARGO_TERM_COLOR"})
+            plan.environment.erase(name);
+    }
     if (spec.kernel) {
         // Kbuild has its own flag channels. Keep the source of truth in
         // build.toml: compiler flags become KCFLAGS (and the corresponding
         // preprocessor/linker/Rust channels), while LLVM=1 is derived only
         // from the compiler Sage actually selected and probed.
-        plan.environment["KCFLAGS"] = cfg.cflags;
-        plan.environment["KCPPFLAGS"] = cfg.cppflags;
-        plan.environment["KBUILD_LDFLAGS"] = cfg.ldflags;
-        plan.environment["KRUSTFLAGS"] = cfg.rustflags;
+        plan.environment["KCFLAGS"] = cflags;
+        plan.environment["KCPPFLAGS"] = cppflags;
+        plan.environment["KBUILD_LDFLAGS"] = ldflags_base;
+        plan.environment["KRUSTFLAGS"] = apply_flag_policy(
+            cfg.rustflags, spec.flag_policy);
         if (compiler == "clang") plan.environment["LLVM"] = "1";
         if (!tools.target_triplet.empty()) {
             plan.environment["ARCH"] = config::triplet_to_kbuild_arch(tools.target_triplet);
@@ -349,6 +432,29 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     else plan.environment["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     if (spec.system == package::BuildSystem::Cargo)
         plan.environment["RUSTC"] = rustc_exec;
+    if (spec.system == package::BuildSystem::Go) {
+        // By default Sage builds Go hermetically: the sandbox has no network,
+        // so module dependencies must be inputs -- a committed vendor/ tree, or
+        // a module cache staged from [[source]] entries by a prepare step.
+        // GOPROXY=off fails fast instead of hanging and GOTOOLCHAIN=local stops
+        // the go command from fetching a different toolchain. A recipe that
+        // declares build.network = true keeps the network and lets `go` fetch
+        // from its regular proxy (go.sum still pins every module version).
+        std::error_code vendor_ec;
+        if (std::filesystem::is_directory(source / "vendor", vendor_ec))
+            plan.environment["GOFLAGS"] = "-mod=vendor";
+        if (!spec.network) {
+            plan.environment["GOPROXY"] = "off";
+        }
+        plan.environment["GOTOOLCHAIN"] = "local";
+        plan.environment["GOBIN"] = (paths.package / "usr/bin").string();
+        if (!paths.home.empty()) {
+            plan.environment["GOPATH"] = (paths.home / "go").string();
+            plan.environment["GOCACHE"] = (paths.home / "go-cache").string();
+            plan.environment["GOMODCACHE"] =
+                (paths.home / "go" / "pkg" / "mod").string();
+        }
+    }
     auto valid_env_name = [](std::string_view name) {
         if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0]))
                               || name[0] == '_')) return false;
@@ -368,9 +474,9 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                        const std::string& value) {
         for (const auto& name : names) plan.environment[name] = value;
     };
-    aliases(spec.cflags_env, cfg.cflags);
+    aliases(spec.cflags_env, cflags);
     aliases(spec.cxxflags_env, cxxflags);
-    aliases(spec.cppflags_env, cfg.cppflags);
+    aliases(spec.cppflags_env, cppflags);
     aliases(spec.ldflags_env, ldflags);
     aliases(spec.rustflags_env, rustflags);
     aliases(spec.cc_env, cc_exec);
@@ -391,6 +497,16 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             "RUSTC_WRAPPER",
         };
         if (spec.system == package::BuildSystem::Cargo) names.insert("RUSTC");
+        if (spec.system == package::BuildSystem::Go) {
+            for (const auto& name : {std::string_view{"GOFLAGS"},
+                                      std::string_view{"GOPROXY"},
+                                      std::string_view{"GOTOOLCHAIN"},
+                                      std::string_view{"GOBIN"},
+                                      std::string_view{"GOPATH"},
+                                      std::string_view{"GOCACHE"},
+                                      std::string_view{"GOMODCACHE"}})
+                names.insert(std::string(name));
+        }
         if (spec.kernel) {
             names.insert("LLVM");
             names.insert("KCFLAGS");
@@ -651,7 +767,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 (tools.cache_for_build.empty() ? std::string{} :
                     cmake_arg("CMAKE_C_COMPILER_LAUNCHER", tools.cache_for_build) +
                     cmake_arg("CMAKE_CXX_COMPILER_LAUNCHER", tools.cache_for_build)) +
-                cmake_arg("CMAKE_C_FLAGS", cfg.cflags) +
+                cmake_arg("CMAKE_C_FLAGS", cflags) +
                 cmake_arg("CMAKE_CXX_FLAGS", cxxflags) +
                 cmake_arg("CMAKE_EXE_LINKER_FLAGS", ldflags) +
                 cmake_arg("CMAKE_SHARED_LINKER_FLAGS", ldflags));
@@ -775,8 +891,8 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("configure", source, "xmake f --root -m " + xmake_mode +
                 (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(cc_exec) +
                 " --cxx=" + shell_quote(cxx_exec) + " --ld=" +
-                shell_quote(cxx_driver_exec) + " --cflags=" + shell_quote(cfg.cflags) +
-                " --cxflags=" + shell_quote(cfg.cppflags) +
+                shell_quote(cxx_driver_exec) + " --cflags=" + shell_quote(cflags) +
+                " --cxflags=" + shell_quote(cppflags) +
                 " --cxxflags=" + shell_quote(cxxflags) +
                 " --ldflags=" + shell_quote(ldflags));
             custom_steps("pre-build");
@@ -833,6 +949,31 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("install", source, "cargo install --path . --root " +
                 shell_quote((paths.package / "usr").string()) + locked_flag + " --no-track" +
                 cargo_build_flags + (install_targets.empty() ? "" : " " + install_targets));
+            custom_steps("install");
+            custom_steps("post-install");
+            break;
+        }
+        case package::BuildSystem::Go: {
+            for (const auto* values : {&spec.build_targets, &spec.install_targets})
+                for (const auto& value : *values)
+                    if (value == "-C" || value.starts_with("-C=")
+                        || value == "-mod" || value.starts_with("-mod=")
+                        || value == "-overlay" || value.starts_with("-overlay=")
+                        || value == "-toolexec" || value.starts_with("-toolexec="))
+                        return std::unexpected(
+                            "Go -C/-mod/-overlay/-toolexec are Sage-managed and "
+                            "cannot be overridden");
+            const auto go_build_args = join_args(spec.build_targets);
+            const auto go_install_args = join_args(spec.install_targets);
+            custom_steps("pre-build");
+            if (!spec.build_targets.empty())
+                step("build", source, "go build" +
+                    (go_build_args.empty() ? "" : " " + go_build_args));
+            custom_steps("post-build");
+            custom_steps("check");
+            custom_steps("pre-install");
+            step("install", source, "go install" +
+                (go_install_args.empty() ? " ./..." : " " + go_install_args));
             custom_steps("install");
             custom_steps("post-install");
             break;

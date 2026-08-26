@@ -4,8 +4,10 @@ module;
 #include <cstddef>
 #include <cstring>
 #include <fcntl.h>
+#include <grp.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <pwd.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
@@ -37,7 +39,8 @@ struct ToolProbe {
     std::string version;
 };
 
-std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) {
+std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false,
+                                    std::string_view version_arg = "--version") {
     if (tool.empty()) return std::nullopt;
     std::filesystem::path out = std::filesystem::temp_directory_path()
         / std::format("sage-cc-probe-{}.txt", sage::util::current_pid());
@@ -55,8 +58,8 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
     // Double quotes would still expand `$()`/backticks from build.toml and
     // make version probing an unintended command-execution surface.
     const auto probe_command = "LC_ALL=C LANG=C "
-        + sage::build::shell_quote(tool) + " --version > "
-        + sage::build::shell_quote(out.string()) + " 2>&1";
+        + sage::build::shell_quote(tool) + " " + std::string(version_arg)
+        + " > " + sage::build::shell_quote(out.string()) + " 2>&1";
     int rc = std::system(probe_command.c_str());
     if (rc != 0) return std::nullopt;
     std::ifstream f(out);
@@ -81,12 +84,23 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
         else if (lower.contains("gcc")
                  || lower.contains("free software foundation")) family = "gcc";
     }
+    if (family.empty()) {
+        // `go version` reports "go version go1.24.1 linux/amd64": neither the
+        // clang/gcc heuristics nor a leading digit apply, so recognize the
+        // Go toolchain explicitly.
+        if (output.starts_with("go version")) family = "go";
+    }
     if (family.empty()) family = sage::build::tool_family(tool, linker);
 
     size_t i = 0;
     while (i < line.size()) {
         size_t j = line.find(' ', i);
         std::string_view tok(line.data() + i, (j == std::string::npos ? line.size() : j) - i);
+        if (family == "go" && tok.starts_with("go")
+            && tok.size() > 2
+            && std::isdigit(static_cast<unsigned char>(tok[2]))) {
+            return ToolProbe{std::move(family), std::string(tok.substr(2))};
+        }
         if (!tok.empty() && std::isdigit(static_cast<unsigned char>(tok.front()))) {
             return ToolProbe{std::move(family), std::string(tok)};
         }
@@ -205,8 +219,37 @@ std::expected<void, std::string> apply_file_permissions(
     const std::vector<sage::package::FilePermission>& perms)
 {
     std::error_code ec;
+    // Symbolic owner spellings resolve through the host user database at
+    // build time; a name Sage cannot resolve is a packaging error rather
+    // than a silent uid 0.
+    const auto resolve_user = [&](const std::string& name) -> std::expected<uint32_t, std::string> {
+        if (name.empty()) return 0u;
+        if (const auto* pw = ::getpwnam(name.c_str())) {
+            if (pw->pw_uid <= 0xFFFF)
+                return static_cast<uint32_t>(pw->pw_uid);
+            return std::unexpected(std::format(
+                "file_permissions user '{}' resolves to non-system uid {}", name, pw->pw_uid));
+        }
+        return std::unexpected("file_permissions user '" + name + "' does not exist");
+    };
+    const auto resolve_group = [&](const std::string& name) -> std::expected<uint32_t, std::string> {
+        if (name.empty()) return 0u;
+        if (const auto* gr = ::getgrnam(name.c_str())) {
+            if (gr->gr_gid <= 0xFFFF)
+                return static_cast<uint32_t>(gr->gr_gid);
+            return std::unexpected(std::format(
+                "file_permissions group '{}' resolves to non-system gid {}", name, gr->gr_gid));
+        }
+        return std::unexpected("file_permissions group '" + name + "' does not exist");
+    };
     for (const auto& fp : perms) {
         if (fp.path.empty()) continue;
+        uint32_t uid = fp.uid;
+        uint32_t gid = fp.gid;
+        if (auto resolved = resolve_user(fp.user)) uid = *resolved;
+        else return std::unexpected(resolved.error());
+        if (auto resolved = resolve_group(fp.group)) gid = *resolved;
+        else return std::unexpected(resolved.error());
         const auto target = pkg_dir / fp.path;
         if (!std::filesystem::exists(target, ec) && !std::filesystem::is_symlink(target, ec)) {
             return std::unexpected("File permission target does not exist: " + fp.path);
@@ -216,6 +259,15 @@ std::expected<void, std::string> apply_file_permissions(
             std::filesystem::perm_options::replace, ec);
         if (ec) {
             return std::unexpected("Cannot set permissions for '" + fp.path + "': " + ec.message());
+        }
+        if (!fp.user.empty() || !fp.group.empty()) {
+            if (uid == 0 && gid == 0) continue;
+            if (::chown(target.c_str(), uid, gid) != 0) {
+                // Non-root builders cannot change ownership; declaring a
+                // non-root owner is therefore a hard error, not a warning.
+                return std::unexpected("Cannot set owner for '" + fp.path + "': "
+                                       + std::strerror(errno));
+            }
         }
     }
     return {};
@@ -1217,6 +1269,158 @@ struct ToolAudit {
     }
 };
 
+std::expected<void, std::string> apply_content_policy(
+    const std::filesystem::path& pkg_dir,
+    const sage::package::ContentPolicy& content)
+{
+    if (content.empty()) return {};
+    std::error_code ec;
+
+    if (content.strip != "none") {
+        auto strip = ToolAudit::resolve("strip");
+        if (!strip) return std::unexpected(
+            "build.content.strip requires the strip utility inside the build environment");
+        const std::string mode = content.strip == "debug"
+            ? "--strip-debug" : "--strip-unneeded";
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) return std::unexpected("Cannot inspect payload for strip: " + ec.message());
+            if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) continue;
+            if (!sage::util::scan_elf(entry.path())) continue;
+            const auto command = std::format("{} {} {}",
+                sage::build::shell_quote(strip->string()), mode,
+                sage::build::shell_quote(entry.path().string()));
+            if (std::system(command.c_str()) != 0)
+                return std::unexpected("Cannot strip payload ELF file: "
+                                       + entry.path().string());
+        }
+    }
+
+    if (content.man_compress == "gzip") {
+        auto gzip = ToolAudit::resolve("gzip");
+        if (!gzip) return std::unexpected(
+            "build.content.man_compress requires the gzip utility inside the build environment");
+        const auto man_root = pkg_dir / "usr/share/man";
+        if (std::filesystem::is_directory(man_root, ec)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                     man_root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (ec) return std::unexpected("Cannot inspect man pages: " + ec.message());
+                if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) continue;
+                if (entry.path().extension() == ".gz") continue;
+                // -n omits the timestamp and original name: the archive stays
+                // byte-reproducible across builds.
+                const auto command = std::format("{} -n {}",
+                    sage::build::shell_quote(gzip->string()),
+                    sage::build::shell_quote(entry.path().string()));
+                if (std::system(command.c_str()) != 0)
+                    return std::unexpected("Cannot compress man page: "
+                                           + entry.path().string());
+            }
+        }
+    }
+
+    if (!content.locales.empty()) {
+        const auto locale_root = pkg_dir / "usr/share/locale";
+        if (std::filesystem::is_directory(locale_root, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(
+                     locale_root, ec)) {
+                if (!entry.is_directory(ec)) continue;
+                if (!std::ranges::contains(content.locales,
+                        entry.path().filename().string())) {
+                    std::filesystem::remove_all(entry.path(), ec);
+                    if (ec) return std::unexpected("Cannot prune locale: " + ec.message());
+                }
+            }
+        }
+    }
+
+    if (content.shebangs == "absolute") {
+        static constexpr std::pair<std::string_view, std::string_view> interpreters[]{
+            {"sh", "/bin/sh"},
+            {"bash", "/usr/bin/bash"},
+            {"python3", "/usr/bin/python3"},
+            {"perl", "/usr/bin/perl"},
+            {"awk", "/usr/bin/awk"},
+        };
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) return std::unexpected("Cannot inspect payload for shebangs: " + ec.message());
+            if (entry.is_symlink(ec) || !entry.is_regular_file(ec)) continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            std::string first(256, '\0');
+            in.read(first.data(), static_cast<std::streamsize>(first.size()));
+            first.resize(static_cast<std::size_t>(in.gcount()));
+            const auto newline = first.find('\n');
+            if (newline != std::string::npos) first.resize(newline);
+            constexpr std::string_view env_prefix = "#!/usr/bin/env ";
+            if (!first.starts_with(env_prefix)) continue;
+            const auto interpreter = std::string_view(first).substr(env_prefix.size());
+            std::string_view absolute;
+            for (const auto& [name, path] : interpreters) {
+                if (name == interpreter) { absolute = path; break; }
+            }
+            if (absolute.empty()) {
+                return std::unexpected(std::format(
+                    "Payload script '{}' uses '#!/usr/bin/env {}' but the interpreter "
+                    "is not a Sage-standard one; pin it in the recipe",
+                    entry.path().filename().string(), interpreter));
+            }
+            std::string replacement = "#!" + std::string(absolute);
+            std::ifstream full(entry.path(), std::ios::binary);
+            std::string body((std::istreambuf_iterator<char>(full)),
+                             std::istreambuf_iterator<char>());
+            body.replace(0, first.size(), replacement);
+            std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+            out.write(body.data(), static_cast<std::streamsize>(body.size()));
+            if (!out) return std::unexpected(
+                "Cannot rewrite shebang: " + entry.path().string());
+        }
+    }
+    return {};
+}
+
+// Materialize the recipe's sysusers declaration as a sysusers.d fragment
+// inside the payload. The fragment is injected after the payload filter so a
+// split package cannot accidentally drop its own user declaration.
+std::expected<void, std::string> apply_sysusers_fragment(
+    const std::filesystem::path& pkg_dir,
+    const std::string& package_name,
+    const std::vector<sage::package::SysUserEntry>& sysusers)
+{
+    if (sysusers.empty()) return {};
+    std::error_code ec;
+    const auto fragment_dir = pkg_dir / "usr/lib/sysusers.d";
+    std::filesystem::create_directories(fragment_dir, ec);
+    if (ec) return std::unexpected("Cannot create sysusers.d directory: " + ec.message());
+    std::ostringstream ss;
+    ss << "# Generated by sage for " << package_name << "\n";
+    for (const auto& entry : sysusers) {
+        ss << (entry.type == "group" ? 'g' : 'u') << ' ' << entry.name << ' '
+           << (entry.id ? std::to_string(*entry.id) : "-");
+        if (entry.type == "user") {
+            ss << " \"" << entry.description << "\" "
+               << (entry.home.empty() ? "-" : entry.home) << ' '
+               << (entry.shell.empty() ? "/usr/bin/nologin" : entry.shell);
+            if (!entry.group.empty()) ss << ' ' << entry.group;
+        } else {
+            ss << " -";
+        }
+        ss << '\n';
+    }
+    const auto fragment = fragment_dir / (package_name + ".conf");
+    std::ofstream out(fragment, std::ios::binary | std::ios::trunc);
+    if (!out) return std::unexpected("Cannot write sysusers fragment: " + fragment.string());
+    out << ss.str();
+    out.close();
+    std::filesystem::permissions(fragment,
+        std::filesystem::perms::owner_read | std::filesystem::perms::group_read
+            | std::filesystem::perms::others_read,
+        std::filesystem::perm_options::replace, ec);
+    if (ec) return std::unexpected("Cannot set sysusers fragment mode: " + ec.message());
+    return {};
+}
+
+
 std::expected<std::string, std::string> select_compiler_cache(
     std::string_view requested,
     sage::package::BuildSystem system,
@@ -1746,8 +1950,15 @@ export int cmd_build(const CliOptions& opts) {
                               r.name, check.error());
         return 1;
     }
-    const auto requested_cache = r.schema_version == 2
-        && r.managed_build.system != sage::package::BuildSystem::Script
+    const bool needs_managed_toolchain =
+        r.schema_version == 2
+        && (r.managed_build.system != sage::package::BuildSystem::Script
+            || r.managed_build.script_managed_tools);
+    const bool script_recipe =
+        r.schema_version == 2
+        && r.managed_build.system == sage::package::BuildSystem::Script
+        && !r.managed_build.script_managed_tools;
+    const auto requested_cache = needs_managed_toolchain
         ? bcfg.compiler_cache_mode() : std::string_view{"none"};
     auto cache_mode_res = select_compiler_cache(
         requested_cache, r.managed_build.system, bcfg.sysroot);
@@ -1788,16 +1999,41 @@ export int cmd_build(const CliOptions& opts) {
     // fails must fail the recipe rather than silently produce core system
     // packages from the wrong compiler.
     struct Toolchain {
-        std::string cc, cxx, linker, rustc;
+        std::string cc, cxx, linker, rustc, go;
         std::string cc_for_build, cxx_for_build, linker_for_build, rustc_for_build,
             cc_cache_for_build, cxx_cache_for_build, cache_for_build,
             path_for_build;
-        std::string compiler_version, cxx_version, linker_version, rustc_version;
-        std::string compiler_family, cxx_family, linker_family, rustc_family;
+        std::string compiler_version, cxx_version, linker_version, rustc_version,
+            go_version;
+        std::string compiler_family, cxx_family, linker_family, rustc_family,
+            go_family;
     };
     std::vector<Toolchain> candidates;
     auto try_candidate = [&](const std::string& cc_name, const std::string& cxx_name,
                              const std::string& linker_name) {
+        // Go recipes have their own toolchain: a C compiler/linker pair is not
+        // a prerequisite, so probe only the `go` executable and skip the C
+        // toolchain entirely. cgo builds that need a C compiler still route
+        // through it only when it is present; a pure-Go recipe must not block
+        // on an otherwise absent CC.
+        if (r.schema_version == 2
+            && r.managed_build.system == sage::package::BuildSystem::Go) {
+            if (std::ranges::any_of(candidates,
+                    [](const Toolchain& t) { return !t.go.empty(); }))
+                return;
+            auto probed_go = probe_tool("go", false, "version");
+            if (!probed_go || probed_go->family != "go"
+                || probed_go->version == "unknown") {
+                sage::util::log_warn(
+                    "Go toolchain 'go' is not usable or has no parseable 'go version' output");
+                return;
+            }
+            candidates.push_back(Toolchain{
+                .cc = "", .cxx = "", .linker = "", .rustc = "", .go = "go",
+                .go_version = std::move(probed_go->version),
+                .go_family = std::move(probed_go->family)});
+            return;
+        }
         if (cc_name.empty() || std::ranges::any_of(candidates, [&](const Toolchain& t) { return t.cc == cc_name; })) {
             return;
         }
@@ -1809,6 +2045,7 @@ export int cmd_build(const CliOptions& opts) {
         ToolProbe cxx;
         ToolProbe linker;
         ToolProbe rustc;
+        ToolProbe go;
         if (r.schema_version == 2) {
             const auto& spec = r.managed_build;
             const auto& cf = compiler->family;
@@ -1851,6 +2088,16 @@ export int cmd_build(const CliOptions& opts) {
                 }
                 rustc = std::move(*probed_rustc);
             }
+            if (spec.system == sage::package::BuildSystem::Go) {
+                auto probed_go = probe_tool("go", false, "version");
+                if (!probed_go || probed_go->family != "go"
+                    || probed_go->version == "unknown") {
+                    sage::util::log_warn(
+                        "Go toolchain 'go' is not usable or has no parseable 'go version' output");
+                    return;
+                }
+                go = std::move(*probed_go);
+            }
             if (compiler->version == "unknown" || cxx.version == "unknown"
                 || linker.version == "unknown") {
                 if (opts.verbose) sage::util::log_info(
@@ -1877,32 +2124,30 @@ export int cmd_build(const CliOptions& opts) {
                 return;
             }
         }
-        candidates.push_back(Toolchain{
-            .cc = cc_name, .cxx = cxx_name,
-            .linker = r.schema_version == 2
-                ? (linker_name == "lld" ? "ld.lld" : linker_name) : "",
-            .rustc = r.managed_build.system == sage::package::BuildSystem::Cargo
-                ? bcfg.rustc : "",
-            .compiler_version = std::move(compiler->version),
-            .cxx_version = std::move(cxx.version),
-            .linker_version = std::move(linker.version),
-            .rustc_version = std::move(rustc.version),
-            .compiler_family = std::move(compiler->family),
-            .cxx_family = std::move(cxx.family),
-            .linker_family = std::move(linker.family),
-            .rustc_family = std::move(rustc.family)});
+            candidates.push_back(Toolchain{
+                .cc = cc_name, .cxx = cxx_name,
+                .linker = r.schema_version == 2
+                    ? (linker_name == "lld" ? "ld.lld" : linker_name) : "",
+                .rustc = r.managed_build.system == sage::package::BuildSystem::Cargo
+                    ? bcfg.rustc : "",
+                .go = r.managed_build.system == sage::package::BuildSystem::Go
+                    ? std::string{"go"} : "",
+                .compiler_version = std::move(compiler->version),
+                .cxx_version = std::move(cxx.version),
+                .linker_version = std::move(linker.version),
+                .rustc_version = std::move(rustc.version),
+                .go_version = std::move(go.version),
+                .compiler_family = std::move(compiler->family),
+                .cxx_family = std::move(cxx.family),
+                .linker_family = std::move(linker.family),
+                .rustc_family = std::move(rustc.family),
+                .go_family = std::move(go.family)});
     };
-    const bool needs_managed_toolchain =
-        r.schema_version == 2
-        && r.managed_build.system != sage::package::BuildSystem::Script;
-    const bool script_recipe =
-        r.schema_version == 2
-        && r.managed_build.system == sage::package::BuildSystem::Script;
     if (script_recipe) {
         // Script recipes are for deterministic repackaging and package fixups;
         // they must not manufacture compiler/linker provenance.
         candidates.push_back(Toolchain{});
-    } else if (!r.cc.empty()) {
+    } else if (!r.cc.empty() && r.schema_version == 1) {
         // Pinned: exactly this pair, no fallback. A pinned build that cannot
         // even probe its compiler fails the recipe outright.
         const std::string pin_cxx = r.cxx.empty() ? bcfg.cxx : r.cxx;
@@ -1987,23 +2232,33 @@ export int cmd_build(const CliOptions& opts) {
         auto& selected = candidates.front();
         auto canonical = sage::build::Toolchain{
             .cc = selected.cc, .cxx = selected.cxx, .linker = selected.linker,
-            .rustc = selected.rustc,
+            .rustc = selected.rustc, .go = selected.go,
             .target_triplet = target_triplet,
             .compiler_cache_mode = active_cache_mode,
             .compiler_version = selected.compiler_version,
             .cxx_version = selected.cxx_version,
             .linker_version = selected.linker_version,
             .rustc_version = selected.rustc_version,
+            .go_version = selected.go_version,
             .compiler_family = selected.compiler_family,
             .cxx_family = selected.cxx_family,
             .linker_family = selected.linker_family,
-            .rustc_family = selected.rustc_family};
+            .rustc_family = selected.rustc_family,
+            .go_family = selected.go_family};
         tool_audit = ToolAudit::create(
             canonical, hermetic_root, bcfg.sysroot, cache_dir, active_cache_mode);
         if (!tool_audit) {
             sage::util::log_error(
                 "Cannot create the v2 tool audit fence; refusing to build without actual execution evidence");
             return 1;
+        }
+        // An opt-in build.network = true lifts the sandbox's network isolation
+        // so a Go/Cargo recipe can fetch its module dependencies. Everything
+        // else (the read-only sysroot, the private /tmp, the audit fence)
+        // stays in place; only the registered unshare-net is dropped.
+        if (r.managed_build.network) {
+            tool_audit->sandbox = sage::build::replace_all(
+                std::move(tool_audit->sandbox), " --unshare-net", "");
         }
         selected.cc_for_build = tool_audit->cc;
         selected.cxx_for_build = tool_audit->cxx;
@@ -2281,7 +2536,7 @@ export int cmd_build(const CliOptions& opts) {
                 r, bcfg, {.source = work_dir, .package = pkg_dir,
                            .home = build_home, .temp = build_temp},
                 {.cc = cand.cc, .cxx = cand.cxx, .linker = cand.linker,
-                 .rustc = cand.rustc,
+                 .rustc = cand.rustc, .go = cand.go,
                  .cc_for_build = cand.cc_for_build,
                  .cxx_for_build = cand.cxx_for_build,
                  .linker_for_build = cand.linker_for_build,
@@ -2295,19 +2550,26 @@ export int cmd_build(const CliOptions& opts) {
                  .cxx_version = cand.cxx_version,
                  .linker_version = cand.linker_version,
                  .rustc_version = cand.rustc_version,
+                 .go_version = cand.go_version,
                  .compiler_family = cand.compiler_family,
                  .cxx_family = cand.cxx_family,
                  .linker_family = cand.linker_family,
-                 .rustc_family = cand.rustc_family}, compile_jobs);
+                 .rustc_family = cand.rustc_family,
+                 .go_family = cand.go_family}, compile_jobs);
             if (!plan) {
                 sage::util::log_error("Cannot plan recipe v2 build: {}", plan.error());
                 return 1;
             }
-            ran_cflags = plan->environment.at("CFLAGS");
-            ran_cxxflags = plan->environment.at("CXXFLAGS");
-            ran_cppflags = plan->environment.at("CPPFLAGS");
-            ran_ldflags = plan->environment.at("LDFLAGS");
-            ran_rustflags = plan->environment.at("RUSTFLAGS");
+            ran_cflags = plan->environment.contains("CFLAGS")
+                ? plan->environment.at("CFLAGS") : std::string{};
+            ran_cxxflags = plan->environment.contains("CXXFLAGS")
+                ? plan->environment.at("CXXFLAGS") : std::string{};
+            ran_cppflags = plan->environment.contains("CPPFLAGS")
+                ? plan->environment.at("CPPFLAGS") : std::string{};
+            ran_ldflags = plan->environment.contains("LDFLAGS")
+                ? plan->environment.at("LDFLAGS") : std::string{};
+            ran_rustflags = plan->environment.contains("RUSTFLAGS")
+                ? plan->environment.at("RUSTFLAGS") : std::string{};
             auto capture_parameter = [&](std::vector<std::string>& parameters,
                                          std::string_view name) {
                 auto it = plan->environment.find(std::string(name));
@@ -2426,6 +2688,8 @@ export int cmd_build(const CliOptions& opts) {
     // boundary.  Enforce the recipe's explicit v2 payload policy before ELF
     // scanning and archive creation so omitted files cannot reappear in the
     // manifest through a later packaging pass.
+    std::vector<std::string> go_command_lines;
+    std::uint64_t go_executions = 0;
     if (r.schema_version == 2) {
         const auto transform_source = src_dir / r.managed_build.source_subdir;
         auto transforms = apply_install_transforms(
@@ -2445,6 +2709,14 @@ export int cmd_build(const CliOptions& opts) {
                                   r.name, file_perms_res.error());
             return 1;
         }
+        // [build.content] post-processing runs on the common staging tree, so
+        // every output view inherits the same stripped, compressed payload.
+        auto content_res = apply_content_policy(pkg_dir, r.managed_build.content);
+        if (!content_res) {
+            sage::util::log_error("Cannot apply content policy for '{}': {}",
+                                  r.name, content_res.error());
+            return 1;
+        }
         if (r.managed_build.outputs.empty()) {
             auto payload = apply_payload_policy(
                 pkg_dir, r.managed_build.install_files,
@@ -2453,6 +2725,25 @@ export int cmd_build(const CliOptions& opts) {
             if (!payload) {
                 sage::util::log_error("Invalid staged payload for '{}': {}",
                                       r.name, payload.error());
+                return 1;
+            }
+            auto sysusers_res = apply_sysusers_fragment(pkg_dir, r.name, r.sysusers);
+            if (!sysusers_res) {
+                sage::util::log_error("Cannot stage sysusers for '{}': {}",
+                                      r.name, sysusers_res.error());
+                return 1;
+            }
+        }
+        // An alternatives link is created by sage at install time; a payload
+        // file occupying the same path would defeat the arbitration.
+        for (const auto& alt : r.alternatives) {
+            std::error_code alt_ec;
+            const auto occupied = pkg_dir / alt.link;
+            if (std::filesystem::exists(occupied, alt_ec)
+                || std::filesystem::is_symlink(occupied, alt_ec)) {
+                sage::util::log_error(
+                    "Package '{}' declares alternative link '{}' but its payload "
+                    "already occupies that path", r.name, alt.link);
                 return 1;
             }
         }
@@ -2546,13 +2837,42 @@ export int cmd_build(const CliOptions& opts) {
         }
         const bool cargo = r.managed_build.system
             == sage::package::BuildSystem::Cargo;
+        const bool go_backend = r.managed_build.system
+            == sage::package::BuildSystem::Go;
+        // A script recipe that declared build.tools = true is audited like
+        // any managed backend; only the tools-free script variant is exempt.
         const bool script = r.managed_build.system
-            == sage::package::BuildSystem::Script;
+            == sage::package::BuildSystem::Script
+            && !r.managed_build.script_managed_tools;
+        // The go toolchain is not PATH-fenced: prove it executed through the
+        // ptrace process log instead, and keep its observed command lines as
+        // the manifest's execution evidence.
+        if (go_backend) {
+            auto resolved_go = ToolAudit::resolve("go");
+            if (!resolved_go) {
+                sage::util::log_error("Go recipe requires a 'go' executable");
+                return 1;
+            }
+            for (const auto& event : process_execs) {
+                const auto path_marker = event.find(" path=");
+                if (path_marker == std::string::npos) continue;
+                const auto begin = path_marker + 6;
+                const auto end = event.find(' ', begin);
+                const auto path = event.substr(begin,
+                    end == std::string::npos ? std::string::npos : end - begin);
+                if (!audit_path_equal(path, resolved_go->string())) continue;
+                ++go_executions;
+                const auto argv_marker = event.find("argv=");
+                if (argv_marker != std::string::npos)
+                    go_command_lines.push_back(event.substr(argv_marker + 5));
+            }
+        }
         const auto compiler_execs = tool_audit->executions("cc")
             + tool_audit->executions("cxx");
         const auto rustc_execs = tool_audit->executions("rustc");
         if ((!script && cargo && rustc_execs == 0)
-            || (!script && !cargo && compiler_execs == 0)) {
+            || (!script && !cargo && !go_backend && compiler_execs == 0)
+            || (!script && go_backend && go_executions == 0)) {
             sage::util::log_error(
                 "No Sage audit marker proves that the configured compiler executed");
             return 1;
@@ -2575,7 +2895,7 @@ export int cmd_build(const CliOptions& opts) {
             if (!entry.is_regular_file()) continue;
             if (sage::util::scan_elf(entry.path())) { has_elf = true; break; }
         }
-        if (!script && has_elf && linker_execs == 0) {
+        if (!script && !go_backend && has_elf && linker_execs == 0) {
             sage::util::log_error(
                 "ELF payload exists but no selected linker execution was observed");
             return 1;
@@ -2596,6 +2916,8 @@ export int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;
+    manifest.sysusers = r.sysusers;
+    manifest.alternatives = r.alternatives;
     if (r.schema_version == 2) {
         const auto& tools = candidates.front();
         const auto normalize_audit_text = [&](std::string value) {
@@ -2604,6 +2926,10 @@ export int cmd_build(const CliOptions& opts) {
         };
         for (auto command : tool_audit->commands())
             manifest.managed_build_commands.push_back(normalize_audit_text(std::move(command)));
+        // The go toolchain has no PATH wrapper; its observed command lines
+        // come from the ptrace process log recorded above.
+        for (auto& command : go_command_lines)
+            manifest.managed_build_commands.push_back(normalize_audit_text(command));
         const auto normalize_parameters = [&](std::vector<std::string>& parameters) {
             for (auto& parameter : parameters)
                 parameter = normalize_audit_text(std::move(parameter));
@@ -2632,6 +2958,19 @@ export int cmd_build(const CliOptions& opts) {
             add_tool("rustc", tools.rustc, tools.rustc_family,
                      tools.rustc_version, managed_rustc_parameters,
                      tool_audit->executions("rustc"));
+        } else if (r.managed_build.system == sage::package::BuildSystem::Go) {
+            add_tool("go", "go", "go", tools.go_version, {}, go_executions);
+            // cgo builds route through the managed C toolchain like any other
+            // backend; record those roles when their wrappers executed.
+            add_tool("cc", tools.cc, tools.compiler_family,
+                     tools.compiler_version, managed_cc_parameters,
+                     tool_audit->executions("cc"));
+            add_tool("cxx", tools.cxx, tools.cxx_family,
+                     tools.cxx_version, managed_cxx_parameters,
+                     tool_audit->executions("cxx"));
+            add_tool("linker", tools.linker, tools.linker_family,
+                     tools.linker_version, managed_linker_parameters,
+                     tool_audit->executions("linker"));
         } else {
             add_tool("cc", tools.cc, tools.compiler_family, tools.compiler_version,
                      managed_cc_parameters, tool_audit->executions("cc"));
@@ -2941,6 +3280,13 @@ export int cmd_build(const CliOptions& opts) {
             if (!output_perms) {
                 sage::util::log_error("Invalid file permissions for output '{}': {}",
                                       output.name, output_perms.error());
+                return 1;
+            }
+            auto output_sysusers = apply_sysusers_fragment(
+                data, output.name, r.sysusers);
+            if (!output_sysusers) {
+                sage::util::log_error("Cannot stage sysusers for output '{}': {}",
+                                      output.name, output_sysusers.error());
                 return 1;
             }
             output_paths.push_back({output.name, data});
@@ -3278,19 +3624,25 @@ export int cmd_build(const CliOptions& opts) {
             auto& selected = candidates.front();
             auto canonical = sage::build::Toolchain{
                 .cc = selected.cc, .cxx = selected.cxx, .linker = selected.linker,
-                .rustc = selected.rustc,
+                .rustc = selected.rustc, .go = selected.go,
                 .target_triplet = target_triplet,
                 .compiler_cache_mode = active_cache_mode,
                 .compiler_version = selected.compiler_version,
                 .cxx_version = selected.cxx_version,
                 .linker_version = selected.linker_version,
                 .rustc_version = selected.rustc_version,
+                .go_version = selected.go_version,
                 .compiler_family = selected.compiler_family,
                 .cxx_family = selected.cxx_family,
                 .linker_family = selected.linker_family,
-                .rustc_family = selected.rustc_family};
+                .rustc_family = selected.rustc_family,
+                .go_family = selected.go_family};
             repro_tool_audit = ToolAudit::create(
                 canonical, repro_root, bcfg.sysroot, cache_dir, active_cache_mode);
+            if (repro_tool_audit && r.managed_build.network) {
+                repro_tool_audit->sandbox = sage::build::replace_all(
+                    std::move(repro_tool_audit->sandbox), " --unshare-net", "");
+            }
             if (repro_tool_audit && !repro_tool_audit->sandbox.empty()) {
                 repro_tool_audit->sandbox += " --ro-bind "
                     + sage::build::shell_quote(recipe_dir.string()) + " "
@@ -3326,7 +3678,7 @@ export int cmd_build(const CliOptions& opts) {
                 r, bcfg, {.source = repro_work, .package = repro_pkg,
                            .home = repro_home, .temp = repro_temp},
                 {.cc = cand.cc, .cxx = cand.cxx, .linker = cand.linker,
-                 .rustc = cand.rustc,
+                 .rustc = cand.rustc, .go = cand.go,
                  .target_triplet = target_triplet,
                  .cc_for_build = repro_tool_audit ? repro_tool_audit->cc : cand.cc,
                  .cxx_for_build = repro_tool_audit ? repro_tool_audit->cxx : cand.cxx,
@@ -3344,10 +3696,12 @@ export int cmd_build(const CliOptions& opts) {
                  .cxx_version = cand.cxx_version,
                  .linker_version = cand.linker_version,
                  .rustc_version = cand.rustc_version,
+                 .go_version = cand.go_version,
                  .compiler_family = cand.compiler_family,
                  .cxx_family = cand.cxx_family,
                  .linker_family = cand.linker_family,
-                 .rustc_family = cand.rustc_family}, compile_jobs);
+                 .rustc_family = cand.rustc_family,
+                 .go_family = cand.go_family}, compile_jobs);
             if (!repro_plan) {
                 sage::util::log_error("Reproducibility pass failed to plan: {}", repro_plan.error());
                 return 1;
@@ -3397,6 +3751,12 @@ export int cmd_build(const CliOptions& opts) {
             r.managed_build.install_removes,
             r.managed_build.install_generates);
         apply_file_permissions(repro_pkg, r.managed_build.file_permissions);
+        if (auto repro_content = apply_content_policy(
+                repro_pkg, r.managed_build.content); !repro_content) {
+            sage::util::log_error("Reproducibility pass content policy failed: {}",
+                                  repro_content.error());
+            return 1;
+        }
 
         for (const auto& [pkg_name, pass1_file] : created_packages) {
             std::filesystem::path repro_pkg_data = repro_pkg;
@@ -3420,11 +3780,25 @@ export int cmd_build(const CliOptions& opts) {
                         output_spec->install_removes,
                         output_spec->install_generates);
                     apply_file_permissions(repro_pkg_data, output_spec->file_permissions);
+                    if (auto repro_sysusers = apply_sysusers_fragment(
+                            repro_pkg_data, pkg_name, r.sysusers); !repro_sysusers) {
+                        sage::util::log_error(
+                            "Reproducibility pass sysusers staging failed: {}",
+                            repro_sysusers.error());
+                        return 1;
+                    }
                 }
             } else {
                 apply_payload_policy(repro_pkg_data, r.managed_build.install_files,
                                      r.managed_build.install_excludes,
                                      r.managed_build.optional_excludes);
+                if (auto repro_sysusers = apply_sysusers_fragment(
+                        repro_pkg_data, pkg_name, r.sysusers); !repro_sysusers) {
+                    sage::util::log_error(
+                        "Reproducibility pass sysusers staging failed: {}",
+                        repro_sysusers.error());
+                    return 1;
+                }
             }
             std::filesystem::path repro_pkg_file = repro_root / pass1_file.filename();
             auto pack_res = sage::archive::create_package(manifest, repro_pkg_data, repro_pkg_file);

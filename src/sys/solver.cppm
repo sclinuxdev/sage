@@ -29,20 +29,45 @@ struct Term {
 
     [[nodiscard]] bool satisfies(const package::PackageManifest& pkg) const noexcept {
         if (pkg.name != package_name) {
-            // Check if package provides this symbol (virtual provider or soname)
+            // Versioned provides ("virtual/libc = 2.44"): the request is
+            // satisfied by the declared provides version, not by the
+            // provider's own package version.
             bool provides_match = false;
+            bool versioned_match = false;
             for (const auto& prov : pkg.provides) {
-                if (prov == package_name || prov.starts_with(package_name + " ")) {
-                    provides_match = true;
-                    break;
+                if (prov == package_name) { provides_match = true; continue; }
+                if (!prov.starts_with(package_name + " ")) continue;
+                provides_match = true;
+                auto entry = package::Dependency::parse(prov);
+                if (entry.op != package::ConstraintOp::Any
+                    && constraint.satisfies(entry.version)) {
+                    versioned_match = true;
                 }
             }
             if (!provides_match) return !is_positive;
+            if (versioned_match) return is_positive;
+            // Unversioned provides fall back to the provider's own version.
+            bool sat = constraint.satisfies(pkg.version);
+            return is_positive ? sat : !sat;
         }
         bool sat = constraint.satisfies(pkg.version);
         return is_positive ? sat : !sat;
     }
 };
+
+// The version a package provides `name` at, when the provides entry carries
+// one. Absent means: use the package's own version.
+inline std::optional<package::Version> provided_version_of(
+    const package::PackageManifest& pkg, std::string_view name)
+{
+    const std::string prefix = std::string(name) + " ";
+    for (const auto& prov : pkg.provides) {
+        if (!prov.starts_with(prefix)) continue;
+        auto entry = package::Dependency::parse(prov);
+        if (entry.op != package::ConstraintOp::Any) return entry.version;
+    }
+    return std::nullopt;
+}
 
 enum class CauseKind {
     Root,
@@ -96,8 +121,8 @@ public:
         for (const auto& pkg : pool_) {
             by_name_[pkg.name].push_back(pkg);
             for (const auto& prov : pkg.provides) {
-                // e.g. "virtual/init", "so:libc.so.6"
-                by_provides_[prov].push_back(pkg);
+                // e.g. "virtual/init", "so:libc.so.6" or "virtual/libc = 2.44"
+                by_provides_[package::Dependency::parse(prov).name].push_back(pkg);
             }
         }
     }
@@ -136,7 +161,11 @@ public:
             //      ties deterministically.
             const package::PackageManifest* best_candidate = nullptr;
             for (const auto& cand : candidates) {
-                if (!req.satisfies(cand.version)) continue;
+                // A versioned provides entry answers version constraints on
+                // the virtual name itself.
+                auto provided = provided_version_of(cand, req.name);
+                const auto& effective = provided ? *provided : cand.version;
+                if (!req.satisfies(effective)) continue;
                 if (!best_candidate) { best_candidate = &cand; continue; }
                 const auto rank = [&](const package::PackageManifest& m) {
                     if (m.name == req.name) return 2;
