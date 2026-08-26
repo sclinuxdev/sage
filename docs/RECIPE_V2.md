@@ -115,8 +115,13 @@ In v2 every source URL, including additional sources, must have a SHA-256.
 ```toml
 [build]
 system = "cmake"
+payload = "all"                 # all | allowlist | outputs (required)
 patches = ["fix-musl.patch"]
 patch_strip = 1
+
+[build.patch_checksums]
+# Required for a patch shipped beside recipe.toml or in distfiles/.
+fix-musl.patch = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
 ## Managed build table
@@ -124,6 +129,7 @@ patch_strip = 1
 ```toml
 [build]
 system = "cmake"               # autotools | cmake | meson | xmake | cargo | make | script
+payload = "all"                 # required payload boundary
 kernel = false                  # true for Linux Kbuild projects using the Make backend
 source_subdir = "src"          # optional, relative to unpacked source root
 build_dir = "build"            # cmake/meson build directory
@@ -163,12 +169,19 @@ from silently shipping the same upstream install tree. Split package recipes
 whose names end in `-libs` or `-dev` must declare a non-empty allowlist; Sage
 rejects an unbounded split recipe before running the build.
 
+`payload = "all"` is valid only when both top-level lists and `outputs` are
+empty. If a package needs exclusions, use `payload = "allowlist"` and spell
+out an include set. A broad `"**"` include is accepted for an intentionally
+complete package, but it is not a substitute for reviewing the resulting
+payload.
+
 For a normal package that intentionally ships the complete upstream install,
 leave both lists empty. For a split package, make the boundary explicit:
 
 ```toml
 [build]
 system = "autotools"
+payload = "allowlist"
 install_targets = ["install"]
 install_files = [
     "usr/lib/libexample.so.*",
@@ -208,12 +221,17 @@ split package.
 `install_moves` moves an existing staged artifact, `install_removes` removes
 matching staged paths, and `install_generates` writes a deterministic file with
 the declared mode. All paths stay relative to the package staging root and are
-checked before the operation. Operations run in the order copy, move, remove,
-generate, symlink, then the payload allowlist.
+checked before the operation; existing parent symlinks that resolve outside the
+source or package root are rejected, and copy/generate never follow a symlink
+at their destination. Operations run in the order copy, move, remove, generate,
+symlink, then the payload allowlist.
 
 Several outputs can share one build:
 
 ```toml
+[build]
+system = "autotools"
+payload = "outputs"
 outputs = [
   { name = "foo-libs", install_files = ["usr/lib/libfoo.so.*"] },
   { name = "foo-dev", install_files = ["usr/include/**", "usr/lib/libfoo.so"] },
@@ -236,6 +254,7 @@ same fakeroot, bubblewrap namespace, clean environment and fixed timestamp:
 ```toml
 [build]
 system = "script"
+payload = "allowlist"
 install_files = ["usr/lib/myapp/**", "usr/share/myapp/**"]
 
 [[build.steps]]
@@ -310,6 +329,7 @@ this build”, not “inferred as the producer of every payload file”.
 ```toml
 [build]
 system = "cmake"
+payload = "all"
 configure_options = [
   "-DBUILD_TESTING=OFF",
   "-DENABLE_SHARED=ON",
@@ -329,6 +349,7 @@ targets to run under `DESTDIR` instead of the normal `cmake --install` step.
 ```toml
 [build]
 system = "meson"
+payload = "all"
 configure_options = [
   "-Dtests=disabled",
   "-Ddefault_library=shared",
@@ -346,6 +367,7 @@ does not accept target names.
 ```toml
 [build]
 system = "xmake"
+payload = "all"
 configure_options = ["--shared=y"]
 build_targets = ["example"]
 ```
@@ -359,6 +381,7 @@ configuration and installs under the package staging root. Xmake recipes leave
 ```toml
 [build]
 system = "cargo"
+payload = "all"
 build_targets = ["--features", "system-zlib"]
 install_targets = ["--bin", "example"]
 allowed_linkers = ["lld", "mold", "ld"]
@@ -410,6 +433,7 @@ compiler/linker flags remain owned by Sage.
 ```toml
 [build]
 system = "make"
+payload = "all"
 build_targets = ["all"]
 install_targets = ["install"]
 
@@ -444,6 +468,7 @@ version = "6.18.1"
 release = "1"
 license = "GPL-2.0-only"
 channel = "system"
+arch = "amd64"
 
 [upstream]
 url = "https://www.kernel.org/releases.json"
@@ -455,6 +480,7 @@ sha256 = "..."
 
 [build]
 system = "make"
+payload = "allowlist"
 kernel = true
 build_targets = ["all"]
 install_targets = ["modules_install", "install"]

@@ -3,6 +3,7 @@ module;
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <fcntl.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
@@ -17,6 +18,7 @@ export module sage.cli.build;
 // Package authoring: recipe builds and local repository indexing.
 import std;
 import sage;
+import sage.vendor.libarchive;
 
 import sage.cli;
 
@@ -47,8 +49,13 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
     // shells can print a locale warning before the tool's real first line.
     // Force the portable C locale so that the version parser observes the
     // selected executable rather than an environment diagnostic.
-    int rc = std::system(std::format("LC_ALL=C LANG=C \"{}\" --version > \"{}\" 2>&1",
-                                     tool, out.string()).c_str());
+    // Use shell-quoting even for administrator-provided executable names.
+    // Double quotes would still expand `$()`/backticks from build.toml and
+    // make version probing an unintended command-execution surface.
+    const auto probe_command = "LC_ALL=C LANG=C "
+        + sage::build::shell_quote(tool) + " --version > "
+        + sage::build::shell_quote(out.string()) + " 2>&1";
+    int rc = std::system(probe_command.c_str());
     if (rc != 0) return std::nullopt;
     std::ifstream f(out);
     std::stringstream captured;
@@ -192,9 +199,44 @@ std::expected<void, std::string> apply_install_transforms(
         return !path.empty() && !path.is_absolute() && !path.has_root_path()
             && std::ranges::none_of(path, [](const auto& part) { return part == ".."; });
     };
+    const auto path_inside = [&](const std::filesystem::path& root,
+                                 const std::filesystem::path& relative) {
+        if (!safe_relative(relative)) return false;
+        std::error_code path_ec;
+        const auto root_canonical = std::filesystem::weakly_canonical(root, path_ec);
+        if (path_ec) return false;
+        const auto parent_canonical = std::filesystem::weakly_canonical(
+            (root / relative).parent_path(), path_ec);
+        if (path_ec) return false;
+        return parent_canonical == root_canonical
+            || parent_canonical.string().starts_with(root_canonical.string() + "/");
+    };
+    const auto existing_inside = [&](const std::filesystem::path& root,
+                                     const std::filesystem::path& relative) {
+        if (!path_inside(root, relative)) return false;
+        std::error_code path_ec;
+        const auto status = std::filesystem::symlink_status(root / relative, path_ec);
+        if (path_ec || status.type() != std::filesystem::file_type::symlink) return !path_ec;
+        const auto root_canonical = std::filesystem::weakly_canonical(root, path_ec);
+        const auto target_canonical = std::filesystem::weakly_canonical(
+            root / relative, path_ec);
+        return !path_ec && (target_canonical == root_canonical
+            || target_canonical.string().starts_with(root_canonical.string() + "/"));
+    };
     for (const auto& copy : copies) {
+        if (!existing_inside(source_dir, copy.source)
+            || !path_inside(pkg_dir, copy.destination))
+            return std::unexpected("Install copy path follows a symlink outside its root");
         const auto source = source_dir / copy.source;
         const auto destination = pkg_dir / copy.destination;
+        auto destination_status = std::filesystem::symlink_status(destination, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory)
+            return std::unexpected("Cannot inspect install copy destination: " + ec.message());
+        if (!ec && destination_status.type() == std::filesystem::file_type::symlink) {
+            std::filesystem::remove(destination, ec);
+            if (ec) return std::unexpected("Cannot replace install copy destination: "
+                                           + ec.message());
+        }
         if (!std::filesystem::is_regular_file(source, ec)) {
             if (ec) return std::unexpected("Cannot inspect install copy source '"
                                            + source.string() + "': " + ec.message());
@@ -214,8 +256,8 @@ std::expected<void, std::string> apply_install_transforms(
         }
     }
     for (const auto& move : moves) {
-        if (!safe_relative(move.source) || !safe_relative(move.destination))
-            return std::unexpected("Install move path escapes the staging root");
+        if (!path_inside(pkg_dir, move.source) || !path_inside(pkg_dir, move.destination))
+            return std::unexpected("Install move path follows a symlink outside the staging root");
         const auto source = pkg_dir / move.source;
         const auto destination = pkg_dir / move.destination;
         if (!std::filesystem::exists(source, ec)) {
@@ -255,9 +297,17 @@ std::expected<void, std::string> apply_install_transforms(
         }
     }
     for (const auto& generate : generates) {
-        if (!safe_relative(generate.path))
-            return std::unexpected("Install generate path escapes the staging root");
+        if (!path_inside(pkg_dir, generate.path))
+            return std::unexpected("Install generate path follows a symlink outside the staging root");
         const auto destination = pkg_dir / generate.path;
+        auto destination_status = std::filesystem::symlink_status(destination, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory)
+            return std::unexpected("Cannot inspect generated payload destination: " + ec.message());
+        if (!ec && destination_status.type() == std::filesystem::file_type::symlink) {
+            std::filesystem::remove(destination, ec);
+            if (ec) return std::unexpected("Cannot replace generated payload symlink: "
+                                           + ec.message());
+        }
         std::filesystem::create_directories(destination.parent_path(), ec);
         if (ec) return std::unexpected("Cannot create generated payload directory: "
                                        + ec.message());
@@ -273,8 +323,8 @@ std::expected<void, std::string> apply_install_transforms(
                                        + destination.string() + "': " + ec.message());
     }
     for (const auto& link : symlinks) {
-        if (!safe_relative(link.path))
-            return std::unexpected("Install symlink path escapes the staging root");
+        if (!path_inside(pkg_dir, link.path))
+            return std::unexpected("Install symlink path follows a symlink outside the staging root");
         const std::filesystem::path target(link.target);
         const auto resolved = (std::filesystem::path(link.path).parent_path()
                                / target).lexically_normal();
@@ -293,6 +343,189 @@ std::expected<void, std::string> apply_install_transforms(
         if (ec) return std::unexpected("Cannot create install symlink '"
                                        + destination.string() + "' -> '"
                                        + link.target + "': " + ec.message());
+    }
+    return {};
+}
+
+// Source archives are untrusted build inputs.  Use the same libarchive reader
+// boundary as package archives instead of shelling out to tar, reject path and
+// symlink escapes, and choose a top-level strip only when every member agrees
+// on the same directory.  The second pass is intentional: archive readers are
+// streaming, so no payload is retained in memory while we inspect the names.
+std::expected<void, std::string> extract_source_archive(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path& destination)
+{
+    struct Fd {
+        int value{-1};
+        explicit Fd(int fd) : value(fd) {}
+        ~Fd() { if (value >= 0) ::close(value); }
+        Fd(const Fd&) = delete;
+        Fd& operator=(const Fd&) = delete;
+        Fd(Fd&& other) noexcept : value(std::exchange(other.value, -1)) {}
+        Fd& operator=(Fd&& other) noexcept {
+            if (this != &other) {
+                if (value >= 0) ::close(value);
+                value = std::exchange(other.value, -1);
+            }
+            return *this;
+        }
+    };
+    const auto open_reader = [&]() -> std::expected<
+        std::pair<Fd, sage::vendor::libarchive::ArchiveReader>, std::string> {
+        Fd fd{::open(archive_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        if (fd.value < 0) return std::unexpected(
+            "Cannot open source archive: " + archive_path.string());
+        auto reader = sage::vendor::libarchive::ArchiveReader::open_fd(fd.value);
+        if (!reader) return std::unexpected(reader.error());
+        return std::pair<Fd, sage::vendor::libarchive::ArchiveReader>{
+            std::move(fd), std::move(*reader)};
+    };
+    const auto clean_name = [](std::string_view raw)
+        -> std::expected<std::filesystem::path, std::string> {
+        if (raw.empty()) return std::unexpected("Source archive contains an empty path");
+        const std::filesystem::path path{std::string(raw)};
+        if (path.is_absolute() || path.has_root_path()
+            || std::ranges::any_of(path, [](const auto& part) { return part == ".."; }))
+            return std::unexpected("Source archive contains an unsafe path: "
+                                   + std::string(raw));
+        const auto normalized = path.lexically_normal();
+        if (normalized.empty() || normalized == ".")
+            return std::unexpected("Source archive contains an empty normalized path");
+        return normalized;
+    };
+    const auto drain = [](sage::vendor::libarchive::ArchiveReader& reader)
+        -> std::expected<void, std::string> {
+        std::array<std::uint8_t, 64 * 1024> buffer{};
+        for (;;) {
+            auto count = reader.read_data(buffer);
+            if (!count) return std::unexpected(count.error());
+            if (*count == 0) break;
+        }
+        return {};
+    };
+
+    auto first = open_reader();
+    if (!first) return std::unexpected(first.error());
+    std::set<std::string> raw_names;
+    std::string common_root;
+    bool all_nested = true;
+    bool saw_member = false;
+    for (;;) {
+        auto header = first->second.next_header();
+        if (!header) return std::unexpected(header.error());
+        if (!*header) break;
+        auto name = clean_name((*header)->pathname);
+        if (!name) return std::unexpected(name.error());
+        const auto text = name->generic_string();
+        if (!raw_names.insert(text).second)
+            return std::unexpected("Source archive contains duplicate path: " + text);
+        saw_member = true;
+        const auto slash = text.find('/');
+        // Tar writers normally include an explicit top-level directory entry
+        // (`project-1.0/`) before its children.  That entry is not evidence
+        // of a flat archive; only a root-level non-directory payload disables
+        // the common-root strip.
+        if (slash == std::string::npos
+            && (*header)->filetype != sage::vendor::libarchive::type_directory)
+            all_nested = false;
+        else {
+            const auto root = text.substr(0, slash);
+            if (common_root.empty()) common_root = root;
+            else if (common_root != root) all_nested = false;
+        }
+        if ((*header)->filetype == sage::vendor::libarchive::type_regular) {
+            if (auto result = drain(first->second); !result)
+                return std::unexpected(result.error());
+        }
+    }
+    const bool strip_root = saw_member && all_nested && !common_root.empty();
+
+    auto second = open_reader();
+    if (!second) return std::unexpected(second.error());
+    std::set<std::string> extracted;
+    for (;;) {
+        auto header = second->second.next_header();
+        if (!header) return std::unexpected(header.error());
+        if (!*header) break;
+        auto name = clean_name((*header)->pathname);
+        if (!name) return std::unexpected(name.error());
+        auto relative = name->generic_string();
+        if (strip_root) {
+            const auto prefix = common_root + "/";
+            if (relative == common_root) relative.clear();
+            else if (relative.starts_with(prefix)) relative.erase(0, prefix.size());
+            else return std::unexpected(
+                "Source archive has inconsistent top-level paths");
+        }
+        if (relative.empty()) {
+            if ((*header)->filetype == sage::vendor::libarchive::type_regular) {
+                auto result = drain(second->second);
+                if (!result) return std::unexpected(
+                    "Cannot discard source archive root payload");
+            }
+            continue;
+        }
+        const std::filesystem::path out_rel(relative);
+        if (out_rel.is_absolute() || out_rel.has_root_path()
+            || std::ranges::any_of(out_rel,
+                [](const auto& part) { return part == ".."; }))
+            return std::unexpected("Source archive path escapes destination: " + relative);
+        if (!extracted.insert(relative).second)
+            return std::unexpected("Source archive contains duplicate extracted path: " + relative);
+        const auto out = destination / out_rel;
+        std::error_code ec;
+        if ((*header)->filetype == sage::vendor::libarchive::type_directory) {
+            std::filesystem::create_directories(out, ec);
+            if (ec) return std::unexpected("Cannot create source directory '"
+                                           + out.string() + "': " + ec.message());
+            std::filesystem::permissions(out,
+                static_cast<std::filesystem::perms>((*header)->perm),
+                std::filesystem::perm_options::replace, ec);
+            if (ec) return std::unexpected("Cannot set source directory mode: "
+                                           + ec.message());
+        } else if ((*header)->filetype == sage::vendor::libarchive::type_symlink) {
+            const std::filesystem::path target((*header)->symlink);
+            const auto resolved = out_rel.parent_path() / target;
+            if (target.empty() || target.is_absolute() || target.has_root_path()
+                || std::ranges::any_of(resolved.lexically_normal(),
+                    [](const auto& part) { return part == ".."; }))
+                return std::unexpected("Source archive symlink escapes destination: "
+                                       + relative);
+            std::filesystem::create_directories(out.parent_path(), ec);
+            if (ec) return std::unexpected("Cannot create source symlink directory: "
+                                           + ec.message());
+            std::filesystem::create_symlink((*header)->symlink, out, ec);
+            if (ec) return std::unexpected("Cannot create source symlink '"
+                                           + out.string() + "': " + ec.message());
+        } else if ((*header)->filetype == sage::vendor::libarchive::type_regular) {
+            std::filesystem::create_directories(out.parent_path(), ec);
+            if (ec) return std::unexpected("Cannot create source file directory: "
+                                           + ec.message());
+            std::ofstream file(out, std::ios::binary | std::ios::trunc);
+            if (!file) return std::unexpected("Cannot create source file: " + out.string());
+            std::array<std::uint8_t, 64 * 1024> buffer{};
+            std::uint64_t written = 0;
+            for (;;) {
+                auto count = second->second.read_data(buffer);
+                if (!count) return std::unexpected(count.error());
+                if (*count == 0) break;
+                file.write(reinterpret_cast<const char*>(buffer.data()),
+                           static_cast<std::streamsize>(*count));
+                if (!file) return std::unexpected("Cannot write source file: " + out.string());
+                written += *count;
+            }
+            if (written != (*header)->size) return std::unexpected(
+                "Source archive file size changed while extracting: " + relative);
+            file.close();
+            std::filesystem::permissions(out,
+                static_cast<std::filesystem::perms>((*header)->perm),
+                std::filesystem::perm_options::replace, ec);
+            if (ec) return std::unexpected("Cannot set source file mode: " + ec.message());
+        } else {
+            return std::unexpected("Source archive contains unsupported special file: "
+                                   + relative);
+        }
     }
     return {};
 }
@@ -1562,27 +1795,11 @@ export int cmd_build(const CliOptions& opts) {
             std::filesystem::create_directories(src_dir / "distfiles");
             if (!archive_path.empty()) {
                 sage::util::log_info("Unpacking source to {}...", src_dir.string());
-                // Strip the top-level directory only when there is one: flat
-                // archives (tzcode, tzdata) carry their files at the root,
-                // and stripping a component of those silently extracts
-                // nothing -- every entry loses its only path element.
-                const auto probe = std::format(
-                    "/tmp/sage-tarhead-{}.txt", sage::util::current_pid());
-                std::system(std::format("tar -tf \"{}\" 2>/dev/null | head -n1 > \"{}\"",
-                    archive_path.string(), probe).c_str());
-                std::ifstream head_in(probe);
-                std::string first_entry;
-                std::getline(head_in, first_entry);
-                std::filesystem::remove(probe, ec);
-                const bool flat = !first_entry.empty()
-                    && first_entry.find('/') == std::string::npos;
-                std::string cmd = flat
-                    ? std::format("tar -xf \"{}\" -C \"{}\"",
-                        archive_path.string(), src_dir.string())
-                    : std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
-                        archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
-                if (std::system(cmd.c_str()) != 0) {
-                    sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
+                auto extracted = extract_source_archive(archive_path, src_dir);
+                if (!extracted) {
+                    sage::util::log_error(
+                        "Failed to unpack source archive: {}. Cleaning up...",
+                        extracted.error());
                     std::filesystem::remove(archive_path, ec);
                     std::filesystem::remove_all(src_dir, ec);
                     return 1;
@@ -1629,6 +1846,18 @@ export int cmd_build(const CliOptions& opts) {
                 const auto attached = std::filesystem::is_regular_file(beside_recipe, ec)
                     ? beside_recipe : recipe_dir / "distfiles" / patch;
                 if (!std::filesystem::is_regular_file(attached, ec)) continue;
+                const auto checksum = r.managed_build.patch_checksums.find(patch);
+                if (checksum == r.managed_build.patch_checksums.end()) {
+                    sage::util::log_error(
+                        "Local v2 patch '{}' has no build.patch_checksums entry", patch);
+                    return 1;
+                }
+                auto patch_hash = sage::util::compute_file_sha256(attached);
+                if (!patch_hash || *patch_hash != checksum->second) {
+                    sage::util::log_error(
+                        "Local v2 patch SHA256 mismatch for '{}'", patch);
+                    return 1;
+                }
                 std::filesystem::copy_file(attached, src_dir / "distfiles" / patch,
                     std::filesystem::copy_options::overwrite_existing, ec);
                 if (ec) {
@@ -1868,31 +2097,32 @@ export int cmd_build(const CliOptions& opts) {
             for (const auto& event : process_execs) text += event + "\n";
             return text;
         }();
+        const auto audit_path_equal = [&](std::string_view actual,
+                                          std::string_view expected) {
+            if (actual == expected) return true;
+            // When Sage itself is entered through a host-side chroot, the
+            // ptrace observer can report the host mount prefix while the
+            // child sees the sysroot as `/`. Accept exactly that configured
+            // prefix rewrite; a generic suffix match would let
+            // `/untrusted/usr/bin/gcc` masquerade as the selected compiler.
+            if (bcfg.sysroot == "/") return false;
+            const auto host_path = (bcfg.sysroot
+                / std::filesystem::path(expected).relative_path()).lexically_normal();
+            return actual == host_path.string();
+        };
         const auto require_real_exec = [&](std::string_view role,
                                            std::uint64_t executions) {
             if (executions == 0) return true;
             const auto expected_it = tool_audit->expected_real_execs.find(std::string(role));
             if (expected_it == tool_audit->expected_real_execs.end()) return false;
             const auto& expected = expected_it->second;
-            const auto path_equal = [](std::string_view actual,
-                                       std::string_view path) {
-                // When Sage itself runs in a chroot, the outer ptrace
-                // observer sees the host mount prefix (for example
-                // /mnt/tmp/...) while Sage sees /tmp/... .  The audit
-                // directory's random component and host-root suffix are
-                // still exact, so accepting that single prefix rewrite
-                // preserves identity without accepting another file.
-                return actual == path
-                    || (actual.size() > path.size()
-                        && actual.ends_with(path));
-            };
             const auto observed = [&](const std::string& path) {
                 for (size_t begin = 0;;) {
                     const auto found = process_exec_text.find("path=", begin);
                     if (found == std::string::npos) return false;
                     const auto path_begin = found + 5;
                     const auto path_end = process_exec_text.find_first_of(" \n", path_begin);
-                    if (path_equal(process_exec_text.substr(path_begin,
+                    if (audit_path_equal(process_exec_text.substr(path_begin,
                             path_end == std::string::npos
                                 ? std::string::npos : path_end - path_begin), path))
                         return true;
@@ -1926,9 +2156,7 @@ export int cmd_build(const CliOptions& opts) {
             bool selected = false;
             for (const auto& [_, expected] : tool_audit->expected_real_execs)
                 if (std::ranges::any_of(expected, [&](const auto& value) {
-                        return path == value
-                            || (path.size() > value.size()
-                                && path.ends_with(value));
+                        return audit_path_equal(path, value);
                     })) selected = true;
             if (!selected) {
                 sage::util::log_error(
@@ -1989,6 +2217,7 @@ export int cmd_build(const CliOptions& opts) {
     manifest.channel = r.channel;
     manifest.dependencies = r.host_deps;
     manifest.provides = r.provides;
+    manifest.conflicts = r.conflicts;
     manifest.conffiles = r.conffiles;
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
@@ -2201,12 +2430,47 @@ export int cmd_build(const CliOptions& opts) {
         output_paths.push_back({r.name, pkg_dir});
     }
 
+    if (output_paths.size() > 1) {
+        std::map<std::string, std::string> owners;
+        for (const auto& output : output_paths) {
+            std::error_code output_ec;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                     output.data, std::filesystem::directory_options::skip_permission_denied,
+                     output_ec)) {
+                if (output_ec) {
+                    sage::util::log_error("Cannot inspect output '{}': {}",
+                                          output.name, output_ec.message());
+                    return 1;
+                }
+                if (entry.is_directory(output_ec) && !entry.is_symlink(output_ec)) continue;
+                const auto rel = entry.path().lexically_relative(output.data).generic_string();
+                const auto [it, inserted] = owners.emplace(rel, output.name);
+                if (!inserted) {
+                    sage::util::log_error(
+                        "Outputs '{}' and '{}' both claim payload path '{}'",
+                        it->second, output.name, rel);
+                    return 1;
+                }
+            }
+        }
+    }
+
     for (const auto& output : output_paths) {
         auto output_manifest = manifest;
         output_manifest.name = output.name;
-        if (output.name != r.name) {
-            output_manifest.provides = r.provides;
-            output_manifest.dependencies = r.host_deps;
+        if (!r.managed_build.outputs.empty()) {
+            const auto output_spec = std::ranges::find(r.managed_build.outputs,
+                output.name, &sage::package::InstallOutput::name);
+            if (output_spec == r.managed_build.outputs.end()) {
+                sage::util::log_error("Output '{}' has no recipe metadata", output.name);
+                return 1;
+            }
+            output_manifest.description = output_spec->description.value_or(r.description);
+            output_manifest.license = output_spec->license.value_or(r.license);
+            output_manifest.dependencies = output_spec->dependencies.value_or(r.host_deps);
+            output_manifest.provides = output_spec->provides.value_or(r.provides);
+            output_manifest.conflicts = output_spec->conflicts.value_or(r.conflicts);
+            output_manifest.conffiles = output_spec->conffiles.value_or(r.conffiles);
             std::set<std::string> output_self_sonames;
             std::set<std::string> output_needed_sonames;
             for (const auto& entry : std::filesystem::recursive_directory_iterator(output.data)) {

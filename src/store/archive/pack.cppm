@@ -293,6 +293,12 @@ inline std::expected<void, std::string> generate_repo_index(
         ss << "provides = [\n";
         for (const auto& prov : m.provides) ss << "    \"" << quote(prov) << "\",\n";
         ss << "]\n";
+        if (!m.conflicts.empty()) {
+            ss << "conflicts = [\n";
+            for (const auto& conflict : m.conflicts)
+                ss << "    \"" << quote(conflict.to_string()) << "\",\n";
+            ss << "]\n";
+        }
         if (!m.conffiles.empty()) {
             ss << "conffiles = [\n";
             for (const auto& c : m.conffiles) ss << "    \"" << quote(c) << "\",\n";

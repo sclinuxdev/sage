@@ -93,12 +93,29 @@ struct ManagedBuildStep {
 // `--output` in a later phase.  The default output is the recipe package.
 struct InstallOutput {
     std::string name;
+    std::optional<std::string> description;
+    std::optional<std::string> license;
+    std::optional<std::vector<Dependency>> dependencies;
+    std::optional<std::vector<std::string>> provides;
+    std::optional<std::vector<Dependency>> conflicts;
+    std::optional<std::vector<std::string>> conffiles;
     std::vector<std::string> install_files;
     std::vector<std::string> install_excludes;
 };
 
+enum class PayloadMode {
+    All,
+    Allowlist,
+    Outputs,
+};
+
 struct ManagedBuildSpec {
     BuildSystem system{BuildSystem::Legacy};
+    // v2 requires the author to state whether the complete install tree,
+    // an explicit allowlist, or named outputs become package payload.  The
+    // explicit mode prevents a misspelled install_files key from silently
+    // widening a split package to the whole DESTDIR.
+    PayloadMode payload{PayloadMode::All};
     // Kbuild-compatible Make project. Sage derives kernel-specific channels
     // from the selected toolchain: clang enables LLVM=1, while the global
     // flag classes are mapped to KCFLAGS/KCPPFLAGS/KBUILD_LDFLAGS/KRUSTFLAGS.
@@ -113,9 +130,9 @@ struct ManagedBuildSpec {
     std::vector<std::string> install_targets;
     // Paths that may survive the backend's install step.  These are package
     // payload paths relative to the staging root (for example
-    // `usr/lib/libfoo.so.*`), not DESTDIR-prefixed filesystem paths.  An
-    // empty list preserves the historical "all installed files" behaviour;
-    // split `-libs`/`-dev` recipes are required to spell this allowlist out.
+    // `usr/lib/libfoo.so.*`), not DESTDIR-prefixed filesystem paths.  The
+    // `all` payload mode intentionally leaves this empty; `allowlist` requires
+    // at least one pattern so a split package cannot widen itself silently.
     std::vector<std::string> install_files;
     // Optional path globs removed after the allowlist is applied.  Excludes
     // are useful for a package that takes most of an upstream install but
@@ -129,6 +146,7 @@ struct ManagedBuildSpec {
     std::vector<InstallOutput> outputs;
     std::vector<ManagedBuildStep> steps;
     std::vector<std::string> patches;
+    std::map<std::string, std::string> patch_checksums;
     int patch_strip{1};
     std::map<std::string, std::string> variables;
     std::vector<std::string> allowed_compilers;
@@ -162,6 +180,7 @@ struct Recipe {
     ManagedBuildSpec managed_build;
     std::vector<std::string> build_deps;
     std::vector<Dependency> host_deps;
+    std::vector<Dependency> conflicts;
     std::vector<std::string> provides;
     // Absolute paths of shipped files protected from clobbering on reinstall;
     // copied verbatim onto the built manifest.
@@ -191,7 +210,41 @@ struct Recipe {
         if (!tbl_res) return std::unexpected(tbl_res.error());
         const auto& tbl = *tbl_res;
 
+        const auto reject_unknown = [](const vendor::toml::table& table,
+                                       std::initializer_list<std::string_view> allowed,
+                                       std::string_view scope)
+            -> std::expected<void, std::string> {
+            for (const auto& [key, _] : table) {
+                if (!std::ranges::contains(allowed, key.str())) {
+                    return std::unexpected(std::format(
+                        "Unknown key '{}' in {}", key.str(), scope));
+                }
+            }
+            return {};
+        };
+        const auto require_string = [](const vendor::toml::table& table,
+                                       std::string_view key,
+                                       std::string_view scope,
+                                       bool required)
+            -> std::expected<std::string, std::string> {
+            const auto* node = table.get(key);
+            if (!node) {
+                if (required) return std::unexpected(std::format(
+                    "Missing required string '{}.{}'", scope, key));
+                return std::string{};
+            }
+            auto value = node->value<std::string_view>();
+            if (!value) return std::unexpected(std::format(
+                "'{}.{}' must be a string", scope, key));
+            if (required && value->empty()) return std::unexpected(std::format(
+                "'{}.{}' must not be empty", scope, key));
+            return std::string(*value);
+        };
+
         Recipe r;
+        if (tbl.contains("schema_version")
+            && !tbl["schema_version"].value<std::int64_t>())
+            return std::unexpected("schema_version must be an integer");
         r.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
         if (r.schema_version != 1 && r.schema_version != 2) {
             return std::unexpected(std::format(
@@ -199,7 +252,22 @@ struct Recipe {
                 r.schema_version));
         }
 
+        if (r.schema_version == 2) {
+            if (auto result = reject_unknown(tbl,
+                    {"schema_version", "package", "upstream", "source",
+                     "build", "capability_hooks", "triggers"}, "recipe"); !result)
+                return std::unexpected(result.error());
+        }
+
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            if (r.schema_version == 2) {
+                if (auto result = reject_unknown(*pkg,
+                        {"name", "version", "release", "description", "license",
+                         "channel", "arch", "dependencies", "build_dependencies",
+                         "provides", "conflicts", "conffiles", "upstream",
+                         "upstream_regex"}, "package"); !result)
+                    return std::unexpected(result.error());
+            }
             r.name = (*pkg)["name"].value_or("");
             std::string ver_str = std::string((*pkg)["version"].value_or(""));
             r.version = Version::parse(ver_str);
@@ -218,7 +286,15 @@ struct Recipe {
             return std::unexpected("Missing [package] section in recipe");
         }
 
+        if (r.schema_version == 2 && tbl.contains("upstream")
+            && !tbl.get_as<vendor::toml::table>("upstream"))
+            return std::unexpected("recipe.upstream must be a table");
         if (auto* upstream = tbl.get_as<vendor::toml::table>("upstream")) {
+            if (r.schema_version == 2) {
+                if (auto result = reject_unknown(*upstream,
+                        {"url", "version_regex"}, "upstream"); !result)
+                    return std::unexpected(result.error());
+            }
             r.upstream.url = (*upstream)["url"].value_or(r.upstream.url);
             r.upstream.version_regex =
                 (*upstream)["version_regex"].value_or(r.upstream.version_regex);
@@ -228,6 +304,30 @@ struct Recipe {
                 "Upstream tracking requires both url and version_regex");
         }
 
+        if (r.schema_version == 2) {
+            auto pkg = tbl.get_as<vendor::toml::table>("package");
+            for (const auto key : {"name", "version", "license", "channel", "arch"}) {
+                auto value = require_string(*pkg, key, "package", true);
+                if (!value) return std::unexpected(value.error());
+            }
+            for (const auto key : {"description", "upstream", "upstream_regex"}) {
+                auto value = require_string(*pkg, key, "package", false);
+                if (!value) return std::unexpected(value.error());
+            }
+            if (r.name.find('/') != std::string::npos || r.name == "." || r.name == "..")
+                return std::unexpected("package.name must be a simple package name");
+            if (r.version.ver.empty())
+                return std::unexpected("package.version must not be empty");
+            if (!r.upstream.version_regex.empty()) {
+                try {
+                    (void)std::regex(r.upstream.version_regex);
+                } catch (const std::regex_error& error) {
+                    return std::unexpected(std::format(
+                        "Invalid upstream.version_regex: {}", error.what()));
+                }
+            }
+        }
+
         // [source] is either one table (a single download) or an array of
         // tables (`[[source]]`): the first element is the primary archive that
         // gets unpacked to src/, any further elements are extra downloads.
@@ -235,6 +335,10 @@ struct Recipe {
         // element, so every scope-sensitive collector below must see all of
         // them -- src_scopes is the shared third layer.
         std::vector<const vendor::toml::table*> src_scopes;
+        if (r.schema_version == 2 && tbl.contains("source")
+            && !tbl.get_as<vendor::toml::array>("source")
+            && !tbl.get_as<vendor::toml::table>("source"))
+            return std::unexpected("recipe.source must be a table or array of tables");
         if (auto* arr = tbl.get_as<vendor::toml::array>("source")) {
             for (auto&& el : *arr) {
                 const vendor::toml::table* t = el.as_table();
@@ -253,6 +357,38 @@ struct Recipe {
             r.source_url = (*src)["url"].value_or("");
             r.source_sha256 = (*src)["sha256"].value_or("");
             src_scopes.push_back(src);
+        }
+
+        if (r.schema_version == 2) {
+            for (const auto* src : src_scopes) {
+                if (auto result = reject_unknown(*src, {"url", "sha256"},
+                                                 "source"); !result)
+                    return std::unexpected(result.error());
+                auto url = require_string(*src, "url", "source", true);
+                auto sha = require_string(*src, "sha256", "source", true);
+                if (!url || !sha) return std::unexpected(
+                    (!url ? url.error() : sha.error()));
+            }
+            if (!src_scopes.empty() && r.source_url.empty())
+                return std::unexpected(
+                    "v2 source entries require a non-empty primary source URL");
+            const auto source_basename = [](std::string_view url) {
+                const auto path = url.substr(0, url.find_first_of("?#"));
+                return std::filesystem::path(std::string(path)).filename().string();
+            };
+            std::set<std::string> source_names;
+            for (const auto& url : [&]() {
+                    std::vector<std::string> urls;
+                    if (!r.source_url.empty()) urls.push_back(r.source_url);
+                    for (const auto& extra : r.extra_sources) urls.push_back(extra.url);
+                    return urls;
+                }()) {
+                const auto name = source_basename(url);
+                if (name.empty()) return std::unexpected(
+                    "v2 source URL must have a filename component");
+                if (!source_names.insert(name).second) return std::unexpected(
+                    "v2 source URLs must have unique filenames: " + name);
+            }
         }
 
         auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {
@@ -275,13 +411,52 @@ struct Recipe {
             }
         };
 
+        const auto parse_string_array_strict = [&](const vendor::toml::table& table,
+                                                   std::string_view key,
+                                                   std::string_view scope,
+                                                   std::vector<std::string>& target)
+            -> std::expected<void, std::string> {
+            const auto* node = table.get(key);
+            if (!node) return {};
+            const auto* array = node->as_array();
+            if (!array) return std::unexpected(std::format(
+                "'{}.{}' must be an array of strings", scope, key));
+            for (const auto& element : *array) {
+                auto value = element.value<std::string_view>();
+                if (!value) return std::unexpected(std::format(
+                    "'{}.{}' must contain only strings", scope, key));
+                target.emplace_back(*value);
+            }
+            return {};
+        };
+        const auto parse_deps_strict = [&](const vendor::toml::table& table,
+                                           std::string_view key,
+                                           std::string_view scope,
+                                           std::vector<Dependency>& target)
+            -> std::expected<void, std::string> {
+            const auto* node = table.get(key);
+            if (!node) return {};
+            const auto* array = node->as_array();
+            if (!array) return std::unexpected(std::format(
+                "'{}.{}' must be an array of dependency strings", scope, key));
+            for (const auto& element : *array) {
+                auto value = element.value<std::string_view>();
+                if (!value || value->empty()) return std::unexpected(std::format(
+                    "'{}.{}' must contain only non-empty strings", scope, key));
+                target.push_back(Dependency::parse(*value));
+            }
+            return {};
+        };
+
         parse_deps(tbl, "dependencies", r.host_deps);
+        parse_deps(tbl, "conflicts", r.conflicts);
         parse_strings(tbl, "build_dependencies", r.build_deps);
         parse_strings(tbl, "provides", r.provides);
         parse_strings(tbl, "conffiles", r.conffiles);
 
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             parse_deps(*pkg, "dependencies", r.host_deps);
+            parse_deps(*pkg, "conflicts", r.conflicts);
             parse_strings(*pkg, "build_dependencies", r.build_deps);
             parse_strings(*pkg, "provides", r.provides);
             parse_strings(*pkg, "conffiles", r.conffiles);
@@ -352,6 +527,27 @@ struct Recipe {
                 if (auto v = (*bld)["ldflags"].value<std::string_view>()) r.ldflags = std::string(*v);
             }
         } else {
+            auto pkg = tbl.get_as<vendor::toml::table>("package");
+            r.host_deps.clear();
+            r.conflicts.clear();
+            r.build_deps.clear();
+            r.provides.clear();
+            r.conffiles.clear();
+            if (auto result = parse_deps_strict(*pkg, "dependencies", "package",
+                                                r.host_deps); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_deps_strict(*pkg, "conflicts", "package",
+                                                r.conflicts); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*pkg, "build_dependencies",
+                    "package", r.build_deps); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*pkg, "provides",
+                    "package", r.provides); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*pkg, "conffiles",
+                    "package", r.conffiles); !result)
+                return std::unexpected(result.error());
             const auto valid_sha256 = [](std::string_view value) {
                 return value.size() == 64 && std::ranges::all_of(value, [](char c) {
                     return std::isxdigit(static_cast<unsigned char>(c));
@@ -369,6 +565,16 @@ struct Recipe {
             }
             auto* bld = tbl.get_as<vendor::toml::table>("build");
             if (!bld) return std::unexpected("Recipe v2 requires a [build] table");
+            if (auto result = reject_unknown(*bld,
+                    {"system", "payload", "kernel", "source_subdir", "build_dir",
+                     "configure_options", "build_targets", "install_targets",
+                     "install_files", "install_excludes", "install_copies",
+                     "install_symlinks", "install_moves", "install_removes",
+                     "install_generates", "outputs", "steps", "patches",
+                     "patch_checksums", "patch_strip", "allowed_compilers",
+                     "allowed_linkers", "variables", "flag_env", "tool_env",
+                     "toolchain"}, "build"); !result)
+                return std::unexpected(result.error());
             auto has_commands = [&](const vendor::toml::table& scope) {
                 return scope.get_as<vendor::toml::array>("prepare")
                     || scope.get_as<vendor::toml::array>("build")
@@ -390,6 +596,16 @@ struct Recipe {
             auto system = parse_build_system((*bld)["system"].value_or(""));
             if (!system) return std::unexpected(system.error());
             r.managed_build.system = *system;
+            const auto payload_value = (*bld)["payload"].value<std::string_view>();
+            if (!payload_value) return std::unexpected(
+                "Recipe v2 requires build.payload = \"all\", \"allowlist\", or \"outputs\"");
+            if (*payload_value == "all") r.managed_build.payload = PayloadMode::All;
+            else if (*payload_value == "allowlist")
+                r.managed_build.payload = PayloadMode::Allowlist;
+            else if (*payload_value == "outputs")
+                r.managed_build.payload = PayloadMode::Outputs;
+            else return std::unexpected(
+                "build.payload must be \"all\", \"allowlist\", or \"outputs\"");
             if (auto value = (*bld)["kernel"].value<bool>())
                 r.managed_build.kernel = *value;
             else if (bld->contains("kernel"))
@@ -398,18 +614,38 @@ struct Recipe {
                 && r.managed_build.system != BuildSystem::Make)
                 return std::unexpected(
                     "build.kernel=true requires system = \"make\"");
-            r.managed_build.source_subdir = (*bld)["source_subdir"].value_or("");
-            r.managed_build.build_dir = (*bld)["build_dir"].value_or(
+            auto source_subdir = require_string(*bld, "source_subdir", "build", false);
+            auto build_dir = require_string(*bld, "build_dir", "build", false);
+            if (!source_subdir || !build_dir)
+                return std::unexpected(!source_subdir ? source_subdir.error()
+                                                        : build_dir.error());
+            r.managed_build.source_subdir = std::move(*source_subdir);
+            r.managed_build.build_dir = build_dir->empty()
+                ? (
                 *system == BuildSystem::CMake || *system == BuildSystem::Meson
-                    ? "build" : "");
+                    ? "build" : "")
+                : std::move(*build_dir);
+            if (bld->contains("patch_strip")
+                && !(*bld)["patch_strip"].value<std::int64_t>())
+                return std::unexpected("build.patch_strip must be an integer");
             r.managed_build.patch_strip = static_cast<int>((*bld)["patch_strip"].value_or(1LL));
             if (r.managed_build.patch_strip < 0 || r.managed_build.patch_strip > 9)
                 return std::unexpected("build.patch_strip must be between 0 and 9");
-            parse_strings(*bld, "configure_options", r.managed_build.configure_options);
-            parse_strings(*bld, "build_targets", r.managed_build.build_targets);
-            parse_strings(*bld, "install_targets", r.managed_build.install_targets);
-            parse_strings(*bld, "install_files", r.managed_build.install_files);
-            parse_strings(*bld, "install_excludes", r.managed_build.install_excludes);
+            if (auto result = parse_string_array_strict(*bld, "configure_options",
+                    "build", r.managed_build.configure_options); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*bld, "build_targets",
+                    "build", r.managed_build.build_targets); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*bld, "install_targets",
+                    "build", r.managed_build.install_targets); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*bld, "install_files",
+                    "build", r.managed_build.install_files); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*bld, "install_excludes",
+                    "build", r.managed_build.install_excludes); !result)
+                return std::unexpected(result.error());
             auto parse_copy_entries = [&](const char* key,
                                           std::vector<InstallCopy>& target)
                 -> std::expected<void, std::string> {
@@ -418,6 +654,9 @@ struct Recipe {
                         auto* item = element.as_table();
                         if (!item) return std::unexpected(std::format(
                             "build.{} entries must be inline tables", key));
+                        if (auto result = reject_unknown(*item, {"from", "to"},
+                                std::string("build.") + key + "[]"); !result)
+                            return std::unexpected(result.error());
                         auto source = (*item)["from"].value<std::string_view>();
                         auto destination = (*item)["to"].value<std::string_view>();
                         if (!source || !destination || source->empty()
@@ -428,6 +667,13 @@ struct Recipe {
                 }
                 return {};
             };
+            for (const auto key : {"install_copies", "install_symlinks",
+                                   "install_moves", "install_removes",
+                                   "install_generates"}) {
+                if (bld->contains(key) && !bld->get_as<vendor::toml::array>(key))
+                    return std::unexpected(std::format(
+                        "build.{} must be an array", key));
+            }
             auto parse_symlink_entries = [&](const char* key,
                                              std::vector<InstallSymlink>& target)
                 -> std::expected<void, std::string> {
@@ -436,6 +682,9 @@ struct Recipe {
                         auto* item = element.as_table();
                         if (!item) return std::unexpected(std::format(
                             "build.{} entries must be inline tables", key));
+                        if (auto result = reject_unknown(*item, {"path", "target"},
+                                std::string("build.") + key + "[]"); !result)
+                            return std::unexpected(result.error());
                         auto path = (*item)["path"].value<std::string_view>();
                         auto target_path = (*item)["target"].value<std::string_view>();
                         if (!path || !target_path || path->empty()
@@ -475,6 +724,8 @@ struct Recipe {
                 -> std::expected<void, std::string> {
                 if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
                     for (auto&& element : *arr) {
+                        if (!element.is_string()) return std::unexpected(std::format(
+                            "build.{} entries must be strings", key));
                         auto path = element.value<std::string_view>();
                         if (!path || path->empty()) return std::unexpected(std::format(
                             "build.{} entries must be non-empty strings", key));
@@ -494,8 +745,16 @@ struct Recipe {
                     auto* item = element.as_table();
                     if (!item) return std::unexpected(
                         "build.install_generates entries must be inline tables");
+                    if (auto result = reject_unknown(*item,
+                            {"path", "content", "mode"}, "build.install_generates[]");
+                        !result)
+                        return std::unexpected(result.error());
                     auto path = (*item)["path"].value<std::string_view>();
                     auto content = (*item)["content"].value<std::string_view>();
+                    if (item->contains("mode")
+                        && !(*item)["mode"].value<std::int64_t>())
+                        return std::unexpected(
+                            "build.install_generates.mode must be an integer");
                     auto mode = (*item)["mode"].value<std::int64_t>().value_or(0644);
                     if (!path || !content || path->empty() || mode < 0 || mode > 07777)
                         return std::unexpected(
@@ -509,26 +768,78 @@ struct Recipe {
                     auto* item = element.as_table();
                     if (!item) return std::unexpected(
                         "build.outputs entries must be inline tables");
+                    if (auto result = reject_unknown(*item,
+                            {"name", "description", "license", "dependencies",
+                             "provides", "conflicts", "conffiles", "install_files",
+                             "install_excludes"}, "build.outputs[]"); !result)
+                        return std::unexpected(result.error());
                     auto name = (*item)["name"].value<std::string_view>();
                     if (!name || name->empty()) return std::unexpected(
                         "build.outputs entries require a non-empty name");
-                    InstallOutput output{.name = std::string(*name)};
-                    if (auto* files = item->get_as<vendor::toml::array>("install_files"))
-                        for (auto&& file : *files)
-                            if (auto value = file.value<std::string_view>())
-                                output.install_files.emplace_back(*value);
-                    if (auto* excludes = item->get_as<vendor::toml::array>("install_excludes"))
-                        for (auto&& exclude : *excludes)
-                            if (auto value = exclude.value<std::string_view>())
-                                output.install_excludes.emplace_back(*value);
+                    InstallOutput output;
+                    output.name = std::string(*name);
+                    auto parse_output_string = [&](const char* key,
+                                                   std::optional<std::string>& target)
+                        -> std::expected<void, std::string> {
+                        if (!item->contains(key)) return {};
+                        auto value = (*item)[key].value<std::string_view>();
+                        if (!value) return std::unexpected(std::format(
+                            "build.outputs.{} must be a string", key));
+                        target = std::string(*value);
+                        return {};
+                    };
+                    if (auto result = parse_output_string("description",
+                            output.description); !result)
+                        return std::unexpected(result.error());
+                    if (auto result = parse_output_string("license",
+                            output.license); !result)
+                        return std::unexpected(result.error());
+                    if (auto result = parse_string_array_strict(*item, "install_files",
+                            "build.outputs[]", output.install_files); !result)
+                        return std::unexpected(result.error());
+                    if (auto result = parse_string_array_strict(*item, "install_excludes",
+                            "build.outputs[]", output.install_excludes); !result)
+                        return std::unexpected(result.error());
+                    if (item->contains("dependencies")) {
+                        output.dependencies.emplace();
+                        if (auto result = parse_deps_strict(*item, "dependencies",
+                                "build.outputs[]", *output.dependencies); !result)
+                            return std::unexpected(result.error());
+                    }
+                    if (item->contains("conflicts")) {
+                        output.conflicts.emplace();
+                        if (auto result = parse_deps_strict(*item, "conflicts",
+                                "build.outputs[]", *output.conflicts); !result)
+                            return std::unexpected(result.error());
+                    }
+                    if (item->contains("provides")) {
+                        output.provides.emplace();
+                        if (auto result = parse_string_array_strict(*item, "provides",
+                                "build.outputs[]", *output.provides); !result)
+                            return std::unexpected(result.error());
+                    }
+                    if (item->contains("conffiles")) {
+                        output.conffiles.emplace();
+                        if (auto result = parse_string_array_strict(*item, "conffiles",
+                                "build.outputs[]", *output.conffiles); !result)
+                            return std::unexpected(result.error());
+                    }
                     r.managed_build.outputs.push_back(std::move(output));
                 }
             }
+            if (bld->contains("outputs") && !bld->get_as<vendor::toml::array>("outputs"))
+                return std::unexpected("build.outputs must be an array");
             if (r.managed_build.system == BuildSystem::Script
                 && r.managed_build.install_files.empty()
                 && r.managed_build.outputs.empty())
                 return std::unexpected(
                     "Script recipes require an explicit install_files boundary or outputs");
+            if (r.managed_build.system == BuildSystem::Script
+                && r.managed_build.payload == PayloadMode::All)
+                return std::unexpected(
+                    "Script recipes cannot use build.payload=all");
+            if (bld->contains("steps") && !bld->get_as<vendor::toml::array>("steps"))
+                return std::unexpected("build.steps must be an array");
             if (auto* arr = bld->get_as<vendor::toml::array>("steps")) {
                 static constexpr std::array<std::string_view, 6> phases{
                     "prepare", "pre-build", "post-build", "pre-install",
@@ -539,6 +850,10 @@ struct Recipe {
                     auto* item = element.as_table();
                     if (!item) return std::unexpected(
                         "build.steps entries must be inline tables");
+                    if (auto result = reject_unknown(*item,
+                            {"name", "phase", "cwd", "command"},
+                            "build.steps[]"); !result)
+                        return std::unexpected(result.error());
                     auto name = (*item)["name"].value<std::string_view>();
                     auto phase = (*item)["phase"].value<std::string_view>();
                     auto cwd = (*item)["cwd"].value<std::string_view>().value_or("source");
@@ -566,9 +881,33 @@ struct Recipe {
                 && r.managed_build.steps.empty())
                 return std::unexpected(
                     "Script recipes require at least one build.steps entry");
-            parse_strings(*bld, "patches", r.managed_build.patches);
-            parse_strings(*bld, "allowed_compilers", r.managed_build.allowed_compilers);
-            parse_strings(*bld, "allowed_linkers", r.managed_build.allowed_linkers);
+            if (auto result = parse_string_array_strict(*bld, "patches",
+                    "build", r.managed_build.patches); !result)
+                return std::unexpected(result.error());
+            if (bld->contains("patch_checksums")
+                && !bld->get_as<vendor::toml::table>("patch_checksums"))
+                return std::unexpected("build.patch_checksums must be a table");
+            if (auto* checksums = bld->get_as<vendor::toml::table>("patch_checksums")) {
+                for (const auto& [name, value] : *checksums) {
+                    auto sha = value.value<std::string_view>();
+                    if (name.str().empty() || std::filesystem::path(name.str()).filename() != name.str()
+                        || !sha || sha->size() != 64
+                        || !std::ranges::all_of(*sha, [](char c) {
+                               return std::isxdigit(static_cast<unsigned char>(c));
+                           }))
+                        return std::unexpected(
+                            "build.patch_checksums entries require a basename and 64-hex SHA-256");
+                    r.managed_build.patch_checksums.emplace(name.str(), std::string(*sha));
+                }
+            }
+            if (auto result = parse_string_array_strict(*bld, "allowed_compilers",
+                    "build", r.managed_build.allowed_compilers); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_string_array_strict(*bld, "allowed_linkers",
+                    "build", r.managed_build.allowed_linkers); !result)
+                return std::unexpected(result.error());
+            if (bld->contains("variables") && !bld->get_as<vendor::toml::table>("variables"))
+                return std::unexpected("build.variables must be a table");
             if (auto* vars = bld->get_as<vendor::toml::table>("variables")) {
                 for (auto&& [key, value] : *vars) {
                     if (auto s = value.value<std::string_view>())
@@ -576,17 +915,44 @@ struct Recipe {
                     else return std::unexpected("build.variables values must be strings");
                 }
             }
+            if (bld->contains("flag_env") && !bld->get_as<vendor::toml::table>("flag_env"))
+                return std::unexpected("build.flag_env must be a table");
             if (auto* flags = bld->get_as<vendor::toml::table>("flag_env")) {
-                parse_strings(*flags, "cflags", r.managed_build.cflags_env);
-                parse_strings(*flags, "cxxflags", r.managed_build.cxxflags_env);
-                parse_strings(*flags, "cppflags", r.managed_build.cppflags_env);
-                parse_strings(*flags, "ldflags", r.managed_build.ldflags_env);
-                parse_strings(*flags, "rustflags", r.managed_build.rustflags_env);
+                if (auto result = reject_unknown(*flags,
+                        {"cflags", "cxxflags", "cppflags", "ldflags", "rustflags"},
+                        "build.flag_env"); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*flags, "cflags",
+                        "build.flag_env", r.managed_build.cflags_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*flags, "cxxflags",
+                        "build.flag_env", r.managed_build.cxxflags_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*flags, "cppflags",
+                        "build.flag_env", r.managed_build.cppflags_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*flags, "ldflags",
+                        "build.flag_env", r.managed_build.ldflags_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*flags, "rustflags",
+                        "build.flag_env", r.managed_build.rustflags_env); !result)
+                    return std::unexpected(result.error());
             }
+            if (bld->contains("tool_env") && !bld->get_as<vendor::toml::table>("tool_env"))
+                return std::unexpected("build.tool_env must be a table");
             if (auto* tools = bld->get_as<vendor::toml::table>("tool_env")) {
-                parse_strings(*tools, "cc", r.managed_build.cc_env);
-                parse_strings(*tools, "cxx", r.managed_build.cxx_env);
-                parse_strings(*tools, "linker", r.managed_build.linker_env);
+                if (auto result = reject_unknown(*tools, {"cc", "cxx", "linker"},
+                        "build.tool_env"); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*tools, "cc",
+                        "build.tool_env", r.managed_build.cc_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*tools, "cxx",
+                        "build.tool_env", r.managed_build.cxx_env); !result)
+                    return std::unexpected(result.error());
+                if (auto result = parse_string_array_strict(*tools, "linker",
+                        "build.tool_env", r.managed_build.linker_env); !result)
+                    return std::unexpected(result.error());
             }
 
             const auto validate_payload_patterns = [](const std::vector<std::string>& patterns,
@@ -684,6 +1050,24 @@ struct Recipe {
                     || !r.managed_build.install_excludes.empty()))
                 return std::unexpected(
                     "build.outputs and top-level install_files/install_excludes are mutually exclusive");
+            if (r.managed_build.payload == PayloadMode::All
+                && (!r.managed_build.install_files.empty()
+                    || !r.managed_build.install_excludes.empty()
+                    || !r.managed_build.outputs.empty()))
+                return std::unexpected(
+                    "build.payload=all cannot be combined with an allowlist or outputs");
+            if (r.managed_build.payload == PayloadMode::Allowlist
+                && r.managed_build.install_files.empty())
+                return std::unexpected(
+                    "build.payload=allowlist requires non-empty build.install_files");
+            if (r.managed_build.payload == PayloadMode::Outputs
+                && r.managed_build.outputs.empty())
+                return std::unexpected(
+                    "build.payload=outputs requires at least one build.outputs entry");
+            if (!r.managed_build.outputs.empty()
+                && r.managed_build.payload != PayloadMode::Outputs)
+                return std::unexpected(
+                    "build.outputs requires build.payload=outputs");
             for (const auto& link : r.managed_build.install_symlinks) {
                 if (auto result = validate_payload_path(link.path,
                         "install_symlinks.path", false); !result)
@@ -701,19 +1085,33 @@ struct Recipe {
                         link.target));
             }
             if ((r.name.ends_with("-libs") || r.name.ends_with("-dev"))
+                && r.managed_build.payload != PayloadMode::Outputs
                 && r.managed_build.install_files.empty()) {
                 return std::unexpected(std::format(
                     "Recipe v2 split package '{}' must declare build.install_files; "
                     "the backend install tree is not an implicit package boundary",
                     r.name));
             }
+            if (bld->contains("toolchain") && !bld->get_as<vendor::toml::table>("toolchain"))
+                return std::unexpected("build.toolchain must be a table");
             if (auto* suite = bld->get_as<vendor::toml::table>("toolchain")) {
+                if (auto result = reject_unknown(*suite,
+                        {"compiler", "linker", "rust"}, "build.toolchain"); !result)
+                    return std::unexpected(result.error());
                 auto parse_tool = [&](std::string_view kind,
-                                      ToolRequirement& requirement,
+                        ToolRequirement& requirement,
                                       std::initializer_list<std::string_view> families)
                     -> std::expected<void, std::string> {
+                    if (suite->contains(kind)
+                        && !suite->get_as<vendor::toml::table>(kind))
+                        return std::unexpected(std::format(
+                            "build.toolchain.{} must be a table", kind));
                     auto* tool = suite->get_as<vendor::toml::table>(kind);
                     if (!tool) return {};
+                    if (auto result = reject_unknown(*tool,
+                            {"family", "package", "minimum_version"},
+                            std::string("build.toolchain.") + std::string(kind)); !result)
+                        return std::unexpected(result.error());
                     requirement.family = (*tool)["family"].value_or("");
                     requirement.package = (*tool)["package"].value_or("");
                     requirement.minimum_version =

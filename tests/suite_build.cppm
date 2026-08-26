@@ -353,11 +353,15 @@ schema_version = 2
 name = "managed"
 version = "1.0.0"
 release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 upstream = "https://github.com/example/managed/tags"
 upstream_regex = 'v(\d+\.\d+\.\d+)'
 
 [build]
 system = "cmake"
+payload = "allowlist"
 configure_options = ["-DBUILD_TESTING=OFF"]
 install_files = ["usr/bin/**"]
 install_copies = [{ from = "built/tool", to = "usr/bin/tool" }]
@@ -406,8 +410,13 @@ schema_version = 2
 [package]
 name = "managed-outputs"
 version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "make"
+payload = "outputs"
 outputs = [
   { name = "managed-libs", install_files = ["usr/lib/libmanaged.so.*"] },
   { name = "managed-dev", install_files = ["usr/include/**"] },
@@ -417,14 +426,58 @@ outputs = [
             sage::util::log_error("Recipe v2 multi-output model did not parse");
             return 1;
         }
+        auto bad_step_key = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "bad-step-key"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/bad-step-key/**"]
+[[build.steps]]
+name = "run"
+phase = "install"
+command = "true"
+unexpected = "must be rejected"
+)");
+        auto bad_toolchain_type = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "bad-toolchain-type"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/bin/bad-toolchain-type"]
+[build.toolchain]
+compiler = "clang"
+)");
+        if (bad_step_key || bad_toolchain_type) {
+            sage::util::log_error(
+                "Recipe v2 accepted unknown step/toolchain fields");
+            return 1;
+        }
         auto scripted = sage::package::Recipe::parse_toml(R"(
 schema_version = 2
 [package]
 name = "scripted"
 version = "1.0.0"
 release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "script"
+payload = "allowlist"
 install_files = ["usr/share/scripted/**"]
 [[build.steps]]
 name = "post-install-fixup"
@@ -445,8 +498,12 @@ schema_version = 2
 name = "managed-cargo"
 version = "1.0.0"
 release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "cargo"
+payload = "all"
 [build.toolchain.compiler]
 family = "clang"
 package = "clang"
@@ -471,8 +528,12 @@ schema_version = 2
 name = "rust-only"
 version = "1.0.0"
 release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "cargo"
+payload = "all"
 [build.toolchain.rust]
 family = "rustc"
 package = "rust"
@@ -494,24 +555,50 @@ minimum_version = "1.96.1"
 [package]
 name = "bad-meson"
 version = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "meson"
+payload = "allowlist"
+install_files = ["usr/bin/bad-meson"]
 configure_options = ["-Dprefix=/tmp/escape"]
 )"),
                 std::string(R"(schema_version = 2
 [package]
+name = "bad-meson-cli"
+version = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "meson"
+payload = "allowlist"
+install_files = ["usr/bin/bad-meson-cli"]
+configure_options = ["--prefix=/tmp/escape"]
+)") ,
+                std::string(R"(schema_version = 2
+[package]
 name = "bad-cargo"
 version = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "cargo"
+payload = "all"
 build_targets = ["--config=/tmp/escape"]
 )"),
                 std::string(R"(schema_version = 2
 [package]
 name = "bad-autotools"
 version = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "autotools"
+payload = "all"
 configure_options = ["--exec-prefix=/tmp/escape"]
 )" )}) {
             auto parsed_bad = sage::package::Recipe::parse_toml(bad);
@@ -559,8 +646,12 @@ schema_version = 2
 name = "linux"
 version = "6.18.1"
 release = "1"
+license = "GPL-2.0-only"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "make"
+payload = "allowlist"
 kernel = true
 install_files = ["boot/vmlinuz-*"]
 )");
@@ -570,8 +661,12 @@ schema_version = 2
 name = "not-kernel"
 version = "1.0.0"
 release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
 [build]
 system = "cmake"
+payload = "allowlist"
 kernel = true
 install_files = ["usr/bin/tool"]
 )");
@@ -784,9 +879,12 @@ release = "1"
 description = "managed Make canary"
 license = "MIT"
 channel = "system"
+arch = "x86_64"
+conflicts = ["v2makecanary-legacy < 2"]
 
 [build]
 system = "make"
+payload = "allowlist"
 install_files = [
     "usr/bin/v2makecanary",
     "usr/share/v2makecanary/**",
@@ -852,6 +950,8 @@ install:
             || observed_cc->family != "gcc" || observed_cc->version.empty()
             || !observed_ld || observed_ld->executable != "ld"
             || observed_ld->family != "ld" || observed_ld->version.empty()
+            || v2_built->conflicts.size() != 1
+            || v2_built->conflicts.front().to_string() != "v2makecanary-legacy < 2-1"
             || !std::ranges::contains(observed_cc->parameters,
                 "CFLAGS=-DV2_POLICY=1")
             || !std::ranges::contains(observed_cc->parameters,
@@ -871,7 +971,10 @@ install:
         if (!v2_indexed || !v2_index
             || v2_index->available_packages.size() != 1
             || v2_index->available_packages.front().managed_build_tools
-                != v2_built->managed_build_tools) {
+                != v2_built->managed_build_tools
+            || v2_index->available_packages.front().conflicts.size() != 1
+            || v2_index->available_packages.front().conflicts.front().to_string()
+                != "v2makecanary-legacy < 2-1") {
             sage::util::log_error(
                 "Managed v2 tool observations did not survive repository indexing");
             return 1;
@@ -894,8 +997,10 @@ release = "1"
 description = "managed Cargo canary"
 license = "MIT"
 channel = "system"
+arch = "x86_64"
 [build]
 system = "cargo"
+payload = "all"
 [build.toolchain.compiler]
 family = "gcc"
 package = "gcc"
@@ -996,8 +1101,10 @@ release = "1"
 description = "deterministic repackaging canary"
 license = "MIT"
 channel = "system"
+arch = "x86_64"
 [build]
 system = "script"
+payload = "allowlist"
 install_files = ["usr/share/v2script/**"]
 [[build.steps]]
 name = "write-payload"
@@ -1041,8 +1148,10 @@ version = "1.0.0"
 release = "1"
 license = "MIT"
 channel = "system"
+arch = "x86_64"
 [build]
 system = "script"
+payload = "allowlist"
 install_files = ["usr/share/v2bypass/**"]
 [[build.steps]]
 name = "absolute-compiler"
