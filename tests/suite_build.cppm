@@ -409,6 +409,26 @@ minimum_version = "1.90"
             sage::util::log_error("Cargo recipe did not derive its Rust compiler dependency");
             return 1;
         }
+        auto rust_only = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "rust-only"
+version = "1.0.0"
+release = "1"
+[build]
+system = "cargo"
+[build.toolchain.rust]
+family = "rustc"
+package = "rust"
+minimum_version = "1.96.1"
+)");
+        if (!rust_only || !rust_only->managed_build.compiler.family.empty()
+            || !rust_only->managed_build.linker.family.empty()
+            || !std::ranges::contains(rust_only->build_deps, "rust >= 1.96.1")) {
+            sage::util::log_error(
+                "Cargo recipe could not declare a Rust-only tool requirement");
+            return 1;
+        }
         sage::config::BuildConfig managed_cfg;
         managed_cfg.cc = "clang";
         managed_cfg.cxx = "clang++";

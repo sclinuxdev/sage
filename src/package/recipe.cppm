@@ -349,8 +349,7 @@ struct Recipe {
                                       std::initializer_list<std::string_view> families)
                     -> std::expected<void, std::string> {
                     auto* tool = suite->get_as<vendor::toml::table>(kind);
-                    if (!tool) return std::unexpected(std::format(
-                        "build.toolchain requires a [{}] table", kind));
+                    if (!tool) return {};
                     requirement.family = (*tool)["family"].value_or("");
                     requirement.package = (*tool)["package"].value_or("");
                     requirement.minimum_version =
@@ -383,12 +382,14 @@ struct Recipe {
                         return std::unexpected(result.error());
                 }
 
-                if (!r.managed_build.allowed_compilers.empty()
+                if (!r.managed_build.compiler.family.empty()
+                    && !r.managed_build.allowed_compilers.empty()
                     && !std::ranges::contains(r.managed_build.allowed_compilers,
                                               r.managed_build.compiler.family))
                     return std::unexpected(
                         "Default compiler family is absent from allowed_compilers");
-                if (!r.managed_build.allowed_linkers.empty()
+                if (!r.managed_build.linker.family.empty()
+                    && !r.managed_build.allowed_linkers.empty()
                     && !std::ranges::contains(r.managed_build.allowed_linkers,
                                               r.managed_build.linker.family))
                     return std::unexpected(
@@ -415,10 +416,14 @@ struct Recipe {
                         requirement.minimum_version));
                     return std::expected<void, std::string>{};
                 };
-                if (auto result = require_package(r.managed_build.compiler); !result)
-                    return std::unexpected(result.error());
-                if (auto result = require_package(r.managed_build.linker); !result)
-                    return std::unexpected(result.error());
+                if (!r.managed_build.compiler.family.empty()) {
+                    if (auto result = require_package(r.managed_build.compiler); !result)
+                        return std::unexpected(result.error());
+                }
+                if (!r.managed_build.linker.family.empty()) {
+                    if (auto result = require_package(r.managed_build.linker); !result)
+                        return std::unexpected(result.error());
+                }
                 if (!r.managed_build.rust.family.empty()) {
                     if (auto result = require_package(r.managed_build.rust); !result)
                         return std::unexpected(result.error());
