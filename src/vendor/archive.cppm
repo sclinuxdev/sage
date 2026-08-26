@@ -19,6 +19,7 @@ using std::uint64_t;
 struct EntryInfo {
     std::string pathname;
     std::string symlink;
+    std::string hardlink;
     uint64_t size{0};
     uint32_t perm{0644};
     unsigned int filetype{0};
@@ -28,8 +29,11 @@ struct EntryInfo {
 struct WriteEntry {
     std::string_view pathname;
     std::string_view symlink;
+    std::string_view hardlink;
     uint64_t size{0};
     uint32_t perm{0644};
+    uint32_t uid{0};
+    uint32_t gid{0};
     unsigned int filetype{0};
     uint64_t mtime{1700000000};
 };
@@ -94,6 +98,8 @@ public:
         info.pathname = name ? name : "";
         const char* target = ::archive_entry_symlink(entry);
         info.symlink = target ? target : "";
+        const char* hlink = ::archive_entry_hardlink(entry);
+        info.hardlink = hlink ? hlink : "";
         info.size = static_cast<uint64_t>(::archive_entry_size(entry));
         info.perm = static_cast<uint32_t>(::archive_entry_perm(entry));
         info.filetype = ::archive_entry_filetype(entry);
@@ -178,10 +184,13 @@ public:
         ::archive_entry_set_filetype(raw, meta.filetype);
         ::archive_entry_set_size(raw, static_cast<la_int64_t>(meta.size));
         ::archive_entry_set_mtime(raw, static_cast<la_int64_t>(meta.mtime), 0);
-        ::archive_entry_set_uid(raw, 0);
-        ::archive_entry_set_gid(raw, 0);
+        ::archive_entry_set_uid(raw, static_cast<la_int64_t>(meta.uid));
+        ::archive_entry_set_gid(raw, static_cast<la_int64_t>(meta.gid));
         if (!meta.symlink.empty()) {
             ::archive_entry_set_symlink(raw, std::string(meta.symlink).c_str());
+        }
+        if (!meta.hardlink.empty()) {
+            ::archive_entry_set_hardlink(raw, std::string(meta.hardlink).c_str());
         }
         if (::archive_write_header(handle_, entry.get()) != ARCHIVE_OK) {
             return std::unexpected(detail::last_error(handle_));

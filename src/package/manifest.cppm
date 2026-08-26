@@ -18,13 +18,17 @@ using std::uint64_t;
 enum class FileType {
     Regular,
     Directory,
-    Symlink
+    Symlink,
+    Hardlink
 };
 
 struct FileEntry {
     std::string path; // Clean relative path (e.g. "usr/bin/rg")
     uint64_t size{0};
     uint32_t mode{0644};
+    uint32_t uid{0};
+    uint32_t gid{0};
+    std::string caps;
     std::string sha256;
     FileType type{FileType::Regular};
     std::string link_target;
@@ -49,10 +53,282 @@ struct ManagedBuildTool {
     bool operator==(const ManagedBuildTool&) const = default;
 };
 
+struct BuildAttestationTool {
+    std::string role;       // cc | cxx | linker-driver | linker | rustc
+    std::string executable; // exact build.toml command/path Sage invoked
+    std::string family;     // gcc | clang | ld | lld | mold | rustc
+    std::string version;
+    uint64_t executions{0};
+    std::string path;
+    std::string sha256;
+    uint64_t inode{0};
+    std::vector<std::string> parameters;
+
+    bool operator==(const BuildAttestationTool&) const = default;
+};
+
+struct BuildAttestationPackage {
+    std::string name;
+    std::string version;
+    std::string release;
+    std::string channel{"system"};
+    std::string arch{"x86_64"};
+    std::string sha256;
+
+    bool operator==(const BuildAttestationPackage&) const = default;
+};
+
+struct BuildAttestationSource {
+    std::string url;
+    std::string sha256;
+
+    bool operator==(const BuildAttestationSource&) const = default;
+};
+
+struct BuildAttestationSysrootPackage {
+    std::string name;
+    std::string version;
+    std::string release;
+    std::string sha256;
+
+    bool operator==(const BuildAttestationSysrootPackage&) const = default;
+};
+
+struct BuildAttestation {
+    uint32_t schema_version{2};
+    std::string built_at;
+    std::string builder;
+    std::string host_arch;
+    std::string target_arch;
+    std::string host_triplet;
+    std::string target_triplet;
+    std::string exec_audit_digest;
+    BuildAttestationPackage package;
+    std::vector<BuildAttestationSource> sources;
+    std::vector<BuildAttestationTool> tools;
+    std::vector<BuildAttestationSysrootPackage> sysroot_packages;
+    // Build-only test roots; deliberately not PackageManifest.dependencies.
+    std::vector<std::string> check_dependencies;
+    std::vector<std::string> audit_commands;
+    std::vector<std::string> env;
+
+    [[nodiscard]] std::string serialize_toml() const {
+        const auto quote = [](std::string_view value) {
+            return escape_toml_basic_string(value);
+        };
+        std::ostringstream ss;
+        ss << "schema_version = " << schema_version << "\n\n";
+        ss << "[attestation]\n";
+        if (!built_at.empty()) ss << "built_at = \"" << quote(built_at) << "\"\n";
+        if (!builder.empty()) ss << "builder = \"" << quote(builder) << "\"\n";
+        if (!host_arch.empty()) ss << "host_arch = \"" << quote(host_arch) << "\"\n";
+        if (!target_arch.empty()) ss << "target_arch = \"" << quote(target_arch) << "\"\n";
+        if (!host_triplet.empty()) ss << "host_triplet = \"" << quote(host_triplet) << "\"\n";
+        if (!target_triplet.empty()) ss << "target_triplet = \"" << quote(target_triplet) << "\"\n";
+        if (!exec_audit_digest.empty()) ss << "exec_audit_digest = \"" << quote(exec_audit_digest) << "\"\n";
+        if (!check_dependencies.empty()) {
+            ss << "check_dependencies = [";
+            for (size_t i = 0; i < check_dependencies.size(); ++i)
+                ss << (i ? ", " : "") << "\"" << quote(check_dependencies[i]) << "\"";
+            ss << "]\n";
+        }
+        if (!audit_commands.empty()) {
+            ss << "audit_commands = [\n";
+            for (const auto& cmd : audit_commands) {
+                ss << "    \"" << quote(cmd) << "\",\n";
+            }
+            ss << "]\n";
+        }
+        if (!env.empty()) {
+            ss << "env = [\n";
+            for (const auto& e : env) {
+                ss << "    \"" << quote(e) << "\",\n";
+            }
+            ss << "]\n";
+        }
+        ss << "\n";
+
+        ss << "[package]\n";
+        ss << "name = \"" << quote(package.name) << "\"\n";
+        ss << "version = \"" << quote(package.version) << "\"\n";
+        ss << "release = \"" << quote(package.release) << "\"\n";
+        ss << "channel = \"" << quote(package.channel.empty() ? "system" : package.channel) << "\"\n";
+        ss << "arch = \"" << quote(package.arch.empty() ? "x86_64" : package.arch) << "\"\n";
+        if (!package.sha256.empty()) ss << "sha256 = \"" << quote(package.sha256) << "\"\n";
+        ss << "\n";
+
+        if (!sources.empty()) {
+            for (const auto& src : sources) {
+                ss << "[[sources]]\n";
+                ss << "url = \"" << quote(src.url) << "\"\n";
+                ss << "sha256 = \"" << quote(src.sha256) << "\"\n\n";
+            }
+        }
+
+        if (!tools.empty()) {
+            for (const auto& tool : tools) {
+                ss << "[[tools]]\n";
+                ss << "role = \"" << quote(tool.role) << "\"\n";
+                ss << "executable = \"" << quote(tool.executable) << "\"\n";
+                ss << "family = \"" << quote(tool.family) << "\"\n";
+                ss << "version = \"" << quote(tool.version) << "\"\n";
+                ss << "executions = " << tool.executions << "\n";
+                if (!tool.path.empty()) ss << "path = \"" << quote(tool.path) << "\"\n";
+                if (!tool.sha256.empty()) ss << "sha256 = \"" << quote(tool.sha256) << "\"\n";
+                if (tool.inode > 0) ss << "inode = " << tool.inode << "\n";
+                if (!tool.parameters.empty()) {
+                    ss << "parameters = [";
+                    for (size_t i = 0; i < tool.parameters.size(); ++i) {
+                        ss << (i ? ", " : "") << "\"" << quote(tool.parameters[i]) << "\"";
+                    }
+                    ss << "]\n";
+                }
+                ss << "\n";
+            }
+        }
+
+        if (!sysroot_packages.empty()) {
+            for (const auto& pkg : sysroot_packages) {
+                ss << "[[sysroot_packages]]\n";
+                ss << "name = \"" << quote(pkg.name) << "\"\n";
+                ss << "version = \"" << quote(pkg.version) << "\"\n";
+                ss << "release = \"" << quote(pkg.release) << "\"\n";
+                if (!pkg.sha256.empty()) ss << "sha256 = \"" << quote(pkg.sha256) << "\"\n";
+                ss << "\n";
+            }
+        }
+        return ss.str();
+    }
+
+    static std::expected<BuildAttestation, std::string> parse_toml(
+        std::string_view toml_content) {
+        auto tbl_res = vendor::toml::parse_string(toml_content);
+        if (!tbl_res) return std::unexpected(tbl_res.error());
+        const auto& tbl = *tbl_res;
+
+        BuildAttestation att;
+        att.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(2LL));
+
+        if (auto* att_tbl = tbl.get_as<vendor::toml::table>("attestation")) {
+            att.built_at = (*att_tbl)["built_at"].value_or("");
+            att.builder = (*att_tbl)["builder"].value_or("");
+            att.host_arch = (*att_tbl)["host_arch"].value_or("");
+            att.target_arch = (*att_tbl)["target_arch"].value_or("");
+            att.host_triplet = (*att_tbl)["host_triplet"].value_or("");
+            att.target_triplet = (*att_tbl)["target_triplet"].value_or("");
+            if (att_tbl->contains("check_dependencies")
+                && !att_tbl->get_as<vendor::toml::array>("check_dependencies"))
+                return std::unexpected(
+                    "attestation.check_dependencies must be an array");
+            att.exec_audit_digest = (*att_tbl)["exec_audit_digest"].value_or("");
+            if (auto* checks = att_tbl->get_as<vendor::toml::array>(
+                    "check_dependencies")) {
+                for (auto&& el : *checks) {
+                    auto value = el.value<std::string_view>();
+                    if (!value || value->empty()) return std::unexpected(
+                        "attestation.check_dependencies entries must be non-empty strings");
+                    att.check_dependencies.emplace_back(*value);
+                }
+            }
+            if (auto* cmds = att_tbl->get_as<vendor::toml::array>("audit_commands")) {
+                for (auto&& el : *cmds) {
+                    if (auto str = el.value<std::string_view>()) {
+                        att.audit_commands.emplace_back(*str);
+                    }
+                }
+            }
+            if (auto* env_arr = att_tbl->get_as<vendor::toml::array>("env")) {
+                for (auto&& el : *env_arr) {
+                    if (auto str = el.value<std::string_view>()) {
+                        att.env.emplace_back(*str);
+                    }
+                }
+            }
+        }
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            att.package.name = (*pkg)["name"].value_or("");
+            att.package.version = (*pkg)["version"].value_or("");
+            att.package.release = (*pkg)["release"].value_or("");
+            att.package.channel = (*pkg)["channel"].value_or("system");
+            att.package.arch = (*pkg)["arch"].value_or("x86_64");
+            att.package.sha256 = (*pkg)["sha256"].value_or("");
+        }
+
+        if (auto* sources_arr = tbl.get_as<vendor::toml::array>("sources")) {
+            for (auto&& el : *sources_arr) {
+                if (auto* t = el.as_table()) {
+                    BuildAttestationSource src;
+                    src.url = (*t)["url"].value_or("");
+                    src.sha256 = (*t)["sha256"].value_or("");
+                    att.sources.push_back(std::move(src));
+                }
+            }
+        }
+
+        if (auto* tools_arr = tbl.get_as<vendor::toml::array>("tools")) {
+            for (auto&& el : *tools_arr) {
+                if (auto* t = el.as_table()) {
+                    BuildAttestationTool tool;
+                    tool.role = (*t)["role"].value_or("");
+                    tool.executable = (*t)["executable"].value_or("");
+                    tool.family = (*t)["family"].value_or("");
+                    tool.version = (*t)["version"].value_or("");
+                    tool.executions = static_cast<uint64_t>((*t)["executions"].value_or(0LL));
+                    tool.path = (*t)["path"].value_or("");
+                    tool.sha256 = (*t)["sha256"].value_or("");
+                    tool.inode = static_cast<uint64_t>((*t)["inode"].value_or(0LL));
+                    if (auto* params = t->get_as<vendor::toml::array>("parameters")) {
+                        for (auto&& p : *params) {
+                            if (auto str = p.value<std::string_view>()) {
+                                tool.parameters.emplace_back(*str);
+                            }
+                        }
+                    }
+                    att.tools.push_back(std::move(tool));
+                }
+            }
+        }
+
+        if (auto* sysroot_arr = tbl.get_as<vendor::toml::array>("sysroot_packages")) {
+            for (auto&& el : *sysroot_arr) {
+                if (auto* t = el.as_table()) {
+                    BuildAttestationSysrootPackage pkg;
+                    pkg.name = (*t)["name"].value_or("");
+                    pkg.version = (*t)["version"].value_or("");
+                    pkg.release = (*t)["release"].value_or("");
+                    pkg.sha256 = (*t)["sha256"].value_or("");
+                    att.sysroot_packages.push_back(std::move(pkg));
+                }
+            }
+        }
+
+        if (att.audit_commands.empty()) {
+            if (auto* cmds = tbl.get_as<vendor::toml::array>("audit_commands")) {
+                for (auto&& el : *cmds) {
+                    if (auto str = el.value<std::string_view>()) {
+                        att.audit_commands.emplace_back(*str);
+                    }
+                }
+            }
+        }
+        if (att.env.empty()) {
+            if (auto* env_arr = tbl.get_as<vendor::toml::array>("env")) {
+                for (auto&& el : *env_arr) {
+                    if (auto str = el.value<std::string_view>()) {
+                        att.env.emplace_back(*str);
+                    }
+                }
+            }
+        }
+        return att;
+    }
+};
+
 inline std::string_view to_string(FileType t) noexcept {
     switch (t) {
         case FileType::Directory: return "dir";
         case FileType::Symlink:   return "link";
+        case FileType::Hardlink:  return "hardlink";
         default:                  return "file";
     }
 }
@@ -60,6 +336,7 @@ inline std::string_view to_string(FileType t) noexcept {
 inline FileType parse_file_type(std::string_view s) noexcept {
     if (s == "dir")  return FileType::Directory;
     if (s == "link") return FileType::Symlink;
+    if (s == "hardlink" || s == "hlink") return FileType::Hardlink;
     return FileType::Regular;
 }
 
@@ -79,6 +356,7 @@ struct PackageManifest {
     // scripts for whichever init system is active. Empty for non-daemons.
     std::string service_toml;
 
+    std::string attestation_toml;
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"
     // Configuration files the package ships but does not own outright: on
@@ -214,6 +492,9 @@ struct PackageManifest {
                     if (fe.path.empty()) continue;
                     fe.size = (*ftab)["size"].value_or(0ULL);
                     fe.mode = static_cast<uint32_t>((*ftab)["mode"].value_or(0644LL));
+                    fe.uid = static_cast<uint32_t>((*ftab)["uid"].value_or(0LL));
+                    fe.gid = static_cast<uint32_t>((*ftab)["gid"].value_or(0LL));
+                    fe.caps = (*ftab)["caps"].value_or("");
                     fe.sha256 = (*ftab)["sha256"].value_or("");
                     fe.type = parse_file_type((*ftab)["type"].value_or("file"));
                     fe.link_target = (*ftab)["link_target"].value_or("");
@@ -315,6 +596,13 @@ struct PackageManifest {
             return std::unexpected(
                 "managed_build_tools require captured managed_build_commands");
 
+        if (auto att = tbl["attestation_toml"].value<std::string_view>()) {
+            m.attestation_toml = std::string(*att);
+        } else if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            if (auto att_pkg = (*pkg)["attestation_toml"].value<std::string_view>()) {
+                m.attestation_toml = std::string(*att_pkg);
+            }
+        }
         return m;
     }
 
@@ -350,6 +638,10 @@ struct PackageManifest {
         ss << "arch = \"" << quote(arch) << "\"\n";
         if (!service_toml.empty()) ss << "service_toml = \"" << quote(service_toml) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
+        if (!attestation_toml.empty()) {
+            ss << "attestation_toml = \"\"\"" << attestation_toml << "\"\"\"\n\n";
+        }
+
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {
             ss << "    \"" << quote(d.to_string()) << "\",\n";
@@ -447,10 +739,12 @@ struct PackageManifest {
                 ss << "path = \"" << quote(f.path) << "\"\n";
                 ss << "type = \"" << to_string(f.type) << "\"\n";
                 ss << "mode = " << f.mode << "\n";
+                if (f.uid > 0) ss << "uid = " << f.uid << "\n";
+                if (f.gid > 0) ss << "gid = " << f.gid << "\n";
+                if (!f.caps.empty()) ss << "caps = \"" << quote(f.caps) << "\"\n";
                 ss << "size = " << f.size << "\n";
                 if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
                 if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
-                ss << "\n";
             }
         }
 

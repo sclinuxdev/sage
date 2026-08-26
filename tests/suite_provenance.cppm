@@ -790,6 +790,460 @@ install = [
     }
     sage::util::log_success("   Deterministic cmd_build ELF Manifest Ordering OK");
 
+    // 2c. Build Attestation TOML Serialization, Parsing & Round-Trip
+    {
+        sage::package::BuildAttestation att;
+        att.schema_version = 2;
+        att.built_at = "2026-08-27T12:00:00Z";
+        att.builder = "sage-builder-test-runner";
+        att.host_arch = "amd64";
+        att.target_arch = "aarch64";
+        att.host_triplet = "x86_64-linux-gnu";
+        att.target_triplet = "aarch64-linux-gnu";
+        att.check_dependencies = {"python >= 3.14"};
+        att.exec_audit_digest = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+        att.package = {
+            .name = "provenance-tool",
+            .version = "2.1.0",
+            .release = "1",
+            .channel = "system",
+            .arch = "x86_64",
+            .sha256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        };
+        att.sources = {
+            {
+                .url = "https://example.org/provenance-tool-2.1.0.tar.gz",
+                .sha256 = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            }
+        };
+        att.tools = {
+            {
+                .role = "cc",
+                .executable = "gcc",
+                .family = "gcc",
+                .version = "14.2.0",
+                .executions = 15,
+                .path = "/usr/bin/gcc",
+                .sha256 = "sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+                .inode = 67890,
+                .parameters = {"CFLAGS=-O3 -fstack-protector-strong", "KCFLAGS=-O3"}
+            },
+            {
+                .role = "linker",
+                .executable = "ld",
+                .family = "ld",
+                .version = "2.43",
+                .executions = 1,
+                .path = "/usr/bin/ld",
+                .sha256 = "sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+                .inode = 67891,
+                .parameters = {"LDFLAGS=-fuse-ld=bfd -z relro"}
+            }
+        };
+        att.sysroot_packages = {
+            {
+                .name = "glibc",
+                .version = "2.40",
+                .release = "1",
+                .sha256 = "sha256:2c624232cdd221771294dfbb310aca000a0df6ac8b66b696d90ef9f540215dd8"
+            },
+            {
+                .name = "binutils",
+                .version = "2.43",
+                .release = "1",
+                .sha256 = "sha256:19e483e387063462947158a176840742f36d2c46399c54e0b0200caeecc488d5"
+            }
+        };
+        att.audit_commands = {
+            "gcc -c main.c -o main.o -O3 -fstack-protector-strong",
+            "ld -o provenance-tool main.o -fuse-ld=bfd -z relro"
+        };
+        att.env = {
+            "SOURCE_DATE_EPOCH=1700000000",
+            "PATH=/usr/bin:/bin",
+            "LC_ALL=C"
+        };
+
+        const std::string toml_str = att.serialize_toml();
+        auto parsed_res = sage::package::BuildAttestation::parse_toml(toml_str);
+        if (!parsed_res) {
+            sage::util::log_error("Failed to parse serialized BuildAttestation: {}", parsed_res.error());
+            return 1;
+        }
+        const auto& parsed = *parsed_res;
+        if (parsed.schema_version != 2) { sage::util::log_error("mismatch schema_version: {} vs {}", parsed.schema_version, att.schema_version); return 1; }
+        if (parsed.built_at != att.built_at) { sage::util::log_error("mismatch built_at: '{}' vs '{}'", parsed.built_at, att.built_at); return 1; }
+        if (parsed.builder != att.builder) { sage::util::log_error("mismatch builder: '{}' vs '{}'", parsed.builder, att.builder); return 1; }
+        if (parsed.host_arch != att.host_arch) { sage::util::log_error("mismatch host_arch: '{}' vs '{}'", parsed.host_arch, att.host_arch); return 1; }
+        if (parsed.target_arch != att.target_arch) { sage::util::log_error("mismatch target_arch: '{}' vs '{}'", parsed.target_arch, att.target_arch); return 1; }
+        if (parsed.host_triplet != att.host_triplet
+            || parsed.target_triplet != att.target_triplet
+            || parsed.check_dependencies != att.check_dependencies) {
+            sage::util::log_error("mismatch attestation target provenance or check dependencies");
+            return 1;
+        }
+        if (parsed.exec_audit_digest != att.exec_audit_digest) { sage::util::log_error("mismatch exec_audit_digest: '{}' vs '{}'", parsed.exec_audit_digest, att.exec_audit_digest); return 1; }
+        if (parsed.package != att.package) { sage::util::log_error("mismatch package"); return 1; }
+        if (parsed.sources != att.sources) { sage::util::log_error("mismatch sources (size {} vs {})", parsed.sources.size(), att.sources.size()); return 1; }
+        if (parsed.tools != att.tools) { sage::util::log_error("mismatch tools (size {} vs {})", parsed.tools.size(), att.tools.size()); return 1; }
+        if (parsed.sysroot_packages != att.sysroot_packages) { sage::util::log_error("mismatch sysroot_packages (size {} vs {})", parsed.sysroot_packages.size(), att.sysroot_packages.size()); return 1; }
+        if (parsed.audit_commands != att.audit_commands) { sage::util::log_error("mismatch audit_commands (size {} vs {})", parsed.audit_commands.size(), att.audit_commands.size()); return 1; }
+        if (parsed.env != att.env) { sage::util::log_error("mismatch env (size {} vs {})", parsed.env.size(), att.env.size()); return 1; }
+
+        // Round-trip parity check
+        const std::string toml_str_2 = parsed.serialize_toml();
+        auto parsed_res_2 = sage::package::BuildAttestation::parse_toml(toml_str_2);
+        if (!parsed_res_2
+            || parsed_res_2->schema_version != parsed.schema_version
+            || parsed_res_2->built_at != parsed.built_at
+            || parsed_res_2->builder != parsed.builder
+            || parsed_res_2->host_arch != parsed.host_arch
+            || parsed_res_2->target_arch != parsed.target_arch
+            || parsed_res_2->host_triplet != parsed.host_triplet
+            || parsed_res_2->target_triplet != parsed.target_triplet
+            || parsed_res_2->check_dependencies != parsed.check_dependencies
+            || parsed_res_2->exec_audit_digest != parsed.exec_audit_digest
+            || parsed_res_2->package != parsed.package
+            || parsed_res_2->sources != parsed.sources
+            || parsed_res_2->tools != parsed.tools
+            || parsed_res_2->sysroot_packages != parsed.sysroot_packages
+            || parsed_res_2->audit_commands != parsed.audit_commands
+            || parsed_res_2->env != parsed.env) {
+            sage::util::log_error("BuildAttestation second-pass round-trip mismatch");
+            return 1;
+        }
+
+        // Rejection of malformed TOML
+        auto bad_att = sage::package::BuildAttestation::parse_toml("not a valid toml document [[[");
+        if (bad_att) {
+            sage::util::log_error("BuildAttestation accepted malformed TOML input");
+            return 1;
+        }
+        sage::util::log_success("   BuildAttestation Serialization & Round-Trip OK");
+    }
+
+    // 2d. FileEntry Extended Attributes (uid, gid, caps) & 9-Column Index
+    {
+        std::vector<sage::package::FileEntry> entries;
+        entries.push_back({
+            .path = "usr/bin/tool",
+            .size = 1024,
+            .mode = 0755,
+            .uid = 0,
+            .gid = 0,
+            .caps = "",
+            .sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+            .type = sage::package::FileType::Regular,
+            .link_target = ""
+        });
+        entries.push_back({
+            .path = "usr/bin/sudo-canary",
+            .size = 2048,
+            .mode = 04755,
+            .uid = 0,
+            .gid = 0,
+            .caps = "",
+            .sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
+            .type = sage::package::FileType::Regular,
+            .link_target = ""
+        });
+        entries.push_back({
+            .path = "usr/bin/ping-canary",
+            .size = 4096,
+            .mode = 0755,
+            .uid = 1000,
+            .gid = 1000,
+            .caps = "cap_net_raw=+ep",
+            .sha256 = "3333333333333333333333333333333333333333333333333333333333333333",
+            .type = sage::package::FileType::Regular,
+            .link_target = ""
+        });
+        entries.push_back({
+            .path = "etc/restricted.conf",
+            .size = 512,
+            .mode = 0640,
+            .uid = 0,
+            .gid = 999,
+            .caps = "",
+            .sha256 = "4444444444444444444444444444444444444444444444444444444444444444",
+            .type = sage::package::FileType::Regular,
+            .link_target = ""
+        });
+        entries.push_back({
+            .path = "usr/bin/tool-link",
+            .size = 0,
+            .mode = 0777,
+            .uid = 0,
+            .gid = 0,
+            .caps = "",
+            .sha256 = "",
+            .type = sage::package::FileType::Symlink,
+            .link_target = "tool"
+        });
+        entries.push_back({
+            .path = "usr/share/doc",
+            .size = 0,
+            .mode = 0755,
+            .uid = 0,
+            .gid = 0,
+            .caps = "",
+            .sha256 = "",
+            .type = sage::package::FileType::Directory,
+            .link_target = ""
+        });
+
+        std::string serialized_idx = sage::archive::serialize_files_idx(entries);
+        if (!serialized_idx.contains("# sage files index v2")
+            || !serialized_idx.contains("cap_net_raw=+ep")
+            || !serialized_idx.contains("4755")
+            || !serialized_idx.contains("1000\t1000")) {
+            sage::util::log_error("serialize_files_idx did not format 9-column index correctly");
+            return 1;
+        }
+
+        auto parsed_idx = sage::archive::parse_files_idx(serialized_idx);
+        if (parsed_idx.size() != entries.size()) {
+            sage::util::log_error("parse_files_idx returned {} entries, expected {}",
+                parsed_idx.size(), entries.size());
+            return 1;
+        }
+        if (parsed_idx[1].mode != 04755 || parsed_idx[1].uid != 0 || parsed_idx[1].gid != 0
+            || parsed_idx[2].uid != 1000 || parsed_idx[2].gid != 1000
+            || parsed_idx[2].caps != "cap_net_raw=+ep"
+            || parsed_idx[3].mode != 0640 || parsed_idx[3].gid != 999
+            || parsed_idx[4].link_target != "tool"
+            || parsed_idx[5].type != sage::package::FileType::Directory) {
+            sage::util::log_error("parse_files_idx did not preserve extended attributes (uid, gid, caps, mode)");
+            return 1;
+        }
+
+        // Legacy 6-column files.idx compatibility test
+        std::string legacy_idx =
+            "# sage files index v1\n"
+            "# type\tmode\tsize\tsha256\tpath\ttarget\n"
+            "f\t755\t100\t1111\tusr/bin/legacy-tool\t-\n"
+            "l\t777\t0\t-\tusr/bin/legacy-link\tlegacy-tool\n";
+        auto parsed_legacy = sage::archive::parse_files_idx(legacy_idx);
+        if (parsed_legacy.size() != 2
+            || parsed_legacy[0].path != "usr/bin/legacy-tool"
+            || parsed_legacy[0].mode != 0755
+            || parsed_legacy[0].uid != 0
+            || parsed_legacy[0].gid != 0
+            || !parsed_legacy[0].caps.empty()
+            || parsed_legacy[1].link_target != "legacy-tool") {
+            sage::util::log_error("Legacy 6-column files.idx compatibility parsing failed");
+            return 1;
+        }
+
+        // Archive pack and extract with preset permissions
+        auto extattr_data = temp_dir / "extattr-data";
+        std::filesystem::create_directories(extattr_data / "usr/bin");
+        std::filesystem::create_directories(extattr_data / "etc");
+        {
+            std::ofstream f(extattr_data / "usr/bin/ping-tool");
+            f << "#!/bin/sh\necho ping\n";
+        }
+        {
+            std::ofstream f(extattr_data / "etc/daemon.conf");
+            f << "key = value\n";
+        }
+        sage::package::PackageManifest extattr_manifest;
+        extattr_manifest.name = "extattr-test";
+        extattr_manifest.version = sage::package::Version::parse("1.0.0-1");
+        extattr_manifest.description = "extended attribute test";
+        extattr_manifest.license = "MIT";
+        extattr_manifest.channel = "system";
+        extattr_manifest.files = {
+            {
+                .path = "usr/bin/ping-tool",
+                .mode = 0755,
+                .uid = 1001,
+                .gid = 1001,
+                .caps = "cap_net_raw=+ep"
+            },
+            {
+                .path = "etc/daemon.conf",
+                .mode = 0600,
+                .uid = 0,
+                .gid = 100
+            }
+        };
+        auto extattr_pkg = temp_dir / "extattr-test-1.0.0-1-x86_64.pkg.tar.zst";
+        auto extattr_pack = sage::archive::create_package(extattr_manifest, extattr_data, extattr_pkg);
+        if (!extattr_pack) {
+            sage::util::log_error("Failed to pack extattr test archive: {}", extattr_pack.error());
+            return 1;
+        }
+        auto extattr_inspected = sage::archive::inspect_package(extattr_pkg);
+        if (!extattr_inspected || extattr_inspected->data_files.size() < 2) {
+            sage::util::log_error("inspect_package failed for extattr archive");
+            return 1;
+        }
+        auto ping_entry = std::ranges::find(extattr_inspected->data_files, "usr/bin/ping-tool",
+            &sage::package::FileEntry::path);
+        auto conf_entry = std::ranges::find(extattr_inspected->data_files, "etc/daemon.conf",
+            &sage::package::FileEntry::path);
+        if (ping_entry == extattr_inspected->data_files.end()
+            || ping_entry->uid != 1001 || ping_entry->gid != 1001
+            || ping_entry->caps != "cap_net_raw=+ep"
+            || conf_entry == extattr_inspected->data_files.end()
+            || conf_entry->mode != 0600 || conf_entry->gid != 100) {
+            sage::util::log_error("inspect_package did not preserve preset extended attributes");
+            return 1;
+        }
+
+        auto extattr_extract_root = temp_dir / "extattr-extract";
+        auto extattr_extracted = sage::archive::extract_package(extattr_pkg, extattr_extract_root);
+        if (!extattr_extracted
+            || !std::filesystem::exists(extattr_extract_root / "usr/bin/ping-tool")
+            || !std::filesystem::exists(extattr_extract_root / "etc/daemon.conf")) {
+            sage::util::log_error("extract_package failed for extattr archive");
+            return 1;
+        }
+        sage::util::log_success("   FileEntry Extended Attributes (uid, gid, caps) & 9-Column Index OK");
+    }
+
+    // 2e. ELF RPATH / RUNPATH Extraction and Build-Root Leak Rejection
+    {
+        auto write_test_elf_rpath = [](const std::filesystem::path& path,
+                                       std::string_view soname,
+                                       std::string_view needed,
+                                       std::string_view rpath,
+                                       std::string_view runpath) {
+            constexpr std::size_t phoff = 64;
+            constexpr std::size_t dynoff = 176;
+            constexpr std::size_t stroff = 320;
+            constexpr std::uint64_t base = 0x400000;
+
+            std::string strings(1, '\0');
+            const std::uint64_t soname_offset = strings.size();
+            strings.append(soname);
+            strings.push_back('\0');
+            const std::uint64_t needed_offset = strings.size();
+            strings.append(needed);
+            strings.push_back('\0');
+            const std::uint64_t rpath_offset = strings.size();
+            strings.append(rpath);
+            strings.push_back('\0');
+            const std::uint64_t runpath_offset = strings.size();
+            strings.append(runpath);
+            strings.push_back('\0');
+
+            std::vector<std::uint8_t> elf(stroff + strings.size());
+            auto put = [&](std::size_t offset, std::uint64_t value, std::size_t width) {
+                for (std::size_t i = 0; i < width; ++i) {
+                    elf[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
+                }
+            };
+
+            elf[0] = 0x7f;
+            elf[1] = 'E';
+            elf[2] = 'L';
+            elf[3] = 'F';
+            elf[4] = 2;
+            elf[5] = 1;
+            elf[6] = 1;
+            put(16, 3, 2);
+            put(18, 62, 2);
+            put(20, 1, 4);
+            put(32, phoff, 8);
+            put(52, 64, 2);
+            put(54, 56, 2);
+            put(56, 2, 2);
+
+            put(64, 1, 4);
+            put(68, 4, 4);
+            put(80, base, 8);
+            put(88, base, 8);
+            put(96, elf.size(), 8);
+            put(104, elf.size(), 8);
+            put(112, 0x1000, 8);
+
+            put(120, 2, 4);
+            put(124, 4, 4);
+            put(128, dynoff, 8);
+            put(136, base + dynoff, 8);
+            put(144, base + dynoff, 8);
+            put(152, 112, 8); // 7 dynamic entries * 16 bytes
+            put(160, 112, 8);
+            put(168, 8, 8);
+
+            auto put_dynamic = [&](std::size_t index, std::uint64_t tag, std::uint64_t value) {
+                put(dynoff + index * 16, tag, 8);
+                put(dynoff + index * 16 + 8, value, 8);
+            };
+            put_dynamic(0, 5, base + stroff);   // DT_STRTAB
+            put_dynamic(1, 10, strings.size()); // DT_STRSZ
+            put_dynamic(2, 1, needed_offset);   // DT_NEEDED
+            put_dynamic(3, 14, soname_offset);  // DT_SONAME
+            put_dynamic(4, 15, rpath_offset);   // DT_RPATH
+            put_dynamic(5, 29, runpath_offset); // DT_RUNPATH
+            put_dynamic(6, 0, 0);               // DT_NULL
+
+            std::memcpy(elf.data() + stroff, strings.data(), strings.size());
+            std::ofstream out(path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+            return out.good();
+        };
+
+        auto rpath_elf_path = temp_dir / "rpath_test.so";
+        if (!write_test_elf_rpath(rpath_elf_path, "librpath.so.1", "libc.so.6",
+                                  "$ORIGIN/../lib:/usr/lib",
+                                  "/tmp/sage-build-scratch/src/lib:/opt/custom/lib")) {
+            sage::util::log_error("Failed to write ELF with RPATH/RUNPATH test binary");
+            return 1;
+        }
+        auto scan_res = sage::util::scan_elf(rpath_elf_path);
+        if (!scan_res) {
+            sage::util::log_error("scan_elf failed on ELF with RPATH/RUNPATH: {}", scan_res.error());
+            return 1;
+        }
+        if (scan_res->soname != "librpath.so.1"
+            || scan_res->needed != std::vector<std::string>{"libc.so.6"}
+            || scan_res->rpaths != std::vector<std::string>{"$ORIGIN/../lib:/usr/lib"}
+            || scan_res->runpaths != std::vector<std::string>{"/tmp/sage-build-scratch/src/lib:/opt/custom/lib"}) {
+            sage::util::log_error("scan_elf did not accurately extract RPATH / RUNPATH entries: soname='{}' needed=[{}] rpaths=[{}] runpaths=[{}]",
+                scan_res->soname,
+                scan_res->needed.empty() ? "" : scan_res->needed[0],
+                scan_res->rpaths.empty() ? "" : scan_res->rpaths[0],
+                scan_res->runpaths.empty() ? "" : scan_res->runpaths[0]);
+            return 1;
+        }
+
+        // Verify leak detection logic: search for build-dir / /tmp/ in rpaths/runpaths
+        auto has_build_root_leak = [](const sage::util::ElfMetadata& meta,
+                                      std::string_view build_dir) {
+            auto check = [&](const std::vector<std::string>& paths) {
+                for (const auto& entry : paths) {
+                    if (entry.contains("/tmp/") || entry.contains(build_dir)
+                        || entry.contains("DESTDIR") || entry.contains("/home/")) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            return check(meta.rpaths) || check(meta.runpaths);
+        };
+
+        if (!has_build_root_leak(*scan_res, "/tmp/sage-build-scratch")) {
+            sage::util::log_error("Build-root leak in RUNPATH was not detected");
+            return 1;
+        }
+
+        auto clean_elf_path = temp_dir / "clean_rpath.so";
+        if (!write_test_elf_rpath(clean_elf_path, "libclean.so.1", "libc.so.6",
+                                  "$ORIGIN/../lib", "$ORIGIN")) {
+            sage::util::log_error("Failed to write clean ELF binary");
+            return 1;
+        }
+        auto clean_scan = sage::util::scan_elf(clean_elf_path);
+        if (!clean_scan || has_build_root_leak(*clean_scan, "/tmp/sage-build-scratch")) {
+            sage::util::log_error("Clean standard $ORIGIN RPATH was falsely flagged as build leak");
+            return 1;
+        }
+        sage::util::log_success("   ELF RPATH / RUNPATH Extraction and Leak Detection OK");
+    }
+
     return 0;
 }
 

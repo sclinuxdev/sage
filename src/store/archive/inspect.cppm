@@ -26,6 +26,7 @@ struct MetadataContents {
     std::string service;
     std::string triggers;
     std::string files_idx;
+    std::string attestation;
 };
 
 inline std::expected<std::string, std::string> read_member_payload(
@@ -54,7 +55,8 @@ inline std::expected<bool, std::string> capture_metadata_member(
     const bool is_metadata = info.pathname == ".METADATA/manifest.toml"
         || info.pathname == ".METADATA/service.toml"
         || info.pathname == ".METADATA/triggers.toml"
-        || info.pathname == ".METADATA/files.idx";
+        || info.pathname == ".METADATA/files.idx"
+        || info.pathname == ".METADATA/build-attestation.toml";
     if (!is_metadata || info.filetype != vendor::libarchive::type_regular) {
         return false;
     }
@@ -69,6 +71,8 @@ inline std::expected<bool, std::string> capture_metadata_member(
         out.service = std::move(*content);
     } else if (info.pathname == ".METADATA/triggers.toml") {
         out.triggers = std::move(*content);
+    } else if (info.pathname == ".METADATA/build-attestation.toml") {
+        out.attestation = std::move(*content);
     } else {
         out.files_idx = std::move(*content);
     }
@@ -96,6 +100,9 @@ inline std::expected<package::PackageManifest, std::string> finalize_manifest(
             return std::unexpected("Failed to parse service.toml: " + service_res.error());
         }
         manifest.service_toml = std::move(meta.service);
+    }
+    if (!meta.attestation.empty()) {
+        manifest.attestation_toml = std::move(meta.attestation);
     }
     return manifest;
 }

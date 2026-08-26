@@ -67,6 +67,34 @@ cflags = "-O3 -march=x86-64-v3"
             return 1;
         }
 
+        auto cache_cfg = sage::config::BuildConfig::parse_toml(
+            "compiler_cache = \"auto\"\nccache_dir = \"/tmp/sage-cache\"\n"
+            "memory_limit = \"1048576\"\npids_limit = 8\n");
+        auto empty_limit_cfg = sage::config::BuildConfig::parse_toml(
+            "memory_limit = \"\"\n");
+        auto invalid_cache_cfg = sage::config::BuildConfig::parse_toml(
+            "compiler_cache = \"bad\"\n");
+        auto invalid_memory_cfg = sage::config::BuildConfig::parse_toml(
+            "memory_limit = \"1G\"\n");
+        auto invalid_pids_cfg = sage::config::BuildConfig::parse_toml(
+            "pids_limit = -1\n");
+        if (!cache_cfg || cache_cfg->compiler_cache_mode() != "auto"
+            || cache_cfg->ccache_dir != "/tmp/sage-cache"
+            || cache_cfg->memory_limit != "1048576"
+            || cache_cfg->pids_limit != 8
+            || !empty_limit_cfg || !empty_limit_cfg->memory_limit.empty()
+            || invalid_cache_cfg || invalid_memory_cfg || invalid_pids_cfg) {
+            sage::util::log_error("BuildConfig cache/resource-limit parsing drifted");
+            return 1;
+        }
+        if (!sage::package::validate_package_architecture("riscv64")
+            || !sage::package::validate_package_architecture("armv7")
+            || sage::config::triplet_to_arch("riscv64-linux-gnu") != "riscv64"
+            || sage::config::triplet_to_arch("arm-linux-gnueabihf") != "armv7") {
+            sage::util::log_error("Cross-target architecture support is inconsistent");
+            return 1;
+        }
+
         auto write_build_toml = [&](const std::filesystem::path& root, std::string_view body) {
             std::filesystem::create_directories(root / "etc/sage");
             std::ofstream(root / "etc/sage/system.toml") << "schema_version = 1\n";
@@ -364,6 +392,7 @@ system = "cmake"
 payload = "allowlist"
 configure_options = ["-DBUILD_TESTING=OFF"]
 install_files = ["usr/bin/**"]
+patches = [{ file = "fix.patch", strip = 0, sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }]
 install_copies = [{ from = "built/tool", to = "usr/bin/tool" }]
 install_symlinks = [{ path = "usr/bin/cc", target = "clang" }]
 install_moves = [{ from = "usr/libexec/helper", to = "usr/bin/helper" }]
@@ -400,9 +429,99 @@ minimum_version = "1"
             || managed->managed_build.install_moves.size() != 1
             || managed->managed_build.install_removes.size() != 1
             || managed->managed_build.install_generates.size() != 1
+            || managed->managed_build.patches_spec.size() != 1
+            || managed->managed_build.patches_spec.front().file != "fix.patch"
+            || managed->managed_build.patches_spec.front().strip != 0
+            || managed->managed_build.patches_spec.front().sha256
+                != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             || !std::ranges::contains(managed->build_deps, "clang >= 1")
             || !std::ranges::contains(managed->build_deps, "lld >= 1")) {
             sage::util::log_error("Recipe v2 upstream/build model did not parse");
+            return 1;
+        }
+        auto checked = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "checked"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+check_dependencies = ["pkg-config >= 1"]
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/checked/**"]
+[[build.steps]]
+name = "run-tests"
+phase = "check"
+cwd = "source"
+command = "true"
+)");
+        auto missing_check_phase = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "missing-check"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+check_dependencies = ["pkg-config >= 1"]
+[build]
+system = "make"
+payload = "all"
+)");
+        auto conflicting_patch = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "conflicting-patch"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[source]
+url = "https://example.invalid/fix.patch"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/conflicting/**"]
+patches = [{ file = "fix.patch", sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }]
+[[build.steps]]
+name = "build"
+phase = "install"
+command = "true"
+)");
+        auto duplicate_patch = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "duplicate-patch"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[source]
+url = "https://example.invalid/fix.patch"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/duplicate/**"]
+patches = ["fix.patch", "fix.patch"]
+[[build.steps]]
+name = "build"
+phase = "install"
+command = "true"
+)");
+        if (!checked || checked->check_deps != std::vector<std::string>{"pkg-config >= 1"}
+            || checked->managed_build.steps.front().phase != "check"
+            || missing_check_phase || conflicting_patch || duplicate_patch) {
+            sage::util::log_error(
+                "Recipe v2 check phase or normalized patch semantics failed");
             return 1;
         }
         auto managed_outputs = sage::package::Recipe::parse_toml(R"(
@@ -628,7 +747,7 @@ configure_options = ["--exec-prefix=/tmp/escape"]
             ? std::ranges::find(managed_plan->steps, "configure",
                 &sage::build::BuildStep::name)
             : std::vector<sage::build::BuildStep>::iterator{};
-        if (!managed_plan || managed_plan->steps.size() != 4
+        if (!managed_plan || managed_plan->steps.size() != 5
             || managed_plan->environment["KCFLAGS"] != managed_cfg.cflags
             || managed_plan->environment["KBUILD_LDFLAGS"].find("-fuse-ld=lld")
                 == std::string::npos
@@ -1120,8 +1239,10 @@ command = "set -eu; test ! -w /etc; mkdir -p usr/share/v2script; printf '%s|%s|%
             "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst");
         const auto script_archive = script_dir
             / "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst";
+        const auto copy_archive_1 = temp_dir / "script-copy-1.pkg.tar.zst";
+        std::filesystem::copy_file(script_archive, copy_archive_1, std::filesystem::copy_options::overwrite_existing);
         const auto script_hash_1 = script_built
-            ? sage::util::compute_file_sha256(script_archive)
+            ? sage::util::compute_file_sha256(copy_archive_1)
             : std::expected<std::string, std::string>(std::unexpected("not-built"));
         auto script_built_again = build_with_root(
             script_dir, script_root, temp_dir / "bcfg-v2-script-x2",
@@ -1138,6 +1259,106 @@ command = "set -eu; test ! -w /etc; mkdir -p usr/share/v2script; printf '%s|%s|%
                 temp_dir / "bcfg-v2-script-x2/usr/share/v2script/result")) {
             sage::util::log_error(
                 "Managed v2 script repackaging was not hermetic and compiler-free");
+            return 1;
+        }
+        auto check_failure_dir = temp_dir / "bcfg-v2-check-failure";
+        if (!write_canary_recipe(check_failure_dir, R"(schema_version = 2
+[package]
+name = "v2checkfailure"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/check-failure/**"]
+[[build.steps]]
+name = "run-tests"
+phase = "check"
+command = "false"
+[[build.steps]]
+name = "write-payload"
+phase = "install"
+cwd = "package"
+command = "mkdir -p usr/share/check-failure; printf x > usr/share/check-failure/result"
+)")) {
+            sage::util::log_error("Failed to create check-failure fixture");
+            return 1;
+        }
+        CliOptions check_failure_opts;
+        check_failure_opts.args = {check_failure_dir.string()};
+        check_failure_opts.target_root = script_root;
+        const auto check_failure_archive = check_failure_dir
+            / "v2checkfailure-1.0.0-1-x86_64.pkg.tar.zst";
+        if (cmd_build(check_failure_opts) == 0
+            || std::filesystem::exists(check_failure_archive)
+            || std::filesystem::exists(
+                check_failure_dir / "pkg/usr/share/check-failure/result")) {
+            sage::util::log_error(
+                "A failed v2 check phase must block packaging");
+            return 1;
+        }
+        auto check_root = temp_dir / "bcfg-v2-check-root";
+        auto check_db = sage::db::Database::open(
+            check_root / "var/lib/sage/data.mdb");
+        if (!check_db) {
+            sage::util::log_error("Failed to create check dependency database");
+            return 1;
+        }
+        auto check_txn = check_db->begin_write_txn();
+        sage::package::PackageManifest check_pkg;
+        check_pkg.name = "pkg-config";
+        check_pkg.version = sage::package::Version::parse("2.0");
+        check_pkg.arch = "x86_64";
+        if (!check_txn
+            || !check_db->put_package(*check_txn, check_pkg)
+            || !check_txn->commit()) {
+            sage::util::log_error("Failed to seed check dependency database");
+            return 1;
+        }
+        if (!write_build_toml(check_root, "")
+            || !write_canary_recipe(check_root / "recipe-input", R"(schema_version = 2
+[package]
+name = "v2checkcanary"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+check_dependencies = ["pkg-config >= 1"]
+[build]
+system = "script"
+payload = "allowlist"
+install_files = ["usr/share/check-canary/**"]
+[[build.steps]]
+name = "run-tests"
+phase = "check"
+command = "true"
+[[build.steps]]
+name = "install"
+phase = "install"
+cwd = "package"
+command = "mkdir -p usr/share/check-canary; printf x > usr/share/check-canary/result"
+)")) {
+            sage::util::log_error("Failed to create check dependency fixture");
+            return 1;
+        }
+        auto check_built = build_with_root(
+            check_root / "recipe-input", check_root,
+            temp_dir / "bcfg-v2-check-extract",
+            "v2checkcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        auto check_attestation = check_built
+            ? sage::package::BuildAttestation::parse_toml(
+                check_built->attestation_toml)
+            : std::expected<sage::package::BuildAttestation, std::string>(
+                std::unexpected("not-built"));
+        if (!check_built || !check_attestation
+            || check_attestation->check_dependencies
+                != std::vector<std::string>{"pkg-config >= 1"}) {
+            sage::util::log_error(
+                "check_dependencies were not resolved and attested");
             return 1;
         }
         auto bypass_dir = temp_dir / "bcfg-v2-script-bypass";
@@ -1199,6 +1420,794 @@ system = "make"
             sage::util::log_error(
                 "Recipe v2 accepted a split package without build.install_files");
             return 1;
+        }
+
+        // (g) Typed Backend Specs TOML parsing & plan_v2 validation
+        {
+            // CMake typed backend spec
+            auto cmake_spec_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "typed-cmake"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "cmake"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+[build.cmake]
+build_type = "Debug"
+definitions = { "ENABLE_FOO" = "ON", "FOO_DIR" = "/usr/share/foo" }
+features = ["lto", "STATIC=OFF"]
+raw_options = ["-Wno-dev"]
+)");
+            if (!cmake_spec_recipe || !cmake_spec_recipe->managed_build.cmake
+                || cmake_spec_recipe->managed_build.cmake->build_type != "Debug"
+                || cmake_spec_recipe->managed_build.cmake->definitions.at("ENABLE_FOO") != "ON"
+                || cmake_spec_recipe->managed_build.cmake->definitions.at("FOO_DIR") != "/usr/share/foo"
+                || cmake_spec_recipe->managed_build.cmake->features.size() != 2
+                || cmake_spec_recipe->managed_build.cmake->raw_options != std::vector<std::string>{"-Wno-dev"}) {
+                sage::util::log_error("CMake typed backend spec did not parse correctly");
+                return 1;
+            }
+            auto cmake_plan = sage::build::plan_v2(
+                *cmake_spec_recipe, managed_cfg,
+                {.source = "/tmp/cmake-src", .package = "/tmp/cmake-pkg"},
+                kernel_tools, 4);
+            const auto cmake_conf = cmake_plan
+                ? std::ranges::find(cmake_plan->steps, "configure", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!cmake_plan || cmake_conf == cmake_plan->steps.end()
+                || !cmake_conf->command.contains("-DCMAKE_BUILD_TYPE=Debug")
+                || !cmake_conf->command.contains("-DENABLE_FOO=ON")
+                || !cmake_conf->command.contains("-DFOO_DIR=/usr/share/foo")
+                || !cmake_conf->command.contains("-Dlto=ON")
+                || !cmake_conf->command.contains("-DSTATIC=OFF")
+                || !cmake_conf->command.contains("-Wno-dev")) {
+                sage::util::log_error("CMake typed backend plan did not emit expected configure arguments");
+                return 1;
+            }
+            auto checked_plan_recipe = *cmake_spec_recipe;
+            checked_plan_recipe.check_deps = {"pkg-config >= 1"};
+            checked_plan_recipe.managed_build.steps.push_back({
+                .name = "run-tests", .phase = "check", .cwd = "build",
+                .command = "ctest --output-on-failure"});
+            auto checked_plan = sage::build::plan_v2(
+                checked_plan_recipe, managed_cfg,
+                {.source = "/tmp/cmake-src", .package = "/tmp/cmake-pkg"},
+                kernel_tools, 4);
+            const auto check_index = checked_plan
+                ? std::ranges::find(checked_plan->steps, "custom-run-tests",
+                    &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            const auto build_index = checked_plan
+                ? std::ranges::find(checked_plan->steps, "build",
+                    &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            const auto install_index = checked_plan
+                ? std::ranges::find(checked_plan->steps, "install",
+                    &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!checked_plan || check_index == checked_plan->steps.end()
+                || build_index == checked_plan->steps.end()
+                || install_index == checked_plan->steps.end()
+                || !(build_index < check_index && check_index < install_index)
+                || check_index->work_dir != "/tmp/cmake-src/build") {
+                sage::util::log_error(
+                    "Recipe v2 check phase was not placed between build and install");
+                return 1;
+            }
+
+            auto cached_tools = kernel_tools;
+            cached_tools.cc_cache_for_build = "/tmp/cache-bin/clang";
+            cached_tools.cxx_cache_for_build = "/tmp/cache-bin/clang++";
+            cached_tools.cache_for_build = "/usr/bin/ccache";
+            cached_tools.compiler_cache_mode = "ccache";
+            auto cached_plan = sage::build::plan_v2(
+                *cmake_spec_recipe, managed_cfg,
+                {.source = "/tmp/cmake-src", .package = "/tmp/cmake-pkg"},
+                cached_tools, 4);
+            const auto cached_conf = cached_plan
+                ? std::ranges::find(cached_plan->steps, "configure",
+                    &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!cached_plan || cached_plan->environment["CC"] != "/tmp/cache-bin/clang"
+                || cached_plan->environment["CXX"] != "/tmp/cache-bin/clang++"
+                || cached_conf == cached_plan->steps.end()
+                || !cached_conf->command.contains(
+                    "CMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache")
+                || !cached_conf->command.contains(
+                    "CMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache")) {
+                sage::util::log_error(
+                    "Recipe v2 compiler cache was not wired into CMake");
+                return 1;
+            }
+
+            // Meson typed backend spec
+            auto meson_spec_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "typed-meson"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "meson"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+[build.meson]
+build_type = "debugoptimized"
+options = { "b_lto" = "true", "feature_x" = "enabled" }
+raw_options = ["--warnlevel=2"]
+)");
+            if (!meson_spec_recipe || !meson_spec_recipe->managed_build.meson
+                || meson_spec_recipe->managed_build.meson->build_type != "debugoptimized"
+                || meson_spec_recipe->managed_build.meson->options.at("b_lto") != "true"
+                || meson_spec_recipe->managed_build.meson->options.at("feature_x") != "enabled"
+                || meson_spec_recipe->managed_build.meson->raw_options != std::vector<std::string>{"--warnlevel=2"}) {
+                sage::util::log_error("Meson typed backend spec did not parse correctly");
+                return 1;
+            }
+            auto meson_plan = sage::build::plan_v2(
+                *meson_spec_recipe, managed_cfg,
+                {.source = "/tmp/meson-src", .package = "/tmp/meson-pkg"},
+                kernel_tools, 4);
+            const auto meson_conf = meson_plan
+                ? std::ranges::find(meson_plan->steps, "configure", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!meson_plan || meson_conf == meson_plan->steps.end()
+                || !meson_conf->command.contains("--buildtype=debugoptimized")
+                || !meson_conf->command.contains("-Db_lto=true")
+                || !meson_conf->command.contains("-Dfeature_x=enabled")
+                || !meson_conf->command.contains("--warnlevel=2")) {
+                sage::util::log_error("Meson typed backend plan did not emit expected configure arguments");
+                return 1;
+            }
+
+            // Cargo typed backend spec
+            auto cargo_spec_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "typed-cargo"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "cargo"
+payload = "all"
+[build.cargo]
+features = ["derive", "alloc"]
+default_features = false
+locked = true
+raw_options = ["--verbose"]
+)");
+            if (!cargo_spec_recipe || !cargo_spec_recipe->managed_build.cargo
+                || cargo_spec_recipe->managed_build.cargo->features != std::vector<std::string>{"derive", "alloc"}
+                || cargo_spec_recipe->managed_build.cargo->default_features != false
+                || !cargo_spec_recipe->managed_build.cargo->locked
+                || cargo_spec_recipe->managed_build.cargo->raw_options != std::vector<std::string>{"--verbose"}) {
+                sage::util::log_error("Cargo typed backend spec did not parse correctly");
+                return 1;
+            }
+            auto cargo_plan = sage::build::plan_v2(
+                *cargo_spec_recipe, managed_cfg,
+                {.source = "/tmp/cargo-src", .package = "/tmp/cargo-pkg"},
+                kernel_tools, 4);
+            const auto cargo_bld = cargo_plan
+                ? std::ranges::find(cargo_plan->steps, "build", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!cargo_plan || cargo_bld == cargo_plan->steps.end()
+                || !cargo_bld->command.contains("--no-default-features")
+                || !cargo_bld->command.contains("--features 'derive,alloc'")
+                || !cargo_bld->command.contains("--locked")
+                || !cargo_bld->command.contains("--verbose")) {
+                sage::util::log_error("Cargo typed backend plan did not emit expected build arguments");
+                return 1;
+            }
+
+            // Autotools typed backend spec
+            auto autotools_spec_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "typed-autotools"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "autotools"
+payload = "all"
+[build.autotools]
+enable = ["silent-rules", "shared"]
+disable = ["static", "nls"]
+with = ["zlib"]
+without = ["readline"]
+raw_options = ["--disable-rpath"]
+)");
+            if (!autotools_spec_recipe || !autotools_spec_recipe->managed_build.autotools
+                || autotools_spec_recipe->managed_build.autotools->enable != std::vector<std::string>{"silent-rules", "shared"}
+                || autotools_spec_recipe->managed_build.autotools->disable != std::vector<std::string>{"static", "nls"}
+                || autotools_spec_recipe->managed_build.autotools->with != std::vector<std::string>{"zlib"}
+                || autotools_spec_recipe->managed_build.autotools->without != std::vector<std::string>{"readline"}
+                || autotools_spec_recipe->managed_build.autotools->raw_options != std::vector<std::string>{"--disable-rpath"}) {
+                sage::util::log_error("Autotools typed backend spec did not parse correctly");
+                return 1;
+            }
+            auto autotools_plan = sage::build::plan_v2(
+                *autotools_spec_recipe, managed_cfg,
+                {.source = "/tmp/autotools-src", .package = "/tmp/autotools-pkg"},
+                kernel_tools, 4);
+            const auto autotools_conf = autotools_plan
+                ? std::ranges::find(autotools_plan->steps, "configure", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!autotools_plan || autotools_conf == autotools_plan->steps.end()
+                || !autotools_conf->command.contains("--enable-silent-rules")
+                || !autotools_conf->command.contains("--enable-shared")
+                || !autotools_conf->command.contains("--disable-static")
+                || !autotools_conf->command.contains("--disable-nls")
+                || !autotools_conf->command.contains("--with-zlib")
+                || !autotools_conf->command.contains("--without-readline")
+                || !autotools_conf->command.contains("--disable-rpath")) {
+                sage::util::log_error("Autotools typed backend plan did not emit expected configure arguments");
+                return 1;
+            }
+
+            // Make typed backend spec
+            auto make_spec_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "typed-make"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+[build]
+system = "make"
+payload = "all"
+[build.make]
+targets = ["all", "docs"]
+install_targets = ["install", "install-data"]
+variables = { "VERBOSE" = "1", "DEBUG" = "0" }
+raw_options = ["--keep-going"]
+)");
+            if (!make_spec_recipe || !make_spec_recipe->managed_build.make
+                || make_spec_recipe->managed_build.make->targets != std::vector<std::string>{"all", "docs"}
+                || make_spec_recipe->managed_build.make->install_targets != std::vector<std::string>{"install", "install-data"}
+                || make_spec_recipe->managed_build.make->variables.at("VERBOSE") != "1"
+                || make_spec_recipe->managed_build.make->variables.at("DEBUG") != "0"
+                || make_spec_recipe->managed_build.make->raw_options != std::vector<std::string>{"--keep-going"}) {
+                sage::util::log_error("Make typed backend spec did not parse correctly");
+                return 1;
+            }
+            auto make_plan = sage::build::plan_v2(
+                *make_spec_recipe, managed_cfg,
+                {.source = "/tmp/make-src", .package = "/tmp/make-pkg"},
+                kernel_tools, 4);
+            const auto make_bld = make_plan
+                ? std::ranges::find(make_plan->steps, "build", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            const auto make_inst = make_plan
+                ? std::ranges::find(make_plan->steps, "install", &sage::build::BuildStep::name)
+                : std::vector<sage::build::BuildStep>::iterator{};
+            if (!make_plan || make_bld == make_plan->steps.end() || make_inst == make_plan->steps.end()
+                || !make_bld->command.contains("VERBOSE='1'")
+                || !make_bld->command.contains("DEBUG='0'")
+                || !make_bld->command.contains("--keep-going")
+                || !make_bld->command.contains("'all'")
+                || !make_bld->command.contains("'docs'")
+                || !make_inst->command.contains("'install'")
+                || !make_inst->command.contains("'install-data'")
+                || !make_inst->command.contains("--keep-going")) {
+                sage::util::log_error("Make typed backend plan did not emit expected build/install arguments: build='{}' install='{}'",
+                    make_bld == make_plan->steps.end() ? "" : make_bld->command,
+                    make_inst == make_plan->steps.end() ? "" : make_inst->command);
+                return 1;
+            }
+            sage::util::log_success("   Typed Backend Specs ([build.cmake], [build.meson], etc.) Planning OK");
+        }
+
+        // (h) Multi-Output Exhaustiveness & Unassigned Payload Error
+        {
+            auto exhaust_root = temp_dir / "bcfg-exhaust-root";
+            auto exhaust_dir = temp_dir / "bcfg-exhaust";
+            if (!write_build_toml(exhaust_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(exhaust_dir, R"(schema_version = 2
+[package]
+name = "exhaust-canary"
+version = "1.0.0"
+release = "1"
+description = "exhaustiveness canary"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "outputs"
+outputs = [
+  { name = "exhaust-bin", install_files = ["usr/bin/**"] },
+]
+)")) {
+                sage::util::log_error("Failed to create exhaustiveness fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(exhaust_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) test.c -o test-bin
+install:
+	mkdir -p $(DESTDIR)/usr/bin $(DESTDIR)/usr/share/doc
+	cp test-bin $(DESTDIR)/usr/bin/test-bin
+	printf 'unassigned doc\n' > $(DESTDIR)/usr/share/doc/unassigned.txt
+)";
+            }
+            CliOptions exhaust_opts;
+            exhaust_opts.args = {exhaust_dir.string()};
+            exhaust_opts.target_root = exhaust_root;
+            // Build MUST fail because usr/share/doc/unassigned.txt is unassigned in outputs mode
+            if (cmd_build(exhaust_opts) == 0) {
+                sage::util::log_error("Multi-output build did not reject unassigned payload in DESTDIR");
+                return 1;
+            }
+
+            // Now add an output claiming usr/share/** and verify build succeeds
+            if (!write_canary_recipe(exhaust_dir, R"(schema_version = 2
+[package]
+name = "exhaust-canary"
+version = "1.0.0"
+release = "1"
+description = "exhaustiveness canary"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "outputs"
+outputs = [
+  { name = "exhaust-bin", install_files = ["usr/bin/**"] },
+  { name = "exhaust-doc", install_files = ["usr/share/**"] },
+]
+)")) {
+                sage::util::log_error("Failed to update exhaustiveness fixture");
+                return 1;
+            }
+            if (cmd_build(exhaust_opts) != 0
+                || !std::filesystem::exists(exhaust_dir / "exhaust-bin-1.0.0-1-x86_64.pkg.tar.zst")
+                || !std::filesystem::exists(exhaust_dir / "exhaust-doc-1.0.0-1-x86_64.pkg.tar.zst")) {
+                sage::util::log_error("Complete multi-output build failed to produce both packages");
+                return 1;
+            }
+            sage::util::log_success("   Multi-Output Exhaustiveness & Unassigned Payload Check OK");
+        }
+
+        // (i) Exclude Matching & optional_excludes Validation
+        {
+            auto excl_root = temp_dir / "bcfg-excl-root";
+            auto excl_dir = temp_dir / "bcfg-excl";
+            if (!write_build_toml(excl_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(excl_dir, R"(schema_version = 2
+[package]
+name = "excl-canary"
+version = "1.0.0"
+release = "1"
+description = "exclude matching canary"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+install_excludes = ["usr/bin/nonexistent*"]
+)")) {
+                sage::util::log_error("Failed to create exclude matching fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(excl_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) test.c -o real-bin
+install:
+	mkdir -p $(DESTDIR)/usr/bin
+	cp real-bin $(DESTDIR)/usr/bin/real-bin
+)";
+            }
+            CliOptions excl_opts;
+            excl_opts.args = {excl_dir.string()};
+            excl_opts.target_root = excl_root;
+            // Non-matching exclude MUST trigger error when not listed in optional_excludes
+            if (cmd_build(excl_opts) == 0) {
+                sage::util::log_error("Non-matching install_excludes was not rejected");
+                return 1;
+            }
+
+            // Adding it to optional_excludes makes the build succeed
+            if (!write_canary_recipe(excl_dir, R"(schema_version = 2
+[package]
+name = "excl-canary"
+version = "1.0.0"
+release = "1"
+description = "exclude matching canary"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+install_excludes = ["usr/bin/nonexistent*"]
+optional_excludes = ["usr/bin/nonexistent*"]
+)")) {
+                sage::util::log_error("Failed to update optional_excludes fixture");
+                return 1;
+            }
+            if (cmd_build(excl_opts) != 0
+                || !std::filesystem::exists(excl_dir / "excl-canary-1.0.0-1-x86_64.pkg.tar.zst")) {
+                sage::util::log_error("Build failed despite non-matching exclude being in optional_excludes");
+                return 1;
+            }
+            sage::util::log_success("   Exclude Matching & optional_excludes Validation OK");
+        }
+
+        // (j) Output Metadata Inheritance & Safe Defaults
+        {
+            auto inherit_root = temp_dir / "bcfg-inherit-root";
+            auto inherit_dir = temp_dir / "bcfg-inherit";
+            if (!write_build_toml(inherit_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(inherit_dir, R"(schema_version = 2
+[package]
+name = "inherit-root"
+version = "2.0.0"
+release = "1"
+description = "Root package description"
+license = "Apache-2.0"
+channel = "system"
+arch = "x86_64"
+dependencies = ["glibc >= 2.40"]
+provides = ["so:libinherit.so.1"]
+conflicts = ["legacy-inherit < 2"]
+conffiles = ["/etc/inherit.conf"]
+
+[build]
+system = "make"
+payload = "outputs"
+outputs = [
+  { name = "inherit-default", install_files = ["usr/bin/**"] },
+  { name = "inherit-custom", inherit = ["dependencies", "provides", "conflicts", "conffiles"], description = "Custom sub description", install_files = ["usr/lib/**", "etc/**"] },
+]
+)")) {
+                sage::util::log_error("Failed to create metadata inheritance fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(inherit_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) test.c -o test-bin
+install:
+	mkdir -p $(DESTDIR)/usr/bin $(DESTDIR)/usr/lib $(DESTDIR)/etc
+	cp test-bin $(DESTDIR)/usr/bin/test-bin
+	printf 'fake lib\n' > $(DESTDIR)/usr/lib/libinherit.so
+	printf 'conf\n' > $(DESTDIR)/etc/inherit.conf
+)";
+            }
+            CliOptions inherit_opts;
+            inherit_opts.args = {inherit_dir.string()};
+            inherit_opts.target_root = inherit_root;
+            inherit_opts.no_elf_check = true;
+            if (cmd_build(inherit_opts) != 0) {
+                sage::util::log_error("Failed to build multi-output inheritance fixture");
+                return 1;
+            }
+            auto def_pkg = sage::archive::extract_package(
+                inherit_dir / "inherit-default-2.0.0-1-x86_64.pkg.tar.zst",
+                temp_dir / "inherit-default-extracted");
+            auto cust_pkg = sage::archive::extract_package(
+                inherit_dir / "inherit-custom-2.0.0-1-x86_64.pkg.tar.zst",
+                temp_dir / "inherit-custom-extracted");
+            if (!def_pkg || !cust_pkg) {
+                sage::util::log_error("Failed to extract built multi-output packages");
+                return 1;
+            }
+            // Default output inherits name, version, license, description, but NOT root dependencies/provides/conflicts/conffiles
+            if (def_pkg->manifest.name != "inherit-default"
+                || def_pkg->manifest.description != "Root package description"
+                || def_pkg->manifest.license != "Apache-2.0"
+                || std::ranges::any_of(def_pkg->manifest.dependencies, [](const auto& d) { return d.name == "glibc"; })
+                || std::ranges::any_of(def_pkg->manifest.provides, [](const auto& p) { return p == "so:libinherit.so.1"; })
+                || !def_pkg->manifest.conflicts.empty()
+                || !def_pkg->manifest.conffiles.empty()) {
+                sage::util::log_error("Default output did not isolate dependencies/provides/conflicts/conffiles");
+                return 1;
+            }
+            // Custom output with inherit = [...] inherits dependencies, provides, conflicts, conffiles
+            if (cust_pkg->manifest.name != "inherit-custom"
+                || cust_pkg->manifest.description != "Custom sub description"
+                || cust_pkg->manifest.dependencies.empty()
+                || cust_pkg->manifest.dependencies.front().name != "glibc"
+                || !std::ranges::contains(cust_pkg->manifest.provides, "so:libinherit.so.1")
+                || cust_pkg->manifest.conflicts.empty()
+                || cust_pkg->manifest.conflicts.front().name != "legacy-inherit"
+                || cust_pkg->manifest.conffiles != std::vector<std::string>{"/etc/inherit.conf"}) {
+                sage::util::log_error("Custom output did not inherit requested metadata channels");
+                return 1;
+            }
+            sage::util::log_success("   Output Metadata Inheritance & Safe Defaults OK");
+        }
+
+        // (k) Per-Output Transforms & File Permissions
+        {
+            auto tf_root = temp_dir / "bcfg-tf-root";
+            auto tf_dir = temp_dir / "bcfg-tf";
+            if (!write_build_toml(tf_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(tf_dir, R"(schema_version = 2
+[package]
+name = "tf-canary"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "outputs"
+[[build.outputs]]
+name = "tf-pkg"
+install_files = ["usr/**"]
+install_copies = [{ from = "extra.dat", to = "usr/share/extra.dat" }]
+install_symlinks = [{ path = "usr/bin/tool-symlink", target = "tool" }]
+install_moves = [{ from = "usr/share/old.txt", to = "usr/share/new.txt" }]
+install_removes = ["usr/share/unwanted/**"]
+install_generates = [{ path = "etc/generated.conf", content = "magic_key = 12345\n", mode = 420 }]
+file_permissions = [{ path = "usr/bin/admin-tool", mode = 2541, uid = 0, gid = 0, caps = "cap_net_admin=+ep" }]
+)")) {
+                sage::util::log_error("Failed to create per-output transforms fixture");
+                return 1;
+            }
+            {
+                std::ofstream extra_file(tf_dir / "extra.dat");
+                extra_file << "copied extra content\n";
+                std::ofstream makefile(tf_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) test.c -o tool
+	cp tool admin-tool
+install:
+	mkdir -p $(DESTDIR)/usr/bin $(DESTDIR)/usr/share/unwanted
+	cp tool $(DESTDIR)/usr/bin/tool
+	cp admin-tool $(DESTDIR)/usr/bin/admin-tool
+	printf 'old doc\n' > $(DESTDIR)/usr/share/old.txt
+	printf 'garbage\n' > $(DESTDIR)/usr/share/unwanted/junk.txt
+)";
+            }
+            CliOptions tf_opts;
+            tf_opts.args = {tf_dir.string()};
+            tf_opts.target_root = tf_root;
+            tf_opts.no_elf_check = true;
+            if (cmd_build(tf_opts) != 0) {
+                sage::util::log_error("Failed to build per-output transforms recipe");
+                return 1;
+            }
+            auto tf_pkg_path = tf_dir / "tf-pkg-1.0.0-1-x86_64.pkg.tar.zst";
+            auto tf_inspected = sage::archive::inspect_package(tf_pkg_path);
+            auto tf_extracted = sage::archive::extract_package(tf_pkg_path, temp_dir / "tf-extracted");
+            if (!tf_inspected || !tf_extracted) {
+                sage::util::log_error("Failed to inspect/extract per-output transforms package");
+                return 1;
+            }
+            auto read_tf_file = [](const std::filesystem::path& p) {
+                std::ifstream f(p);
+                std::stringstream ss;
+                ss << f.rdbuf();
+                return ss.str();
+            };
+            if (read_tf_file(temp_dir / "tf-extracted/usr/share/extra.dat") != "copied extra content\n"
+                || !std::filesystem::is_symlink(temp_dir / "tf-extracted/usr/bin/tool-symlink")
+                || std::filesystem::read_symlink(temp_dir / "tf-extracted/usr/bin/tool-symlink").generic_string() != "tool"
+                || read_tf_file(temp_dir / "tf-extracted/usr/share/new.txt") != "old doc\n"
+                || std::filesystem::exists(temp_dir / "tf-extracted/usr/share/old.txt")
+                || std::filesystem::exists(temp_dir / "tf-extracted/usr/share/unwanted")
+                || read_tf_file(temp_dir / "tf-extracted/etc/generated.conf") != "magic_key = 12345\n") {
+                sage::util::log_error("Per-output transforms (copies/symlinks/moves/removes/generates) did not apply accurately");
+                return 1;
+            }
+            auto admin_entry = std::ranges::find(tf_inspected->data_files, "usr/bin/admin-tool",
+                &sage::package::FileEntry::path);
+            if (admin_entry == tf_inspected->data_files.end()
+                || admin_entry->mode != 04755
+                || admin_entry->caps != "cap_net_admin=+ep") {
+                sage::util::log_error("Per-output file_permissions was not preserved in files.idx");
+                return 1;
+            }
+            sage::util::log_success("   Per-Output Transforms & File Permissions OK");
+        }
+
+        // (l) Build Attestation Generation (.METADATA/build-attestation.toml)
+        {
+            auto att_root = temp_dir / "bcfg-att-root";
+            auto att_dir = temp_dir / "bcfg-att";
+            if (!write_build_toml(att_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+cflags = "-O2 -pipe"
+)") || !write_canary_recipe(att_dir, R"(schema_version = 2
+[package]
+name = "att-canary"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+
+[build.flag_env]
+cflags = ["KCFLAGS"]
+
+[build.toolchain.compiler]
+family = "gcc"
+package = "gcc"
+minimum_version = "1"
+
+[build.toolchain.linker]
+family = "ld"
+package = "binutils"
+minimum_version = "1"
+)")) {
+                sage::util::log_error("Failed to create build attestation fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(att_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) $(CFLAGS) test.c -o att-tool
+install:
+	mkdir -p $(DESTDIR)/usr/bin
+	cp att-tool $(DESTDIR)/usr/bin/att-tool
+)";
+            }
+            CliOptions att_opts;
+            att_opts.args = {att_dir.string()};
+            att_opts.target_root = att_root;
+            att_opts.no_elf_check = true;
+            if (cmd_build(att_opts) != 0) {
+                sage::util::log_error("Failed to build attestation test package");
+                return 1;
+            }
+            auto att_pkg_path = att_dir / "att-canary-1.0.0-1-x86_64.pkg.tar.zst";
+            auto att_inspected = sage::archive::inspect_package(att_pkg_path);
+            if (!att_inspected || att_inspected->manifest.attestation_toml.empty()) {
+                sage::util::log_error("Built package manifest did not carry build-attestation.toml");
+                return 1;
+            }
+            auto parsed_att = sage::package::BuildAttestation::parse_toml(
+                att_inspected->manifest.attestation_toml);
+            if (!parsed_att
+                || parsed_att->schema_version != 2
+                || parsed_att->package.name != "att-canary"
+                || parsed_att->package.version != "1.0.0"
+                || parsed_att->host_arch != sage::config::native_package_architecture()
+                || parsed_att->target_arch != sage::config::native_package_architecture()
+                || parsed_att->host_triplet != sage::config::native_target_triplet()
+                || parsed_att->target_triplet != sage::config::native_target_triplet()
+                || parsed_att->exec_audit_digest.empty()
+                || !parsed_att->check_dependencies.empty()
+                || parsed_att->tools.empty()) {
+                sage::util::log_error("Build attestation in built archive is invalid or incomplete");
+                return 1;
+            }
+            sage::util::log_success("   Build Attestation Generation (.METADATA/build-attestation.toml) OK");
+        }
+
+        // (m) --check-reproducible Mode Validation
+        {
+            auto repro_root = temp_dir / "bcfg-repro-root";
+            auto repro_dir = temp_dir / "bcfg-repro";
+            if (!write_build_toml(repro_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(repro_dir, R"(schema_version = 2
+[package]
+name = "repro-canary"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/bin/**"]
+)")) {
+                sage::util::log_error("Failed to create reproducibility fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(repro_dir / "Makefile");
+                makefile << R"(all:
+	printf 'int main(void){return 0;}\n' > test.c
+	$(CC) test.c -o repro-bin
+install:
+	mkdir -p $(DESTDIR)/usr/bin
+	cp repro-bin $(DESTDIR)/usr/bin/repro-bin
+)";
+            }
+            // (1) Deterministic build with --check-reproducible MUST pass
+            CliOptions repro_opts;
+            repro_opts.args = {repro_dir.string()};
+            repro_opts.target_root = repro_root;
+            repro_opts.no_elf_check = true;
+            repro_opts.check_reproducible = true;
+            if (cmd_build(repro_opts) != 0) {
+                sage::util::log_error("--check-reproducible failed on a deterministic build");
+                return 1;
+            }
+
+            // (2) Non-deterministic build with --check-reproducible MUST fail
+            auto nonrepro_dir = temp_dir / "bcfg-nonrepro";
+            if (!write_canary_recipe(nonrepro_dir, R"(schema_version = 2
+[package]
+name = "nonrepro-canary"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "x86_64"
+
+[build]
+system = "make"
+payload = "allowlist"
+install_files = ["usr/share/**"]
+)")) {
+                sage::util::log_error("Failed to create non-reproducible fixture");
+                return 1;
+            }
+            {
+                std::ofstream makefile(nonrepro_dir / "Makefile");
+                // Writing a nanosecond timestamp or random token ensures bit divergence across 2 passes
+                makefile << R"(all:
+install:
+	mkdir -p $(DESTDIR)/usr/share
+	head -c 32 /dev/urandom > $(DESTDIR)/usr/share/stamp.txt
+)";
+            }
+            CliOptions nonrepro_opts;
+            nonrepro_opts.args = {nonrepro_dir.string()};
+            nonrepro_opts.target_root = repro_root;
+            nonrepro_opts.check_reproducible = true;
+            if (cmd_build(nonrepro_opts) == 0) {
+                sage::util::log_error("--check-reproducible did not catch non-deterministic build artifact divergence");
+                return 1;
+            }
+            sage::util::log_success("   --check-reproducible Mode Validation OK");
         }
 
 

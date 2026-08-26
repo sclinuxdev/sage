@@ -110,9 +110,20 @@ struct BuildConfig {
     // Parallel jobs inside one package build. Explicit 0 means one job per
     // hardware thread; nullopt preserves the legacy `jobs` behaviour.
     std::optional<int> compile_jobs;
+    // Compiler cache integration (ccache, sccache, auto, none). Empty is
+    // retained as the legacy spelling of "none".
+    std::string compiler_cache;
+    std::filesystem::path ccache_dir{"/var/cache/sage/ccache"};
+    // Sandbox resource limits (cgroups v2; RLIMIT_NPROC is supplementary).
+    std::string memory_limit;
+    std::uint64_t pids_limit{0};
 
     [[nodiscard]] int configured_compile_jobs() const noexcept {
         return compile_jobs.value_or(jobs);
+    }
+
+    [[nodiscard]] std::string_view compiler_cache_mode() const noexcept {
+        return compiler_cache.empty() ? std::string_view{"none"} : compiler_cache;
     }
 
     bool operator==(const BuildConfig&) const = default;
@@ -143,6 +154,44 @@ struct BuildConfig {
         if (auto v = tbl["cppflags"].value<std::string_view>()) cfg.cppflags = std::string(*v);
         if (auto v = tbl["ldflags"].value<std::string_view>()) cfg.ldflags = std::string(*v);
         if (auto v = tbl["rustflags"].value<std::string_view>()) cfg.rustflags = std::string(*v);
+        if (tbl.contains("compiler_cache")
+            && !tbl["compiler_cache"].value<std::string_view>())
+            return std::unexpected("compiler_cache must be a string");
+        if (auto v = tbl["compiler_cache"].value<std::string_view>()) {
+            cfg.compiler_cache = std::string(*v);
+            if (cfg.compiler_cache != "ccache" && cfg.compiler_cache != "sccache"
+                && cfg.compiler_cache != "auto" && cfg.compiler_cache != "none")
+                return std::unexpected(
+                    "compiler_cache must be ccache, sccache, auto, or none");
+        }
+        if (tbl.contains("ccache_dir")
+            && !tbl["ccache_dir"].value<std::string_view>())
+            return std::unexpected("ccache_dir must be a string");
+        if (auto v = tbl["ccache_dir"].value<std::string_view>()) {
+            cfg.ccache_dir = std::filesystem::path(std::string(*v));
+            if (cfg.ccache_dir.empty() || !cfg.ccache_dir.is_absolute()
+                || cfg.ccache_dir.has_root_name())
+                return std::unexpected("ccache_dir must be an absolute path");
+        }
+        if (tbl.contains("memory_limit")
+            && !tbl["memory_limit"].value<std::string_view>())
+            return std::unexpected("memory_limit must be a string");
+        if (auto v = tbl["memory_limit"].value<std::string_view>()) {
+            cfg.memory_limit = std::string(*v);
+            if (!cfg.memory_limit.empty() && cfg.memory_limit != "max"
+                && !std::ranges::all_of(cfg.memory_limit, [](char c) {
+                       return std::isdigit(static_cast<unsigned char>(c));
+                   }))
+                return std::unexpected(
+                    "memory_limit must be a byte count, \"max\", or empty");
+        }
+        if (tbl.contains("pids_limit")
+            && !tbl["pids_limit"].value<std::int64_t>())
+            return std::unexpected("pids_limit must be an integer");
+        if (auto v = tbl["pids_limit"].value<std::int64_t>()) {
+            if (*v < 0) return std::unexpected("pids_limit must be non-negative");
+            cfg.pids_limit = static_cast<std::uint64_t>(*v);
+        }
         if (auto v = tbl["source_date_epoch"].value<std::int64_t>()) {
             if (*v < 0) return std::unexpected("source_date_epoch must be non-negative");
             cfg.source_date_epoch = *v;
@@ -170,14 +219,61 @@ struct BuildConfig {
     }
 };
 
+inline std::string canonical_architecture(std::string_view architecture) {
+    if (architecture == "x86_64") return "amd64";
+    if (architecture == "arm64") return "aarch64";
+    if (architecture == "arm" || architecture == "armhf"
+        || architecture == "armv7" || architecture == "armv7l")
+        return "armv7";
+    if (architecture == "riscv64") return "riscv64";
+    return std::string(architecture);
+}
+
 inline std::string native_package_architecture() {
 #if defined(__x86_64__)
     return "amd64";
 #elif defined(__aarch64__)
     return "aarch64";
+#elif defined(__riscv) && __riscv_xlen == 64
+    return "riscv64";
+#elif defined(__arm__)
+    return "armv7";
 #else
-#error "Sage supports amd64 and aarch64 targets"
+#error "Sage supports amd64, aarch64, riscv64 and armv7 targets"
 #endif
+}
+
+inline std::string native_target_triplet() {
+    const auto arch = native_package_architecture();
+    if (arch == "amd64") return "x86_64-linux-gnu";
+    if (arch == "aarch64") return "aarch64-linux-gnu";
+    if (arch == "riscv64") return "riscv64-linux-gnu";
+    return "arm-linux-gnueabihf";
+}
+
+inline std::string architecture_to_triplet(std::string_view architecture) {
+    const auto arch = canonical_architecture(architecture);
+    if (arch == "amd64") return "x86_64-linux-gnu";
+    if (arch == "aarch64") return "aarch64-linux-gnu";
+    if (arch == "riscv64") return "riscv64-linux-gnu";
+    if (arch == "armv7") return "arm-linux-gnueabihf";
+    return native_target_triplet();
+}
+
+inline std::string triplet_to_arch(std::string_view triplet) {
+    if (triplet.starts_with("aarch64") || triplet.starts_with("arm64")) return "aarch64";
+    if (triplet.starts_with("x86_64") || triplet.starts_with("amd64")) return "amd64";
+    if (triplet.starts_with("riscv64")) return "riscv64";
+    if (triplet.starts_with("arm")) return "armv7";
+    return canonical_architecture(triplet);
+}
+
+inline std::string triplet_to_kbuild_arch(std::string_view triplet) {
+    if (triplet.starts_with("aarch64") || triplet.starts_with("arm64")) return "arm64";
+    if (triplet.starts_with("x86_64") || triplet.starts_with("amd64")) return "x86_64";
+    if (triplet.starts_with("riscv64")) return "riscv";
+    if (triplet.starts_with("arm")) return "arm";
+    return std::string(triplet);
 }
 
 struct SystemConfig {
@@ -246,12 +342,12 @@ struct SystemConfig {
             cfg.root_dir = (*sys)["root_dir"].value_or("/");
             cfg.db_path = (*sys)["db_path"].value_or("/var/lib/sage/data.mdb");
             cfg.cache_dir = (*sys)["cache_dir"].value_or("/var/cache/sage");
-            cfg.architecture = (*sys)["architecture"].value_or(native_package_architecture());
-            if (cfg.architecture != "amd64"
-                && cfg.architecture != "x86_64"
-                && cfg.architecture != "aarch64") {
+            cfg.architecture = canonical_architecture(
+                (*sys)["architecture"].value_or(native_package_architecture()));
+            if (cfg.architecture != "amd64" && cfg.architecture != "aarch64"
+                && cfg.architecture != "riscv64" && cfg.architecture != "armv7") {
                 return std::unexpected(std::format(
-                    "Unsupported system package architecture '{}' (expected amd64 or aarch64)",
+                    "Unsupported system package architecture '{}' (expected amd64, aarch64, riscv64, or armv7)",
                     cfg.architecture));
             }
             if (auto* cfg_d = sys->get("config_dir")) {

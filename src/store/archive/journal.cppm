@@ -8,7 +8,7 @@ inline constexpr std::string_view journal_magic_line = "sage-journal 1";
 inline constexpr std::string_view journal_file_name = "journal";
 
 struct PlanEntry {
-    enum class Kind { PutFile, PutSymlink, EnsureDir, RemoveFile, RemoveDir };
+    enum class Kind { PutFile, PutSymlink, PutHardlink, EnsureDir, RemoveFile, RemoveDir };
     Kind kind;
     std::uint32_t mode{0644};
     std::string staged;
@@ -63,7 +63,7 @@ struct JournalContext {
     std::string sysroot;
     bool regenerate_profile{false};
     std::vector<std::string> toolchain_activations;              // "gcc:15"
-    std::vector<std::pair<char, std::string>> touched;           // 'F'|'D'|'L' + rel path
+    std::vector<std::pair<char, std::string>> touched;           // 'F'|'D'|'L'|'H' + rel path
     std::vector<std::string> package_manifests_toml;             // verbatim blocks
 };
 
@@ -83,6 +83,7 @@ inline std::string render_journal(
         case PlanEntry::Kind::PutFile:
         case PlanEntry::Kind::RemoveFile: type = 'F'; break;
         case PlanEntry::Kind::PutSymlink: type = 'L'; break;
+        case PlanEntry::Kind::PutHardlink: type = 'H'; break;
         case PlanEntry::Kind::RemoveDir: type = 'D'; break;
         case PlanEntry::Kind::EnsureDir: break;
         }
@@ -116,6 +117,9 @@ inline std::string render_journal(
             break;
         case PlanEntry::Kind::PutSymlink:
             text += std::format("P L {} {}\n", entry.staged, entry.target);
+            break;
+        case PlanEntry::Kind::PutHardlink:
+            text += std::format("P H {} {}\n", entry.staged, entry.target);
             break;
         case PlanEntry::Kind::EnsureDir:
             text += std::format("P D {}\n", entry.target);
@@ -229,6 +233,13 @@ inline std::expected<ParsedJournal, std::string> parse_journal(std::string_view 
                 } else if (tokens[1] == "L") {
                     if (tokens.size() == 4) {
                         entry.kind = PlanEntry::Kind::PutSymlink;
+                        entry.staged = tokens[2];
+                        entry.target = tokens[3];
+                        recognized = true;
+                    }
+                } else if (tokens[1] == "H") {
+                    if (tokens.size() == 4) {
+                        entry.kind = PlanEntry::Kind::PutHardlink;
                         entry.staged = tokens[2];
                         entry.target = tokens[3];
                         recognized = true;

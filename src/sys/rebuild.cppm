@@ -800,6 +800,9 @@ public:
                     case package::FileType::Symlink:
                         fsx.plan_put_symlink(staged, target);
                         break;
+                    case package::FileType::Hardlink:
+                        fsx.plan_put_hardlink(target, f.link_target);
+                        break;
                     default:
                         fsx.plan_put_file(target, staged, f.mode);
                         break;

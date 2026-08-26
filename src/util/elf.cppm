@@ -14,12 +14,16 @@ using std::uint64_t;
 using std::size_t;
 
 
-// Native zero-copy ELF SONAME / DT_NEEDED scanner.
+// Native zero-copy ELF SONAME / DT_NEEDED and GNU symbol versioning scanner.
 struct ElfMetadata {
     std::string soname;
     std::vector<std::string> needed;
     bool is_shared{false};
     bool is_executable{false};
+    std::vector<std::string> rpaths;
+    std::vector<std::string> runpaths;
+    std::vector<std::string> verdef_versions;
+    std::vector<std::pair<std::string, std::string>> verneed_entries;
 };
 
 inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::path& path) {
@@ -78,43 +82,54 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
 
         uint64_t strtab_vaddr = 0;
         uint64_t strsz = 0;
+        uint64_t verdef_vaddr = 0;
+        uint64_t verdef_num = 0;
+        uint64_t verneed_vaddr = 0;
+        uint64_t verneed_num = 0;
         std::vector<uint64_t> needed_offsets;
         std::optional<uint64_t> soname_offset;
+        std::vector<uint64_t> rpath_offsets;
+        std::vector<uint64_t> runpath_offsets;
 
         for (const auto& d : dyns) {
             if (d.d_tag == DT_STRTAB) strtab_vaddr = d.d_un.d_ptr;
             else if (d.d_tag == DT_STRSZ) strsz = d.d_un.d_val;
             else if (d.d_tag == DT_NEEDED) needed_offsets.push_back(d.d_un.d_val);
             else if (d.d_tag == DT_SONAME) soname_offset = d.d_un.d_val;
+            else if (d.d_tag == DT_RPATH) rpath_offsets.push_back(d.d_un.d_val);
+            else if (d.d_tag == DT_RUNPATH) runpath_offsets.push_back(d.d_un.d_val);
+            else if (d.d_tag == DT_VERDEF) verdef_vaddr = d.d_un.d_ptr;
+            else if (d.d_tag == DT_VERDEFNUM) verdef_num = d.d_un.d_val;
+            else if (d.d_tag == DT_VERNEED) verneed_vaddr = d.d_un.d_ptr;
+            else if (d.d_tag == DT_VERNEEDNUM) verneed_num = d.d_un.d_val;
             else if (d.d_tag == DT_NULL) break;
         }
 
         if (strtab_vaddr == 0 || strsz == 0) return meta;
 
-        // Convert virtual address to file offset via PT_LOAD segment mapping
-        uint64_t strtab_offset = 0;
-        for (const auto& ph : phdrs) {
-            if (ph.p_type == PT_LOAD && strtab_vaddr >= ph.p_vaddr && strtab_vaddr < (ph.p_vaddr + ph.p_memsz)) {
-                strtab_offset = ph.p_offset + (strtab_vaddr - ph.p_vaddr);
-                break;
-            }
-        }
-
-        if (strtab_offset == 0) {
-            // Fallback: search section headers if present
-            if (ehdr.e_shoff != 0 && ehdr.e_shnum > 0) {
-                file.seekg(static_cast<std::streamoff>(ehdr.e_shoff), std::ios::beg);
-                std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
-                file.read(reinterpret_cast<char*>(shdrs.data()), ehdr.e_shnum * sizeof(Elf64_Shdr));
-                for (const auto& sh : shdrs) {
-                    if (sh.sh_type == SHT_STRTAB && sh.sh_addr == strtab_vaddr) {
-                        strtab_offset = sh.sh_offset;
-                        break;
+        auto vaddr_to_offset = [&](uint64_t vaddr, uint32_t shtype) -> uint64_t {
+            if (vaddr != 0) {
+                for (const auto& ph : phdrs) {
+                    if (ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < (ph.p_vaddr + ph.p_memsz)) {
+                        return ph.p_offset + (vaddr - ph.p_vaddr);
                     }
                 }
             }
-        }
+            if (ehdr.e_shoff != 0 && ehdr.e_shnum > 0) {
+                file.seekg(static_cast<std::streamoff>(ehdr.e_shoff), std::ios::beg);
+                std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+                if (file.read(reinterpret_cast<char*>(shdrs.data()), ehdr.e_shnum * sizeof(Elf64_Shdr))) {
+                    for (const auto& sh : shdrs) {
+                        if ((shtype != 0 && sh.sh_type == shtype) || (vaddr != 0 && sh.sh_addr == vaddr)) {
+                            return sh.sh_offset;
+                        }
+                    }
+                }
+            }
+            return 0;
+        };
 
+        uint64_t strtab_offset = vaddr_to_offset(strtab_vaddr, SHT_STRTAB);
         if (strtab_offset == 0) return meta;
 
         std::vector<char> strtab(strsz);
@@ -140,6 +155,251 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
             std::string nd = get_string(off);
             if (!nd.empty()) {
                 meta.needed.push_back(std::move(nd));
+            }
+        }
+
+        for (uint64_t off : rpath_offsets) {
+            std::string rp = get_string(off);
+            if (!rp.empty()) {
+                meta.rpaths.push_back(std::move(rp));
+            }
+        }
+
+        for (uint64_t off : runpath_offsets) {
+            std::string rp = get_string(off);
+            if (!rp.empty()) {
+                meta.runpaths.push_back(std::move(rp));
+            }
+        }
+
+        // Parse GNU Symbol Version Definitions (DT_VERDEF)
+        uint64_t verdef_offset = vaddr_to_offset(verdef_vaddr, SHT_GNU_verdef);
+        if (verdef_offset != 0) {
+            uint64_t cur = verdef_offset;
+            size_t count = (verdef_num > 0) ? verdef_num : 1024;
+            for (size_t i = 0; i < count; ++i) {
+                file.seekg(static_cast<std::streamoff>(cur), std::ios::beg);
+                Elf64_Verdef vd;
+                if (!file.read(reinterpret_cast<char*>(&vd), sizeof(vd))) break;
+                if (vd.vd_cnt > 0 && !(vd.vd_flags & 1 /* VER_FLG_BASE */)) {
+                    uint64_t aux_cur = cur + vd.vd_aux;
+                    file.seekg(static_cast<std::streamoff>(aux_cur), std::ios::beg);
+                    Elf64_Verdaux vda;
+                    if (file.read(reinterpret_cast<char*>(&vda), sizeof(vda))) {
+                        std::string vname = get_string(vda.vda_name);
+                        if (!vname.empty()) {
+                            meta.verdef_versions.push_back(std::move(vname));
+                        }
+                    }
+                }
+                if (vd.vd_next == 0) break;
+                cur += vd.vd_next;
+            }
+        }
+
+        // Parse GNU Symbol Version Requirements (DT_VERNEED)
+        uint64_t verneed_offset = vaddr_to_offset(verneed_vaddr, SHT_GNU_verneed);
+        if (verneed_offset != 0) {
+            uint64_t cur = verneed_offset;
+            size_t count = (verneed_num > 0) ? verneed_num : 1024;
+            for (size_t i = 0; i < count; ++i) {
+                file.seekg(static_cast<std::streamoff>(cur), std::ios::beg);
+                Elf64_Verneed vn;
+                if (!file.read(reinterpret_cast<char*>(&vn), sizeof(vn))) break;
+                std::string fname = get_string(vn.vn_file);
+                if (vn.vn_cnt > 0) {
+                    uint64_t aux_cur = cur + vn.vn_aux;
+                    for (size_t j = 0; j < vn.vn_cnt; ++j) {
+                        file.seekg(static_cast<std::streamoff>(aux_cur), std::ios::beg);
+                        Elf64_Vernaux vna;
+                        if (!file.read(reinterpret_cast<char*>(&vna), sizeof(vna))) break;
+                        std::string vname = get_string(vna.vna_name);
+                        if (!fname.empty() && !vname.empty()) {
+                            meta.verneed_entries.push_back({fname, vname});
+                        }
+                        if (vna.vna_next == 0) break;
+                        aux_cur += vna.vna_next;
+                    }
+                }
+                if (vn.vn_next == 0) break;
+                cur += vn.vn_next;
+            }
+        }
+    } else {
+        Elf32_Ehdr ehdr;
+        if (!file.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr))) {
+            return std::unexpected("Failed to read ELF32 header");
+        }
+
+        meta.is_shared = (ehdr.e_type == ET_DYN);
+        meta.is_executable = (ehdr.e_type == ET_EXEC || ehdr.e_type == ET_DYN);
+
+        std::vector<Elf32_Phdr> phdrs(ehdr.e_phnum);
+        file.seekg(static_cast<std::streamoff>(ehdr.e_phoff), std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(phdrs.data()), ehdr.e_phnum * sizeof(Elf32_Phdr))) {
+            return meta;
+        }
+
+        const Elf32_Phdr* dyn_phdr = nullptr;
+        for (const auto& ph : phdrs) {
+            if (ph.p_type == PT_DYNAMIC) {
+                dyn_phdr = &ph;
+                break;
+            }
+        }
+
+        if (!dyn_phdr) return meta;
+
+        size_t num_dyn = dyn_phdr->p_filesz / sizeof(Elf32_Dyn);
+        std::vector<Elf32_Dyn> dyns(num_dyn);
+        file.seekg(static_cast<std::streamoff>(dyn_phdr->p_offset), std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(dyns.data()), dyn_phdr->p_filesz)) {
+            return meta;
+        }
+
+        uint64_t strtab_vaddr = 0;
+        uint64_t strsz = 0;
+        uint64_t verdef_vaddr = 0;
+        uint64_t verdef_num = 0;
+        uint64_t verneed_vaddr = 0;
+        uint64_t verneed_num = 0;
+        std::vector<uint64_t> needed_offsets;
+        std::optional<uint64_t> soname_offset;
+        std::vector<uint64_t> rpath_offsets;
+        std::vector<uint64_t> runpath_offsets;
+
+        for (const auto& d : dyns) {
+            if (d.d_tag == DT_STRTAB) strtab_vaddr = d.d_un.d_ptr;
+            else if (d.d_tag == DT_STRSZ) strsz = d.d_un.d_val;
+            else if (d.d_tag == DT_NEEDED) needed_offsets.push_back(d.d_un.d_val);
+            else if (d.d_tag == DT_SONAME) soname_offset = d.d_un.d_val;
+            else if (d.d_tag == DT_RPATH) rpath_offsets.push_back(d.d_un.d_val);
+            else if (d.d_tag == DT_RUNPATH) runpath_offsets.push_back(d.d_un.d_val);
+            else if (d.d_tag == DT_VERDEF) verdef_vaddr = d.d_un.d_ptr;
+            else if (d.d_tag == DT_VERDEFNUM) verdef_num = d.d_un.d_val;
+            else if (d.d_tag == DT_VERNEED) verneed_vaddr = d.d_un.d_ptr;
+            else if (d.d_tag == DT_VERNEEDNUM) verneed_num = d.d_un.d_val;
+            else if (d.d_tag == DT_NULL) break;
+        }
+
+        if (strtab_vaddr == 0 || strsz == 0) return meta;
+
+        auto vaddr_to_offset = [&](uint64_t vaddr, uint32_t shtype) -> uint64_t {
+            if (vaddr != 0) {
+                for (const auto& ph : phdrs) {
+                    if (ph.p_type == PT_LOAD && strtab_vaddr >= ph.p_vaddr && strtab_vaddr < (ph.p_vaddr + ph.p_memsz)) {
+                        return ph.p_offset + (vaddr - ph.p_vaddr);
+                    }
+                }
+            }
+            if (ehdr.e_shoff != 0 && ehdr.e_shnum > 0) {
+                file.seekg(static_cast<std::streamoff>(ehdr.e_shoff), std::ios::beg);
+                std::vector<Elf32_Shdr> shdrs(ehdr.e_shnum);
+                if (file.read(reinterpret_cast<char*>(shdrs.data()), ehdr.e_shnum * sizeof(Elf32_Shdr))) {
+                    for (const auto& sh : shdrs) {
+                        if ((shtype != 0 && sh.sh_type == shtype) || (vaddr != 0 && sh.sh_addr == vaddr)) {
+                            return sh.sh_offset;
+                        }
+                    }
+                }
+            }
+            return 0;
+        };
+
+        uint64_t strtab_offset = vaddr_to_offset(strtab_vaddr, SHT_STRTAB);
+        if (strtab_offset == 0) return meta;
+
+        std::vector<char> strtab(strsz);
+        file.seekg(static_cast<std::streamoff>(strtab_offset), std::ios::beg);
+        if (!file.read(strtab.data(), static_cast<std::streamsize>(strsz))) {
+            return meta;
+        }
+
+        auto get_string = [&](uint64_t offset) -> std::string {
+            if (offset >= strsz) return {};
+            std::string_view sv(strtab.data() + offset, strsz - offset);
+            if (auto nul = sv.find('\0'); nul != std::string_view::npos) {
+                sv = sv.substr(0, nul);
+            }
+            return std::string(sv);
+        };
+
+        if (soname_offset) {
+            meta.soname = get_string(*soname_offset);
+        }
+
+        for (uint64_t off : needed_offsets) {
+            std::string nd = get_string(off);
+            if (!nd.empty()) {
+                meta.needed.push_back(std::move(nd));
+            }
+        }
+
+        for (uint64_t off : rpath_offsets) {
+            std::string rp = get_string(off);
+            if (!rp.empty()) {
+                meta.rpaths.push_back(std::move(rp));
+            }
+        }
+
+        for (uint64_t off : runpath_offsets) {
+            std::string rp = get_string(off);
+            if (!rp.empty()) {
+                meta.runpaths.push_back(std::move(rp));
+            }
+        }
+
+        // Parse GNU Symbol Version Definitions (DT_VERDEF)
+        uint64_t verdef_offset = vaddr_to_offset(verdef_vaddr, SHT_GNU_verdef);
+        if (verdef_offset != 0) {
+            uint64_t cur = verdef_offset;
+            size_t count = (verdef_num > 0) ? verdef_num : 1024;
+            for (size_t i = 0; i < count; ++i) {
+                file.seekg(static_cast<std::streamoff>(cur), std::ios::beg);
+                Elf32_Verdef vd;
+                if (!file.read(reinterpret_cast<char*>(&vd), sizeof(vd))) break;
+                if (vd.vd_cnt > 0 && !(vd.vd_flags & 1 /* VER_FLG_BASE */)) {
+                    uint64_t aux_cur = cur + vd.vd_aux;
+                    file.seekg(static_cast<std::streamoff>(aux_cur), std::ios::beg);
+                    Elf32_Verdaux vda;
+                    if (file.read(reinterpret_cast<char*>(&vda), sizeof(vda))) {
+                        std::string vname = get_string(vda.vda_name);
+                        if (!vname.empty()) {
+                            meta.verdef_versions.push_back(std::move(vname));
+                        }
+                    }
+                }
+                if (vd.vd_next == 0) break;
+                cur += vd.vd_next;
+            }
+        }
+
+        // Parse GNU Symbol Version Requirements (DT_VERNEED)
+        uint64_t verneed_offset = vaddr_to_offset(verneed_vaddr, SHT_GNU_verneed);
+        if (verneed_offset != 0) {
+            uint64_t cur = verneed_offset;
+            size_t count = (verneed_num > 0) ? verneed_num : 1024;
+            for (size_t i = 0; i < count; ++i) {
+                file.seekg(static_cast<std::streamoff>(cur), std::ios::beg);
+                Elf32_Verneed vn;
+                if (!file.read(reinterpret_cast<char*>(&vn), sizeof(vn))) break;
+                std::string fname = get_string(vn.vn_file);
+                if (vn.vn_cnt > 0) {
+                    uint64_t aux_cur = cur + vn.vn_aux;
+                    for (size_t j = 0; j < vn.vn_cnt; ++j) {
+                        file.seekg(static_cast<std::streamoff>(aux_cur), std::ios::beg);
+                        Elf32_Vernaux vna;
+                        if (!file.read(reinterpret_cast<char*>(&vna), sizeof(vna))) break;
+                        std::string vname = get_string(vna.vna_name);
+                        if (!fname.empty() && !vname.empty()) {
+                            meta.verneed_entries.push_back({fname, vname});
+                        }
+                        if (vna.vna_next == 0) break;
+                        aux_cur += vna.vna_next;
+                    }
+                }
+                if (vn.vn_next == 0) break;
+                cur += vn.vn_next;
             }
         }
     }

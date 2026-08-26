@@ -713,6 +713,10 @@ export int cmd_install(
                 filesystem_transaction.plan_put_symlink(
                     rel, std::format("staged/{}", rel));
                 break;
+            case sage::package::FileType::Hardlink:
+                filesystem_transaction.plan_put_hardlink(
+                    rel, file_entry.link_target);
+                break;
             case sage::package::FileType::Directory:
                 break;
             }

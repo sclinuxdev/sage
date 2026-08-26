@@ -22,7 +22,10 @@ struct CliOptions {
     bool no_recursive{false};  // --no-recursive
     bool no_elf_check{false};  // --no-elf-check
     bool reuse_src{false};     // --reuse-src: resume `build` on an extracted tree
+    bool check_reproducible{false};  // --check-reproducible
     std::string channel_filter;  // --channel <NAME>
+    std::string target_triplet;  // --target <TRIPLET>
+    std::string target_arch;     // --arch <ARCH>
     int wait_seconds{0};      // --wait[=SECONDS]: wait for a concurrent sage
 };
 
@@ -65,7 +68,10 @@ Global Options:
   --no-elf-check           Skip build-time DT_NEEDED validation (bootstrap escape hatch)
   --reuse-src              build: resume on the already-extracted src/ tree
                            instead of re-unpacking (kbuild-style increments)
+  --check-reproducible     build: run dual isolated builds and verify bit-identical outputs
   --channel <NAME>         Restrict `install` to a single channel
+  --target <TRIPLET>       build: cross-compile for a target triplet
+  --arch <ARCH>            build: override package architecture
   --wait[=SECONDS]         Wait for a concurrent sage on the same root (default: fail fast)
   --help, -h               Show this help message
   --version, -V            Show version information
@@ -100,8 +106,18 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
             opts.no_elf_check = true;
         } else if (arg == "--reuse-src") {
             opts.reuse_src = true;
+        } else if (arg == "--check-reproducible") {
+            opts.check_reproducible = true;
         } else if (arg == "--channel" && i + 1 < argc) {
             opts.channel_filter = argv[++i];
+        } else if (arg == "--target" && i + 1 < argc) {
+            opts.target_triplet = argv[++i];
+        } else if (arg.starts_with("--target=")) {
+            opts.target_triplet = std::string(arg.substr(9));
+        } else if (arg == "--arch" && i + 1 < argc) {
+            opts.target_arch = argv[++i];
+        } else if (arg.starts_with("--arch=")) {
+            opts.target_arch = std::string(arg.substr(7));
         } else if (arg == "--wait") {
             opts.wait_seconds = 30;
         } else if (arg.starts_with("--wait=")) {

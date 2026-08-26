@@ -249,6 +249,16 @@ std::expected<void, std::string> publish_put_symlink(
         "Cannot allocate temporary symlink name for '{}'", entry.target));
 }
 
+std::expected<void, std::string> publish_put_hardlink(
+    int root_fd, const PlanEntry& entry, const TargetLeaf& target) {
+    (void)::unlinkat(target.parent_fd, target.leaf.c_str(), 0);
+    if (::linkat(root_fd, entry.staged.c_str(), target.parent_fd, target.leaf.c_str(), 0) != 0) {
+        return std::unexpected(std::format(
+            "Cannot link hardlink '{}' -> '{}': {}", entry.target, entry.staged, std::strerror(errno)));
+    }
+    return {};
+}
+
 std::expected<void, std::string> publish_ensure_dir(
     ParentSyncBatch& parents, int root_fd, const PlanEntry& entry) {
     // A directory has no content: the only thing to make durable is its
@@ -457,6 +467,10 @@ public:
         plan_.push_back({PlanEntry::Kind::PutSymlink, 0777,
             std::string(stage_rel), std::string(target_rel)});
     }
+    void plan_put_hardlink(std::string_view target_rel, std::string_view source_rel) {
+        plan_.push_back({PlanEntry::Kind::PutHardlink, 0644,
+            std::string(source_rel), std::string(target_rel)});
+    }
     void plan_ensure_dir(std::string_view target_rel) {
         plan_.push_back({PlanEntry::Kind::EnsureDir, 0755, {}, std::string(target_rel)});
     }
@@ -598,6 +612,13 @@ public:
                     outcome = std::unexpected(target.error());
                 } else {
                     outcome = txn::publish_put_symlink(dir_fd_.get(), entry, *target);
+                }
+            } else if (entry.kind == PlanEntry::Kind::PutHardlink) {
+                auto target = txn::resolve_target(parents, entry.target);
+                if (!target) {
+                    outcome = std::unexpected(target.error());
+                } else {
+                    outcome = txn::publish_put_hardlink(root.get(), entry, *target);
                 }
             } else if (entry.kind == PlanEntry::Kind::EnsureDir) {
                 outcome = txn::publish_ensure_dir(parents, root.get(), entry);

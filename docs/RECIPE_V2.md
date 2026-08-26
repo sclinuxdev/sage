@@ -33,8 +33,12 @@ cppflags = ""
 ldflags = "-Wl,--as-needed"
 rustflags = "-C target-cpu=x86-64-v3"
 source_date_epoch = 0            # fixed timestamp exported to every phase
-jobs = 0                       # concurrent package fetch/inspection; 0 = hardware
-compile_jobs = 0               # threads inside one package build; 0 = hardware
+jobs = 0                         # concurrent package fetch/inspection; 0 = hardware
+compile_jobs = 0                 # threads inside one package build; 0 = hardware
+compiler_cache = "none"          # none | auto | ccache | sccache
+ccache_dir = "/var/cache/sage/ccache"
+memory_limit = ""                # cgroup-v2 bytes, or "max"; empty = off
+pids_limit = 0                   # cgroup-v2 process ceiling; 0 = off
 ```
 
 `compile_jobs` controls the exact parallelism Sage supplies to a single build:
@@ -42,6 +46,25 @@ compile_jobs = 0               # threads inside one package build; 0 = hardware
 CMake, and `-j` for Meson/Xmake. If it is omitted, Sage inherits `jobs` for
 compatibility with older `build.toml` files. Setting `compile_jobs = 0`
 explicitly selects the online hardware-thread count.
+
+`compiler_cache` is resolved once before the build. `none` disables cache
+mounts and wrapper injection. Explicit `ccache` and `sccache` require that
+executable inside the configured build sysroot; failure is fatal. `auto`
+prefers `sccache` for Cargo and `ccache` for other backends, then tries the
+other implementation; if neither exists Sage emits a warning and continues
+without a cache. C/C++ backends receive compiler-specific cache wrappers
+(`CC`/`CXX`, plus CMake launcher settings); Cargo receives `RUSTC_WRAPPER`
+when the selected cache is sccache. The wrapper always invokes Sage's audit
+compiler, so caching cannot bypass tool provenance.
+
+`memory_limit` is a byte count or `max`, and `pids_limit` is a positive
+process count (`0` disables the limit). If either is configured, Sage must
+create a cgroups v2 scope, write every requested controller, and move the
+audit supervisor into it before running a managed step. Any unavailable
+controller, failed control-file write, or failed process move aborts the
+build; Sage never silently downgrades a requested limit. `RLIMIT_NPROC` is
+also applied for `pids_limit` as a defense in depth, not as a cgroup
+replacement.
 
 Every v1 recipe phase and every v2 managed step is
 executed as a child of the configured `fakeroot`. Sage probes that exact
@@ -62,6 +85,16 @@ point it at a populated package sysroot to prevent host files outside that tree
 from entering a build. Sage requires this path to exist and requires the
 configured toolchain and build utilities to be present in it.
 
+
+Cross builds pass `--target <triplet>` to the backend-specific target
+interface (`--host` for Autotools, CMake processor, Cargo target, Kbuild
+`ARCH`/`CROSS_COMPILE`, `CHOST`, and target pkg-config paths). The package
+architecture is derived from that triplet and must be one of `amd64`,
+`aarch64`, `riscv64`, or `armv7` (or `any` for architecture-independent
+payloads). A cross build without an explicit target triplet is rejected when
+the recipe architecture differs from the builder. Every managed v2 attestation
+records both `host_arch`/`host_triplet` and `target_arch`/`target_triplet`;
+they are never copied from one another.
 For v2, a recipe may restrict compatible compiler/linker families and may
 declare one package-specific default suite as described below. It never names
 executable paths or supplies flags. Sage uses the configured fallback only
@@ -88,6 +121,7 @@ release = "1"
 description = "Example package"
 license = "MIT"
 channel = "system"
+check_dependencies = ["pkg-config >= 2.0"]
 arch = "amd64"
 dependencies = ["zlib >= 1.3"]
 build_dependencies = ["cmake", "ninja"]
@@ -106,22 +140,41 @@ sha256 = "..."
 Both fields are optional as a pair. For compatibility with the issue's first
 proposal, `package.upstream` and `package.upstream_regex` are also accepted;
 new recipes should use the dedicated table.
-
 Additional `[[source]]` entries work as in v1. They are verified and staged in
-`src/distfiles/`. Structured patches name files from that directory:
+`src/distfiles/`. In v2 every source URL, including additional sources, must
+have a SHA-256. A patch is always identified by one basename; directory
+components, absolute paths, and duplicate declarations are rejected.
 
-In v2 every source URL, including additional sources, must have a SHA-256.
+The canonical declaration is structured and self-contained:
 
 ```toml
 [build]
 system = "cmake"
 payload = "all"                 # all | allowlist | outputs (required)
+patches = [
+    { file = "fix-musl.patch", strip = 1,
+      sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+]
+```
+
+The compatibility declaration remains accepted:
+
+```toml
 patches = ["fix-musl.patch"]
-patch_strip = 1
 
 [build.patch_checksums]
-# Required for a patch shipped beside recipe.toml or in distfiles/.
 fix-musl.patch = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+For a string entry, Sage obtains the checksum from `build.patch_checksums`,
+or from the unique `[[source]]` whose URL basename is the patch name. A
+structured entry must contain `sha256`. `build.patch_checksums` is a
+cross-check, not an override: if it exists alongside a structured hash or a
+matching source hash, all declarations must be identical (case-insensitive),
+otherwise parsing fails. Keys that do not name a patch are errors. A local
+patch beside `recipe.toml` or under `distfiles/` is hashed before it is staged;
+a remote patch source is verified by its source hash. Every patch therefore
+has exactly one effective SHA-256 before the `patch` command runs.
 ```
 
 ## Managed build table
@@ -259,7 +312,7 @@ install_files = ["usr/lib/myapp/**", "usr/share/myapp/**"]
 
 [[build.steps]]
 name = "generate-config"
-phase = "prepare"                 # prepare | pre-build | post-build |
+phase = "prepare"                 # prepare | pre-build | post-build | check |
                                    # pre-install | install | post-install
 cwd = "source"                    # source | build | package
 command = "./configure-local --output build/config"
@@ -270,6 +323,22 @@ phase = "install"
 cwd = "package"
 command = "rm -rf usr/share/doc; mv usr/libexec/myapp usr/lib/myapp"
 ```
+The `check` phase runs after the backend build and `post-build` steps, before
+`pre-install`. It runs in the same read-only build sysroot and sandbox as every
+other managed step, with the writable source/build/package staging mounts.
+`package` contains only whatever a prior step placed there; normal backend
+installation has not run yet. A non-zero check command aborts the build, so no
+archive or manifest is produced.
+
+`package.check_dependencies` is a build-time root request. Before any source
+work, Sage resolves every request against the installed-package database of
+`build.sysroot`; the matching package payloads and their `provides` are already
+visible in the read-only namespace. Sage does not mutate that sysroot or
+install test packages as a side effect of `sage build`. A missing database,
+unsatisfied constraint, or missing check phase is a hard error. Check
+dependencies never become runtime `package.dependencies`; they are copied into
+the v2 build attestation as `attestation.check_dependencies` so the test
+environment is auditable.
 
 Steps execute in TOML order within each phase. `source` is the unpacked or
 copy-on-write source tree, `build` is the recipe's private build directory,
@@ -323,6 +392,11 @@ synthetic `cxx` entry. C/C++ builds may record `cc`, `cxx`, `linker-driver`, and
 selected linker. These fields are absent from v1 and upstream-prebuilt
 repackages. They mean “this Sage-probed executable was observed executing in
 this build”, not “inferred as the producer of every payload file”.
+
+The same v2 attestation records `host_arch`, `host_triplet`, `target_arch`,
+`target_triplet`, and the raw `check_dependencies` requests. These are
+provenance inputs, not runtime dependency edges. The package manifest's
+`dependencies` remain the only dependencies consumed by installation.
 
 ## CMake
 
@@ -423,6 +497,10 @@ manifest because PIDs and scheduling order would make otherwise identical
 archives differ; the manifest retains only deterministic tool execution
 counts, Sage-supplied flag channels and wrapper command lines. v1 and
 upstream-binary repackaging intentionally retain no compiler provenance.
+
+When limits are configured, the ptrace supervisor itself enters the cgroups
+v2 scope before the first command. The scope is recreated for the
+reproducibility pass, so a second pass cannot accidentally run unbounded.
 
 ## Make and non-standard projects
 

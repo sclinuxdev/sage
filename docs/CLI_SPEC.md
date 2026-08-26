@@ -14,6 +14,8 @@ Global Options:
   --dry-run            Preview install/remove/rebuild without persistent writes
   --wait[=SECONDS]     Wait for another package-state operation
   --root <DIR>         Operate on an alternate target root
+  --target <TRIPLET>   build: select the cross-compilation target triplet
+  --arch <ARCH>        build: override the package architecture
   --quiet, -q          Suppress informational output
   --help, -h           Show help message
   --version, -V        Display Sage version
@@ -99,6 +101,13 @@ All v1 recipe phases and v2 Sage-managed steps run through the exact
 executing a recipe when it cannot probe that executable; it never silently
 runs the recipe outside fakeroot. This virtualizes file metadata only and does
 not provide a security sandbox or elevated privileges.
+
+For recipe-v2, `package.check_dependencies` are resolved against the installed
+package metadata of `build.sysroot` before source work starts. They are visible
+only inside the read-only build namespace. A declared `[[build.steps]]` with
+`phase = "check"` runs after compilation and before installation; any failed
+check stops the build and produces no archive. Check dependencies are recorded
+in the build attestation, not as runtime install dependencies.
 ```bash
 # Build package archive in current directory
 sage build ./recipes/ripgrep

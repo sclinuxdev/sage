@@ -8,6 +8,8 @@ module;
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -102,7 +104,8 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
 std::expected<void, std::string> apply_payload_policy(
     const std::filesystem::path& pkg_dir,
     const std::vector<std::string>& includes,
-    const std::vector<std::string>& excludes)
+    const std::vector<std::string>& excludes,
+    const std::vector<std::string>& optional_excludes = {})
 {
     if (includes.empty() && excludes.empty()) return {};
     if (!std::filesystem::exists(pkg_dir))
@@ -131,13 +134,8 @@ std::expected<void, std::string> apply_payload_policy(
         entries.push_back({item.path(), relative, directory, symlink});
     }
 
-    const auto matches = [](const std::vector<std::string>& patterns,
-                            std::string_view path) {
-        return std::ranges::any_of(patterns, [&](const auto& pattern) {
-            return sage::util::glob_match(pattern, path);
-        });
-    };
     std::vector<bool> include_seen(includes.size(), false);
+    std::vector<bool> exclude_seen(excludes.size(), false);
     std::size_t payload_entries = 0;
     for (const auto& entry : entries) {
         // Directories are retained only when at least one selected child
@@ -149,7 +147,14 @@ std::expected<void, std::string> apply_payload_policy(
             selected = true;
             include_seen[i] = true;
         }
-        if (matches(excludes, entry.relative)) selected = false;
+        bool excluded = false;
+        for (std::size_t i = 0; i < excludes.size(); ++i) {
+            if (sage::util::glob_match(excludes[i], entry.relative)) {
+                excluded = true;
+                exclude_seen[i] = true;
+            }
+        }
+        if (excluded) selected = false;
         if (!selected) {
             std::filesystem::remove(entry.disk, ec);
             if (ec) return std::unexpected("Cannot remove excluded staged payload '"
@@ -181,6 +186,37 @@ std::expected<void, std::string> apply_payload_policy(
         if (!include_seen[i]) return std::unexpected(std::format(
             "build.install_files pattern '{}' matched no installed payload",
             includes[i]));
+    }
+    for (std::size_t i = 0; i < exclude_seen.size(); ++i) {
+        if (!exclude_seen[i]) {
+            const auto& pat = excludes[i];
+            if (!std::ranges::contains(optional_excludes, pat)) {
+                return std::unexpected(std::format(
+                    "build.install_excludes pattern '{}' matched no installed payload",
+                    pat));
+            }
+        }
+    }
+    return {};
+}
+
+std::expected<void, std::string> apply_file_permissions(
+    const std::filesystem::path& pkg_dir,
+    const std::vector<sage::package::FilePermission>& perms)
+{
+    std::error_code ec;
+    for (const auto& fp : perms) {
+        if (fp.path.empty()) continue;
+        const auto target = pkg_dir / fp.path;
+        if (!std::filesystem::exists(target, ec) && !std::filesystem::is_symlink(target, ec)) {
+            return std::unexpected("File permission target does not exist: " + fp.path);
+        }
+        std::filesystem::permissions(target,
+            static_cast<std::filesystem::perms>(fp.mode),
+            std::filesystem::perm_options::replace, ec);
+        if (ec) {
+            return std::unexpected("Cannot set permissions for '" + fp.path + "': " + ec.message());
+        }
     }
     return {};
 }
@@ -294,6 +330,17 @@ std::expected<void, std::string> apply_install_transforms(
             std::filesystem::remove_all(path, ec);
             if (ec) return std::unexpected("Cannot remove generated payload '"
                                            + path.string() + "': " + ec.message());
+        }
+        std::vector<std::filesystem::path> dirs;
+        for (const auto& item : std::filesystem::recursive_directory_iterator(
+                 pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (item.is_directory(ec) && !item.is_symlink(ec)) dirs.push_back(item.path());
+        }
+        std::ranges::sort(dirs, [](const auto& a, const auto& b) { return a.string().size() > b.string().size(); });
+        for (const auto& dir : dirs) {
+            if (std::filesystem::is_empty(dir, ec)) {
+                std::filesystem::remove(dir, ec);
+            }
         }
     }
     for (const auto& generate : generates) {
@@ -585,7 +632,9 @@ struct ToolAudit {
     std::string rustc;
     std::string path;
     std::string sandbox;
-
+    std::string cc_cache;
+    std::string cxx_cache;
+    std::string cache_for_build;
     ToolAudit() = default;
     ToolAudit(const ToolAudit&) = delete;
     ToolAudit& operator=(const ToolAudit&) = delete;
@@ -597,7 +646,10 @@ struct ToolAudit {
           expected_real_execs(std::move(other.expected_real_execs)),
           cc(std::move(other.cc)), cxx(std::move(other.cxx)),
           linker(std::move(other.linker)), rustc(std::move(other.rustc)),
-          path(std::move(other.path)), sandbox(std::move(other.sandbox)) {
+          path(std::move(other.path)), sandbox(std::move(other.sandbox)),
+          cc_cache(std::move(other.cc_cache)),
+          cxx_cache(std::move(other.cxx_cache)),
+          cache_for_build(std::move(other.cache_for_build)) {
         other.root.clear();
     }
     ToolAudit& operator=(ToolAudit&& other) noexcept {
@@ -612,6 +664,9 @@ struct ToolAudit {
             cc = std::move(other.cc); cxx = std::move(other.cxx);
             linker = std::move(other.linker); rustc = std::move(other.rustc);
             path = std::move(other.path); sandbox = std::move(other.sandbox);
+            cc_cache = std::move(other.cc_cache);
+            cxx_cache = std::move(other.cxx_cache);
+            cache_for_build = std::move(other.cache_for_build);
             other.root.clear();
         }
         return *this;
@@ -746,7 +801,9 @@ struct ToolAudit {
 
     static std::optional<ToolAudit> create(const sage::build::Toolchain& tools,
                                            const std::filesystem::path& parent,
-                                           const std::filesystem::path& build_sysroot) {
+                                           const std::filesystem::path& build_sysroot,
+                                           const std::filesystem::path& ccache_dir = {},
+                                           std::string_view compiler_cache = {}) {
         auto cc = resolve(tools.cc);
         auto cxx = resolve(tools.cxx);
         auto linker = resolve(tools.linker);
@@ -775,6 +832,21 @@ struct ToolAudit {
             };
             if (!inside(cc) || !inside(cxx) || !inside(linker) || !inside(rustc))
                 return std::nullopt;
+        }
+        std::optional<std::filesystem::path> cache;
+        if (!compiler_cache.empty() && compiler_cache != "none") {
+            if (compiler_cache != "ccache" && compiler_cache != "sccache")
+                return std::nullopt;
+            cache = resolve(compiler_cache);
+            if (!cache) return std::nullopt;
+            if (build_sysroot != "/") {
+                std::error_code cache_ec;
+                const auto cache_root = std::filesystem::weakly_canonical(
+                    *cache, cache_ec);
+                if (cache_ec || !(cache_root == sysroot_root
+                    || cache_root.string().starts_with(sysroot_root.string() + "/")))
+                    return std::nullopt;
+            }
         }
         ToolAudit audit;
         audit.root = parent / "tool-audit";
@@ -902,6 +974,34 @@ struct ToolAudit {
         if (cc && cc_driver && !make_driver("cc", *cc, *cc_driver, "sage-cc")) return std::nullopt;
         if (cxx && cxx_driver && !make_driver("cxx", *cxx, *cxx_driver, "sage-cxx")) return std::nullopt;
         if (rustc && !make_driver("rustc", *rustc, *rustc, "sage-rustc")) return std::nullopt;
+        if (cache) {
+            const auto cache_exec = namespace_path(*cache).string();
+            const auto make_cache_driver = [&](std::string_view requested,
+                                               std::string_view driver,
+                                               std::string& output) {
+                const auto basename =
+                    std::filesystem::path(requested).filename().string();
+                if (basename.empty()) return false;
+                const auto wrapper = audit.root / "cache-bin" / basename;
+                std::filesystem::create_directories(wrapper.parent_path(), ec);
+                if (ec) return false;
+                const auto script = "#!/bin/sh\nexec "
+                    + sage::build::shell_quote(cache_exec) + " "
+                    + sage::build::shell_quote(
+                        (audit.root / std::string(driver)).string())
+                    + " \"$@\"\n";
+                if (!write_executable(wrapper, script)) return false;
+                output = wrapper.string();
+                return true;
+            };
+            if (cc && cc_driver
+                && !make_cache_driver(tools.cc, "sage-cc", audit.cc_cache))
+                return std::nullopt;
+            if (cxx && cxx_driver
+                && !make_cache_driver(tools.cxx, "sage-cxx", audit.cxx_cache))
+                return std::nullopt;
+            audit.cache_for_build = cache_exec;
+        }
         if (linker) {
             const auto linker_link = real_driver_link(
                 "linker", *linker, linker_driver.value_or(*linker));
@@ -917,9 +1017,9 @@ struct ToolAudit {
         if (cxx) audit.expected_real_execs.emplace("cxx", execution_paths("cxx", *cxx));
         if (linker) audit.expected_real_execs.emplace("linker", execution_paths("linker", *linker));
         if (rustc) audit.expected_real_execs.emplace("rustc", execution_paths("rustc", *rustc));
-        const std::array<std::string_view, 15> base_fenced{
+        const std::array<std::string_view, 14> base_fenced{
             "cc", "c++", "gcc", "g++", "clang", "clang++", "ld", "ld.bfd",
-            "ld.gold", "ld.lld", "lld", "mold", "ld.mold", "rustc", "ccache"};
+            "ld.gold", "ld.lld", "lld", "mold", "ld.mold", "rustc"};
         std::vector<std::string> fenced;
         for (const auto name : base_fenced) fenced.emplace_back(name);
         const auto looks_like_tool = [](std::string_view name) {
@@ -1037,6 +1137,14 @@ struct ToolAudit {
                 + " --ro-bind " + sage::build::shell_quote(build_sysroot.string())
                 + " " + sage::build::shell_quote(real_root.string())
                 + " --dev /dev --proc /proc";
+            if (!ccache_dir.empty()) {
+                std::error_code ccache_ec;
+                std::filesystem::create_directories(ccache_dir, ccache_ec);
+                if (ccache_ec) return std::nullopt;
+                audit.sandbox += " --dir " + sage::build::shell_quote(ccache_dir.string())
+                    + " --bind " + sage::build::shell_quote(ccache_dir.string())
+                    + " " + sage::build::shell_quote(ccache_dir.string());
+            }
             for (const auto& name : fenced) {
                 if (auto resolved = resolve(name)) {
                     const auto target = namespace_path(*resolved);
@@ -1109,12 +1217,178 @@ struct ToolAudit {
     }
 };
 
+std::expected<std::string, std::string> select_compiler_cache(
+    std::string_view requested,
+    sage::package::BuildSystem system,
+    const std::filesystem::path& build_sysroot)
+{
+    if (requested.empty() || requested == "none") return std::string{"none"};
+    std::error_code root_ec;
+    const auto sysroot = std::filesystem::weakly_canonical(
+        build_sysroot, root_ec);
+    if (root_ec) return std::unexpected(std::format(
+        "Cannot resolve compiler-cache build sysroot '{}': {}",
+        build_sysroot.string(), root_ec.message()));
+    const auto available = [&](std::string_view name) {
+        auto path = ToolAudit::resolve(name);
+        if (!path) return false;
+        if (build_sysroot == "/") return true;
+        std::error_code ec;
+        const auto canonical = std::filesystem::weakly_canonical(*path, ec);
+        return !ec && (canonical == sysroot
+            || canonical.string().starts_with(sysroot.string() + "/"));
+    };
+    if (requested == "auto") {
+        const std::array<std::string_view, 2> preference =
+            system == sage::package::BuildSystem::Cargo
+                ? std::array<std::string_view, 2>{"sccache", "ccache"}
+                : std::array<std::string_view, 2>{"ccache", "sccache"};
+        for (const auto mode : preference)
+            if (available(mode)) return std::string(mode);
+        return std::string{"none"};
+    }
+    if (requested != "ccache" && requested != "sccache")
+        return std::unexpected(
+            "compiler_cache must be ccache, sccache, auto, or none");
+    if (!available(requested))
+        return std::unexpected(std::format(
+            "Configured compiler cache '{}' is not available inside build sysroot '{}'",
+            requested, build_sysroot.string()));
+    return std::string(requested);
+}
+std::expected<void, std::string> validate_check_dependencies(
+    const sage::package::Recipe& recipe,
+    const sage::config::SystemConfig& cfg)
+{
+    if (recipe.check_deps.empty()) return {};
+    const auto db_path = cfg.build.sysroot == "/"
+        ? cfg.db_path : cfg.build.sysroot / "var/lib/sage/data.mdb";
+    auto db = sage::db::Database::open_existing_read_only_no_lock(db_path);
+    if (!db) return std::unexpected(std::format(
+        "check_dependencies require a readable package database in build sysroot '{}': {}",
+        cfg.build.sysroot.string(), db.error()));
+    auto installed = db->list_installed_package_summaries();
+    if (!installed) return std::unexpected(std::format(
+        "cannot read check dependency metadata from build sysroot '{}': {}",
+        cfg.build.sysroot.string(), installed.error()));
+    std::vector<sage::package::Dependency> requests;
+    requests.reserve(recipe.check_deps.size());
+    for (const auto& raw : recipe.check_deps) {
+        auto request = sage::package::Dependency::parse(raw);
+        if (request.name.empty()) return std::unexpected(
+            "check_dependencies contains a dependency with an empty package name");
+        requests.push_back(std::move(request));
+    }
+    sage::solver::DependencySolver solver(*installed, cfg.providers);
+    auto resolved = solver.solve(requests);
+    if (!resolved) return std::unexpected(
+        "check_dependencies are not satisfied by the configured build sysroot: "
+        + resolved.error());
+    return {};
+}
+
+
 // Trace the complete process tree for every managed step.  PATH wrappers are
 // still useful for role attribution, but they cannot prove that a child did
 // not invoke an absolute path or a helper which clears LD_PRELOAD.  The
 // ptrace/seccomp pair below observes both successful exec transitions and the
 // execve/execveat syscall boundary for every descendant, including processes
 // created by fakeroot and bubblewrap.
+struct CgroupScope {
+    std::filesystem::path cgroup_path;
+    bool active{false};
+
+    CgroupScope() = default;
+    CgroupScope(const CgroupScope&) = delete;
+    CgroupScope& operator=(const CgroupScope&) = delete;
+    CgroupScope(CgroupScope&& other) noexcept
+        : cgroup_path(std::move(other.cgroup_path)),
+          active(std::exchange(other.active, false)) {}
+    CgroupScope& operator=(CgroupScope&& other) noexcept {
+        if (this != &other) {
+            cleanup();
+            cgroup_path = std::move(other.cgroup_path);
+            active = std::exchange(other.active, false);
+        }
+        return *this;
+    }
+
+    static std::expected<std::optional<CgroupScope>, std::string> create(
+        std::string_view mem_limit, std::uint64_t pids_limit, pid_t pid) {
+        if (mem_limit.empty() && pids_limit == 0)
+            return std::optional<CgroupScope>{};
+
+        const std::filesystem::path base_cgroup = "/sys/fs/cgroup";
+        std::ifstream controllers_file(base_cgroup / "cgroup.controllers");
+        if (!controllers_file) return std::unexpected(
+            "cgroups v2 is unavailable: cannot read cgroup.controllers");
+        std::set<std::string> controllers;
+        for (std::string controller; controllers_file >> controller;)
+            controllers.insert(std::move(controller));
+        if (!mem_limit.empty() && !controllers.contains("memory"))
+            return std::unexpected(
+                "configured memory_limit requires the cgroups v2 memory controller");
+        if (pids_limit > 0 && !controllers.contains("pids"))
+            return std::unexpected(
+                "configured pids_limit requires the cgroups v2 pids controller");
+
+        std::filesystem::path slice =
+            base_cgroup / std::format("sage-build-{}", pid);
+        std::error_code ec;
+        std::filesystem::create_directories(slice, ec);
+        if (ec) return std::unexpected(std::format(
+            "cannot create build cgroup '{}': {}", slice.string(), ec.message()));
+
+        CgroupScope scope;
+        scope.cgroup_path = slice;
+        scope.active = true;
+        const auto write_value = [&](std::string_view name,
+                                     std::string_view value)
+            -> std::expected<void, std::string> {
+            std::ofstream file(slice / std::string(name));
+            if (!file) return std::unexpected(std::format(
+                "cannot open build cgroup control '{}'", (slice / std::string(name)).string()));
+            file << value << '\n';
+            if (!file) return std::unexpected(std::format(
+                "cannot write build cgroup control '{}'", (slice / std::string(name)).string()));
+            return {};
+        };
+        if (!mem_limit.empty()) {
+            if (auto result = write_value("memory.max", mem_limit); !result)
+                return std::unexpected(result.error());
+        }
+        if (pids_limit > 0) {
+            if (auto result = write_value("pids.max", std::to_string(pids_limit));
+                !result)
+                return std::unexpected(result.error());
+        }
+        {
+            std::ofstream procs_file(slice / "cgroup.procs");
+            if (!procs_file) return std::unexpected(
+                "cannot open build cgroup cgroup.procs");
+            procs_file << pid << '\n';
+            if (!procs_file) return std::unexpected(
+                "cannot move build audit supervisor into its cgroup");
+        }
+        return std::optional<CgroupScope>(std::move(scope));
+    }
+
+    ~CgroupScope() { cleanup(); }
+
+private:
+    void cleanup() noexcept {
+        if (!active || cgroup_path.empty()) return;
+        std::ifstream procs(cgroup_path / "cgroup.procs");
+        pid_t p;
+        while (procs >> p) {
+            if (p > 1) (void)::kill(p, SIGKILL);
+        }
+        std::error_code ec;
+        std::filesystem::remove(cgroup_path, ec);
+        active = false;
+    }
+};
+
 struct ProcessExecAudit {
     static bool install_seccomp() noexcept {
         const sock_filter filter[] = {
@@ -1152,19 +1426,38 @@ struct ProcessExecAudit {
     }
 
     static std::expected<int, std::string> run(std::string_view command,
-                                                const std::filesystem::path& log) {
+                                                const std::filesystem::path& log,
+                                                std::string_view memory_limit = {},
+                                                std::uint64_t pids_limit = 0) {
         const auto command_copy = std::string(command);
         const pid_t child = ::fork();
         if (child < 0) return std::unexpected(
             std::format("cannot fork build audit supervisor: {}", std::strerror(errno)));
         if (child == 0) {
+            if (pids_limit > 0) {
+                if (pids_limit > static_cast<std::uint64_t>(
+                        std::numeric_limits<rlim_t>::max()))
+                    _exit(125);
+                struct rlimit rl{static_cast<rlim_t>(pids_limit),
+                                 static_cast<rlim_t>(pids_limit)};
+                if (::setrlimit(RLIMIT_NPROC, &rl) != 0) _exit(125);
+            }
             if (::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0
                 || !install_seccomp()) _exit(125);
             ::raise(SIGSTOP);
             ::execl("/bin/sh", "/bin/sh", "-c", command_copy.c_str(), nullptr);
             _exit(127);
         }
-
+        auto cgroup_res = CgroupScope::create(memory_limit, pids_limit, child);
+        if (!cgroup_res) {
+            ::kill(child, SIGKILL);
+            int cleanup_status = 0;
+            (void)::waitpid(child, &cleanup_status, 0);
+            return std::unexpected(
+                "cannot apply configured build resource limits: "
+                + cgroup_res.error());
+        }
+        auto cgroup_scope = std::move(*cgroup_res);
         std::ofstream audit_log(log, std::ios::out | std::ios::app);
         if (!audit_log) {
             ::kill(child, SIGKILL);
@@ -1320,6 +1613,11 @@ export int cmd_build(const CliOptions& opts) {
         return 1;
     }
     auto r = std::move(*recipe_res);
+    if (!opts.target_triplet.empty()) {
+        r.arch = sage::config::triplet_to_arch(opts.target_triplet);
+    } else if (!opts.target_arch.empty()) {
+        r.arch = opts.target_arch;
+    }
 
     // Load configuration before choosing the identity: configured channel
     // indexes are Recipedia's published state and therefore the authority for
@@ -1331,6 +1629,40 @@ export int cmd_build(const CliOptions& opts) {
         return 1;
     }
     const auto& cfg = *cfg_res;
+    const std::string host_arch = sage::config::native_package_architecture();
+    const std::string host_triplet = sage::config::native_target_triplet();
+    auto target_arch = sage::config::canonical_architecture(r.arch);
+    if (!opts.target_triplet.empty()) {
+        target_arch = sage::config::triplet_to_arch(opts.target_triplet);
+        r.arch = target_arch;
+    } else if (!opts.target_arch.empty()) {
+        target_arch = sage::config::canonical_architecture(opts.target_arch);
+        auto architecture = sage::package::validate_package_architecture(target_arch);
+        if (!architecture) {
+            sage::util::log_error("{}", architecture.error());
+            return 1;
+        }
+        r.arch = target_arch;
+    }
+    auto target_architecture = sage::package::validate_package_architecture(
+        target_arch);
+    if (!target_architecture) {
+        sage::util::log_error("{}", target_architecture.error());
+        return 1;
+    }
+    std::string target_triplet;
+    if (!opts.target_triplet.empty()) {
+        target_triplet = opts.target_triplet;
+    } else if (!opts.target_arch.empty()) {
+        target_triplet = sage::config::architecture_to_triplet(target_arch);
+    } else if (target_arch == "any" || target_arch == host_arch) {
+        target_triplet = host_triplet;
+    } else {
+        sage::util::log_error(
+            "Recipe architecture '{}' differs from builder '{}'; provide --target <triplet> for a cross build",
+            target_arch, host_arch);
+        return 1;
+    }
     std::uint64_t highest_published_release = 0;
     bool has_published_release = false;
     std::size_t active_channels = 0;
@@ -1409,6 +1741,25 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
     }
+    if (auto check = validate_check_dependencies(r, cfg); !check) {
+        sage::util::log_error("Cannot provision check dependencies for '{}': {}",
+                              r.name, check.error());
+        return 1;
+    }
+    const auto requested_cache = r.schema_version == 2
+        && r.managed_build.system != sage::package::BuildSystem::Script
+        ? bcfg.compiler_cache_mode() : std::string_view{"none"};
+    auto cache_mode_res = select_compiler_cache(
+        requested_cache, r.managed_build.system, bcfg.sysroot);
+    if (!cache_mode_res) {
+        sage::util::log_error("Cannot configure compiler cache: {}",
+                              cache_mode_res.error());
+        return 1;
+    }
+    const std::string active_cache_mode = std::move(*cache_mode_res);
+    if (requested_cache == "auto" && active_cache_mode == "none")
+        sage::util::log_warn(
+            "compiler_cache=auto requested, but neither sccache nor ccache is available; continuing without a cache");
 
     // Per-recipe [build] overrides replace the global baseline; cxxflags
     // mirror cflags at whichever level does not spell them out.
@@ -1439,6 +1790,7 @@ export int cmd_build(const CliOptions& opts) {
     struct Toolchain {
         std::string cc, cxx, linker, rustc;
         std::string cc_for_build, cxx_for_build, linker_for_build, rustc_for_build,
+            cc_cache_for_build, cxx_cache_for_build, cache_for_build,
             path_for_build;
         std::string compiler_version, cxx_version, linker_version, rustc_version;
         std::string compiler_family, cxx_family, linker_family, rustc_family;
@@ -1510,6 +1862,7 @@ export int cmd_build(const CliOptions& opts) {
                 {.cc = cc_name, .cxx = cxx_name, .linker = actual_linker,
                  .rustc = spec.system == sage::package::BuildSystem::Cargo
                     ? bcfg.rustc : "",
+                 .target_triplet = target_triplet,
                  .compiler_version = compiler->version,
                  .cxx_version = cxx.version,
                  .linker_version = linker.version,
@@ -1619,6 +1972,8 @@ export int cmd_build(const CliOptions& opts) {
                               hermetic_ec.message());
         return 1;
     }
+    const auto cache_dir = active_cache_mode == "none"
+        ? std::filesystem::path{} : bcfg.ccache_dir;
     struct HermeticCleanup {
         std::filesystem::path root;
         ~HermeticCleanup() {
@@ -1633,6 +1988,8 @@ export int cmd_build(const CliOptions& opts) {
         auto canonical = sage::build::Toolchain{
             .cc = selected.cc, .cxx = selected.cxx, .linker = selected.linker,
             .rustc = selected.rustc,
+            .target_triplet = target_triplet,
+            .compiler_cache_mode = active_cache_mode,
             .compiler_version = selected.compiler_version,
             .cxx_version = selected.cxx_version,
             .linker_version = selected.linker_version,
@@ -1641,7 +1998,8 @@ export int cmd_build(const CliOptions& opts) {
             .cxx_family = selected.cxx_family,
             .linker_family = selected.linker_family,
             .rustc_family = selected.rustc_family};
-        tool_audit = ToolAudit::create(canonical, hermetic_root, bcfg.sysroot);
+        tool_audit = ToolAudit::create(
+            canonical, hermetic_root, bcfg.sysroot, cache_dir, active_cache_mode);
         if (!tool_audit) {
             sage::util::log_error(
                 "Cannot create the v2 tool audit fence; refusing to build without actual execution evidence");
@@ -1651,6 +2009,9 @@ export int cmd_build(const CliOptions& opts) {
         selected.cxx_for_build = tool_audit->cxx;
         selected.linker_for_build = tool_audit->linker;
         selected.rustc_for_build = tool_audit->rustc;
+        selected.cc_cache_for_build = tool_audit->cc_cache;
+        selected.cxx_cache_for_build = tool_audit->cxx_cache;
+        selected.cache_for_build = tool_audit->cache_for_build;
         selected.path_for_build = tool_audit->path;
     }
 
@@ -1841,28 +2202,27 @@ export int cmd_build(const CliOptions& opts) {
             // tree. Make them first-class distfiles so the same `patch`
             // command works for downloaded and local-source recipes.
             std::filesystem::create_directories(src_dir / "distfiles", ec);
-            for (const auto& patch : r.managed_build.patches) {
-                const auto beside_recipe = recipe_dir / patch;
+            for (const auto& patch : r.managed_build.patches_spec) {
+                const auto beside_recipe = recipe_dir / patch.file;
                 const auto attached = std::filesystem::is_regular_file(beside_recipe, ec)
-                    ? beside_recipe : recipe_dir / "distfiles" / patch;
+                    ? beside_recipe : recipe_dir / "distfiles" / patch.file;
                 if (!std::filesystem::is_regular_file(attached, ec)) continue;
-                const auto checksum = r.managed_build.patch_checksums.find(patch);
-                if (checksum == r.managed_build.patch_checksums.end()) {
+                if (patch.sha256.empty()) {
                     sage::util::log_error(
-                        "Local v2 patch '{}' has no build.patch_checksums entry", patch);
+                        "Local v2 patch '{}' has no SHA-256 declaration", patch.file);
                     return 1;
                 }
                 auto patch_hash = sage::util::compute_file_sha256(attached);
-                if (!patch_hash || *patch_hash != checksum->second) {
+                if (!patch_hash || *patch_hash != patch.sha256) {
                     sage::util::log_error(
-                        "Local v2 patch SHA256 mismatch for '{}'", patch);
+                        "Local v2 patch SHA256 mismatch for '{}'", patch.file);
                     return 1;
                 }
-                std::filesystem::copy_file(attached, src_dir / "distfiles" / patch,
+                std::filesystem::copy_file(attached, src_dir / "distfiles" / patch.file,
                     std::filesystem::copy_options::overwrite_existing, ec);
                 if (ec) {
                     sage::util::log_error(
-                        "Failed to stage local patch '{}': {}", patch, ec.message());
+                        "Failed to stage local patch '{}': {}", patch.file, ec.message());
                     return 1;
                 }
             }
@@ -1926,6 +2286,10 @@ export int cmd_build(const CliOptions& opts) {
                  .cxx_for_build = cand.cxx_for_build,
                  .linker_for_build = cand.linker_for_build,
                  .rustc_for_build = cand.rustc_for_build,
+                 .cc_cache_for_build = cand.cc_cache_for_build,
+                 .cxx_cache_for_build = cand.cxx_cache_for_build,
+                 .cache_for_build = cand.cache_for_build,
+                 .compiler_cache_mode = active_cache_mode,
                  .path_for_build = cand.path_for_build,
                  .compiler_version = cand.compiler_version,
                  .cxx_version = cand.cxx_version,
@@ -2021,7 +2385,8 @@ export int cmd_build(const CliOptions& opts) {
                         hermetic_shell(full_cmd));
                 if (opts.verbose) sage::util::log_info("CMD: {}", fakeroot_cmd);
                 const auto command_result = ProcessExecAudit::run(
-                    fakeroot_cmd, tool_audit->process_exec_log);
+                    fakeroot_cmd, tool_audit->process_exec_log,
+                    bcfg.memory_limit, bcfg.pids_limit);
                 if (!command_result || *command_result != 0) {
                     sage::util::log_error("Managed {} step failed: {}",
                         step.name, step.command);
@@ -2074,13 +2439,22 @@ export int cmd_build(const CliOptions& opts) {
                                   r.name, transforms.error());
             return 1;
         }
-        auto payload = apply_payload_policy(
-            pkg_dir, r.managed_build.install_files,
-            r.managed_build.install_excludes);
-        if (!payload) {
-            sage::util::log_error("Invalid staged payload for '{}': {}",
-                                  r.name, payload.error());
+        auto file_perms_res = apply_file_permissions(pkg_dir, r.managed_build.file_permissions);
+        if (!file_perms_res) {
+            sage::util::log_error("Invalid file permissions for '{}': {}",
+                                  r.name, file_perms_res.error());
             return 1;
+        }
+        if (r.managed_build.outputs.empty()) {
+            auto payload = apply_payload_policy(
+                pkg_dir, r.managed_build.install_files,
+                r.managed_build.install_excludes,
+                r.managed_build.optional_excludes);
+            if (!payload) {
+                sage::util::log_error("Invalid staged payload for '{}': {}",
+                                      r.name, payload.error());
+                return 1;
+            }
         }
         if (!tool_audit) {
             sage::util::log_error("Managed build has no execution audit");
@@ -2276,6 +2650,92 @@ export int cmd_build(const CliOptions& opts) {
                      tools.linker_version, managed_linker_parameters,
                      tool_audit->executions("linker"));
         }
+
+        std::string exec_audit_digest;
+        if (!manifest.managed_build_commands.empty()) {
+            sage::util::Sha256 hasher;
+            for (const auto& cmd : manifest.managed_build_commands) {
+                hasher.update(cmd.data(), cmd.size());
+                hasher.update("\n", 1);
+            }
+            exec_audit_digest = "sha256:" + hasher.finalize();
+        }
+
+        sage::package::BuildAttestation attestation;
+        attestation.schema_version = 2;
+        const auto epoch_tp = std::chrono::sys_seconds(
+            std::chrono::seconds(bcfg.source_date_epoch));
+        attestation.built_at = std::format("{:%FT%TZ}", epoch_tp);
+        attestation.builder = "sage " SAGE_VERSION;
+        attestation.host_arch = host_arch;
+        attestation.target_arch = target_arch == "any" ? host_arch : target_arch;
+        attestation.host_triplet = host_triplet;
+        attestation.target_triplet = target_triplet;
+        attestation.check_dependencies = r.check_deps;
+        attestation.exec_audit_digest = exec_audit_digest;
+        attestation.package = {
+            .name = r.name,
+            .version = r.version.ver,
+            .release = r.version.rel,
+            .channel = r.channel,
+            .arch = r.arch,
+            .sha256 = ""
+        };
+        if (!r.source_url.empty()) {
+            attestation.sources.push_back({
+                .url = r.source_url,
+                .sha256 = r.source_sha256
+            });
+        }
+        for (const auto& extra : r.extra_sources) {
+            attestation.sources.push_back({
+                .url = extra.url,
+                .sha256 = extra.sha256
+            });
+        }
+        if (tool_audit) {
+            for (auto command : tool_audit->commands()) {
+                attestation.audit_commands.push_back(normalize_audit_text(std::move(command)));
+            }
+            for (const auto& tool_entry : manifest.managed_build_tools) {
+                sage::package::BuildAttestationTool atool;
+                atool.role = tool_entry.role;
+                atool.executable = tool_entry.executable;
+                atool.family = tool_entry.family;
+                atool.version = tool_entry.version;
+                atool.executions = tool_entry.executions;
+                atool.parameters = tool_entry.parameters;
+                if (auto resolved = ToolAudit::resolve(tool_entry.executable)) {
+                    atool.path = resolved->string();
+                    if (auto h = sage::util::compute_file_sha256(*resolved)) {
+                        atool.sha256 = *h;
+                    }
+                    struct stat st{};
+                    if (::stat(resolved->c_str(), &st) == 0) {
+                        atool.inode = static_cast<std::uint64_t>(st.st_ino);
+                    }
+                }
+                attestation.tools.push_back(std::move(atool));
+            }
+        }
+        if (bcfg.sysroot != "/" || std::filesystem::exists(cfg_res->db_path)) {
+            auto sysroot_db_path = (bcfg.sysroot != "/")
+                ? bcfg.sysroot / "var/lib/sage/packages.lmdb"
+                : cfg_res->db_path;
+            if (auto sdb = sage::db::Database::open(sysroot_db_path, true)) {
+                if (auto pkgs = sdb->list_installed_packages()) {
+                    for (const auto& pkg : *pkgs) {
+                        attestation.sysroot_packages.push_back({
+                            .name = pkg.name,
+                            .version = pkg.version.ver,
+                            .release = pkg.version.rel,
+                            .sha256 = pkg.file
+                        });
+                    }
+                }
+            }
+        }
+        manifest.attestation_toml = attestation.serialize_toml();
     }
 
     // A service.toml beside the recipe declares a daemon: validated here,
@@ -2300,6 +2760,8 @@ export int cmd_build(const CliOptions& opts) {
     // name the offender rather than just the missing library.
     std::set<std::string> self_sonames;
     std::set<std::string> needed_sonames;
+    std::map<std::string, std::set<std::string>> self_verdefs;
+    std::map<std::string, std::set<std::string>> needed_verneeds;
     std::map<std::string, std::vector<std::string>> needed_by;
 
     if (std::filesystem::exists(pkg_dir)) {
@@ -2327,18 +2789,49 @@ export int cmd_build(const CliOptions& opts) {
 
             auto elf_res = sage::util::scan_elf(entry.path());
             if (!elf_res) continue;
+            for (const auto& rpath : elf_res->rpaths) {
+                if (rpath.contains(hermetic_root.string())
+                    || rpath.starts_with("/tmp/")
+                    || rpath == "/tmp"
+                    || rpath.contains(recipe_dir.string())
+                    || rpath.contains(src_dir.string())) {
+                    sage::util::log_error("ELF binary '{}' contains insecure RPATH: '{}'", rel, rpath);
+                    return 1;
+                }
+            }
+            for (const auto& runpath : elf_res->runpaths) {
+                if (runpath.contains(hermetic_root.string())
+                    || runpath.starts_with("/tmp/")
+                    || runpath == "/tmp"
+                    || runpath.contains(recipe_dir.string())
+                    || runpath.contains(src_dir.string())) {
+                    sage::util::log_error("ELF binary '{}' contains insecure RUNPATH: '{}'", rel, runpath);
+                    return 1;
+                }
+            }
             if (!elf_res->soname.empty()) {
                 self_sonames.insert(elf_res->soname);
+                for (const auto& v : elf_res->verdef_versions) {
+                    self_verdefs[elf_res->soname].insert(v);
+                }
             }
             for (const auto& needed : elf_res->needed) {
                 needed_sonames.insert(needed);
                 needed_by[needed].push_back(rel);
+            }
+            for (const auto& [fname, vname] : elf_res->verneed_entries) {
+                needed_verneeds[fname].insert(vname);
             }
         }
     }
 
     for (const auto& soname : self_sonames) {
         manifest.provides.push_back("so:" + soname);
+        if (auto it = self_verdefs.find(soname); it != self_verdefs.end()) {
+            for (const auto& v : it->second) {
+                manifest.provides.push_back(std::format("so:{}({})", soname, v));
+            }
+        }
     }
 
     // A package does not depend on itself: a soname it installs is not an
@@ -2350,6 +2843,12 @@ export int cmd_build(const CliOptions& opts) {
     }
     for (const auto& soname : external_sonames) {
         manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + soname));
+        if (auto it = needed_verneeds.find(soname); it != needed_verneeds.end()) {
+            for (const auto& v : it->second) {
+                manifest.dependencies.push_back(
+                    sage::package::Dependency::parse(std::format("so:{}({})", soname, v)));
+            }
+        }
     }
 
     // Deduplicate. The same soname is routinely reached from a dozen binaries
@@ -2418,16 +2917,81 @@ export int cmd_build(const CliOptions& opts) {
                 return 1;
             }
             auto payload = apply_payload_policy(data, output.install_files,
-                                                 output.install_excludes);
+                                                 output.install_excludes,
+                                                 output.optional_excludes);
             if (!payload) {
                 sage::util::log_error("Invalid payload for output '{}': {}",
                                       output.name, payload.error());
+                return 1;
+            }
+            const auto transform_source = src_dir / r.managed_build.source_subdir;
+            auto output_transforms = apply_install_transforms(
+                transform_source, data,
+                output.install_copies,
+                output.install_symlinks,
+                output.install_moves,
+                output.install_removes,
+                output.install_generates);
+            if (!output_transforms) {
+                sage::util::log_error("Invalid install transform for output '{}': {}",
+                                      output.name, output_transforms.error());
+                return 1;
+            }
+            auto output_perms = apply_file_permissions(data, output.file_permissions);
+            if (!output_perms) {
+                sage::util::log_error("Invalid file permissions for output '{}': {}",
+                                      output.name, output_perms.error());
                 return 1;
             }
             output_paths.push_back({output.name, data});
         }
     } else {
         output_paths.push_back({r.name, pkg_dir});
+    }
+
+    // Exhaustiveness check in outputs mode
+    if (r.schema_version == 2 && (r.managed_build.payload == sage::package::PayloadMode::Outputs || !r.managed_build.outputs.empty())) {
+        std::error_code pkg_ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 pkg_dir, std::filesystem::directory_options::skip_permission_denied, pkg_ec)) {
+            if (pkg_ec) {
+                sage::util::log_error("Cannot inspect staged payload: {}", pkg_ec.message());
+                return 1;
+            }
+            if (entry.is_directory(pkg_ec) && !entry.is_symlink(pkg_ec)) continue;
+            const auto rel = entry.path().lexically_relative(pkg_dir).generic_string();
+            bool claimed = false;
+            for (size_t out_idx = 0; out_idx < output_paths.size(); ++out_idx) {
+                const auto& out = output_paths[out_idx];
+                const auto out_file = out.data / rel;
+                std::error_code check_ec;
+                if (std::filesystem::exists(out_file, check_ec) || std::filesystem::is_symlink(out_file, check_ec)) {
+                    claimed = true;
+                    break;
+                }
+                if (out_idx < r.managed_build.outputs.size()) {
+                    const auto& out_spec = r.managed_build.outputs[out_idx];
+                    for (const auto& move : out_spec.install_moves) {
+                        if (move.source == rel || std::filesystem::path(move.source) == std::filesystem::path(rel)) {
+                            claimed = true;
+                            break;
+                        }
+                    }
+                    if (claimed) break;
+                    for (const auto& rm_pat : out_spec.install_removes) {
+                        if (sage::util::glob_match(rm_pat.path, rel)) {
+                            claimed = true;
+                            break;
+                        }
+                    }
+                    if (claimed) break;
+                }
+            }
+            if (!claimed) {
+                sage::util::log_error("Unassigned payload path '{}' was not claimed by any output", rel);
+                return 1;
+            }
+        }
     }
 
     if (output_paths.size() > 1) {
@@ -2455,6 +3019,8 @@ export int cmd_build(const CliOptions& opts) {
         }
     }
 
+    std::vector<std::pair<std::string, std::filesystem::path>> created_packages;
+
     for (const auto& output : output_paths) {
         auto output_manifest = manifest;
         output_manifest.name = output.name;
@@ -2467,12 +3033,88 @@ export int cmd_build(const CliOptions& opts) {
             }
             output_manifest.description = output_spec->description.value_or(r.description);
             output_manifest.license = output_spec->license.value_or(r.license);
-            output_manifest.dependencies = output_spec->dependencies.value_or(r.host_deps);
-            output_manifest.provides = output_spec->provides.value_or(r.provides);
-            output_manifest.conflicts = output_spec->conflicts.value_or(r.conflicts);
-            output_manifest.conffiles = output_spec->conffiles.value_or(r.conffiles);
+            if (output_spec->version) {
+                output_manifest.version = sage::package::Version::parse(*output_spec->version);
+            } else {
+                output_manifest.version = r.version;
+            }
+            if (output_spec->release) {
+                output_manifest.version.rel = *output_spec->release;
+            }
+            if (output_spec->channel) {
+                output_manifest.channel = *output_spec->channel;
+            } else {
+                output_manifest.channel = r.channel;
+            }
+            if (output_spec->arch) {
+                output_manifest.arch = *output_spec->arch;
+            } else {
+                output_manifest.arch = r.arch;
+            }
+            const auto inherits = [&](std::string_view key) {
+                return std::ranges::contains(output_spec->inherit, key);
+            };
+            if (output_spec->dependencies) {
+                output_manifest.dependencies = *output_spec->dependencies;
+            } else if (inherits("dependencies")) {
+                output_manifest.dependencies = r.host_deps;
+            } else {
+                output_manifest.dependencies.clear();
+            }
+
+            if (output_spec->provides) {
+                output_manifest.provides = *output_spec->provides;
+            } else if (inherits("provides")) {
+                output_manifest.provides = r.provides;
+            } else {
+                output_manifest.provides.clear();
+            }
+
+            if (output_spec->conflicts) {
+                output_manifest.conflicts = *output_spec->conflicts;
+            } else if (inherits("conflicts")) {
+                output_manifest.conflicts = r.conflicts;
+            } else {
+                output_manifest.conflicts.clear();
+            }
+
+            if (output_spec->conffiles) {
+                output_manifest.conffiles = *output_spec->conffiles;
+            } else if (inherits("conffiles")) {
+                output_manifest.conffiles = r.conffiles;
+            } else {
+                output_manifest.conffiles.clear();
+            }
+            output_manifest.files.clear();
+            const auto& perms_list = !output_spec->file_permissions.empty()
+                ? output_spec->file_permissions
+                : r.managed_build.file_permissions;
+            for (const auto& perm : perms_list) {
+                sage::package::FileEntry fe;
+                fe.path = perm.path;
+                fe.mode = perm.mode;
+                fe.uid = perm.uid;
+                fe.gid = perm.gid;
+                fe.caps = perm.caps;
+                output_manifest.files.push_back(std::move(fe));
+            }
+
+            if (!manifest.attestation_toml.empty()) {
+                auto parsed_att = sage::package::BuildAttestation::parse_toml(manifest.attestation_toml);
+                if (parsed_att) {
+                    parsed_att->package.name = output_manifest.name;
+                    parsed_att->package.version = output_manifest.version.ver;
+                    parsed_att->package.release = output_manifest.version.rel;
+                    parsed_att->package.channel = output_manifest.channel;
+                    parsed_att->package.arch = output_manifest.arch;
+                    output_manifest.attestation_toml = parsed_att->serialize_toml();
+                }
+            }
+
             std::set<std::string> output_self_sonames;
             std::set<std::string> output_needed_sonames;
+            std::map<std::string, std::set<std::string>> out_self_verdefs;
+            std::map<std::string, std::set<std::string>> out_needed_verneeds;
             for (const auto& entry : std::filesystem::recursive_directory_iterator(output.data)) {
                 if (entry.is_symlink()) {
                     const auto base = entry.path().filename().string();
@@ -2486,15 +3128,59 @@ export int cmd_build(const CliOptions& opts) {
                     output_self_sonames.insert(base);
                 auto elf = sage::util::scan_elf(entry.path());
                 if (!elf) continue;
-                if (!elf->soname.empty()) output_self_sonames.insert(elf->soname);
+                for (const auto& rpath : elf->rpaths) {
+                    if (rpath.contains(hermetic_root.string())
+                        || rpath.starts_with("/tmp/")
+                        || rpath == "/tmp"
+                        || rpath.contains(recipe_dir.string())
+                        || rpath.contains(src_dir.string())) {
+                        sage::util::log_error("ELF binary in output '{}' contains insecure RPATH: '{}'",
+                                              output.name, rpath);
+                        return 1;
+                    }
+                }
+                for (const auto& runpath : elf->runpaths) {
+                    if (runpath.contains(hermetic_root.string())
+                        || runpath.starts_with("/tmp/")
+                        || runpath == "/tmp"
+                        || runpath.contains(recipe_dir.string())
+                        || runpath.contains(src_dir.string())) {
+                        sage::util::log_error("ELF binary in output '{}' contains insecure RUNPATH: '{}'",
+                                              output.name, runpath);
+                        return 1;
+                    }
+                }
+                if (!elf->soname.empty()) {
+                    output_self_sonames.insert(elf->soname);
+                    for (const auto& v : elf->verdef_versions) {
+                        out_self_verdefs[elf->soname].insert(v);
+                    }
+                }
                 output_needed_sonames.insert(elf->needed.begin(), elf->needed.end());
+                for (const auto& [fname, vname] : elf->verneed_entries) {
+                    out_needed_verneeds[fname].insert(vname);
+                }
             }
-            for (const auto& soname : output_self_sonames)
+            for (const auto& soname : output_self_sonames) {
                 output_manifest.provides.push_back("so:" + soname);
-            for (const auto& soname : output_needed_sonames)
-                if (!output_self_sonames.contains(soname))
+                if (auto it = out_self_verdefs.find(soname); it != out_self_verdefs.end()) {
+                    for (const auto& v : it->second) {
+                        output_manifest.provides.push_back(std::format("so:{}({})", soname, v));
+                    }
+                }
+            }
+            for (const auto& soname : output_needed_sonames) {
+                if (!output_self_sonames.contains(soname)) {
                     output_manifest.dependencies.push_back(
                         sage::package::Dependency::parse("so:" + soname));
+                    if (auto it = out_needed_verneeds.find(soname); it != out_needed_verneeds.end()) {
+                        for (const auto& v : it->second) {
+                            output_manifest.dependencies.push_back(
+                                sage::package::Dependency::parse(std::format("so:{}({})", soname, v)));
+                        }
+                    }
+                }
+            }
             std::unordered_set<std::string> seen_provides;
             std::erase_if(output_manifest.provides, [&](const std::string& value) {
                 return !seen_provides.insert(value).second;
@@ -2504,9 +3190,20 @@ export int cmd_build(const CliOptions& opts) {
                 [&](const sage::package::Dependency& value) {
                     return !seen_dependencies.insert(value.to_string()).second;
                 });
+        } else {
+            output_manifest.files.clear();
+            for (const auto& perm : r.managed_build.file_permissions) {
+                sage::package::FileEntry fe;
+                fe.path = perm.path;
+                fe.mode = perm.mode;
+                fe.uid = perm.uid;
+                fe.gid = perm.gid;
+                fe.caps = perm.caps;
+                output_manifest.files.push_back(std::move(fe));
+            }
         }
         std::string out_name = std::format("{}-{}-{}-{}.pkg.tar.zst",
-            output_manifest.name, r.version.ver, r.version.rel, output_manifest.arch);
+            output_manifest.name, output_manifest.version.ver, output_manifest.version.rel, output_manifest.arch);
         std::filesystem::path out_path = recipe_dir / out_name;
         auto pack_res = sage::archive::create_package(output_manifest, output.data, out_path);
         if (!pack_res) {
@@ -2515,6 +3212,238 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
         sage::util::log_success("Package built successfully: {}", out_path.string());
+        created_packages.push_back({output.name, out_path});
+    }
+
+    if (opts.check_reproducible) {
+        sage::util::log_info("Running second build pass to verify reproducibility (--check-reproducible)...");
+        const auto repro_root = std::filesystem::temp_directory_path()
+            / std::format("sage-repro-{}", sage::util::current_pid());
+        std::error_code repro_ec;
+        std::filesystem::create_directories(repro_root, repro_ec);
+        struct ReproCleanup {
+            std::filesystem::path root;
+            ~ReproCleanup() {
+                std::error_code ec;
+                std::filesystem::remove_all(root, ec);
+            }
+        } repro_cleanup{repro_root};
+
+        std::filesystem::path repro_home = repro_root / "home";
+        std::filesystem::path repro_temp = repro_root / "tmp";
+        std::filesystem::path repro_src = repro_root / "src";
+        std::filesystem::path repro_pkg = repro_root / "pkg";
+        std::filesystem::create_directories(repro_home, repro_ec);
+        std::filesystem::create_directories(repro_temp, repro_ec);
+        std::filesystem::create_directories(repro_pkg, repro_ec);
+        std::filesystem::create_directories(repro_src / "distfiles", repro_ec);
+
+        if (!archive_path.empty()) {
+            auto extracted = extract_source_archive(archive_path, repro_src);
+            if (!extracted) {
+                sage::util::log_error("Reproducibility pass failed to unpack source: {}", extracted.error());
+                return 1;
+            }
+        }
+        for (const auto& path : extra_paths) {
+            std::filesystem::copy_file(path, repro_src / "distfiles" / path.filename(),
+                std::filesystem::copy_options::overwrite_existing, repro_ec);
+        }
+        if (r.schema_version == 2 && r.source_url.empty()) {
+            for (const auto& entry : std::filesystem::directory_iterator(recipe_dir)) {
+                const auto name = entry.path().filename().string();
+                if (name == "recipe.toml" || name == "distfiles"
+                    || name == "pkg" || name == ".sage-source"
+                    || name.ends_with(".pkg.tar.zst")) continue;
+                std::filesystem::copy(entry.path(), repro_src / entry.path().filename(),
+                    std::filesystem::copy_options::recursive
+                    | std::filesystem::copy_options::overwrite_existing, repro_ec);
+            }
+        }
+        if (r.schema_version == 2) {
+            for (const auto& patch : r.managed_build.patches_spec) {
+                const auto beside_recipe = recipe_dir / patch.file;
+                const auto attached = std::filesystem::is_regular_file(beside_recipe, repro_ec)
+                    ? beside_recipe : recipe_dir / "distfiles" / patch.file;
+                if (!std::filesystem::is_regular_file(attached, repro_ec)) continue;
+                std::filesystem::copy_file(attached, repro_src / "distfiles" / patch.file,
+                    std::filesystem::copy_options::overwrite_existing, repro_ec);
+            }
+        }
+        std::filesystem::path repro_work =
+            (r.schema_version == 2 || !r.source_url.empty()) ? repro_src : recipe_dir;
+
+        std::optional<ToolAudit> repro_tool_audit;
+        if (r.schema_version == 2 && !candidates.empty()) {
+            auto& selected = candidates.front();
+            auto canonical = sage::build::Toolchain{
+                .cc = selected.cc, .cxx = selected.cxx, .linker = selected.linker,
+                .rustc = selected.rustc,
+                .target_triplet = target_triplet,
+                .compiler_cache_mode = active_cache_mode,
+                .compiler_version = selected.compiler_version,
+                .cxx_version = selected.cxx_version,
+                .linker_version = selected.linker_version,
+                .rustc_version = selected.rustc_version,
+                .compiler_family = selected.compiler_family,
+                .cxx_family = selected.cxx_family,
+                .linker_family = selected.linker_family,
+                .rustc_family = selected.rustc_family};
+            repro_tool_audit = ToolAudit::create(
+                canonical, repro_root, bcfg.sysroot, cache_dir, active_cache_mode);
+            if (repro_tool_audit && !repro_tool_audit->sandbox.empty()) {
+                repro_tool_audit->sandbox += " --ro-bind "
+                    + sage::build::shell_quote(recipe_dir.string()) + " "
+                    + sage::build::shell_quote(recipe_dir.string())
+                    + " --bind " + sage::build::shell_quote(repro_src.string()) + " "
+                    + sage::build::shell_quote(repro_src.string())
+                    + " --bind " + sage::build::shell_quote(repro_pkg.string()) + " "
+                    + sage::build::shell_quote(repro_pkg.string())
+                    + " --bind " + sage::build::shell_quote(repro_home.string()) + " "
+                    + sage::build::shell_quote(repro_home.string())
+                    + " --bind " + sage::build::shell_quote(repro_temp.string()) + " "
+                    + sage::build::shell_quote(repro_temp.string());
+                if (auto fakeroot_path = ToolAudit::resolve(bcfg.fakeroot)) {
+                    std::error_code sysroot_ec;
+                    const auto sysroot_root = std::filesystem::weakly_canonical(
+                        bcfg.sysroot, sysroot_ec);
+                    const auto relative_root = sysroot_ec ? bcfg.sysroot : sysroot_root;
+                    const auto namespace_fakeroot = (std::filesystem::path("/")
+                        / fakeroot_path->lexically_relative(relative_root)).lexically_normal();
+                    const auto namespace_parent = namespace_fakeroot.parent_path();
+                    const bool hidden_tmp = namespace_parent.string().starts_with("/tmp/");
+                    repro_tool_audit->sandbox += (hidden_tmp
+                        ? " --dir " + sage::build::shell_quote(namespace_parent.string()) : "")
+                        + " --ro-bind " + sage::build::shell_quote(fakeroot_path->string())
+                        + " " + sage::build::shell_quote(namespace_fakeroot.string());
+                }
+            }
+        }
+
+        const Toolchain& cand = candidates.front();
+        if (r.schema_version == 2) {
+            auto repro_plan = sage::build::plan_v2(
+                r, bcfg, {.source = repro_work, .package = repro_pkg,
+                           .home = repro_home, .temp = repro_temp},
+                {.cc = cand.cc, .cxx = cand.cxx, .linker = cand.linker,
+                 .rustc = cand.rustc,
+                 .target_triplet = target_triplet,
+                 .cc_for_build = repro_tool_audit ? repro_tool_audit->cc : cand.cc,
+                 .cxx_for_build = repro_tool_audit ? repro_tool_audit->cxx : cand.cxx,
+                 .linker_for_build = repro_tool_audit ? repro_tool_audit->linker : cand.linker,
+                 .rustc_for_build = repro_tool_audit ? repro_tool_audit->rustc : cand.rustc,
+                 .cc_cache_for_build = repro_tool_audit
+                     ? repro_tool_audit->cc_cache : cand.cc_cache_for_build,
+                 .cxx_cache_for_build = repro_tool_audit
+                     ? repro_tool_audit->cxx_cache : cand.cxx_cache_for_build,
+                 .cache_for_build = repro_tool_audit
+                     ? repro_tool_audit->cache_for_build : cand.cache_for_build,
+                 .compiler_cache_mode = active_cache_mode,
+                 .path_for_build = repro_tool_audit ? repro_tool_audit->path : cand.path_for_build,
+                 .compiler_version = cand.compiler_version,
+                 .cxx_version = cand.cxx_version,
+                 .linker_version = cand.linker_version,
+                 .rustc_version = cand.rustc_version,
+                 .compiler_family = cand.compiler_family,
+                 .cxx_family = cand.cxx_family,
+                 .linker_family = cand.linker_family,
+                 .rustc_family = cand.rustc_family}, compile_jobs);
+            if (!repro_plan) {
+                sage::util::log_error("Reproducibility pass failed to plan: {}", repro_plan.error());
+                return 1;
+            }
+            repro_plan->environment["RECIPE_DIR"] = recipe_dir.string();
+            repro_plan->environment["SRCDIR"] = repro_work.string();
+            repro_plan->environment["PKGDIR"] = repro_pkg.string();
+            std::string exports;
+            for (const auto& [name, value] : repro_plan->environment) {
+                exports += std::format("export {}={}; ", name,
+                    sage::build::shell_quote(value));
+            }
+            for (const auto& step : repro_plan->steps) {
+                const auto full_cmd = exports + "cd "
+                    + sage::build::shell_quote(step.work_dir.string())
+                    + " && " + step.command;
+                const auto configured_fakeroot = ToolAudit::resolve(bcfg.fakeroot)
+                    .value_or(std::filesystem::path(bcfg.fakeroot));
+                std::error_code sysroot_ec;
+                const auto sysroot_root = std::filesystem::weakly_canonical(
+                    bcfg.sysroot, sysroot_ec);
+                const auto relative_root = sysroot_ec ? bcfg.sysroot : sysroot_root;
+                const auto sandbox_fakeroot = (std::filesystem::path("/")
+                    / configured_fakeroot.lexically_relative(relative_root)).lexically_normal();
+                const auto fakeroot_cmd = repro_tool_audit && !repro_tool_audit->sandbox.empty()
+                    ? sandboxed_fakeroot_shell(
+                        sandbox_fakeroot.string(),
+                        full_cmd,
+                        repro_tool_audit->sandbox)
+                    : sage::build::fakeroot_command(bcfg.fakeroot,
+                        hermetic_shell(full_cmd));
+                const auto command_result = ProcessExecAudit::run(
+                    fakeroot_cmd, repro_tool_audit->process_exec_log,
+                    bcfg.memory_limit, bcfg.pids_limit);
+                if (!command_result || *command_result != 0) {
+                    sage::util::log_error("Reproducibility pass step failed: {}", step.name);
+                    return 1;
+                }
+            }
+        }
+
+        const auto repro_transform_source = repro_src / r.managed_build.source_subdir;
+        apply_install_transforms(
+            repro_transform_source, repro_pkg, r.managed_build.install_copies,
+            r.managed_build.install_symlinks,
+            r.managed_build.install_moves,
+            r.managed_build.install_removes,
+            r.managed_build.install_generates);
+        apply_file_permissions(repro_pkg, r.managed_build.file_permissions);
+
+        for (const auto& [pkg_name, pass1_file] : created_packages) {
+            std::filesystem::path repro_pkg_data = repro_pkg;
+            if (!r.managed_build.outputs.empty()) {
+                const auto output_spec = std::ranges::find(r.managed_build.outputs,
+                    pkg_name, &sage::package::InstallOutput::name);
+                if (output_spec != r.managed_build.outputs.end()) {
+                    repro_pkg_data = repro_root / ("output-" + pkg_name);
+                    std::filesystem::create_directories(repro_pkg_data, repro_ec);
+                    std::filesystem::copy(repro_pkg, repro_pkg_data,
+                        std::filesystem::copy_options::recursive
+                            | std::filesystem::copy_options::copy_symlinks, repro_ec);
+                    apply_payload_policy(repro_pkg_data, output_spec->install_files,
+                                         output_spec->install_excludes,
+                                         output_spec->optional_excludes);
+                    apply_install_transforms(
+                        repro_transform_source, repro_pkg_data,
+                        output_spec->install_copies,
+                        output_spec->install_symlinks,
+                        output_spec->install_moves,
+                        output_spec->install_removes,
+                        output_spec->install_generates);
+                    apply_file_permissions(repro_pkg_data, output_spec->file_permissions);
+                }
+            } else {
+                apply_payload_policy(repro_pkg_data, r.managed_build.install_files,
+                                     r.managed_build.install_excludes,
+                                     r.managed_build.optional_excludes);
+            }
+            std::filesystem::path repro_pkg_file = repro_root / pass1_file.filename();
+            auto pack_res = sage::archive::create_package(manifest, repro_pkg_data, repro_pkg_file);
+            if (!pack_res) {
+                sage::util::log_error("Reproducibility check packaging failed: {}", pack_res.error());
+                return 1;
+            }
+            auto hash1 = sage::util::compute_file_sha256(pass1_file);
+            auto hash2 = sage::util::compute_file_sha256(repro_pkg_file);
+            if (!hash1 || !hash2 || *hash1 != *hash2) {
+                sage::util::log_error("Reproducibility check failed for package '{}':\n  Pass 1 SHA256: {}\n  Pass 2 SHA256: {}",
+                    pkg_name,
+                    hash1 ? *hash1 : "error",
+                    hash2 ? *hash2 : "error");
+                return 1;
+            }
+            sage::util::log_success("Reproducibility check passed for package '{}' (SHA256: {})",
+                pkg_name, *hash1);
+        }
     }
     return 0;
 }

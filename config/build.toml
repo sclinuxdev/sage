@@ -21,3 +21,7 @@ rustflags = ""
 
 jobs = 0
 compile_jobs = 0
+compiler_cache = "none"
+ccache_dir = "/var/cache/sage/ccache"
+memory_limit = ""
+pids_limit = 0

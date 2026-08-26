@@ -133,28 +133,36 @@ inline std::expected<uint64_t, std::string> parse_release(std::string_view relea
 }
 
 // Architecture canonicalization shared by manifests, recipes and channel indexes.
+inline std::string_view canonical_package_architecture(
+    std::string_view architecture) noexcept {
+    if (architecture == "x86_64") return "amd64";
+    if (architecture == "arm64") return "aarch64";
+    if (architecture == "arm" || architecture == "armhf"
+        || architecture == "armv7" || architecture == "armv7l")
+        return "armv7";
+    return architecture;
+}
+
 inline bool package_architecture_matches(
     std::string_view package_architecture,
     std::string_view target_architecture)
 {
     if (package_architecture == "any") return true;
-    const auto canonical = [](std::string_view architecture) {
-        return architecture == "x86_64" ? std::string_view{"amd64"} : architecture;
-    };
-    return canonical(package_architecture) == canonical(target_architecture);
+    return canonical_package_architecture(package_architecture)
+        == canonical_package_architecture(target_architecture);
 }
 
 inline std::expected<void, std::string> validate_package_architecture(
     std::string_view architecture)
 {
-    if (architecture == "amd64"
-        || architecture == "x86_64"
-        || architecture == "aarch64"
-        || architecture == "any") {
+    const auto canonical = canonical_package_architecture(architecture);
+    if (canonical == "amd64" || canonical == "aarch64"
+        || canonical == "riscv64" || canonical == "armv7"
+        || canonical == "any") {
         return {};
     }
     return std::unexpected(std::format(
-        "Unsupported package architecture '{}'; expected amd64 (or legacy x86_64), aarch64, or any",
+        "Unsupported package architecture '{}'; expected amd64, aarch64, riscv64, armv7, or any",
         architecture));
 }
 

@@ -1,3 +1,6 @@
+module;
+#include <sys/stat.h>
+
 export module sage.archive:pack;
 
 // Package creation (inventory + hash pass, then one streaming tar+zstd write)
@@ -66,15 +69,19 @@ inline std::expected<void, std::string> create_package(
     // 1. Deterministic payload inventory: sorted relative paths, normalized
     // modes, hardware-accelerated SHA-256 computed in parallel.
     package::PackageManifest final_manifest = manifest;
+    std::map<std::string, package::FileEntry> preset_files;
+    for (const auto& f : manifest.files) {
+        preset_files.emplace(f.path, f);
+    }
     final_manifest.files.clear();
     uint64_t total_size = 0;
-
     struct PayloadItem {
         std::string tar_name;
         std::filesystem::path disk_path;
         package::FileEntry entry;
     };
     std::vector<PayloadItem> payload;
+    std::map<std::pair<uint64_t, uint64_t>, std::string> seen_hardlinks;
 
     if (std::filesystem::exists(data_dir)) {
         for (const auto& item : std::filesystem::recursive_directory_iterator(data_dir)) {
@@ -92,13 +99,36 @@ inline std::expected<void, std::string> create_package(
                 fe.type = package::FileType::Directory;
                 fe.mode = 0755;
             } else if (item.is_regular_file(ec)) {
-                fe.type = package::FileType::Regular;
+                struct stat st{};
                 auto perms = item.status(ec).permissions();
-                fe.mode = ((perms & std::filesystem::perms::owner_exec)
+                auto default_mode = ((perms & std::filesystem::perms::owner_exec)
                         != std::filesystem::perms::none) ? 0755 : 0644;
-                fe.size = item.file_size(ec);
+                if (::stat(item.path().c_str(), &st) == 0 && st.st_nlink > 1) {
+                    auto key = std::pair<uint64_t, uint64_t>{static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino)};
+                    if (auto it = seen_hardlinks.find(key); it != seen_hardlinks.end()) {
+                        fe.type = package::FileType::Hardlink;
+                        fe.link_target = it->second;
+                        fe.size = 0;
+                        fe.mode = default_mode;
+                    } else {
+                        seen_hardlinks[key] = fe.path;
+                        fe.type = package::FileType::Regular;
+                        fe.mode = default_mode;
+                        fe.size = item.file_size(ec);
+                    }
+                } else {
+                    fe.type = package::FileType::Regular;
+                    fe.mode = default_mode;
+                    fe.size = item.file_size(ec);
+                }
             } else {
                 continue;
+            }
+            if (auto it = preset_files.find(fe.path); it != preset_files.end()) {
+                if (it->second.mode != 0) fe.mode = it->second.mode;
+                fe.uid = it->second.uid;
+                fe.gid = it->second.gid;
+                if (!it->second.caps.empty()) fe.caps = it->second.caps;
             }
             payload.push_back(PayloadItem{
                 .tar_name = "data/" + fe.path,
@@ -170,6 +200,11 @@ inline std::expected<void, std::string> create_package(
                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(manifest.service_toml.data()),
                     manifest.service_toml.size())); !res) return res;
     }
+    if (!manifest.attestation_toml.empty()) {
+        if (auto res = add_file_entry(".METADATA/build-attestation.toml",
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(manifest.attestation_toml.data()),
+                    manifest.attestation_toml.size())); !res) return res;
+    }
 
     // 3. Payload members. The files list was moved out of `payload` entries, so
     // stream from disk using the recorded metadata.
@@ -179,17 +214,25 @@ inline std::expected<void, std::string> create_package(
         if (fe.type == package::FileType::Symlink) {
             if (auto res = writer_res->start_entry(libarchive::WriteEntry{
                     .pathname = item.tar_name, .symlink = fe.link_target,
-                    .perm = 0777, .filetype = libarchive::type_symlink}); !res) return res;
+                    .perm = fe.mode, .uid = fe.uid, .gid = fe.gid,
+                    .filetype = libarchive::type_symlink}); !res) return res;
+            if (auto res = writer_res->finish_entry(); !res) return res;
+        } else if (fe.type == package::FileType::Hardlink) {
+            if (auto res = writer_res->start_entry(libarchive::WriteEntry{
+                    .pathname = item.tar_name, .hardlink = "data/" + fe.link_target,
+                    .perm = fe.mode, .uid = fe.uid, .gid = fe.gid,
+                    .filetype = libarchive::type_regular}); !res) return res;
             if (auto res = writer_res->finish_entry(); !res) return res;
         } else if (fe.type == package::FileType::Directory) {
             if (auto res = writer_res->start_entry(libarchive::WriteEntry{
-                    .pathname = item.tar_name, .perm = 0755,
+                    .pathname = item.tar_name, .perm = fe.mode,
+                    .uid = fe.uid, .gid = fe.gid,
                     .filetype = libarchive::type_directory}); !res) return res;
             if (auto res = writer_res->finish_entry(); !res) return res;
         } else {
             if (auto res = writer_res->start_entry(libarchive::WriteEntry{
                     .pathname = item.tar_name, .size = fe.size,
-                    .perm = static_cast<uint32_t>(fe.mode & 0100 ? 0755 : 0644),
+                    .perm = fe.mode, .uid = fe.uid, .gid = fe.gid,
                     .filetype = libarchive::type_regular}); !res) return res;
             std::ifstream input(item.disk_path, std::ios::binary);
             if (!input.is_open()) {

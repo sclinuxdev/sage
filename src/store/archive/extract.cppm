@@ -370,7 +370,8 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         const auto clean_path = util::clean_rel_path(rel_path);
         const bool is_dir = info->filetype == vendor::libarchive::type_directory;
         const bool is_symlink = info->filetype == vendor::libarchive::type_symlink;
-        const char typeflag = is_dir ? '5' : is_symlink ? '2' : info->filetype == vendor::libarchive::type_regular ? '0' : '?';
+        const bool is_hardlink = !info->hardlink.empty();
+        const char typeflag = is_dir ? '5' : is_symlink ? '2' : is_hardlink ? '1' : info->filetype == vendor::libarchive::type_regular ? '0' : '?';
 
         if (typeflag == '?') {
             failed = true;
@@ -474,6 +475,48 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(std::format(
                     "Cannot create symlink '{}' -> '{}': {}",
                     rel_path, info->symlink, std::strerror(errno)));
+            }
+            detail::close_fd(*parent);
+            continue;
+        }
+
+        if (is_hardlink) {
+            std::string_view htarget = info->hardlink;
+            if (htarget.starts_with("data/")) htarget.remove_prefix(5);
+            auto safe_target = normalize_data_path(htarget);
+            if (!safe_target) {
+                failed = true;
+                pool.drain();
+                return std::unexpected(safe_target.error());
+            }
+            package::FileEntry entry;
+            entry.path = rel_path;
+            entry.type = package::FileType::Hardlink;
+            entry.mode = (info->perm & 0100) ? 0755 : 0644;
+            entry.link_target = *safe_target;
+            std::string redirect_leaf;
+            record_entry(std::move(entry), rel_path, std::filesystem::path(rel_path).filename().string(), &redirect_leaf);
+            const auto leaf = redirect_leaf.empty()
+                ? std::filesystem::path(rel_path).filename().string() : redirect_leaf;
+            const auto components_view = std::filesystem::path(rel_path);
+            std::vector<std::string> components;
+            for (const auto& component : components_view.parent_path()) {
+                if (component != ".") components.push_back(component.string());
+            }
+            auto parent = detail::open_anchored_dir(root_fd.get(), components);
+            if (!parent) {
+                failed = true;
+                pool.drain();
+                return std::unexpected(parent.error());
+            }
+            (void)::unlinkat(*parent, leaf.c_str(), 0);
+            if (::linkat(root_fd.get(), safe_target->c_str(), *parent, leaf.c_str(), 0) != 0) {
+                failed = true;
+                pool.drain();
+                detail::close_fd(*parent);
+                return std::unexpected(std::format(
+                    "Cannot create hardlink '{}' -> '{}': {}",
+                    rel_path, *safe_target, std::strerror(errno)));
             }
             detail::close_fd(*parent);
             continue;
