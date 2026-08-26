@@ -1,5 +1,5 @@
 # Build and temporary artifacts
-build/
+/build/
 .xmake/
 gcm.cache/
 *.o

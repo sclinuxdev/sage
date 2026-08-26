@@ -124,30 +124,25 @@ std::expected<void, std::string> run_postprocess(
         if (!regen) return std::unexpected(regen.error());
     }
 
+    const auto under = [](std::string_view path) {
+        return path.starts_with("usr/lib/systemd/system/")
+            || path.starts_with("etc/systemd/system/");
+    };
     const bool systemd_unit_tree_changed = std::ranges::any_of(
-        parsed.ctx.touched, [](const auto& touched) {
-            const auto& path = touched.second;
-            return path.starts_with("usr/lib/systemd/system/")
-                || path.starts_with("etc/systemd/system/");
-        });
+        parsed.ctx.touched, [&](const auto& pair) { return under(pair.second); });
     if (systemd_unit_tree_changed && target_root == "/"
         && std::filesystem::is_directory("/run/systemd/system")) {
         const int status = std::system("/usr/bin/systemctl daemon-reload");
         if (status != 0) {
-            return std::unexpected(std::format(
-                "systemctl daemon-reload failed with status {}", status));
+            return std::unexpected(std::format("systemctl daemon-reload failed with status {}", status));
         }
     }
 
     const std::filesystem::path trigger_sysroot = parsed.ctx.sysroot.empty()
-        ? target_root
-        : std::filesystem::path(parsed.ctx.sysroot);
+        ? target_root : std::filesystem::path(parsed.ctx.sysroot);
     triggers::TriggerContext trig_ctx;
     trig_ctx.sysroot = trigger_sysroot;
     for (const auto& [marker, rel] : parsed.ctx.touched) {
-        // Same tolerance as the manifest parser: an unrecognized marker
-        // degrades to Regular rather than failing recovery on a forward-
-        // compatible journal.
         package::FileEntry entry;
         entry.path = rel;
         entry.type = package::parse_file_type(std::string_view(&marker, 1));
@@ -155,10 +150,7 @@ std::expected<void, std::string> run_postprocess(
     }
     for (const auto& block : parsed.ctx.package_manifests_toml) {
         auto manifest = package::PackageManifest::parse_toml(block);
-        if (!manifest) {
-            return std::unexpected(std::format(
-                "Manifest block in journal failed to parse: {}", manifest.error()));
-        }
+        if (!manifest) return std::unexpected(std::format("Manifest block in journal failed to parse: {}", manifest.error()));
         trig_ctx.transaction_packages.push_back(std::move(*manifest));
     }
     auto installed = db.list_installed_package_summaries();
@@ -167,10 +159,7 @@ std::expected<void, std::string> run_postprocess(
     trig_ctx.providers = cfg->providers;
 
     auto result = triggers::TriggerEngine::run(trig_ctx);
-    if (!result) {
-        return std::unexpected(
-            "Post-transaction trigger failed during recovery: " + result.error());
-    }
+    if (!result) return std::unexpected("Post-transaction trigger failed during recovery: " + result.error());
     return {};
 }
 
@@ -549,6 +538,7 @@ public:
         bool dry_run = false,
         const std::map<std::string, std::string>& providers = {})
     {
+        (void)providers;
         if (!plan.has_changes) {
             // Providers already match, but that is not the only reason to
             // reconcile: nothing in the install path renders service scripts,

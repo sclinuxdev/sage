@@ -155,8 +155,10 @@ inline std::string apply_flag_policy(std::string flags,
     if (policy.empty() || flags.empty()) return flags;
     std::string out;
     std::vector<std::string_view> tokens;
-    for (std::size_t at = 0; at <= flags.size();) {
-        const auto end = flags.find(' ', at);
+    for (std::size_t at = 0; at < flags.size();) {
+        while (at < flags.size() && (flags[at] == ' ' || flags[at] == '\t')) ++at;
+        if (at >= flags.size()) break;
+        const auto end = flags.find_first_of(" \t", at);
         const auto token = std::string_view(flags).substr(
             at, end == std::string::npos ? std::string::npos : end - at);
         if (!token.empty()) tokens.push_back(token);
@@ -165,20 +167,27 @@ inline std::string apply_flag_policy(std::string flags,
     }
     const auto drop_c = [&](std::string_view token) {
         if (policy.no_lto && (token.starts_with("-flto")
-                              || token.starts_with("-ffat-lto"))) return true;
+                              || token.starts_with("-ffat-lto")
+                              || token == "-fno-fat-lto-objects")) return true;
         if (policy.no_march && (token.starts_with("-march=")
                                 || token.starts_with("-mtune=")
                                 || token.starts_with("-mcpu="))) return true;
-        if (policy.no_as_needed && token == "-Wl,--as-needed") return true;
+        if (policy.no_as_needed && (token == "-Wl,--as-needed"
+                                    || token == "-Wl,--no-as-needed"
+                                    || token == "--as-needed"
+                                    || token == "--no-as-needed")) return true;
         return false;
     };
     const auto drop_rust = [&](std::string_view token) {
         if (token == "-C") return false;
         if (policy.no_lto && (token.starts_with("lto")
-                              || token.starts_with("-Clto"))) return true;
+                              || token.starts_with("-Clto")
+                              || token.starts_with("-C lto")
+                              || token.starts_with("embed-bitcode="))) return true;
         if (policy.no_march && (token.starts_with("target-cpu=")
-                                || token.starts_with("-Ctarget-cpu"))) return true;
-        if (policy.no_as_needed && token.contains("--as-needed")) return true;
+                                || token.starts_with("-Ctarget-cpu")
+                                || token.starts_with("-C target-cpu"))) return true;
+        if (policy.no_as_needed && token.contains("as-needed")) return true;
         return false;
     };
     for (std::size_t i = 0; i < tokens.size(); ++i) {
@@ -375,14 +384,11 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         {"USER", "builder"}, {"LOGNAME", "builder"}, {"PAGER", "cat"},
     };
     if (spec.system == package::BuildSystem::Go) {
-        // A Go recipe has its own toolchain and no C/C++/Rust plan channels.
-        // Keep only the common hermetic variables plus the Go channels added
-        // below, so cgo packages never inherit a stray RUSTFLAGS/LDFLAGS shim
-        // meant for a C-family backend.
-        for (const auto* name : {"CC", "CXX", "LD", "CPPFLAGS", "CFLAGS",
-                                 "CXXFLAGS", "LDFLAGS", "RUSTFLAGS",
-                                 "ARFLAGS", "MAKEFLAGS", "CARGO_BUILD_JOBS",
-                                 "CARGO_INCREMENTAL", "CARGO_TERM_COLOR"})
+        // A Go recipe uses its own toolchain. For cgo support, retain CC/CXX/LD
+        // pointing to the Sage toolchain audit wrappers so cgo builds are properly
+        // audited, while stripping Rust/C-specific build flag shims.
+        for (const auto* name : {"RUSTFLAGS", "ARFLAGS", "MAKEFLAGS",
+                                 "CARGO_BUILD_JOBS", "CARGO_INCREMENTAL", "CARGO_TERM_COLOR"})
             plan.environment.erase(name);
     }
     if (spec.kernel) {
@@ -729,24 +735,19 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             }
             for (const auto& option : cmake_opts) {
                 auto upper = option;
-                std::ranges::transform(upper, upper.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::toupper(c));
-                });
-                if (option == "-D" || option.starts_with("-DCMAKE_C_COMPILER")
-                    || option.starts_with("-DCMAKE_CXX_COMPILER")
-                    || option.starts_with("-DCMAKE_LINKER")
-                    || option.starts_with("-DCMAKE_TOOLCHAIN_FILE")
-                    || upper.starts_with("-DCMAKE_INSTALL_")
-                    || upper.starts_with("-DCMAKE_FIND_ROOT_")
-                    || upper.starts_with("-DCMAKE_PREFIX_PATH")
-                    || option.starts_with("-DCMAKE_C_FLAGS")
-                    || option.starts_with("-DCMAKE_CXX_FLAGS")
-                    || option.starts_with("-DCMAKE_EXE_LINKER_FLAGS")
-                    || option.starts_with("-DCMAKE_SHARED_LINKER_FLAGS")
-                    || option == "-G" || option.starts_with("-G"))
-                    return std::unexpected(
-                        "CMake compiler, linker, flags and generator are Sage-managed: "
-                        + option);
+                std::ranges::transform(upper, upper.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+                static constexpr std::string_view banned_cmake[] = {
+                    "-DCMAKE_C_COMPILER", "-DCMAKE_CXX_COMPILER", "-DCMAKE_LINKER",
+                    "-DCMAKE_TOOLCHAIN_FILE", "-DCMAKE_C_FLAGS", "-DCMAKE_CXX_FLAGS",
+                    "-DCMAKE_EXE_LINKER_FLAGS", "-DCMAKE_SHARED_LINKER_FLAGS"
+                };
+                static constexpr std::string_view banned_cmake_upper[] = {
+                    "-DCMAKE_INSTALL_", "-DCMAKE_FIND_ROOT_", "-DCMAKE_PREFIX_PATH"
+                };
+                bool banned = (option == "-D" || option == "-G" || option.starts_with("-G"))
+                    || std::ranges::any_of(banned_cmake, [&](auto p) { return option.starts_with(p); })
+                    || std::ranges::any_of(banned_cmake_upper, [&](auto p) { return upper.starts_with(p); });
+                if (banned) return std::unexpected("CMake compiler, linker, flags and generator are Sage-managed: " + option);
             }
             const auto cmake_arg = [&](std::string name, const std::string& value) {
                 return " " + shell_quote("-D" + std::move(name) + "=" + value);
@@ -772,22 +773,21 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 cmake_arg("CMAKE_EXE_LINKER_FLAGS", ldflags) +
                 cmake_arg("CMAKE_SHARED_LINKER_FLAGS", ldflags));
             custom_steps("pre-build");
-            step("build", source, "cmake --build " + shell_quote(build.string()) +
-                " --parallel " + std::to_string(jobs) +
-                (build_targets.empty() ? "" : " --target " + build_targets));
+            step("build", source, "ninja -C " + shell_quote(build.string()) +
+                " -j " + std::to_string(jobs) +
+                (build_targets.empty() ? "" : " " + build_targets));
             custom_steps("post-build");
             custom_steps("check");
             custom_steps("pre-install");
             step("install", source, "DESTDIR=" + shell_quote(paths.package.string()) +
-                (install_targets.empty()
-                    ? " cmake --install " + shell_quote(build.string())
-                    : " cmake --build " + shell_quote(build.string())
-                        + " --target " + install_targets));
+                " ninja -C " + shell_quote(build.string()) +
+                (install_targets.empty() ? " install" : " " + install_targets));
             custom_steps("install");
             custom_steps("post-install");
             break;
         }
         case package::BuildSystem::Meson: {
+            std::filesystem::path build = paths.source / "build";
             std::vector<std::string> meson_opts = spec.configure_options;
             std::string meson_build_type = "release";
             if (spec.meson) {
@@ -802,40 +802,25 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             }
             for (const auto& option : meson_opts) {
                 auto lower = option;
-                std::ranges::transform(lower, lower.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
+                std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                static constexpr std::string_view banned_prefixes[] = {
+                    "--native-file", "--cross-file", "--backend", "--prefix", "--bindir",
+                    "--sbindir", "--libexecdir", "--libdir", "--datadir", "--includedir",
+                    "--infodir", "--localedir", "--mandir", "--sysconfdir", "--localstatedir",
+                    "--sharedstatedir", "--buildtype", "-Dc_args=", "-Dcpp_args=",
+                    "-Dc_link_args=", "-Dcpp_link_args="
+                };
+                static constexpr std::string_view banned_d_prefixes[] = {
+                    "-dprefix", "-dlibdir", "-dbindir", "-dsbindir", "-dincludedir",
+                    "-ddatadir", "-dsysconfdir", "-dlocalstatedir", "-dlocaledir",
+                    "-dmandir", "-drunstatedir", "-dlibexecdir"
+                };
+                bool banned = (lower == "-d") || std::ranges::any_of(banned_prefixes, [&](auto p) {
+                    return option == p || option.starts_with(std::string(p) + "=") || option.starts_with(p);
+                }) || std::ranges::any_of(banned_d_prefixes, [&](auto p) {
+                    return lower.starts_with(p);
                 });
-                if (option == "--native-file" || option.starts_with("--native-file=")
-                    || option == "--cross-file" || option.starts_with("--cross-file=")
-                    || option == "--backend" || option.starts_with("--backend=")
-                    || option == "--prefix" || option.starts_with("--prefix=")
-                    || option == "--bindir" || option.starts_with("--bindir=")
-                    || option == "--sbindir" || option.starts_with("--sbindir=")
-                    || option == "--libexecdir" || option.starts_with("--libexecdir=")
-                    || option == "--libdir" || option.starts_with("--libdir=")
-                    || option == "--datadir" || option.starts_with("--datadir=")
-                    || option == "--includedir" || option.starts_with("--includedir=")
-                    || option == "--infodir" || option.starts_with("--infodir=")
-                    || option == "--localedir" || option.starts_with("--localedir=")
-                    || option == "--mandir" || option.starts_with("--mandir=")
-                    || option == "--sysconfdir" || option.starts_with("--sysconfdir=")
-                    || option == "--localstatedir" || option.starts_with("--localstatedir=")
-                    || option == "--sharedstatedir" || option.starts_with("--sharedstatedir=")
-                    || lower == "-d"
-                    || lower.starts_with("-dprefix") || lower.starts_with("-dlibdir")
-                    || lower.starts_with("-dbindir") || lower.starts_with("-dsbindir")
-                    || lower.starts_with("-dincludedir") || lower.starts_with("-ddatadir")
-                    || lower.starts_with("-dsysconfdir") || lower.starts_with("-dlocalstatedir")
-                    || lower.starts_with("-dlocaledir") || lower.starts_with("-dmandir")
-                    || lower.starts_with("-drunstatedir") || lower.starts_with("-dlibexecdir")
-                    || option == "--buildtype" || option.starts_with("--buildtype=")
-                    || option.starts_with("-Dc_args=")
-                    || option.starts_with("-Dcpp_args=")
-                    || option.starts_with("-Dc_link_args=")
-                    || option.starts_with("-Dcpp_link_args="))
-                    return std::unexpected(
-                        "Meson toolchain and compiler/linker arguments are Sage-managed: "
-                        + option);
+                if (banned) return std::unexpected("Meson toolchain and compiler/linker arguments are Sage-managed: " + option);
             }
             if (!spec.install_targets.empty()) return std::unexpected(
                 "Meson install does not accept build.install_targets");
@@ -874,16 +859,13 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     spec.xmake->raw_options.begin(), spec.xmake->raw_options.end());
             }
             for (const auto& option : xmake_opts) {
-                if (option == "--cc" || option.starts_with("--cc=")
-                    || option == "--cxx" || option.starts_with("--cxx=")
-                    || option == "--ld" || option.starts_with("--ld=")
-                    || option == "--toolchain" || option.starts_with("--toolchain=")
-                    || option == "--cflags" || option.starts_with("--cflags=")
-                    || option == "--cxflags" || option.starts_with("--cxflags=")
-                    || option == "--cxxflags" || option.starts_with("--cxxflags=")
-                    || option == "--ldflags" || option.starts_with("--ldflags="))
-                    return std::unexpected(
-                        "Xmake compiler, linker and toolchain are Sage-managed: " + option);
+                static constexpr std::string_view banned_xmake[] = {
+                    "--cc", "--cxx", "--ld", "--toolchain", "--cflags", "--cxflags", "--cxxflags", "--ldflags"
+                };
+                bool banned = std::ranges::any_of(banned_xmake, [&](auto p) {
+                    return option == p || option.starts_with(std::string(p) + "=");
+                });
+                if (banned) return std::unexpected("Xmake compiler, linker and toolchain are Sage-managed: " + option);
             }
             if (!spec.install_targets.empty()) return std::unexpected(
                 "Xmake install does not accept build.install_targets");
@@ -967,15 +949,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             const auto go_install_args = join_args(spec.install_targets);
             custom_steps("pre-build");
             if (!spec.build_targets.empty())
-                step("build", source, "go build" +
-                    (go_build_args.empty() ? "" : " " + go_build_args));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
-            step("install", source, "go install" +
-                (go_install_args.empty() ? " ./..." : " " + go_install_args));
-            custom_steps("install");
-            custom_steps("post-install");
+                step("build", source, "go build" + (go_build_args.empty() ? "" : " " + go_build_args));
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
+            step("install", source, "go install" + (go_install_args.empty() ? " ./..." : " " + go_install_args));
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Make: {
@@ -988,13 +965,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             custom_steps("pre-build");
             step("build", source, "make" + make_managed_vars + make_vars + make_raw +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", source, "make" + make_managed_vars + make_vars + make_raw +
                 (install_targets.empty() ? " install" : " " + install_targets));
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Script:
@@ -1002,12 +976,8 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 || !spec.install_targets.empty())
                 return std::unexpected(
                     "Script recipes use build.steps instead of backend targets");
-            custom_steps("pre-build");
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"pre-build", "post-build", "check", "pre-install", "install", "post-install"})
+                custom_steps(phase);
             break;
         case package::BuildSystem::Legacy:
             return std::unexpected("Recipe v2 cannot use the legacy build system");

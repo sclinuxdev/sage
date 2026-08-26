@@ -226,11 +226,34 @@ private:
                 util::log_info("Would create system group '{}'", entry.name);
                 return true;
             }
+            if (ctx.sysroot != "/") {
+                // In non-/ sysroot environments without full chroot/shadow tools,
+                // safely append the group directly to target root's etc/group.
+                std::error_code ec;
+                std::filesystem::create_directories(ctx.sysroot / "etc", ec);
+                std::ofstream group_out(ctx.sysroot / "etc/group", std::ios::app);
+                if (group_out) {
+                    group_out << entry.name << ":x:" << (entry.id ? *entry.id : 999) << ":\n";
+                    existing_groups.insert(entry.name);
+                    util::log_info("Created system group '{}' in sysroot", entry.name);
+                    return true;
+                }
+            }
             std::string cmd = "groupadd -r";
             if (entry.id) cmd += " -g " + std::to_string(*entry.id);
             cmd += " " + entry.name;
             auto result = execute(cmd, "sysusers-group(" + entry.name + ")", false, ctx);
-            if (!result) return std::unexpected(result.error());
+            if (!result) {
+                // If shadow utility fails (e.g. permission/unprivileged root), fallback to direct file injection
+                std::ofstream group_out(ctx.sysroot / "etc/group", std::ios::app);
+                if (group_out) {
+                    group_out << entry.name << ":x:" << (entry.id ? *entry.id : 999) << ":\n";
+                    existing_groups.insert(entry.name);
+                    util::log_warn("sysusers: groupadd failed, direct injection applied for group '{}'", entry.name);
+                    return true;
+                }
+                return std::unexpected(result.error());
+            }
             existing_groups.insert(entry.name);
             return true;
         };
@@ -261,6 +284,21 @@ private:
                     util::log_info("Would create system user '{}'", entry.name);
                     continue;
                 }
+                if (ctx.sysroot != "/") {
+                    std::error_code ec;
+                    std::filesystem::create_directories(ctx.sysroot / "etc", ec);
+                    std::ofstream passwd_out(ctx.sysroot / "etc/passwd", std::ios::app);
+                    if (passwd_out) {
+                        passwd_out << entry.name << ":x:" << (entry.id ? *entry.id : 999) << ":"
+                                   << (entry.id ? *entry.id : 999) << ":"
+                                   << entry.description << ":"
+                                   << (entry.home.empty() ? "/" : entry.home) << ":"
+                                   << (entry.shell.empty() ? "/usr/bin/nologin" : entry.shell) << "\n";
+                        existing_users.insert(entry.name);
+                        util::log_info("Created system user '{}' in sysroot", entry.name);
+                        continue;
+                    }
+                }
                 std::string cmd = "useradd -r -M";
                 if (entry.id) cmd += " -u " + std::to_string(*entry.id);
                 if (!entry.group.empty()) cmd += " -g " + entry.group;
@@ -271,7 +309,20 @@ private:
                     ? std::string("/usr/bin/nologin") : entry.shell);
                 cmd += " " + entry.name;
                 auto result = execute(cmd, "sysusers-user(" + entry.name + ")", false, ctx);
-                if (!result) return std::unexpected(result.error());
+                if (!result) {
+                    std::ofstream passwd_out(ctx.sysroot / "etc/passwd", std::ios::app);
+                    if (passwd_out) {
+                        passwd_out << entry.name << ":x:" << (entry.id ? *entry.id : 999) << ":"
+                                   << (entry.id ? *entry.id : 999) << ":"
+                                   << entry.description << ":"
+                                   << (entry.home.empty() ? "/" : entry.home) << ":"
+                                   << (entry.shell.empty() ? "/usr/bin/nologin" : entry.shell) << "\n";
+                        existing_users.insert(entry.name);
+                        util::log_warn("sysusers: useradd failed, direct injection applied for user '{}'", entry.name);
+                        continue;
+                    }
+                    return std::unexpected(result.error());
+                }
                 existing_users.insert(entry.name);
             }
         }
