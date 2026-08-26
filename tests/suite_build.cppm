@@ -701,8 +701,26 @@ version = "1.0.0"
             ? std::ranges::find(cargo_built->managed_build_tools, "rustc",
                 &sage::package::ManagedBuildTool::role)
             : std::vector<sage::package::ManagedBuildTool>::iterator{};
+        const auto cargo_cc = cargo_built
+            ? std::ranges::find(cargo_built->managed_build_tools, "cc",
+                &sage::package::ManagedBuildTool::role)
+            : std::vector<sage::package::ManagedBuildTool>::iterator{};
+        const auto cargo_cxx = cargo_built
+            ? std::ranges::find(cargo_built->managed_build_tools, "cxx",
+                &sage::package::ManagedBuildTool::role)
+            : std::vector<sage::package::ManagedBuildTool>::iterator{};
+        const auto cargo_linker = cargo_built
+            ? std::ranges::find(cargo_built->managed_build_tools, "linker",
+                &sage::package::ManagedBuildTool::role)
+            : std::vector<sage::package::ManagedBuildTool>::iterator{};
         if (!cargo_built
             || cargo_rustc == cargo_built->managed_build_tools.end()
+            || cargo_cc != cargo_built->managed_build_tools.end()
+            || cargo_cxx != cargo_built->managed_build_tools.end()
+            || cargo_linker == cargo_built->managed_build_tools.end()
+            || cargo_linker->executable != "ld"
+            || !std::ranges::contains(cargo_linker->parameters,
+                "RUSTFLAGS=-C linker=gcc -C link-arg=-fuse-ld=bfd")
             || cargo_rustc->executable != "rustc"
             || cargo_rustc->family != "rustc" || cargo_rustc->version.empty()
             || !std::ranges::contains(cargo_rustc->parameters,

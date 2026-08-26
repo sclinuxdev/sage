@@ -344,11 +344,20 @@ export int cmd_build(const CliOptions& opts) {
             .linker_family = "", .rustc_family = ""});
     } else {
         if (r.schema_version == 2) {
-            sage::util::log_info("Using managed toolchain: CC='{}' ({}) CXX='{}' ({}) LD='{}' ({})",
-                candidates.front().cc, candidates.front().compiler_version,
-                candidates.front().cxx, candidates.front().cxx_version,
-                candidates.front().linker,
-                candidates.front().linker_version);
+            const auto& selected = candidates.front();
+            if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
+                sage::util::log_info(
+                    "Using managed Rust toolchain: RUSTC='{}' ({}) linker-driver='{}' ({}) LD='{}' ({})",
+                    selected.rustc, selected.rustc_version,
+                    selected.cc, selected.compiler_version,
+                    selected.linker, selected.linker_version);
+            } else {
+                sage::util::log_info(
+                    "Using managed toolchain: CC='{}' ({}) CXX='{}' ({}) LD='{}' ({})",
+                    selected.cc, selected.compiler_version,
+                    selected.cxx, selected.cxx_version,
+                    selected.linker, selected.linker_version);
+            }
         }
     }
 
@@ -552,26 +561,35 @@ export int cmd_build(const CliOptions& opts) {
                 if (std::ranges::find(parameters, observed) == parameters.end())
                     parameters.push_back(std::move(observed));
             };
-            capture_parameter(managed_cc_parameters, "CPPFLAGS");
-            capture_parameter(managed_cc_parameters, "CFLAGS");
-            capture_parameter(managed_cxx_parameters, "CPPFLAGS");
-            capture_parameter(managed_cxx_parameters, "CXXFLAGS");
-            capture_parameter(managed_linker_parameters, "LDFLAGS");
-            if (r.managed_build.system == sage::package::BuildSystem::Cargo)
+            const bool cargo = r.managed_build.system
+                == sage::package::BuildSystem::Cargo;
+            if (cargo) {
+                // Cargo does not imply that this package compiled C or C++.
+                // Its linker selection is carried by RUSTFLAGS, so do not
+                // manufacture cc/cxx observations from generic environment
+                // slots which a pure-Rust build never consumed.
+                capture_parameter(managed_linker_parameters, "RUSTFLAGS");
                 capture_parameter(managed_rustc_parameters, "RUSTFLAGS");
-            for (const auto& name : r.managed_build.cppflags_env) {
-                capture_parameter(managed_cc_parameters, name);
-                capture_parameter(managed_cxx_parameters, name);
-            }
-            for (const auto& name : r.managed_build.cflags_env)
-                capture_parameter(managed_cc_parameters, name);
-            for (const auto& name : r.managed_build.cxxflags_env)
-                capture_parameter(managed_cxx_parameters, name);
-            for (const auto& name : r.managed_build.ldflags_env)
-                capture_parameter(managed_linker_parameters, name);
-            if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
-                for (const auto& name : r.managed_build.rustflags_env)
+                for (const auto& name : r.managed_build.rustflags_env) {
+                    capture_parameter(managed_linker_parameters, name);
                     capture_parameter(managed_rustc_parameters, name);
+                }
+            } else {
+                capture_parameter(managed_cc_parameters, "CPPFLAGS");
+                capture_parameter(managed_cc_parameters, "CFLAGS");
+                capture_parameter(managed_cxx_parameters, "CPPFLAGS");
+                capture_parameter(managed_cxx_parameters, "CXXFLAGS");
+                capture_parameter(managed_linker_parameters, "LDFLAGS");
+                for (const auto& name : r.managed_build.cppflags_env) {
+                    capture_parameter(managed_cc_parameters, name);
+                    capture_parameter(managed_cxx_parameters, name);
+                }
+                for (const auto& name : r.managed_build.cflags_env)
+                    capture_parameter(managed_cc_parameters, name);
+                for (const auto& name : r.managed_build.cxxflags_env)
+                    capture_parameter(managed_cxx_parameters, name);
+                for (const auto& name : r.managed_build.ldflags_env)
+                    capture_parameter(managed_linker_parameters, name);
             }
             plan->environment["RECIPE_DIR"] = recipe_dir.string();
             plan->environment["SRCDIR"] = work_dir.string();
@@ -636,22 +654,27 @@ export int cmd_build(const CliOptions& opts) {
     manifest.triggers = r.triggers;
     if (r.schema_version == 2) {
         const auto& tools = candidates.front();
-        manifest.managed_build_tools = {
-            {.role = "cc", .executable = tools.cc,
-             .family = tools.compiler_family, .version = tools.compiler_version,
-             .parameters = managed_cc_parameters},
-            {.role = "cxx", .executable = tools.cxx,
-             .family = tools.cxx_family, .version = tools.cxx_version,
-             .parameters = managed_cxx_parameters},
-            {.role = "linker", .executable = tools.linker,
-             .family = tools.linker_family, .version = tools.linker_version,
-             .parameters = managed_linker_parameters},
-        };
         if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
-            manifest.managed_build_tools.push_back(
+            manifest.managed_build_tools = {
+                {.role = "linker", .executable = tools.linker,
+                 .family = tools.linker_family, .version = tools.linker_version,
+                 .parameters = managed_linker_parameters},
                 {.role = "rustc", .executable = tools.rustc,
                  .family = tools.rustc_family, .version = tools.rustc_version,
-                 .parameters = managed_rustc_parameters});
+                 .parameters = managed_rustc_parameters},
+            };
+        } else {
+            manifest.managed_build_tools = {
+                {.role = "cc", .executable = tools.cc,
+                 .family = tools.compiler_family, .version = tools.compiler_version,
+                 .parameters = managed_cc_parameters},
+                {.role = "cxx", .executable = tools.cxx,
+                 .family = tools.cxx_family, .version = tools.cxx_version,
+                 .parameters = managed_cxx_parameters},
+                {.role = "linker", .executable = tools.linker,
+                 .family = tools.linker_family, .version = tools.linker_version,
+                 .parameters = managed_linker_parameters},
+            };
         }
     }
 
