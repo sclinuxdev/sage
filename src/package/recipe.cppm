@@ -26,6 +26,7 @@ enum class BuildSystem {
     Xmake,
     Cargo,
     Make,
+    Script,
 };
 
 inline std::expected<BuildSystem, std::string> parse_build_system(std::string_view name) {
@@ -35,6 +36,7 @@ inline std::expected<BuildSystem, std::string> parse_build_system(std::string_vi
     if (name == "xmake") return BuildSystem::Xmake;
     if (name == "cargo") return BuildSystem::Cargo;
     if (name == "make") return BuildSystem::Make;
+    if (name == "script") return BuildSystem::Script;
     return std::unexpected("Unsupported recipe v2 build system: " + std::string(name));
 }
 
@@ -74,6 +76,17 @@ struct InstallGenerate {
     uint32_t mode{0644};
 };
 
+// A recipe v2 step is an intentionally arbitrary shell operation, but Sage
+// still owns its shell, environment, cwd and sandbox.  This is the escape
+// hatch for package-specific fixups that cannot be reduced to a copy/move or
+// glob operation without reopening the v1 escape routes.
+struct ManagedBuildStep {
+    std::string name;
+    std::string phase;
+    std::string cwd{"source"};
+    std::string command;
+};
+
 // One output is a named view of the common DESTDIR.  Sage still emits one
 // archive per recipe invocation; output names let a recipe describe the
 // split-package boundary once and let the build driver select an output with
@@ -109,6 +122,7 @@ struct ManagedBuildSpec {
     std::vector<InstallRemove> install_removes;
     std::vector<InstallGenerate> install_generates;
     std::vector<InstallOutput> outputs;
+    std::vector<ManagedBuildStep> steps;
     std::vector<std::string> patches;
     int patch_strip{1};
     std::map<std::string, std::string> variables;
@@ -333,14 +347,19 @@ struct Recipe {
                 if (auto v = (*bld)["ldflags"].value<std::string_view>()) r.ldflags = std::string(*v);
             }
         } else {
-            if (!r.source_url.empty() && r.source_sha256.empty()) {
+            const auto valid_sha256 = [](std::string_view value) {
+                return value.size() == 64 && std::ranges::all_of(value, [](char c) {
+                    return std::isxdigit(static_cast<unsigned char>(c));
+                });
+            };
+            if (!r.source_url.empty() && !valid_sha256(r.source_sha256)) {
                 return std::unexpected(
-                    "Recipe v2 requires source.sha256 when source.url is present");
+                    "Recipe v2 requires a 64-hex source.sha256 when source.url is present");
             }
             for (const auto& source : r.extra_sources) {
-                if (source.url.empty() || source.sha256.empty()) {
+                if (source.url.empty() || !valid_sha256(source.sha256)) {
                     return std::unexpected(
-                        "Recipe v2 [[source]] entries require both url and sha256");
+                        "Recipe v2 [[source]] entries require a URL and a 64-hex sha256");
                 }
             }
             auto* bld = tbl.get_as<vendor::toml::table>("build");
@@ -492,6 +511,48 @@ struct Recipe {
                     r.managed_build.outputs.push_back(std::move(output));
                 }
             }
+            if (r.managed_build.system == BuildSystem::Script
+                && r.managed_build.install_files.empty()
+                && r.managed_build.outputs.empty())
+                return std::unexpected(
+                    "Script recipes require an explicit install_files boundary or outputs");
+            if (auto* arr = bld->get_as<vendor::toml::array>("steps")) {
+                static constexpr std::array<std::string_view, 6> phases{
+                    "prepare", "pre-build", "post-build", "pre-install",
+                    "install", "post-install"};
+                static constexpr std::array<std::string_view, 3> directories{
+                    "source", "build", "package"};
+                for (auto&& element : *arr) {
+                    auto* item = element.as_table();
+                    if (!item) return std::unexpected(
+                        "build.steps entries must be inline tables");
+                    auto name = (*item)["name"].value<std::string_view>();
+                    auto phase = (*item)["phase"].value<std::string_view>();
+                    auto cwd = (*item)["cwd"].value<std::string_view>().value_or("source");
+                    auto command = (*item)["command"].value<std::string_view>();
+                    if (!name || !phase || !command || name->empty()
+                        || phase->empty() || command->empty())
+                        return std::unexpected(
+                            "build.steps entries require name, phase and command");
+                    if (!std::ranges::contains(phases, *phase))
+                        return std::unexpected(std::format(
+                            "build.steps has unsupported phase '{}'; expected prepare, pre-build, post-build, pre-install, install or post-install",
+                            *phase));
+                    if (!std::ranges::contains(directories, cwd))
+                        return std::unexpected(std::format(
+                            "build.steps '{}' has unsupported cwd '{}'; expected source, build or package",
+                            *name, cwd));
+                    r.managed_build.steps.push_back({
+                        .name = std::string(*name),
+                        .phase = std::string(*phase),
+                        .cwd = std::string(cwd),
+                        .command = std::string(*command)});
+                }
+            }
+            if (r.managed_build.system == BuildSystem::Script
+                && r.managed_build.steps.empty())
+                return std::unexpected(
+                    "Script recipes require at least one build.steps entry");
             parse_strings(*bld, "patches", r.managed_build.patches);
             parse_strings(*bld, "allowed_compilers", r.managed_build.allowed_compilers);
             parse_strings(*bld, "allowed_linkers", r.managed_build.allowed_linkers);
@@ -595,6 +656,15 @@ struct Recipe {
                     return std::unexpected(result.error());
                 if (output.install_files.empty())
                     return std::unexpected("build.outputs entries require install_files");
+            }
+            std::set<std::string> step_names;
+            for (const auto& step : r.managed_build.steps) {
+                if (!step_names.insert(step.name).second)
+                    return std::unexpected("build.steps contains duplicate name: "
+                                           + step.name);
+                if (step.command.find('\0') != std::string::npos)
+                    return std::unexpected("build.steps command contains NUL: "
+                                           + step.name);
             }
             if (!r.managed_build.outputs.empty()
                 && (!r.managed_build.install_files.empty()

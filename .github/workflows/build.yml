@@ -11,7 +11,12 @@ jobs:
     # Arch rather than ubuntu-latest: every core module opens with
     # `import std;`, which needs GCC 15. Ubuntu's images are older, and the
     # package format this project targets is Arch's anyway.
-    container: archlinux:latest
+    container:
+      image: archlinux:latest
+      # v2 builds intentionally create user/mount/network namespaces with
+      # bubblewrap. GitHub's job container otherwise rejects that syscall
+      # before Sage can run its own fail-closed sandbox checks.
+      options: --privileged
 
     env:
       # Container steps run as root, and xmake refuses to run as root unless
@@ -33,6 +38,11 @@ jobs:
         run: |
           gcc --version | head -1
           xmake --version | head -1
+
+      - name: Verify bubblewrap namespace capability
+        run: |
+          bwrap --die-with-parent --new-session --unshare-net \
+            --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc true
 
       - name: Configure
         run: xmake f -m release -y

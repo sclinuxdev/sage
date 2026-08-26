@@ -413,6 +413,28 @@ outputs = [
             sage::util::log_error("Recipe v2 multi-output model did not parse");
             return 1;
         }
+        auto scripted = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "scripted"
+version = "1.0.0"
+release = "1"
+[build]
+system = "script"
+install_files = ["usr/share/scripted/**"]
+[[build.steps]]
+name = "post-install-fixup"
+phase = "install"
+cwd = "package"
+command = "mkdir -p usr/share/scripted && printf ok > usr/share/scripted/result"
+)");
+        if (!scripted
+            || scripted->managed_build.system != sage::package::BuildSystem::Script
+            || scripted->managed_build.steps.size() != 1
+            || scripted->managed_build.steps.front().cwd != "package") {
+            sage::util::log_error("Recipe v2 arbitrary script step did not parse");
+            return 1;
+        }
         auto managed_cargo = sage::package::Recipe::parse_toml(R"(
 schema_version = 2
 [package]
@@ -511,14 +533,19 @@ configure_options = ["--exec-prefix=/tmp/escape"]
              .linker_version = "22.1.8", .rustc_version = "1.90.0",
              .compiler_family = "clang", .cxx_family = "clang",
              .linker_family = "lld", .rustc_family = "rustc"}, 8);
-        if (!managed_plan || managed_plan->steps.size() != 3
+        const auto managed_configure = managed_plan
+            ? std::ranges::find(managed_plan->steps, "configure",
+                &sage::build::BuildStep::name)
+            : std::vector<sage::build::BuildStep>::iterator{};
+        if (!managed_plan || managed_plan->steps.size() != 4
             || managed_plan->environment["KCFLAGS"] != managed_cfg.cflags
             || managed_plan->environment["KBUILD_LDFLAGS"].find("-fuse-ld=lld")
                 == std::string::npos
             || managed_plan->environment["HOSTCC"] != "clang"
             || managed_plan->environment["HOSTLD"] != "lld"
             || managed_plan->environment.contains("RUSTC")
-            || managed_plan->steps[0].command.find("cmake -S") == std::string::npos) {
+            || managed_configure == managed_plan->steps.end()
+            || managed_configure->command.find("cmake -S") == std::string::npos) {
             sage::util::log_error("Recipe v2 CMake plan is incomplete");
             return 1;
         }
@@ -535,9 +562,19 @@ configure_options = ["--exec-prefix=/tmp/escape"]
              .linker_version = "22.1.8", .rustc_version = "1.90.0",
              .compiler_family = "clang", .cxx_family = "clang",
              .linker_family = "lld", .rustc_family = "rustc"}, 8);
+        const auto out_of_tree_configure = out_of_tree_plan
+            ? std::ranges::find(out_of_tree_plan->steps, "configure",
+                &sage::build::BuildStep::name)
+            : std::vector<sage::build::BuildStep>::iterator{};
+        const auto out_of_tree_build = out_of_tree_plan
+            ? std::ranges::find(out_of_tree_plan->steps, "build",
+                &sage::build::BuildStep::name)
+            : std::vector<sage::build::BuildStep>::iterator{};
         if (!out_of_tree_plan
-            || !out_of_tree_plan->steps.front().command.contains("../configure")
-            || out_of_tree_plan->steps[1].work_dir
+            || out_of_tree_configure == out_of_tree_plan->steps.end()
+            || !out_of_tree_configure->command.contains("../configure")
+            || out_of_tree_build == out_of_tree_plan->steps.end()
+            || out_of_tree_build->work_dir
                 != std::filesystem::path("/tmp/sage-autotools-src/build")) {
             sage::util::log_error("Managed Autotools out-of-tree plan is incomplete");
             return 1;
@@ -572,6 +609,10 @@ configure_options = ["--exec-prefix=/tmp/escape"]
             }
             const auto build_step = std::ranges::find(
                 variant_plan->steps, "build", &sage::build::BuildStep::name);
+            const auto configure_step = std::ranges::find(
+                variant_plan->steps, "configure", &sage::build::BuildStep::name);
+            const auto install_step = std::ranges::find(
+                variant_plan->steps, "install", &sage::build::BuildStep::name);
             if (build_step == variant_plan->steps.end()
                 || (system == sage::package::BuildSystem::CMake
                     && !build_step->command.contains("--parallel 8"))
@@ -579,31 +620,34 @@ configure_options = ["--exec-prefix=/tmp/escape"]
                     && !build_step->command.contains(" -j 8"))
                 || (system == sage::package::BuildSystem::Xmake
                     && (!build_step->command.contains("xmake -j 8")
-                        || !variant_plan->steps.front().command.contains(
+                        || configure_step == variant_plan->steps.end()
+                        || !configure_step->command.contains(
                             "--ld='clang++'")
-                        || !std::ranges::all_of(variant_plan->steps,
-                            [](const auto& step) {
-                                return step.command.contains("--root");
-                            })))) {
+                        || install_step == variant_plan->steps.end()
+                        || !configure_step->command.contains("--root")
+                        || !build_step->command.contains("--root")
+                        || !install_step->command.contains("--root")))) {
                 sage::util::log_error(
                     "Managed recipe v2 backend lost its explicit job count");
                 return 1;
             }
             if (system == sage::package::BuildSystem::Make
-                && variant_plan->steps[0].command.find("HOSTCC='clang'")
+                && build_step->command.find("HOSTCC='clang'")
                     == std::string::npos) {
                 sage::util::log_error("Make plan did not enforce custom tool channels");
                 return 1;
             }
             if (system == sage::package::BuildSystem::CMake
-                && !variant_plan->steps.front().command.contains(
-                    "CMAKE_INSTALL_LIBDIR=lib")) {
+                && (configure_step == variant_plan->steps.end()
+                    || !configure_step->command.contains(
+                        "CMAKE_INSTALL_LIBDIR=lib"))) {
                 sage::util::log_error(
                     "CMake plan did not enforce Sage's canonical library directory");
                 return 1;
             }
             if (system == sage::package::BuildSystem::Meson
-                && !variant_plan->steps.front().command.contains("--libdir=lib")) {
+                && (configure_step == variant_plan->steps.end()
+                    || !configure_step->command.contains("--libdir=lib"))) {
                 sage::util::log_error(
                     "Meson plan did not enforce Sage's canonical library directory");
                 return 1;
@@ -715,8 +759,8 @@ install:
         const auto v2_policy = read_text(
             temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/policy");
         if (!v2_built
-            || !v2_policy.contains("sage-cc|/tmp/sage-build-")
-            || !v2_policy.contains("sage-linker|-DV2_POLICY=1")
+            || !v2_policy.contains("/tool-audit/sage-cc|")
+            || !v2_policy.contains("/tool-audit/sage-linker|-DV2_POLICY=1")
             || !read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/jobs")
                 .contains("-j2")
             || read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/fakeroot") != "1"
@@ -843,6 +887,90 @@ version = "1.0.0"
                 temp_dir / "bcfg-v2-make-x/usr/include/not-selected.h")) {
             sage::util::log_error(
                 "Managed Cargo build did not preserve its observed rustc identity");
+            return 1;
+        }
+        // Script is the explicit v2 escape hatch for deterministic
+        // repackaging/fixups. It may perform arbitrary package-tree logic but
+        // must not claim a compiler or linker was used, and two clean builds
+        // must produce byte-identical archives.
+        auto script_root = temp_dir / "bcfg-v2-script-root";
+        auto script_dir = temp_dir / "bcfg-v2-script";
+        if (!write_build_toml(script_root, R"(cc = "gcc"
+cxx = "g++"
+linker = "ld"
+)") || !write_canary_recipe(script_dir, R"(schema_version = 2
+[package]
+name = "v2scriptcanary"
+version = "1.0.0"
+release = "1"
+description = "deterministic repackaging canary"
+license = "MIT"
+channel = "system"
+[build]
+system = "script"
+install_files = ["usr/share/v2script/**"]
+[[build.steps]]
+name = "write-payload"
+phase = "install"
+cwd = "package"
+command = "set -eu; test ! -w /etc; mkdir -p usr/share/v2script; printf '%s|%s|%s' \"$CC\" \"$LD\" \"$SOURCE_DATE_EPOCH\" > usr/share/v2script/result"
+)") ) {
+            sage::util::log_error("Failed to create v2 script fixture");
+            return 1;
+        }
+        auto script_built = build_with_root(
+            script_dir, script_root, temp_dir / "bcfg-v2-script-x1",
+            "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        const auto script_archive = script_dir
+            / "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst";
+        const auto script_hash_1 = script_built
+            ? sage::util::compute_file_sha256(script_archive)
+            : std::expected<std::string, std::string>(std::unexpected("not-built"));
+        auto script_built_again = build_with_root(
+            script_dir, script_root, temp_dir / "bcfg-v2-script-x2",
+            "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        const auto script_hash_2 = script_built_again
+            ? sage::util::compute_file_sha256(script_archive)
+            : std::expected<std::string, std::string>(std::unexpected("not-built"));
+        if (!script_built || !script_built_again || !script_hash_1 || !script_hash_2
+            || *script_hash_1 != *script_hash_2
+            || !script_built->managed_build_tools.empty()
+            || read_text(temp_dir / "bcfg-v2-script-x1/usr/share/v2script/result")
+                != "||0"
+            || !std::filesystem::exists(
+                temp_dir / "bcfg-v2-script-x2/usr/share/v2script/result")) {
+            sage::util::log_error(
+                "Managed v2 script repackaging was not hermetic and compiler-free");
+            return 1;
+        }
+        auto bypass_dir = temp_dir / "bcfg-v2-script-bypass";
+        if (!write_canary_recipe(bypass_dir, R"(schema_version = 2
+[package]
+name = "v2scriptbypass"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+[build]
+system = "script"
+install_files = ["usr/share/v2bypass/**"]
+[[build.steps]]
+name = "absolute-compiler"
+phase = "install"
+cwd = "package"
+command = "/usr/bin/gcc --version >/dev/null; mkdir -p usr/share/v2bypass; printf x > usr/share/v2bypass/result"
+)")) {
+            sage::util::log_error("Failed to create v2 absolute-tool bypass fixture");
+            return 1;
+        }
+        CliOptions bypass_opts;
+        bypass_opts.args = {bypass_dir.string()};
+        bypass_opts.target_root = script_root;
+        const auto bypass_archive = bypass_dir
+            / "v2scriptbypass-1.0.0-1-x86_64.pkg.tar.zst";
+        if (cmd_build(bypass_opts) == 0 || std::filesystem::exists(bypass_archive)) {
+            sage::util::log_error(
+                "A v2 script absolute compiler invocation bypassed Sage's audit fence");
             return 1;
         }
         auto unsafe_v2 = sage::package::Recipe::parse_toml(R"(

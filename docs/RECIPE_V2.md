@@ -110,7 +110,7 @@ patch_strip = 1
 
 ```toml
 [build]
-system = "cmake"               # autotools | cmake | meson | xmake | cargo | make
+system = "cmake"               # autotools | cmake | meson | xmake | cargo | make | script
 source_subdir = "src"          # optional, relative to unpacked source root
 build_dir = "build"            # cmake/meson build directory
 configure_options = []         # project feature choices, never compiler flags
@@ -212,6 +212,41 @@ combined with `outputs`, so one output cannot delete another output's files.
 Every upstream symlink is checked during extraction and packing: absolute
 targets and normalized targets that leave the data root are rejected.
 
+### Arbitrary package logic
+
+The `script` backend is the v2 escape hatch for packages whose build or split
+layout cannot be reduced to a backend target and the declarative transforms.
+It still has an explicit payload boundary, and every command runs under Sage's
+same fakeroot, bubblewrap namespace, clean environment and fixed timestamp:
+
+```toml
+[build]
+system = "script"
+install_files = ["usr/lib/myapp/**", "usr/share/myapp/**"]
+
+[[build.steps]]
+name = "generate-config"
+phase = "prepare"                 # prepare | pre-build | post-build |
+                                   # pre-install | install | post-install
+cwd = "source"                    # source | build | package
+command = "./configure-local --output build/config"
+
+[[build.steps]]
+name = "split-and-fixup"
+phase = "install"
+cwd = "package"
+command = "rm -rf usr/share/doc; mv usr/libexec/myapp usr/lib/myapp"
+```
+
+Steps execute in TOML order within each phase. `source` is the unpacked or
+copy-on-write source tree, `build` is the recipe's private build directory,
+and `package` is the only directory that becomes payload. The recipe tree and
+host root remain read-only; writes outside the staged source/package roots
+therefore fail in the namespace. `script` deliberately does not create
+compiler/linker provenance. If a script executes a fenced compiler, Rust
+compiler or linker, Sage rejects the build; use a managed backend for compiled
+packages.
+
 ## Package-specific default toolchain
 
 Omit these tables to use Sage's global primary/fallback policy. A package that
@@ -252,9 +287,9 @@ executable, detected family, parsed version, execution count, and
 `version_argument = "--version"`. A pure-C build therefore need not contain a
 synthetic `cxx` entry. C/C++ builds may record `cc`, `cxx`, `linker-driver`, and
 `linker`; Cargo records `rustc`, its linker-driver, and (when it links) the
-`rustc`. These fields are absent from v1 and upstream-prebuilt repackages. They
-mean “configured and probed by Sage”, not “inferred as the producer of every
-payload file”.
+selected linker. These fields are absent from v1 and upstream-prebuilt
+repackages. They mean “this Sage-probed executable was observed executing in
+this build”, not “inferred as the producer of every payload file”.
 
 ## CMake
 
@@ -330,6 +365,11 @@ a clean environment. Sage sets
 `LC_ALL=C`, `LANG=C`, `TZ=UTC`, `SOURCE_DATE_EPOCH` (default 0), `umask 022`,
 private `HOME`/`TMPDIR`/Cargo directories, and disables global Git
 configuration. Caller PATH, proxy, locale and flag variables are not inherited.
+Before a backend starts, Sage normalizes source and generated-file mtimes to
+`SOURCE_DATE_EPOCH`; local projects are copied out of the read-only recipe
+tree into a private writable source root. Package archives are then packed
+with the same epoch and stable ordering, so repeated clean builds have a
+stable byte-level input boundary.
 Compiler and linker wrappers record actual child invocations; common bare tool
 names in PATH are fenced, and a `-B` audit prefix makes compiler-driver links
 reach the selected linker wrapper. Bubblewrap also masks the canonical paths

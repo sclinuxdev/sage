@@ -445,7 +445,8 @@ struct ToolAudit {
         auto linker = resolve(tools.linker);
         auto rustc = tools.rustc.empty() ? std::optional<std::filesystem::path>{}
                                          : resolve(tools.rustc);
-        if (!cc || !cxx || (!tools.linker.empty() && !linker)
+        if ((!tools.cc.empty() && !cc) || (!tools.cxx.empty() && !cxx)
+            || (!tools.linker.empty() && !linker)
             || (!tools.rustc.empty() && !rustc)) return std::nullopt;
         ToolAudit audit;
         audit.root = parent / "tool-audit";
@@ -464,16 +465,22 @@ struct ToolAudit {
                 | std::filesystem::perms::others_all,
             std::filesystem::perm_options::replace, ec);
         if (ec) return std::nullopt;
+        const auto real_root = audit.root / "host-root";
+        std::filesystem::create_directories(real_root, ec);
+        if (ec) return std::nullopt;
         const auto events = sage::build::shell_quote(audit.events.string());
         // Absolute-path compiler bypasses cannot be audited with PATH alone.
         // Fail closed when bubblewrap is unavailable instead of claiming
         // provenance that a recipe could evade.
         const bool sandboxed = resolve("bwrap").has_value();
         if (!sandboxed) return std::nullopt;
-        const auto execution_path = [&](std::string_view name,
+        const auto execution_path = [&](std::string_view role,
                                         const std::filesystem::path& real) {
-            (void)name;
-            return real.string();
+            (void)role;
+            // The namespace later bind-mounts the host root at this mirror.
+            // Keeping the compiler's original directory layout is important
+            // for GCC's cc1 lookup and for Clang's resource-dir discovery.
+            return (real_root / real.relative_path()).string();
         };
         const auto fmt = [](std::string_view pattern, auto&&... values) {
             return std::vformat(pattern, std::make_format_args(values...));
@@ -492,11 +499,11 @@ struct ToolAudit {
                 "[ \"$backend\" -eq 1 ] && printf '%s\\n' x > {}/mark-linker-selected-$$\n"
                 "exec {} \"$@\"\n", events, role, role, events, role, events,
                 events, role, events,
-                sage::build::shell_quote(execution_path(name, real)));
+                sage::build::shell_quote(execution_path(role, real)));
             return write_executable(audit.root / std::string(name), script);
         };
-        if (!make_driver("cc", *cc, "sage-cc")
-            || !make_driver("cxx", *cxx, "sage-cxx")) return std::nullopt;
+        if (cc && !make_driver("cc", *cc, "sage-cc")) return std::nullopt;
+        if (cxx && !make_driver("cxx", *cxx, "sage-cxx")) return std::nullopt;
         if (rustc && !make_driver("rustc", *rustc, "sage-rustc")) return std::nullopt;
         if (linker) {
             const auto script = fmt(
@@ -586,24 +593,48 @@ struct ToolAudit {
                     return std::nullopt;
             }
         }
+        std::set<std::string> bound_targets;
         if (sandboxed) {
-            audit.sandbox = "bwrap --die-with-parent --ro-bind / / --bind /tmp /tmp"
-                " --dev /dev --proc /proc";
-            const std::array<std::optional<std::filesystem::path>, 4> selected_real{
-                cc, cxx, linker, rustc};
+            const auto parent_name = parent.string();
+            audit.sandbox = "bwrap --die-with-parent --new-session --unshare-net"
+                " --ro-bind / / --tmpfs /tmp"
+                " --dir " + sage::build::shell_quote(parent_name)
+                + " --dir " + sage::build::shell_quote((parent / "home").string())
+                + " --dir " + sage::build::shell_quote((parent / "tmp").string())
+                + " --dir " + sage::build::shell_quote(audit.root.string())
+                + " --bind " + sage::build::shell_quote((parent / "home").string())
+                + " " + sage::build::shell_quote((parent / "home").string())
+                + " --bind " + sage::build::shell_quote((parent / "tmp").string())
+                + " " + sage::build::shell_quote((parent / "tmp").string())
+                + " --bind " + sage::build::shell_quote(audit.root.string())
+                + " " + sage::build::shell_quote(audit.root.string())
+                + " --ro-bind / " + sage::build::shell_quote(real_root.string())
+                + " --dev /dev --proc /proc";
             for (const auto& name : fenced) {
                 if (auto resolved = resolve(name)) {
-                    if (std::ranges::any_of(selected_real, [&](const auto& selected) {
-                            return selected && *selected == *resolved;
-                        })) continue;
+                    if (!bound_targets.insert(resolved->string()).second) continue;
+                    // Bind selected and non-selected aliases alike. Selected
+                    // wrappers execute the mirrored host-root path above, so
+                    // an absolute compiler/linker path cannot bypass observation.
                     audit.sandbox += " --bind "
                         + sage::build::shell_quote((audit.root / std::string(name)).string())
                         + " " + sage::build::shell_quote(resolved->string());
                 }
             }
+            const auto bind_selected = [&](const std::optional<std::filesystem::path>& real,
+                                           std::string_view wrapper) {
+                if (!real || !bound_targets.insert(real->string()).second) return;
+                audit.sandbox += " --bind "
+                    + sage::build::shell_quote((audit.root / std::string(wrapper)).string())
+                    + " " + sage::build::shell_quote(real->string());
+            };
+            bind_selected(cc, "sage-cc");
+            bind_selected(cxx, "sage-cxx");
+            bind_selected(linker, "sage-linker");
+            bind_selected(rustc, "sage-rustc");
         }
-        audit.cc = (audit.root / "sage-cc").string();
-        audit.cxx = (audit.root / "sage-cxx").string();
+        audit.cc = cc ? (audit.root / "sage-cc").string() : "";
+        audit.cxx = cxx ? (audit.root / "sage-cxx").string() : "";
         audit.linker = linker ? (audit.root / "sage-linker").string() : "";
         audit.rustc = rustc ? (audit.root / "sage-rustc").string() : "";
         std::set<std::string> tool_dirs;
@@ -854,7 +885,17 @@ export int cmd_build(const CliOptions& opts) {
             .linker_family = std::move(linker.family),
             .rustc_family = std::move(rustc.family)});
     };
-    if (!r.cc.empty()) {
+    const bool needs_managed_toolchain =
+        r.schema_version == 2
+        && r.managed_build.system != sage::package::BuildSystem::Script;
+    const bool script_recipe =
+        r.schema_version == 2
+        && r.managed_build.system == sage::package::BuildSystem::Script;
+    if (script_recipe) {
+        // Script recipes are for deterministic repackaging and package fixups;
+        // they must not manufacture compiler/linker provenance.
+        candidates.push_back(Toolchain{});
+    } else if (!r.cc.empty()) {
         // Pinned: exactly this pair, no fallback. A pinned build that cannot
         // even probe its compiler fails the recipe outright.
         const std::string pin_cxx = r.cxx.empty() ? bcfg.cxx : r.cxx;
@@ -894,7 +935,7 @@ export int cmd_build(const CliOptions& opts) {
             .rustc_version = "", .compiler_family = "", .cxx_family = "",
             .linker_family = "", .rustc_family = ""});
     } else {
-        if (r.schema_version == 2) {
+        if (needs_managed_toolchain) {
             const auto& selected = candidates.front();
             if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
                 sage::util::log_info(
@@ -960,11 +1001,50 @@ export int cmd_build(const CliOptions& opts) {
     }
 
     std::filesystem::path dist_dir = recipe_dir / "distfiles";
-    std::filesystem::path src_dir = recipe_dir / "src";
+    // A local v2 project may itself contain a conventional `src/` directory
+    // (Cargo does), so never reuse that path as Sage's writable build root.
+    // The recipe tree stays read-only in the sandbox; local source is copied
+    // into this private staging tree before Sage normalizes and builds it.
+    std::filesystem::path src_dir = r.source_url.empty()
+        ? recipe_dir / ".sage-source" : recipe_dir / "src";
     std::filesystem::path pkg_dir = recipe_dir / "pkg";
+    if (r.schema_version == 2 && r.source_url.empty()) {
+        std::error_code source_ec;
+        std::filesystem::create_directories(src_dir, source_ec);
+        if (source_ec) {
+            sage::util::log_error("Cannot create v2 local source directory '{}': {}",
+                                  src_dir.string(), source_ec.message());
+            return 1;
+        }
+    }
     if (tool_audit && !tool_audit->sandbox.empty()) {
-        tool_audit->sandbox += " --bind " + sage::build::shell_quote(recipe_dir.string())
-            + " " + sage::build::shell_quote(recipe_dir.string());
+        // The recipe tree is immutable input. Only the extracted source and
+        // package staging directories are writable; /tmp is a private tmpfs
+        // with Sage's hermetic HOME/TMP subtrees mounted back into it.
+        tool_audit->sandbox += " --ro-bind "
+            + sage::build::shell_quote(recipe_dir.string()) + " "
+            + sage::build::shell_quote(recipe_dir.string())
+            + " --bind " + sage::build::shell_quote(src_dir.string()) + " "
+            + sage::build::shell_quote(src_dir.string())
+            + " --bind " + sage::build::shell_quote(pkg_dir.string()) + " "
+            + sage::build::shell_quote(pkg_dir.string())
+            + " --bind " + sage::build::shell_quote(build_home.string()) + " "
+            + sage::build::shell_quote(build_home.string())
+            + " --bind " + sage::build::shell_quote(build_temp.string()) + " "
+            + sage::build::shell_quote(build_temp.string());
+        // The sandbox owns a private /tmp, so a test adapter or an
+        // administrator-provided fakeroot under /tmp would otherwise vanish
+        // before the inner command starts. Bind the exact executable (and
+        // create its parent in the namespace) rather than exposing its whole
+        // host directory.
+        if (auto fakeroot_path = ToolAudit::resolve(bcfg.fakeroot)) {
+            const auto parent = fakeroot_path->parent_path();
+            const bool hidden_tmp = parent.string().starts_with("/tmp/");
+            tool_audit->sandbox += (hidden_tmp
+                ? " --dir " + sage::build::shell_quote(parent.string()) : "")
+                + " --ro-bind " + sage::build::shell_quote(fakeroot_path->string())
+                + " " + sage::build::shell_quote(fakeroot_path->string());
+        }
     }
     // Resume mode: keep an already-extracted (and possibly already built)
     // tree so incremental build systems only pay for what changed. Only
@@ -1091,11 +1171,51 @@ export int cmd_build(const CliOptions& opts) {
                     return 1;
                 }
             }
+        } else if (r.schema_version == 2 && r.source_url.empty()) {
+            // Local v2 projects are immutable recipe inputs. Copy everything
+            // except Sage metadata/staging directories into a writable source
+            // tree so arbitrary prepare/build/install steps can modify it.
+            std::filesystem::remove_all(src_dir, ec);
+            std::filesystem::create_directories(src_dir, ec);
+            for (const auto& entry : std::filesystem::directory_iterator(recipe_dir)) {
+                const auto name = entry.path().filename().string();
+                if (name == "recipe.toml" || name == "distfiles"
+                    || name == "pkg" || name == ".sage-source") continue;
+                std::filesystem::copy(entry.path(), src_dir / entry.path().filename(),
+                    std::filesystem::copy_options::recursive
+                    | std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    sage::util::log_error(
+                        "Failed to stage local v2 source '{}': {}",
+                        entry.path().string(), ec.message());
+                    return 1;
+                }
+            }
         }
-        // A local project (notably Cargo) legitimately has recipe_dir/src/;
-        // that directory is source code, not Sage's extracted-source root.
-        // Only a primary source archive makes recipe_dir/src the work root.
-        std::filesystem::path work_dir = !r.source_url.empty() ? src_dir : recipe_dir;
+        if (r.schema_version == 2) {
+            // Local patch attachments live beside recipe.toml in the source
+            // tree. Make them first-class distfiles so the same `patch`
+            // command works for downloaded and local-source recipes.
+            std::filesystem::create_directories(src_dir / "distfiles", ec);
+            for (const auto& patch : r.managed_build.patches) {
+                const auto beside_recipe = recipe_dir / patch;
+                const auto attached = std::filesystem::is_regular_file(beside_recipe, ec)
+                    ? beside_recipe : recipe_dir / "distfiles" / patch;
+                if (!std::filesystem::is_regular_file(attached, ec)) continue;
+                std::filesystem::copy_file(attached, src_dir / "distfiles" / patch,
+                    std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    sage::util::log_error(
+                        "Failed to stage local patch '{}': {}", patch, ec.message());
+                    return 1;
+                }
+            }
+        }
+        // A local v2 project is staged into the private source root. Legacy
+        // local recipes keep their historical recipe-dir cwd, while any
+        // archive-backed recipe (v1 or v2) builds from the extracted tree.
+        std::filesystem::path work_dir =
+            (r.schema_version == 2 || !r.source_url.empty()) ? src_dir : recipe_dir;
 
         auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
             if (cmds.empty()) return true;
@@ -1107,6 +1227,8 @@ export int cmd_build(const CliOptions& opts) {
                     "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\" "
                     "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\" "
                     "HOME=\"{}\" TMPDIR=\"{}\" LC_ALL=C LANG=C TZ=UTC SOURCE_DATE_EPOCH=\"{}\" "
+                    "FORCE_SOURCE_DATE=1 PYTHONHASHSEED=0 ARFLAGS=crD ZERO_AR_DATE=1 "
+                    "CARGO_INCREMENTAL=0 CARGO_TERM_COLOR=never DEBUGINFOD_URLS= "
                     "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "
                     "TERM=dumb SHELL=/bin/sh USER=builder LOGNAME=builder PAGER=cat; "
                     "cd \"{}\" && {}",
@@ -1218,7 +1340,10 @@ export int cmd_build(const CliOptions& opts) {
                     + sage::build::shell_quote(step.work_dir.string())
                     + " && " + step.command;
                 const auto fakeroot_cmd = tool_audit && !tool_audit->sandbox.empty()
-                    ? sandboxed_fakeroot_shell(bcfg.fakeroot, full_cmd,
+                    ? sandboxed_fakeroot_shell(
+                        ToolAudit::resolve(bcfg.fakeroot)
+                            .value_or(std::filesystem::path(bcfg.fakeroot)).string(),
+                        full_cmd,
                                                tool_audit->sandbox)
                     : sage::build::fakeroot_command(bcfg.fakeroot,
                         hermetic_shell(full_cmd));
@@ -1260,9 +1385,7 @@ export int cmd_build(const CliOptions& opts) {
     // scanning and archive creation so omitted files cannot reappear in the
     // manifest through a later packaging pass.
     if (r.schema_version == 2) {
-        const auto transform_source =
-            (!r.source_url.empty() ? src_dir : recipe_dir)
-            / r.managed_build.source_subdir;
+        const auto transform_source = src_dir / r.managed_build.source_subdir;
         auto transforms = apply_install_transforms(
             transform_source, pkg_dir, r.managed_build.install_copies,
             r.managed_build.install_symlinks,
@@ -1293,17 +1416,26 @@ export int cmd_build(const CliOptions& opts) {
         }
         const bool cargo = r.managed_build.system
             == sage::package::BuildSystem::Cargo;
+        const bool script = r.managed_build.system
+            == sage::package::BuildSystem::Script;
         const auto compiler_execs = tool_audit->executions("cc")
             + tool_audit->executions("cxx");
         const auto rustc_execs = tool_audit->executions("rustc");
-        if ((cargo && rustc_execs == 0) || (!cargo && compiler_execs == 0)) {
+        if ((!script && cargo && rustc_execs == 0)
+            || (!script && !cargo && compiler_execs == 0)) {
             sage::util::log_error(
                 "No Sage audit marker proves that the configured compiler executed");
             return 1;
         }
         const auto link_driver_execs = tool_audit->executions("linker-driver");
         const auto linker_execs = tool_audit->executions("linker");
-        if (link_driver_execs != 0 && linker_execs == 0) {
+        if (script && (compiler_execs != 0 || rustc_execs != 0
+                       || link_driver_execs != 0 || linker_execs != 0)) {
+            sage::util::log_error(
+                "Script recipe executed a compiler or linker; use a managed build backend for compiled sources");
+            return 1;
+        }
+        if (!script && link_driver_execs != 0 && linker_execs == 0) {
             sage::util::log_error(
                 "A compiler linker-driver executed without the selected linker backend");
             return 1;
@@ -1313,7 +1445,7 @@ export int cmd_build(const CliOptions& opts) {
             if (!entry.is_regular_file()) continue;
             if (sage::util::scan_elf(entry.path())) { has_elf = true; break; }
         }
-        if (has_elf && linker_execs == 0) {
+        if (!script && has_elf && linker_execs == 0) {
             sage::util::log_error(
                 "ELF payload exists but no selected linker execution was observed");
             return 1;

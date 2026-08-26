@@ -83,6 +83,52 @@ inline std::string join_args(const std::vector<std::string>& values) {
     return out;
 }
 
+// A recipe may refine a canonical FHS subdirectory (for example a package's
+// documentation directory), but it may not redirect installation into an
+// arbitrary prefix. Sage appends its own canonical prefix/libdir after these
+// options, and this predicate keeps every accepted refinement inside the
+// corresponding system root.
+inline bool canonical_autotools_install_option(std::string_view option) {
+    static constexpr std::array<std::string_view, 22> names{
+        "--prefix", "--exec-prefix", "--bindir", "--sbindir", "--libexecdir",
+        "--libdir", "--includedir", "--oldincludedir", "--datarootdir", "--datadir",
+        "--infodir", "--localedir", "--mandir", "--docdir", "--htmldir", "--dvidir",
+        "--pdfdir", "--psdir", "--sysconfdir", "--sharedstatedir", "--localstatedir",
+        "--runstatedir"};
+    const auto equal = option.find('=');
+    if (equal == std::string_view::npos) return false;
+    const auto key = option.substr(0, equal);
+    const auto value = option.substr(equal + 1);
+    if (!std::ranges::contains(names, key) || value.empty()) return false;
+    const std::filesystem::path path(value);
+    if (!path.is_absolute() || path.has_root_name()
+        || std::ranges::any_of(path, [](const auto& part) { return part == ".."; }))
+        return false;
+    const auto text = path.lexically_normal().generic_string();
+    const auto exact = [&](std::string_view root) { return text == root; };
+    const auto under = [&](std::string_view root) {
+        return text == root || text.starts_with(std::string(root) + "/");
+    };
+    if (key == "--prefix" || key == "--exec-prefix") return exact("/usr");
+    if (key == "--bindir") return exact("/usr/bin");
+    if (key == "--sbindir") return exact("/usr/sbin") || exact("/usr/bin");
+    if (key == "--libexecdir") return exact("/usr/libexec") || exact("/usr/lib");
+    if (key == "--libdir") return exact("/usr/lib");
+    if (key == "--includedir" || key == "--oldincludedir") return exact("/usr/include");
+    if (key == "--datarootdir") return exact("/usr/share");
+    if (key == "--datadir") return under("/usr/share");
+    if (key == "--infodir") return under("/usr/share/info");
+    if (key == "--localedir") return under("/usr/share/locale");
+    if (key == "--mandir") return under("/usr/share/man");
+    if (key == "--docdir" || key == "--htmldir" || key == "--dvidir"
+        || key == "--pdfdir" || key == "--psdir") return under("/usr/share/doc");
+    if (key == "--sysconfdir") return exact("/etc");
+    if (key == "--sharedstatedir") return under("/var/lib");
+    if (key == "--localstatedir") return under("/var");
+    if (key == "--runstatedir") return under("/run");
+    return false;
+}
+
 inline std::string replace_all(std::string value, std::string_view from,
                                std::string_view to) {
     for (std::size_t at = value.find(from); at != std::string::npos;
@@ -217,6 +263,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         {"CARGO_BUILD_JOBS", std::to_string(jobs)},
         {"LC_ALL", "C"}, {"LANG", "C"}, {"TZ", "UTC"},
         {"SOURCE_DATE_EPOCH", std::to_string(cfg.source_date_epoch)},
+        {"FORCE_SOURCE_DATE", "1"}, {"PYTHONHASHSEED", "0"},
+        {"ARFLAGS", "crD"}, {"ZERO_AR_DATE", "1"},
+        {"CARGO_INCREMENTAL", "0"}, {"CARGO_TERM_COLOR", "never"},
+        {"DEBUGINFOD_URLS", ""},
         {"GIT_CONFIG_NOSYSTEM", "1"}, {"GIT_CONFIG_GLOBAL", "/dev/null"},
         {"TERM", "dumb"}, {"SHELL", "/bin/sh"},
         {"USER", "builder"}, {"LOGNAME", "builder"}, {"PAGER", "cat"},
@@ -265,6 +315,8 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             "CC", "CXX", "LD", "CPPFLAGS", "CFLAGS", "CXXFLAGS",
             "LDFLAGS", "RUSTFLAGS", "DESTDIR", "PREFIX", "MAKEFLAGS",
             "CARGO_BUILD_JOBS", "LC_ALL", "LANG", "TZ", "SOURCE_DATE_EPOCH",
+            "FORCE_SOURCE_DATE", "PYTHONHASHSEED", "ARFLAGS", "ZERO_AR_DATE",
+            "CARGO_INCREMENTAL", "CARGO_TERM_COLOR", "DEBUGINFOD_URLS",
             "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "TMPDIR",
             "CARGO_HOME", "RUSTUP_HOME", "XDG_CONFIG_HOME",
         };
@@ -312,10 +364,30 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     std::string command) {
         plan.steps.push_back({std::move(name), std::move(cwd), std::move(command)});
     };
+    const auto custom_cwd = [&](std::string_view cwd) -> std::filesystem::path {
+        if (cwd == "package") return paths.package;
+        if (cwd == "build") return build;
+        return source;
+    };
+    const auto custom_steps = [&](std::string_view phase) {
+        for (const auto& custom : spec.steps) {
+            if (custom.phase != phase) continue;
+            step("custom-" + custom.name, custom_cwd(custom.cwd), custom.command);
+        }
+    };
     for (const auto& patch : spec.patches) {
         step("patch", source, std::format("patch -p{} --forward --input {}",
             spec.patch_strip, shell_quote((paths.source / "distfiles" / patch).string())));
     }
+    // Source archives carry upstream mtimes and patches/create steps otherwise
+    // inherit the wall clock. Normalize the entire input tree before any
+    // backend sees it; package archives already use the same epoch for their
+    // tar members.
+    step("normalize-source", source,
+        "find " + shell_quote(paths.source.string())
+        + " -depth -exec touch -h -d "
+        + shell_quote("@" + std::to_string(cfg.source_date_epoch)) + " {} +");
+    custom_steps("prepare");
 
     const auto options = join_args(spec.configure_options);
     const auto build_targets = join_args(spec.build_targets);
@@ -355,7 +427,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     "--runstatedir"};
                 if (std::ranges::any_of(install_options, [&](std::string_view name) {
                         return option == name || option.starts_with(std::string(name) + "=");
-                    }))
+                    }) && !canonical_autotools_install_option(option))
                     return std::unexpected(
                         "Autotools installation directory is Sage-managed: " + option);
             }
@@ -379,11 +451,16 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     + (options.empty() ? "" : " " + options));
             }
             const auto autotools_cwd = spec.build_dir.empty() ? source : build;
+            custom_steps("pre-build");
             step("build", autotools_cwd, "make" + make_managed_vars + make_vars +
                 (build_targets.empty() ? "" : " " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", autotools_cwd, "make" + make_managed_vars + make_vars + " DESTDIR=" +
                 shell_quote(paths.package.string()) + " " +
                 (install_targets.empty() ? "install" : install_targets));
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         }
         case package::BuildSystem::CMake: {
@@ -422,14 +499,19 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 cmake_arg("CMAKE_CXX_FLAGS", cxxflags) +
                 cmake_arg("CMAKE_EXE_LINKER_FLAGS", ldflags) +
                 cmake_arg("CMAKE_SHARED_LINKER_FLAGS", ldflags));
+            custom_steps("pre-build");
             step("build", source, "cmake --build " + shell_quote(build.string()) +
                 " --parallel " + std::to_string(jobs) +
                 (build_targets.empty() ? "" : " --target " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", source, "DESTDIR=" + shell_quote(paths.package.string()) +
                 (install_targets.empty()
                     ? " cmake --install " + shell_quote(build.string())
                     : " cmake --build " + shell_quote(build.string())
                         + " --target " + install_targets));
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         }
         case package::BuildSystem::Meson:
@@ -462,11 +544,16 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("configure", source, "meson setup " + shell_quote(build.string()) +
                 " --prefix=/usr --libdir=lib --buildtype=release" +
                 (options.empty() ? "" : " " + options));
+            custom_steps("pre-build");
             step("build", source, "meson compile -C " + shell_quote(build.string()) +
                 " -j " + std::to_string(jobs) +
                 (build_targets.empty() ? "" : " " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", source, "DESTDIR=" + shell_quote(paths.package.string()) +
                 " meson install -C " + shell_quote(build.string()) + " --no-rebuild");
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         case package::BuildSystem::Xmake:
             for (const auto& option : spec.configure_options) {
@@ -497,10 +584,15 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 " --cxflags=" + shell_quote(cfg.cppflags) +
                 " --cxxflags=" + shell_quote(cxxflags) +
                 " --ldflags=" + shell_quote(ldflags));
+            custom_steps("pre-build");
             step("build", source, "xmake -j " + std::to_string(jobs) + " --root" +
                 (build_targets.empty() ? "" : " " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", source, "xmake install --root -o " +
                 shell_quote((paths.package / "usr").string()));
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         case package::BuildSystem::Cargo:
             if (!spec.configure_options.empty()) return std::unexpected(
@@ -513,19 +605,40 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     }))
                     return std::unexpected(
                         "Cargo config/root/target-dir are Sage-managed and cannot be overridden");
+            custom_steps("pre-build");
             step("build", source, "cargo build --release --locked" +
                 (build_targets.empty() ? "" : " " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", source, "cargo install --path . --root " +
                 shell_quote((paths.package / "usr").string()) + " --locked --no-track" +
                 (install_targets.empty() ? "" : " " + install_targets));
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         case package::BuildSystem::Make:
             if (!spec.configure_options.empty()) return std::unexpected(
                 "Make has no configure step; use build.variables and targets");
+            custom_steps("pre-build");
             step("build", source, "make" + make_managed_vars + make_vars +
                 (build_targets.empty() ? "" : " " + build_targets));
+            custom_steps("post-build");
+            custom_steps("pre-install");
             step("install", source, "make" + make_managed_vars + make_vars +
                 (install_targets.empty() ? " install" : " " + install_targets));
+            custom_steps("install");
+            custom_steps("post-install");
+            break;
+        case package::BuildSystem::Script:
+            if (!spec.configure_options.empty() || !spec.build_targets.empty()
+                || !spec.install_targets.empty())
+                return std::unexpected(
+                    "Script recipes use build.steps instead of backend targets");
+            custom_steps("pre-build");
+            custom_steps("post-build");
+            custom_steps("pre-install");
+            custom_steps("install");
+            custom_steps("post-install");
             break;
         case package::BuildSystem::Legacy:
             return std::unexpected("Recipe v2 cannot use the legacy build system");
