@@ -7,6 +7,7 @@ import sage.vendor.libarchive;
 import sage.package;
 import sage.util;
 import :core;
+import :detail;
 import :idx;
 import :inspect;
 
@@ -84,6 +85,9 @@ inline std::expected<void, std::string> create_package(
                 fe.type = package::FileType::Symlink;
                 fe.mode = 0777;
                 fe.link_target = std::filesystem::read_symlink(item.path(), ec).generic_string();
+                auto safe_target = normalize_link_target(fe.path, fe.link_target);
+                if (!safe_target) return std::unexpected(safe_target.error());
+                fe.link_target = *safe_target;
             } else if (item.is_directory(ec)) {
                 fe.type = package::FileType::Directory;
                 fe.mode = 0755;
@@ -239,6 +243,21 @@ inline std::expected<void, std::string> generate_repo_index(
         return package.second;
     });
 
+    // A repository is a set of selectable package payloads, so a concrete
+    // file path may not be claimed by two different package names.  The
+    // install transaction protects a target root too, but rejecting the
+    // overlap here catches `foo`/`foo-libs` mistakes before publication and
+    // makes split-package boundaries a repository invariant.  Directory
+    // entries are intentionally ignored: shared empty parents are normal.
+    std::map<std::string, std::pair<std::string, std::string>> payload_owners;
+    const auto split_family = [](std::string_view name) {
+        for (const auto suffix : {std::string_view{"-libs"},
+                                  std::string_view{"-dev"}}) {
+            if (name.ends_with(suffix)) return std::string(name.substr(
+                0, name.size() - suffix.size()));
+        }
+        return std::string(name);
+    };
     for (const auto& [abs_path, rel_path] : packages) {
         auto inspect_res = inspect_package(abs_path);
         if (!inspect_res) {
@@ -246,6 +265,17 @@ inline std::expected<void, std::string> generate_repo_index(
                 "Cannot index package '{}': {}", rel_path, inspect_res.error()));
         }
         const auto& m = inspect_res->manifest;
+        for (const auto& file : inspect_res->data_files) {
+            if (file.type == package::FileType::Directory) continue;
+            auto [it, inserted] = payload_owners.emplace(
+                file.path, std::pair{m.name, rel_path});
+            if (!inserted && it->second.first != m.name
+                && split_family(it->second.first) == split_family(m.name)) {
+                return std::unexpected(std::format(
+                    "Payload path '{}' is claimed by both '{}' and '{}'",
+                    file.path, it->second.second, rel_path));
+            }
+        }
         ss << "[[packages]]\n";
         ss << "name = \"" << quote(m.name) << "\"\n";
         ss << "version = \"" << quote(m.version.ver) << "\"\n";
@@ -268,12 +298,20 @@ inline std::expected<void, std::string> generate_repo_index(
             for (const auto& c : m.conffiles) ss << "    \"" << quote(c) << "\",\n";
             ss << "]\n";
         }
+        if (!m.managed_build_commands.empty()) {
+            ss << "managed_build_commands = [";
+            for (size_t i = 0; i < m.managed_build_commands.size(); ++i)
+                ss << (i ? ", " : "") << "\""
+                   << quote(m.managed_build_commands[i]) << "\"";
+            ss << "]\n";
+        }
         for (const auto& tool : m.managed_build_tools) {
             ss << "[[packages.managed_build_tools]]\n";
             ss << "role = \"" << quote(tool.role) << "\"\n";
             ss << "executable = \"" << quote(tool.executable) << "\"\n";
             ss << "family = \"" << quote(tool.family) << "\"\n";
             ss << "version = \"" << quote(tool.version) << "\"\n";
+            ss << "executions = " << tool.executions << "\n";
             ss << "version_argument = \"--version\"\n";
             if (!tool.parameters.empty()) {
                 ss << "parameters = [";

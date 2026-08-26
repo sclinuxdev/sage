@@ -11,6 +11,15 @@ struct Toolchain {
     std::string cxx;
     std::string linker;
     std::string rustc;
+    // The first four fields are the canonical executables Sage probed.  The
+    // *_for_build fields are deliberately separate: during a build Sage may
+    // substitute an audit wrapper, while manifests continue to name the
+    // executable whose --version was actually inspected.
+    std::string cc_for_build;
+    std::string cxx_for_build;
+    std::string linker_for_build;
+    std::string rustc_for_build;
+    std::string path_for_build;
     std::string compiler_version;
     std::string cxx_version;
     std::string linker_version;
@@ -24,6 +33,8 @@ struct Toolchain {
 struct BuildPaths {
     std::filesystem::path source;
     std::filesystem::path package;
+    std::filesystem::path home;
+    std::filesystem::path temp;
 };
 
 struct BuildStep {
@@ -170,29 +181,57 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             "Sage selected linker '{}' but recipe does not allow it", linker));
 
     BuildPlan plan;
+    const auto cc_exec = tools.cc_for_build.empty() ? tools.cc : tools.cc_for_build;
+    const auto cxx_exec = tools.cxx_for_build.empty() ? tools.cxx : tools.cxx_for_build;
+    const auto linker_exec = tools.linker_for_build.empty() ? tools.linker : tools.linker_for_build;
+    const auto rustc_exec = tools.rustc_for_build.empty() ? tools.rustc : tools.rustc_for_build;
     const auto source = spec.source_subdir.empty()
         ? paths.source : paths.source / spec.source_subdir;
     const auto build = source / spec.build_dir;
     const auto fuse_name = linker == "ld" ? "bfd" : linker;
     const std::string fuse = fuse_name.empty() ? "" : "-fuse-ld=" + fuse_name;
+    // GCC/Clang normally resolve the backend linker through an absolute
+    // collect2 path. `-B` places Sage's logging shim ahead of that lookup,
+    // turning the selected backend into an observed child execution.
+    const auto audit_root = tools.path_for_build.substr(
+        0, tools.path_for_build.find(':'));
+    const std::string audit_prefix = tools.path_for_build.empty()
+        ? "" : " -B" + audit_root;
     const std::string cxxflags = cfg.cxxflags.empty() ? cfg.cflags : cfg.cxxflags;
     const std::string ldflags = cfg.ldflags +
-        (fuse.empty() ? "" : (cfg.ldflags.empty() ? "" : " ") + fuse);
+        (fuse.empty() ? "" : (cfg.ldflags.empty() ? "" : " ") + fuse)
+        + audit_prefix;
     const std::string rustflags = cfg.rustflags
         + (cfg.rustflags.empty() ? "" : " ")
-        + "-C linker=" + tools.cc
-        + (fuse.empty() ? "" : " -C link-arg=" + fuse);
+        + "-C linker=" + cc_exec
+        + (fuse.empty() ? "" : " -C link-arg=" + fuse)
+        + (tools.path_for_build.empty() ? ""
+            : " -C link-arg=-B" + audit_root);
 
     plan.environment = {
-        {"CC", tools.cc}, {"CXX", tools.cxx}, {"LD", tools.linker},
+        {"CC", cc_exec}, {"CXX", cxx_exec}, {"LD", linker_exec},
         {"CPPFLAGS", cfg.cppflags}, {"CFLAGS", cfg.cflags},
         {"CXXFLAGS", cxxflags}, {"LDFLAGS", ldflags},
         {"RUSTFLAGS", rustflags}, {"DESTDIR", paths.package.string()},
         {"PREFIX", "/usr"}, {"MAKEFLAGS", std::format("-j{}", jobs)},
         {"CARGO_BUILD_JOBS", std::to_string(jobs)},
+        {"LC_ALL", "C"}, {"LANG", "C"}, {"TZ", "UTC"},
+        {"SOURCE_DATE_EPOCH", std::to_string(cfg.source_date_epoch)},
+        {"GIT_CONFIG_NOSYSTEM", "1"}, {"GIT_CONFIG_GLOBAL", "/dev/null"},
+        {"TERM", "dumb"}, {"SHELL", "/bin/sh"},
+        {"USER", "builder"}, {"LOGNAME", "builder"}, {"PAGER", "cat"},
     };
+    if (!paths.home.empty()) plan.environment["HOME"] = paths.home.string();
+    if (!paths.temp.empty()) plan.environment["TMPDIR"] = paths.temp.string();
+    if (!paths.home.empty()) {
+        plan.environment["CARGO_HOME"] = (paths.home / ".cargo").string();
+        plan.environment["RUSTUP_HOME"] = (paths.home / ".rustup").string();
+        plan.environment["XDG_CONFIG_HOME"] = (paths.home / ".config").string();
+    }
+    if (!tools.path_for_build.empty()) plan.environment["PATH"] = tools.path_for_build;
+    else plan.environment["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     if (spec.system == package::BuildSystem::Cargo)
-        plan.environment["RUSTC"] = tools.rustc;
+        plan.environment["RUSTC"] = rustc_exec;
     auto valid_env_name = [](std::string_view name) {
         if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name[0]))
                               || name[0] == '_')) return false;
@@ -217,17 +256,20 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     aliases(spec.cppflags_env, cfg.cppflags);
     aliases(spec.ldflags_env, ldflags);
     aliases(spec.rustflags_env, rustflags);
-    aliases(spec.cc_env, tools.cc);
-    aliases(spec.cxx_env, tools.cxx);
-    aliases(spec.linker_env, tools.linker);
+    aliases(spec.cc_env, cc_exec);
+    aliases(spec.cxx_env, cxx_exec);
+    aliases(spec.linker_env, linker_exec);
 
     const std::set<std::string> managed_names = [&] {
         std::set<std::string> names{
             "CC", "CXX", "LD", "CPPFLAGS", "CFLAGS", "CXXFLAGS",
             "LDFLAGS", "RUSTFLAGS", "DESTDIR", "PREFIX", "MAKEFLAGS",
-            "CARGO_BUILD_JOBS",
+            "CARGO_BUILD_JOBS", "LC_ALL", "LANG", "TZ", "SOURCE_DATE_EPOCH",
+            "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "TMPDIR",
+            "CARGO_HOME", "RUSTUP_HOME", "XDG_CONFIG_HOME",
         };
         if (spec.system == package::BuildSystem::Cargo) names.insert("RUSTC");
+        names.insert("PATH");
         for (const auto* aliases : {&spec.cflags_env, &spec.cxxflags_env,
                                     &spec.cppflags_env, &spec.ldflags_env,
                                     &spec.rustflags_env, &spec.cc_env,
@@ -235,18 +277,28 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             names.insert(aliases->begin(), aliases->end());
         return names;
     }();
+    static constexpr std::array<std::string_view, 23> install_variable_names{
+        "prefix", "exec_prefix", "bindir", "sbindir", "libexecdir", "libdir",
+        "includedir", "oldincludedir", "datarootdir", "datadir", "infodir",
+        "localedir", "mandir", "docdir", "htmldir", "dvidir", "pdfdir", "psdir",
+        "sysconfdir", "sharedstatedir", "localstatedir", "runstatedir", "DESTDIR"};
     for (const auto& [name, _] : spec.variables) {
         if (!valid_env_name(name))
             return std::unexpected("Invalid build.variables name: " + name);
         if (managed_names.contains(name))
             return std::unexpected(
                 "build.variables cannot override Sage-managed channel: " + name);
+        if (std::ranges::contains(install_variable_names, name))
+            return std::unexpected(
+                "build.variables cannot override Sage-managed install directory: " + name);
     }
 
     auto managed_assignment = [&](std::string_view value) {
         const auto equal = value.find('=');
-        return equal != std::string_view::npos
-            && managed_names.contains(std::string(value.substr(0, equal)));
+        if (equal == std::string_view::npos) return false;
+        const auto name = value.substr(0, equal);
+        return managed_names.contains(std::string(name))
+            || std::ranges::contains(install_variable_names, name);
     };
     for (const auto* values : {&spec.configure_options, &spec.build_targets,
                                &spec.install_targets}) {
@@ -292,26 +344,61 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         for (const auto& name : *names) make_channel(name);
 
     switch (spec.system) {
-        case package::BuildSystem::Autotools:
+        case package::BuildSystem::Autotools: {
             for (const auto& option : spec.configure_options) {
-                if (option == "--prefix" || option.starts_with("--prefix="))
+                static constexpr std::array<std::string_view, 22> install_options{
+                    "--prefix", "--exec-prefix", "--bindir", "--sbindir",
+                    "--libexecdir", "--libdir", "--includedir", "--oldincludedir",
+                    "--datarootdir", "--datadir", "--infodir", "--localedir",
+                    "--mandir", "--docdir", "--htmldir", "--dvidir", "--pdfdir",
+                    "--psdir", "--sysconfdir", "--sharedstatedir", "--localstatedir",
+                    "--runstatedir"};
+                if (std::ranges::any_of(install_options, [&](std::string_view name) {
+                        return option == name || option.starts_with(std::string(name) + "=");
+                    }))
                     return std::unexpected(
-                        "Autotools installation prefix is Sage-managed: " + option);
+                        "Autotools installation directory is Sage-managed: " + option);
             }
-            step("configure", source, "./configure --prefix=/usr" +
-                (options.empty() ? "" : " " + options));
-            step("build", source, "make" + make_managed_vars + make_vars +
+            const auto configure_vars = make_vars.empty()
+                ? std::string{}
+                : make_vars.substr(1) + " ";
+            if (spec.build_dir.empty()) {
+                step("configure", source, configure_vars
+                    + "./configure --prefix=/usr --libdir=/usr/lib" +
+                    (options.empty() ? "" : " " + options));
+            } else {
+                // Out-of-tree Autotools projects (glibc is the important
+                // system example) keep generated files out of the source
+                // archive.  The directory is created inside Sage's source
+                // root, and only the relative `../configure` entry point is
+                // reachable from it.
+                step("configure", source, "mkdir -p " + shell_quote(build.string())
+                    + " && cd " + shell_quote(build.string())
+                    + " && " + configure_vars
+                    + "../configure --prefix=/usr --libdir=/usr/lib"
+                    + (options.empty() ? "" : " " + options));
+            }
+            const auto autotools_cwd = spec.build_dir.empty() ? source : build;
+            step("build", autotools_cwd, "make" + make_managed_vars + make_vars +
                 (build_targets.empty() ? "" : " " + build_targets));
-            step("install", source, "make" + make_managed_vars + make_vars + " DESTDIR=" +
+            step("install", autotools_cwd, "make" + make_managed_vars + make_vars + " DESTDIR=" +
                 shell_quote(paths.package.string()) + " " +
                 (install_targets.empty() ? "install" : install_targets));
             break;
+        }
         case package::BuildSystem::CMake: {
             for (const auto& option : spec.configure_options) {
-                if (option.starts_with("-DCMAKE_C_COMPILER")
+                auto upper = option;
+                std::ranges::transform(upper, upper.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::toupper(c));
+                });
+                if (option == "-D" || option.starts_with("-DCMAKE_C_COMPILER")
                     || option.starts_with("-DCMAKE_CXX_COMPILER")
                     || option.starts_with("-DCMAKE_LINKER")
                     || option.starts_with("-DCMAKE_TOOLCHAIN_FILE")
+                    || upper.starts_with("-DCMAKE_INSTALL_")
+                    || upper.starts_with("-DCMAKE_FIND_ROOT_")
+                    || upper.starts_with("-DCMAKE_PREFIX_PATH")
                     || option.starts_with("-DCMAKE_C_FLAGS")
                     || option.starts_with("-DCMAKE_CXX_FLAGS")
                     || option.starts_with("-DCMAKE_EXE_LINKER_FLAGS")
@@ -327,6 +414,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("configure", source, "cmake -S . -B " + shell_quote(build.string()) +
                 (options.empty() ? "" : " " + options) +
                 " -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release" +
+                " -DCMAKE_INSTALL_LIBDIR=lib" +
                 cmake_arg("CMAKE_C_COMPILER", tools.cc) +
                 cmake_arg("CMAKE_CXX_COMPILER", tools.cxx) +
                 cmake_arg("CMAKE_LINKER", tools.linker) +
@@ -346,10 +434,20 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         }
         case package::BuildSystem::Meson:
             for (const auto& option : spec.configure_options) {
+                auto lower = option;
+                std::ranges::transform(lower, lower.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
                 if (option == "--native-file" || option.starts_with("--native-file=")
                     || option == "--cross-file" || option.starts_with("--cross-file=")
                     || option == "--backend" || option.starts_with("--backend=")
-                    || option == "--prefix" || option.starts_with("--prefix=")
+                    || lower == "-d"
+                    || lower.starts_with("-dprefix") || lower.starts_with("-dlibdir")
+                    || lower.starts_with("-dbindir") || lower.starts_with("-dsbindir")
+                    || lower.starts_with("-dincludedir") || lower.starts_with("-ddatadir")
+                    || lower.starts_with("-dsysconfdir") || lower.starts_with("-dlocalstatedir")
+                    || lower.starts_with("-dlocaledir") || lower.starts_with("-dmandir")
+                    || lower.starts_with("-drunstatedir") || lower.starts_with("-dlibexecdir")
                     || option == "--buildtype" || option.starts_with("--buildtype=")
                     || option.starts_with("-Dc_args=")
                     || option.starts_with("-Dcpp_args=")
@@ -362,7 +460,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             if (!spec.install_targets.empty()) return std::unexpected(
                 "Meson install does not accept build.install_targets");
             step("configure", source, "meson setup " + shell_quote(build.string()) +
-                " --prefix=/usr --buildtype=release" +
+                " --prefix=/usr --libdir=lib --buildtype=release" +
                 (options.empty() ? "" : " " + options));
             step("build", source, "meson compile -C " + shell_quote(build.string()) +
                 " -j " + std::to_string(jobs) +
@@ -408,9 +506,13 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             if (!spec.configure_options.empty()) return std::unexpected(
                 "Cargo has no configure step; use build_targets/install_targets");
             for (const auto* values : {&spec.build_targets, &spec.install_targets})
-                if (std::ranges::contains(*values, "--config"))
+                if (std::ranges::any_of(*values, [](const std::string& value) {
+                        return value == "--config" || value.starts_with("--config=")
+                            || value == "--root" || value.starts_with("--root=")
+                            || value == "--target-dir" || value.starts_with("--target-dir=");
+                    }))
                     return std::unexpected(
-                        "Cargo --config can override the Sage-managed toolchain");
+                        "Cargo config/root/target-dir are Sage-managed and cannot be overridden");
             step("build", source, "cargo build --release --locked" +
                 (build_targets.empty() ? "" : " " + build_targets));
             step("install", source, "cargo install --path . --root " +

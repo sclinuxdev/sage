@@ -355,6 +355,12 @@ upstream_regex = 'v(\d+\.\d+\.\d+)'
 [build]
 system = "cmake"
 configure_options = ["-DBUILD_TESTING=OFF"]
+install_files = ["usr/bin/**"]
+install_copies = [{ from = "built/tool", to = "usr/bin/tool" }]
+install_symlinks = [{ path = "usr/bin/cc", target = "clang" }]
+install_moves = [{ from = "usr/libexec/helper", to = "usr/bin/helper" }]
+install_removes = ["usr/share/doc/**"]
+install_generates = [{ path = "usr/lib/tool.conf", content = "x\n", mode = 420 }]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
@@ -378,9 +384,33 @@ minimum_version = "1"
 )");
         if (!managed || managed->upstream.url.empty()
             || managed->upstream.version_regex.empty()
+            || managed->managed_build.install_files != std::vector<std::string>{"usr/bin/**"}
+            || managed->managed_build.install_copies.size() != 1
+            || managed->managed_build.install_copies.front().source != "built/tool"
+            || managed->managed_build.install_symlinks.size() != 1
+            || managed->managed_build.install_symlinks.front().target != "clang"
+            || managed->managed_build.install_moves.size() != 1
+            || managed->managed_build.install_removes.size() != 1
+            || managed->managed_build.install_generates.size() != 1
             || !std::ranges::contains(managed->build_deps, "clang >= 1")
             || !std::ranges::contains(managed->build_deps, "lld >= 1")) {
             sage::util::log_error("Recipe v2 upstream/build model did not parse");
+            return 1;
+        }
+        auto managed_outputs = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "managed-outputs"
+version = "1.0.0"
+[build]
+system = "make"
+outputs = [
+  { name = "managed-libs", install_files = ["usr/lib/libmanaged.so.*"] },
+  { name = "managed-dev", install_files = ["usr/include/**"] },
+]
+)");
+        if (!managed_outputs || managed_outputs->managed_build.outputs.size() != 2) {
+            sage::util::log_error("Recipe v2 multi-output model did not parse");
             return 1;
         }
         auto managed_cargo = sage::package::Recipe::parse_toml(R"(
@@ -433,6 +463,46 @@ minimum_version = "1.96.1"
         managed_cfg.cc = "clang";
         managed_cfg.cxx = "clang++";
         managed_cfg.linker = "lld";
+        for (const auto& bad : {
+                std::string(R"(schema_version = 2
+[package]
+name = "bad-meson"
+version = "1"
+[build]
+system = "meson"
+configure_options = ["-Dprefix=/tmp/escape"]
+)"),
+                std::string(R"(schema_version = 2
+[package]
+name = "bad-cargo"
+version = "1"
+[build]
+system = "cargo"
+build_targets = ["--config=/tmp/escape"]
+)"),
+                std::string(R"(schema_version = 2
+[package]
+name = "bad-autotools"
+version = "1"
+[build]
+system = "autotools"
+configure_options = ["--exec-prefix=/tmp/escape"]
+)" )}) {
+            auto parsed_bad = sage::package::Recipe::parse_toml(bad);
+            auto planned_bad = parsed_bad
+                ? sage::build::plan_v2(*parsed_bad, managed_cfg,
+                    {.source = "/tmp/bad-src", .package = "/tmp/bad-pkg"},
+                    {.cc = "clang", .cxx = "clang++", .linker = "lld",
+                     .compiler_version = "22.1", .cxx_version = "22.1",
+                     .linker_version = "22.1", .compiler_family = "clang",
+                     .cxx_family = "clang", .linker_family = "lld"}, 1)
+                : std::expected<sage::build::BuildPlan, std::string>(
+                    std::unexpected("parse"));
+            if (planned_bad) {
+                sage::util::log_error("v2 accepted a backend installation-directory override");
+                return 1;
+            }
+        }
         auto managed_plan = sage::build::plan_v2(
             *managed, managed_cfg,
             {.source = "/tmp/sage-v2-src", .package = "/tmp/sage-v2-pkg"},
@@ -450,6 +520,26 @@ minimum_version = "1.96.1"
             || managed_plan->environment.contains("RUSTC")
             || managed_plan->steps[0].command.find("cmake -S") == std::string::npos) {
             sage::util::log_error("Recipe v2 CMake plan is incomplete");
+            return 1;
+        }
+        auto out_of_tree = *managed;
+        out_of_tree.managed_build.system = sage::package::BuildSystem::Autotools;
+        out_of_tree.managed_build.build_dir = "build";
+        out_of_tree.managed_build.configure_options.clear();
+        out_of_tree.managed_build.install_targets = {"install"};
+        auto out_of_tree_plan = sage::build::plan_v2(
+            out_of_tree, managed_cfg,
+            {.source = "/tmp/sage-autotools-src", .package = "/tmp/sage-autotools-pkg"},
+            {.cc = "clang", .cxx = "clang++", .linker = "lld", .rustc = "rustc",
+             .compiler_version = "22.1.8", .cxx_version = "22.1.8",
+             .linker_version = "22.1.8", .rustc_version = "1.90.0",
+             .compiler_family = "clang", .cxx_family = "clang",
+             .linker_family = "lld", .rustc_family = "rustc"}, 8);
+        if (!out_of_tree_plan
+            || !out_of_tree_plan->steps.front().command.contains("../configure")
+            || out_of_tree_plan->steps[1].work_dir
+                != std::filesystem::path("/tmp/sage-autotools-src/build")) {
+            sage::util::log_error("Managed Autotools out-of-tree plan is incomplete");
             return 1;
         }
         for (auto system : {sage::package::BuildSystem::Meson,
@@ -503,6 +593,19 @@ minimum_version = "1.96.1"
                 && variant_plan->steps[0].command.find("HOSTCC='clang'")
                     == std::string::npos) {
                 sage::util::log_error("Make plan did not enforce custom tool channels");
+                return 1;
+            }
+            if (system == sage::package::BuildSystem::CMake
+                && !variant_plan->steps.front().command.contains(
+                    "CMAKE_INSTALL_LIBDIR=lib")) {
+                sage::util::log_error(
+                    "CMake plan did not enforce Sage's canonical library directory");
+                return 1;
+            }
+            if (system == sage::package::BuildSystem::Meson
+                && !variant_plan->steps.front().command.contains("--libdir=lib")) {
+                sage::util::log_error(
+                    "Meson plan did not enforce Sage's canonical library directory");
                 return 1;
             }
             if (system == sage::package::BuildSystem::Cargo
@@ -560,6 +663,10 @@ channel = "system"
 
 [build]
 system = "make"
+install_files = [
+    "usr/bin/v2makecanary",
+    "usr/share/v2makecanary/**",
+]
 
 [build.flag_env]
 cflags = ["KCFLAGS"]
@@ -585,7 +692,9 @@ minimum_version = "1"
 	$(CC) $(CPPFLAGS) $(CFLAGS) canary.c $(LDFLAGS) -o canary
 install:
 	mkdir -p $(DESTDIR)/usr/bin $(DESTDIR)/usr/share/v2makecanary
+	mkdir -p $(DESTDIR)/usr/include
 	cp canary $(DESTDIR)/usr/bin/v2makecanary
+	printf 'not part of this package\n' > $(DESTDIR)/usr/include/not-selected.h
 	printf '%s|%s|%s' '$(CC)' '$(LD)' '$(CFLAGS)' > $(DESTDIR)/usr/share/v2makecanary/policy
 	printf '%s' '$(MAKEFLAGS)' > $(DESTDIR)/usr/share/v2makecanary/jobs
 	printf '%s' "$$SAGE_TEST_FAKEROOT_ACTIVE" > $(DESTDIR)/usr/share/v2makecanary/fakeroot
@@ -602,31 +711,28 @@ install:
             return it == v2_built->managed_build_tools.end() ? nullptr : &*it;
         };
         const auto* observed_cc = observed_tool("cc");
-        const auto* observed_cxx = observed_tool("cxx");
         const auto* observed_ld = observed_tool("linker");
+        const auto v2_policy = read_text(
+            temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/policy");
         if (!v2_built
-            || read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/policy")
-                != "gcc|ld|-DV2_POLICY=1"
+            || !v2_policy.contains("sage-cc|/tmp/sage-build-")
+            || !v2_policy.contains("sage-linker|-DV2_POLICY=1")
             || !read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/jobs")
                 .contains("-j2")
             || read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/fakeroot") != "1"
             || v2_built->schema_version != 2
             || !observed_cc || observed_cc->executable != "gcc"
             || observed_cc->family != "gcc" || observed_cc->version.empty()
-            || !observed_cxx || observed_cxx->executable != "g++"
-            || observed_cxx->family != "gcc" || observed_cxx->version.empty()
             || !observed_ld || observed_ld->executable != "ld"
             || observed_ld->family != "ld" || observed_ld->version.empty()
             || !std::ranges::contains(observed_cc->parameters,
                 "CFLAGS=-DV2_POLICY=1")
             || !std::ranges::contains(observed_cc->parameters,
                 "KCFLAGS=-DV2_POLICY=1")
-            || !std::ranges::contains(observed_cxx->parameters,
-                "CXXFLAGS=-DV2_POLICY=1")
-            || !std::ranges::contains(observed_ld->parameters,
-                "LDFLAGS=-fuse-ld=bfd")
-            || !std::ranges::contains(observed_ld->parameters,
-                "KBUILD_LDFLAGS=-fuse-ld=bfd")) {
+            || !std::ranges::any_of(observed_ld->parameters,
+                [](const auto& value) { return value.starts_with("LDFLAGS=-fuse-ld=bfd"); })
+            || !std::ranges::any_of(observed_ld->parameters,
+                [](const auto& value) { return value.starts_with("KBUILD_LDFLAGS=-fuse-ld=bfd"); })) {
             sage::util::log_error("Managed v2 Make build did not use Sage policy");
             return 1;
         }
@@ -719,14 +825,22 @@ version = "1.0.0"
             || cargo_cxx != cargo_built->managed_build_tools.end()
             || cargo_linker == cargo_built->managed_build_tools.end()
             || cargo_linker->executable != "ld"
-            || !std::ranges::contains(cargo_linker->parameters,
-                "RUSTFLAGS=-C linker=gcc -C link-arg=-fuse-ld=bfd")
+            || !std::ranges::any_of(cargo_linker->parameters,
+                [](const auto& value) {
+                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/sage-cc")
+                        && value.contains("-C link-arg=-fuse-ld=bfd");
+                })
             || cargo_rustc->executable != "rustc"
             || cargo_rustc->family != "rustc" || cargo_rustc->version.empty()
-            || !std::ranges::contains(cargo_rustc->parameters,
-                "RUSTFLAGS=-C linker=gcc -C link-arg=-fuse-ld=bfd")
+            || !std::ranges::any_of(cargo_rustc->parameters,
+                [](const auto& value) {
+                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/sage-cc")
+                        && value.contains("-C link-arg=-fuse-ld=bfd");
+                })
             || !std::filesystem::exists(
-                temp_dir / "bcfg-v2-cargo-x/usr/bin/v2cargocanary")) {
+                temp_dir / "bcfg-v2-cargo-x/usr/bin/v2cargocanary")
+            || std::filesystem::exists(
+                temp_dir / "bcfg-v2-make-x/usr/include/not-selected.h")) {
             sage::util::log_error(
                 "Managed Cargo build did not preserve its observed rustc identity");
             return 1;
@@ -743,6 +857,20 @@ install = ["make install"]
 )");
         if (unsafe_v2) {
             sage::util::log_error("Recipe v2 accepted a legacy shell command array");
+            return 1;
+        }
+        auto unbounded_split = sage::package::Recipe::parse_toml(R"(
+schema_version = 2
+[package]
+name = "unsafe-libs"
+version = "1"
+release = "1"
+[build]
+system = "make"
+)");
+        if (unbounded_split) {
+            sage::util::log_error(
+                "Recipe v2 accepted a split package without build.install_files");
             return 1;
         }
 

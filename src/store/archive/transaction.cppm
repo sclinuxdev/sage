@@ -421,13 +421,15 @@ public:
         std::string_view stage_rel, std::string_view link_target) {
         auto normalized = normalize_data_path(stage_rel);
         if (!normalized) return std::unexpected(normalized.error());
+        auto safe_target = normalize_link_target(*normalized, link_target);
+        if (!safe_target) return std::unexpected(safe_target.error());
         auto components = detail::rel_components(*normalized);
         const std::string leaf = components.back();
         components.pop_back();
         auto parent = detail::create_anchored_dir_chain(dir_fd_.get(),
             parent_path_text(*normalized), 0700);
         if (!parent) return std::unexpected(parent.error());
-        if (::symlinkat(std::string(link_target).c_str(),
+        if (::symlinkat(safe_target->c_str(),
                 parent->get(), leaf.c_str()) != 0) {
             return std::unexpected(std::format(
                 "Cannot stage symlink '{}': {}", stage_rel, std::strerror(errno)));

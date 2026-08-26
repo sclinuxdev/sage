@@ -37,6 +37,27 @@ inline std::expected<std::string, std::string> normalize_data_path(std::string_v
     return text;
 }
 
+// A symlink target is interpreted relative to the directory containing the
+// link.  The target itself may contain `..` (normal upstream trees commonly
+// use `../lib`), but its normalized result must remain below the archive's
+// data root.  Absolute targets and targets which reach `.METADATA` or the
+// target root are rejected before any inode is created.
+inline std::expected<std::string, std::string> normalize_link_target(
+    std::string_view link_path, std::string_view raw_target) {
+    const std::filesystem::path target(raw_target);
+    if (raw_target.empty() || target.is_absolute() || target.has_root_path())
+        return std::unexpected("Package symlink target must be relative: "
+                               + std::string(raw_target));
+    const auto parent = std::filesystem::path(link_path).parent_path();
+    const auto resolved = (parent / target).lexically_normal();
+    if (resolved.is_absolute() || std::ranges::any_of(resolved,
+            [](const auto& component) { return component == ".."; }))
+        return std::unexpected("Package symlink target escapes the data root: "
+                               + std::string(link_path) + " -> "
+                               + std::string(raw_target));
+    return std::string(raw_target);
+}
+
 inline std::expected<std::string, bool> canonicalize_merge_claim(std::string_view path) {
     static constexpr std::array<std::pair<std::string_view, std::string_view>, 6> aliases{{
         {"usr/sbin", "usr/bin"},

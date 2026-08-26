@@ -34,10 +34,13 @@ struct FileEntry {
 // build. This is an execution observation, not inferred producer provenance:
 // `version` is parsed from this exact executable's `--version` output.
 struct ManagedBuildTool {
-    std::string role;       // cc | cxx | linker | rustc
+    std::string role;       // cc | cxx | linker-driver | linker | rustc
     std::string executable; // exact build.toml command/path Sage invoked
     std::string family;     // gcc | clang | ld | lld | mold
     std::string version;
+    // Number of successful child-process executions observed through Sage's
+    // audit wrapper. A version probe alone never populates a manifest.
+    uint64_t executions{0};
     // Non-empty environment/config channels Sage actually handed to the
     // managed backend for this tool, e.g. CFLAGS=..., KCFLAGS=... or
     // LDFLAGS=.... These are plan observations, not binary inference.
@@ -89,6 +92,9 @@ struct PackageManifest {
     // Empty for recipe v1 and upstream-binary repackaging. Sage populates it
     // only after a managed recipe-v2 build has completed successfully.
     std::vector<ManagedBuildTool> managed_build_tools;
+    // Shell-quoted child invocations captured by Sage's tool audit wrappers.
+    // Empty for v1 and upstream-binary repackaging.
+    std::vector<std::string> managed_build_commands;
 
     // The hook this package publishes for `cap`, if any.
     [[nodiscard]] const CapabilityHook* hook_for(std::string_view cap) const {
@@ -242,6 +248,9 @@ struct PackageManifest {
                 observed.executable = (*tool)["executable"].value_or("");
                 observed.family = (*tool)["family"].value_or("");
                 observed.version = (*tool)["version"].value_or("");
+                auto executions = (*tool)["executions"].value<std::int64_t>();
+                if (executions && *executions >= 0)
+                    observed.executions = static_cast<uint64_t>(*executions);
                 if (auto* parameters = tool->get_as<vendor::toml::array>("parameters")) {
                     for (auto&& parameter : *parameters) {
                         auto value = parameter.value<std::string_view>();
@@ -253,10 +262,13 @@ struct PackageManifest {
                 const std::string version_argument =
                     (*tool)["version_argument"].value_or("");
                 const bool known_role = observed.role == "cc"
-                    || observed.role == "cxx" || observed.role == "linker"
+                    || observed.role == "cxx" || observed.role == "linker-driver"
+                    || observed.role == "linker"
                     || observed.role == "rustc";
                 const bool known_family =
                     ((observed.role == "cc" || observed.role == "cxx")
+                        && (observed.family == "gcc" || observed.family == "clang"))
+                    || (observed.role == "linker-driver"
                         && (observed.family == "gcc" || observed.family == "clang"))
                     || (observed.role == "linker"
                         && (observed.family == "ld" || observed.family == "lld"
@@ -264,9 +276,10 @@ struct PackageManifest {
                     || (observed.role == "rustc" && observed.family == "rustc");
                 if (!known_role || observed.executable.empty()
                     || !known_family || observed.version.empty()
+                    || observed.executions == 0
                     || version_argument != "--version") {
                     return std::unexpected(
-                        "managed_build_tools require a unique cc/cxx/linker/rustc role, executable, family, version and version_argument='--version'");
+                        "managed_build_tools require an actually executed role, executable, family, version, executions and version_argument='--version'");
                 }
                 if (!roles.insert(observed.role).second) return std::unexpected(
                     "managed_build_tools contains a duplicate role: "
@@ -274,6 +287,33 @@ struct PackageManifest {
                 m.managed_build_tools.push_back(std::move(observed));
             }
         }
+        const auto parse_commands = [&](const vendor::toml::table& owner)
+            -> std::expected<void, std::string> {
+            if (auto* commands = owner.get_as<vendor::toml::array>(
+                    "managed_build_commands")) {
+                if (m.schema_version < 2) return std::unexpected(
+                    "managed_build_commands are valid only in package manifest schema v2");
+                for (auto&& command : *commands) {
+                    auto value = command.value<std::string_view>();
+                    if (!value || value->empty()) return std::unexpected(
+                        "managed_build_commands entries must be non-empty strings");
+                    m.managed_build_commands.emplace_back(*value);
+                }
+            }
+            return {};
+        };
+        if (auto result = parse_commands(tbl); !result)
+            return std::unexpected(result.error());
+        if (m.managed_build_commands.empty()) {
+            if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+                if (auto result = parse_commands(*pkg); !result)
+                    return std::unexpected(result.error());
+            }
+        }
+        if (m.schema_version >= 2 && !m.managed_build_tools.empty()
+            && m.managed_build_commands.empty())
+            return std::unexpected(
+                "managed_build_tools require captured managed_build_commands");
 
         return m;
     }
@@ -373,12 +413,20 @@ struct PackageManifest {
             ss << "]\n\n";
         }
 
+        if (!managed_build_commands.empty()) {
+            ss << "managed_build_commands = [";
+            for (size_t i = 0; i < managed_build_commands.size(); ++i)
+                ss << (i ? ", " : "") << "\""
+                   << quote(managed_build_commands[i]) << "\"";
+            ss << "]\n\n";
+        }
         for (const auto& tool : managed_build_tools) {
             ss << "[[managed_build_tools]]\n";
             ss << "role = \"" << quote(tool.role) << "\"\n";
             ss << "executable = \"" << quote(tool.executable) << "\"\n";
             ss << "family = \"" << quote(tool.family) << "\"\n";
             ss << "version = \"" << quote(tool.version) << "\"\n";
+            ss << "executions = " << tool.executions << "\n";
             ss << "version_argument = \"--version\"\n";
             if (!tool.parameters.empty()) {
                 ss << "parameters = [";
@@ -390,7 +438,6 @@ struct PackageManifest {
             }
             ss << "\n";
         }
-
         // Array-of-tables, not bare paths: the per-file hash and mode are what
         // make `sage query files` and integrity verification possible at all,
         // and this serialization is also the LMDB record.

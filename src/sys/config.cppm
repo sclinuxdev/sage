@@ -95,6 +95,10 @@ struct BuildConfig {
     std::string cppflags;
     std::string ldflags;
     std::string rustflags;
+    // Fixed epoch and locale make generated archives independent of the
+    // caller's shell environment.  A non-zero epoch may be selected by the
+    // distributor when it is tied to a source snapshot.
+    std::int64_t source_date_epoch{0};
     // Sage package-operation concurrency (downloads/inspection). Historical
     // build.toml files also used this for compilation, so compile_jobs inherits
     // it when absent.
@@ -129,6 +133,10 @@ struct BuildConfig {
         if (auto v = tbl["cppflags"].value<std::string_view>()) cfg.cppflags = std::string(*v);
         if (auto v = tbl["ldflags"].value<std::string_view>()) cfg.ldflags = std::string(*v);
         if (auto v = tbl["rustflags"].value<std::string_view>()) cfg.rustflags = std::string(*v);
+        if (auto v = tbl["source_date_epoch"].value<std::int64_t>()) {
+            if (*v < 0) return std::unexpected("source_date_epoch must be non-negative");
+            cfg.source_date_epoch = *v;
+        }
         auto parse_jobs = [&](std::string_view key)
             -> std::expected<std::optional<int>, std::string> {
             const auto* node = tbl.get(key);

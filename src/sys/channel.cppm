@@ -219,6 +219,9 @@ struct ChannelIndex {
                             observed.executable = (*tool)["executable"].value_or("");
                             observed.family = (*tool)["family"].value_or("");
                             observed.version = (*tool)["version"].value_or("");
+                            auto executions = (*tool)["executions"].value<std::int64_t>();
+                            if (executions && *executions >= 0)
+                                observed.executions = static_cast<std::uint64_t>(*executions);
                             if (auto* parameters = tool->get_as<vendor::toml::array>(
                                     "parameters")) {
                                 for (auto&& parameter : *parameters) {
@@ -231,7 +234,8 @@ struct ChannelIndex {
                             const std::string version_argument =
                                 (*tool)["version_argument"].value_or("");
                             const bool known =
-                                ((observed.role == "cc" || observed.role == "cxx")
+                                ((observed.role == "cc" || observed.role == "cxx"
+                                    || observed.role == "linker-driver")
                                     && (observed.family == "gcc"
                                         || observed.family == "clang"))
                                 || (observed.role == "linker"
@@ -241,7 +245,7 @@ struct ChannelIndex {
                                 || (observed.role == "rustc"
                                     && observed.family == "rustc");
                             if (!known || observed.executable.empty()
-                                || observed.version.empty()
+                                || observed.version.empty() || observed.executions == 0
                                 || version_argument != "--version") {
                                 return std::unexpected(
                                     "Incomplete managed_build_tools entry in channel index");
@@ -252,6 +256,19 @@ struct ChannelIndex {
                             m.managed_build_tools.push_back(std::move(observed));
                         }
                     }
+                    if (auto* commands = ptab->get_as<vendor::toml::array>(
+                            "managed_build_commands")) {
+                        for (auto&& command : *commands) {
+                            auto value = command.value<std::string_view>();
+                            if (!value || value->empty()) return std::unexpected(
+                                "Managed build command in channel index must be non-empty");
+                            m.managed_build_commands.emplace_back(*value);
+                        }
+                    }
+                    if (!m.managed_build_tools.empty()
+                        && m.managed_build_commands.empty())
+                        return std::unexpected(
+                            "Managed build tools in channel index have no execution audit");
                     if (!m.name.empty()) {
                         idx.available_packages.push_back(std::move(m));
                     }

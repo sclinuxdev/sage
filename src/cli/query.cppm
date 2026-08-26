@@ -221,12 +221,14 @@ export int cmd_query(const CliOptions& opts) {
             std::println("Description: {}", pkg.description);
             std::println("Provides:    {}", sage::util::join(pkg.provides, ", "));
             for (const auto& tool : pkg.managed_build_tools) {
-                std::println("Build {:<7} {} [{} {}] (version source: {} --version)",
+                std::println("Build {:<13} {} [{} {}] ({} executions; version: {} --version)",
                     tool.role + ":", tool.executable, tool.family, tool.version,
-                    tool.executable);
+                    tool.executions, tool.executable);
                 for (const auto& parameter : tool.parameters)
                     std::println("  configured {}", parameter);
             }
+            for (const auto& command : pkg.managed_build_commands)
+                std::println("  executed {}", command);
         } else {
             sage::util::log_error("Package '{}' is not installed", pkg_name);
             return 1;

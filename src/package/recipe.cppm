@@ -49,13 +49,66 @@ struct ToolRequirement {
     std::string minimum_version;
 };
 
+struct InstallCopy {
+    std::string source;
+    std::string destination;
+};
+
+struct InstallSymlink {
+    std::string path;
+    std::string target;
+};
+
+struct InstallMove {
+    std::string source;
+    std::string destination;
+};
+
+struct InstallRemove {
+    std::string path;
+};
+
+struct InstallGenerate {
+    std::string path;
+    std::string content;
+    uint32_t mode{0644};
+};
+
+// One output is a named view of the common DESTDIR.  Sage still emits one
+// archive per recipe invocation; output names let a recipe describe the
+// split-package boundary once and let the build driver select an output with
+// `--output` in a later phase.  The default output is the recipe package.
+struct InstallOutput {
+    std::string name;
+    std::vector<std::string> install_files;
+    std::vector<std::string> install_excludes;
+};
+
 struct ManagedBuildSpec {
     BuildSystem system{BuildSystem::Legacy};
     std::string source_subdir;
-    std::string build_dir{"build"};
+    // Empty means in-tree for Autotools/Make/Xmake/Cargo. CMake and Meson
+    // receive a backend-specific `build` default in the parser below.
+    std::string build_dir;
     std::vector<std::string> configure_options;
     std::vector<std::string> build_targets;
     std::vector<std::string> install_targets;
+    // Paths that may survive the backend's install step.  These are package
+    // payload paths relative to the staging root (for example
+    // `usr/lib/libfoo.so.*`), not DESTDIR-prefixed filesystem paths.  An
+    // empty list preserves the historical "all installed files" behaviour;
+    // split `-libs`/`-dev` recipes are required to spell this allowlist out.
+    std::vector<std::string> install_files;
+    // Optional path globs removed after the allowlist is applied.  Excludes
+    // are useful for a package that takes most of an upstream install but
+    // deliberately leaves a sub-tree to a sibling package.
+    std::vector<std::string> install_excludes;
+    std::vector<InstallCopy> install_copies;
+    std::vector<InstallSymlink> install_symlinks;
+    std::vector<InstallMove> install_moves;
+    std::vector<InstallRemove> install_removes;
+    std::vector<InstallGenerate> install_generates;
+    std::vector<InstallOutput> outputs;
     std::vector<std::string> patches;
     int patch_strip{1};
     std::map<std::string, std::string> variables;
@@ -314,13 +367,131 @@ struct Recipe {
             if (!system) return std::unexpected(system.error());
             r.managed_build.system = *system;
             r.managed_build.source_subdir = (*bld)["source_subdir"].value_or("");
-            r.managed_build.build_dir = (*bld)["build_dir"].value_or("build");
+            r.managed_build.build_dir = (*bld)["build_dir"].value_or(
+                *system == BuildSystem::CMake || *system == BuildSystem::Meson
+                    ? "build" : "");
             r.managed_build.patch_strip = static_cast<int>((*bld)["patch_strip"].value_or(1LL));
             if (r.managed_build.patch_strip < 0 || r.managed_build.patch_strip > 9)
                 return std::unexpected("build.patch_strip must be between 0 and 9");
             parse_strings(*bld, "configure_options", r.managed_build.configure_options);
             parse_strings(*bld, "build_targets", r.managed_build.build_targets);
             parse_strings(*bld, "install_targets", r.managed_build.install_targets);
+            parse_strings(*bld, "install_files", r.managed_build.install_files);
+            parse_strings(*bld, "install_excludes", r.managed_build.install_excludes);
+            auto parse_copy_entries = [&](const char* key,
+                                          std::vector<InstallCopy>& target)
+                -> std::expected<void, std::string> {
+                if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
+                    for (auto&& element : *arr) {
+                        auto* item = element.as_table();
+                        if (!item) return std::unexpected(std::format(
+                            "build.{} entries must be inline tables", key));
+                        auto source = (*item)["from"].value<std::string_view>();
+                        auto destination = (*item)["to"].value<std::string_view>();
+                        if (!source || !destination || source->empty()
+                            || destination->empty()) return std::unexpected(std::format(
+                                "build.{} entries require non-empty from and to", key));
+                        target.push_back({std::string(*source), std::string(*destination)});
+                    }
+                }
+                return {};
+            };
+            auto parse_symlink_entries = [&](const char* key,
+                                             std::vector<InstallSymlink>& target)
+                -> std::expected<void, std::string> {
+                if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
+                    for (auto&& element : *arr) {
+                        auto* item = element.as_table();
+                        if (!item) return std::unexpected(std::format(
+                            "build.{} entries must be inline tables", key));
+                        auto path = (*item)["path"].value<std::string_view>();
+                        auto target_path = (*item)["target"].value<std::string_view>();
+                        if (!path || !target_path || path->empty()
+                            || target_path->empty()) return std::unexpected(std::format(
+                                "build.{} entries require non-empty path and target", key));
+                        target.push_back({std::string(*path), std::string(*target_path)});
+                    }
+                }
+                return {};
+            };
+            if (auto result = parse_copy_entries("install_copies",
+                                                 r.managed_build.install_copies); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_symlink_entries("install_symlinks",
+                                                    r.managed_build.install_symlinks); !result)
+                return std::unexpected(result.error());
+            auto parse_move_entries = [&](const char* key,
+                                          std::vector<InstallMove>& target)
+                -> std::expected<void, std::string> {
+                if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
+                    for (auto&& element : *arr) {
+                        auto* item = element.as_table();
+                        if (!item) return std::unexpected(std::format(
+                            "build.{} entries must be inline tables", key));
+                        auto source = (*item)["from"].value<std::string_view>();
+                        auto destination = (*item)["to"].value<std::string_view>();
+                        if (!source || !destination || source->empty()
+                            || destination->empty()) return std::unexpected(std::format(
+                            "build.{} entries require non-empty from and to", key));
+                        target.push_back({std::string(*source), std::string(*destination)});
+                    }
+                }
+                return {};
+            };
+            auto parse_remove_entries = [&](const char* key,
+                                            std::vector<InstallRemove>& target)
+                -> std::expected<void, std::string> {
+                if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
+                    for (auto&& element : *arr) {
+                        auto path = element.value<std::string_view>();
+                        if (!path || path->empty()) return std::unexpected(std::format(
+                            "build.{} entries must be non-empty strings", key));
+                        target.push_back({std::string(*path)});
+                    }
+                }
+                return {};
+            };
+            if (auto result = parse_move_entries("install_moves",
+                                                r.managed_build.install_moves); !result)
+                return std::unexpected(result.error());
+            if (auto result = parse_remove_entries("install_removes",
+                                                  r.managed_build.install_removes); !result)
+                return std::unexpected(result.error());
+            if (auto* arr = bld->get_as<vendor::toml::array>("install_generates")) {
+                for (auto&& element : *arr) {
+                    auto* item = element.as_table();
+                    if (!item) return std::unexpected(
+                        "build.install_generates entries must be inline tables");
+                    auto path = (*item)["path"].value<std::string_view>();
+                    auto content = (*item)["content"].value<std::string_view>();
+                    auto mode = (*item)["mode"].value<std::int64_t>().value_or(0644);
+                    if (!path || !content || path->empty() || mode < 0 || mode > 07777)
+                        return std::unexpected(
+                            "build.install_generates entries require path/content and a valid mode");
+                    r.managed_build.install_generates.push_back({
+                        std::string(*path), std::string(*content), static_cast<uint32_t>(mode)});
+                }
+            }
+            if (auto* arr = bld->get_as<vendor::toml::array>("outputs")) {
+                for (auto&& element : *arr) {
+                    auto* item = element.as_table();
+                    if (!item) return std::unexpected(
+                        "build.outputs entries must be inline tables");
+                    auto name = (*item)["name"].value<std::string_view>();
+                    if (!name || name->empty()) return std::unexpected(
+                        "build.outputs entries require a non-empty name");
+                    InstallOutput output{.name = std::string(*name)};
+                    if (auto* files = item->get_as<vendor::toml::array>("install_files"))
+                        for (auto&& file : *files)
+                            if (auto value = file.value<std::string_view>())
+                                output.install_files.emplace_back(*value);
+                    if (auto* excludes = item->get_as<vendor::toml::array>("install_excludes"))
+                        for (auto&& exclude : *excludes)
+                            if (auto value = exclude.value<std::string_view>())
+                                output.install_excludes.emplace_back(*value);
+                    r.managed_build.outputs.push_back(std::move(output));
+                }
+            }
             parse_strings(*bld, "patches", r.managed_build.patches);
             parse_strings(*bld, "allowed_compilers", r.managed_build.allowed_compilers);
             parse_strings(*bld, "allowed_linkers", r.managed_build.allowed_linkers);
@@ -342,6 +513,116 @@ struct Recipe {
                 parse_strings(*tools, "cc", r.managed_build.cc_env);
                 parse_strings(*tools, "cxx", r.managed_build.cxx_env);
                 parse_strings(*tools, "linker", r.managed_build.linker_env);
+            }
+
+            const auto validate_payload_patterns = [](const std::vector<std::string>& patterns,
+                                                       std::string_view field)
+                -> std::expected<void, std::string> {
+                for (const auto& pattern : patterns) {
+                    if (pattern.empty() || pattern.starts_with('/')
+                        || std::filesystem::path(pattern).has_root_path()
+                        || std::ranges::any_of(std::filesystem::path(pattern),
+                            [](const auto& part) { return part == ".."; })) {
+                        return std::unexpected(std::format(
+                            "build.{} entries must be non-empty relative paths without '..': {}",
+                            field, pattern));
+                    }
+                    if (pattern.starts_with("data/") || pattern == "data") {
+                        return std::unexpected(std::format(
+                            "build.{} addresses the archive metadata prefix 'data/': {}",
+                            field, pattern));
+                    }
+                }
+                return {};
+            };
+            if (auto result = validate_payload_patterns(r.managed_build.install_files,
+                                                         "install_files"); !result)
+                return std::unexpected(result.error());
+            if (auto result = validate_payload_patterns(r.managed_build.install_excludes,
+                                                         "install_excludes"); !result)
+                return std::unexpected(result.error());
+            const auto validate_payload_path = [](std::string_view path,
+                                                  std::string_view field,
+                                                  bool allow_absolute) -> std::expected<void, std::string> {
+                const std::filesystem::path candidate(path);
+                if (path.empty() || (!allow_absolute && candidate.is_absolute())
+                    || std::ranges::any_of(candidate,
+                        [](const auto& part) { return part == ".."; })) {
+                    return std::unexpected(std::format(
+                        "build.{} path must stay within the source/staging root: {}",
+                        field, path));
+                }
+                return {};
+            };
+            for (const auto& copy : r.managed_build.install_copies) {
+                if (auto result = validate_payload_path(copy.source, "install_copies.from", false);
+                    !result) return std::unexpected(result.error());
+                if (auto result = validate_payload_path(copy.destination,
+                        "install_copies.to", false); !result)
+                    return std::unexpected(result.error());
+            }
+            for (const auto& move : r.managed_build.install_moves) {
+                if (auto result = validate_payload_path(move.source,
+                        "install_moves.from", false); !result)
+                    return std::unexpected(result.error());
+                if (auto result = validate_payload_path(move.destination,
+                        "install_moves.to", false); !result)
+                    return std::unexpected(result.error());
+            }
+            for (const auto& remove : r.managed_build.install_removes) {
+                if (auto result = validate_payload_patterns({remove.path},
+                        "install_removes"); !result)
+                    return std::unexpected(result.error());
+            }
+            for (const auto& generate : r.managed_build.install_generates) {
+                if (auto result = validate_payload_path(generate.path,
+                        "install_generates.path", false); !result)
+                    return std::unexpected(result.error());
+            }
+            std::set<std::string> output_names;
+            for (const auto& output : r.managed_build.outputs) {
+                if (!output_names.insert(output.name).second)
+                    return std::unexpected("build.outputs contains duplicate name: "
+                                           + output.name);
+                if (output.name.find('/') != std::string::npos
+                    || output.name == "." || output.name == "..")
+                    return std::unexpected("build.outputs names must be simple package names");
+                if (auto result = validate_payload_patterns(output.install_files,
+                        "outputs.install_files"); !result)
+                    return std::unexpected(result.error());
+                if (auto result = validate_payload_patterns(output.install_excludes,
+                        "outputs.install_excludes"); !result)
+                    return std::unexpected(result.error());
+                if (output.install_files.empty())
+                    return std::unexpected("build.outputs entries require install_files");
+            }
+            if (!r.managed_build.outputs.empty()
+                && (!r.managed_build.install_files.empty()
+                    || !r.managed_build.install_excludes.empty()))
+                return std::unexpected(
+                    "build.outputs and top-level install_files/install_excludes are mutually exclusive");
+            for (const auto& link : r.managed_build.install_symlinks) {
+                if (auto result = validate_payload_path(link.path,
+                        "install_symlinks.path", false); !result)
+                    return std::unexpected(result.error());
+                const std::filesystem::path target(link.target);
+                const auto parent = std::filesystem::path(link.path).parent_path();
+                const auto resolved = (parent / target).lexically_normal();
+                if (link.target.empty() || target.is_absolute() || target.has_root_path()
+                    || resolved.is_absolute()
+                    || std::ranges::any_of(resolved, [](const auto& part) {
+                        return part == "..";
+                    }))
+                    return std::unexpected(std::format(
+                        "build.install_symlinks.target must remain inside the staging root: {}",
+                        link.target));
+            }
+            if ((r.name.ends_with("-libs") || r.name.ends_with("-dev"))
+                && r.managed_build.install_files.empty()) {
+                return std::unexpected(std::format(
+                    "Recipe v2 split package '{}' must declare build.install_files; "
+                    "the backend install tree is not an implicit package boundary",
+                    r.name));
             }
             if (auto* suite = bld->get_as<vendor::toml::table>("toolchain")) {
                 auto parse_tool = [&](std::string_view kind,

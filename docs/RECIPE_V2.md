@@ -21,7 +21,7 @@ schema_version = 1
 fakeroot = "fakeroot"            # exact command/path; required for recipe execution
 cc = "clang"
 cxx = "clang++"
-linker = "lld"                 # lld | mold | ld, or an executable path
+linker = "ld.lld"              # lld/ld.lld | mold | ld, or an executable path
 fallback_cc = "gcc"
 fallback_cxx = "g++"
 fallback_linker = "ld"
@@ -31,6 +31,7 @@ cxxflags = ""                 # empty mirrors cflags
 cppflags = ""
 ldflags = "-Wl,--as-needed"
 rustflags = "-C target-cpu=x86-64-v3"
+source_date_epoch = 0            # fixed timestamp exported to every phase
 jobs = 0                       # concurrent package fetch/inspection; 0 = hardware
 compile_jobs = 0               # threads inside one package build; 0 = hardware
 ```
@@ -115,6 +116,14 @@ build_dir = "build"            # cmake/meson build directory
 configure_options = []         # project feature choices, never compiler flags
 build_targets = []
 install_targets = []
+install_files = []           # post-install payload allowlist, relative to DESTDIR
+install_excludes = []        # optional post-install payload exclusions
+install_copies = []          # [{ from = "built/file", to = "usr/bin/file" }]
+install_symlinks = []        # [{ path = "usr/bin/sh", target = "bash" }]
+install_moves = []           # [{ from = "usr/libexec/foo", to = "usr/bin/foo" }]
+install_removes = []         # relative globs removed after install
+install_generates = []       # [{ path = "usr/lib/foo.conf", content = "...", mode = 420 }]
+outputs = []                 # [{ name = "foo-libs", install_files = [...] }]
 patches = []
 patch_strip = 1
 allowed_compilers = ["clang", "gcc"]
@@ -126,6 +135,82 @@ shell arrays. `configure_options` and targets are passed as individual quoted
 arguments, so they cannot replace the managed build procedure. Sage also
 rejects compiler/linker/flag assignments and each backend's toolchain override
 options. `[build.variables]` cannot use a Sage-managed name.
+
+`install_targets` names a target understood by the selected build backend; it
+does not define the package boundary. The backend first installs into Sage's
+private `DESTDIR`, then Sage applies `install_files` and
+`install_excludes` against canonical paths below that directory. Globs use the
+same shell-style matching as Sage's query commands. Patterns are relative (for
+example `usr/bin/example` or `usr/lib/libexample.so.*`) and may not contain
+`..`, an absolute path, or the archive metadata prefix `data/`. Every
+`install_files` pattern must match at least one file, and an empty result is a
+build error. This is the mechanism that keeps `foo`, `foo-libs`, and `foo-dev`
+from silently shipping the same upstream install tree. Split package recipes
+whose names end in `-libs` or `-dev` must declare a non-empty allowlist; Sage
+rejects an unbounded split recipe before running the build.
+
+For a normal package that intentionally ships the complete upstream install,
+leave both lists empty. For a split package, make the boundary explicit:
+
+```toml
+[build]
+system = "autotools"
+install_targets = ["install"]
+install_files = [
+    "usr/lib/libexample.so.*",
+    "usr/lib/libexample.so",       # retain a deliberate linker symlink only when needed
+]
+```
+
+The filter runs before ELF dependency scanning, manifest creation and archive
+packing. It never follows symlinks outside the staging root and removes only
+the selected package's private staging files.
+
+Autotools recipes may request an out-of-tree build with `build_dir = "build"`.
+Sage then configures from that directory with `../configure`, runs the build
+and install there, and still owns the canonical `/usr` prefix and `/usr/lib`
+library directory. Leaving `build_dir` empty keeps the upstream in-tree layout
+for projects whose generated files are expected beside their sources.
+
+When an upstream build does not install a required artifact, v2 can express a
+small, deterministic payload transform without reopening arbitrary shell
+execution:
+
+```toml
+install_copies = [
+    { from = "libbz2.so.1.0.8", to = "usr/lib/libbz2.so.1.0.8" },
+]
+install_symlinks = [
+    { path = "usr/lib/libbz2.so.1", target = "libbz2.so.1.0.8" },
+]
+```
+
+Copy sources are relative to the selected source subdirectory; destinations
+are relative to `DESTDIR`. Symlink targets are recorded exactly as declared,
+while their link paths remain anchored below the staging root. Missing copy
+sources are hard errors, so a recipe cannot silently publish an incomplete
+split package.
+
+`install_moves` moves an existing staged artifact, `install_removes` removes
+matching staged paths, and `install_generates` writes a deterministic file with
+the declared mode. All paths stay relative to the package staging root and are
+checked before the operation. Operations run in the order copy, move, remove,
+generate, symlink, then the payload allowlist.
+
+Several outputs can share one build:
+
+```toml
+outputs = [
+  { name = "foo-libs", install_files = ["usr/lib/libfoo.so.*"] },
+  { name = "foo-dev", install_files = ["usr/include/**", "usr/lib/libfoo.so"] },
+]
+```
+
+Sage copies the common staging tree before filtering each output and writes one
+archive per `name`. Top-level `install_files`/`install_excludes` cannot be
+combined with `outputs`, so one output cannot delete another output's files.
+Every upstream symlink is checked during extraction and packing: absolute
+targets and normalized targets that leave the data root are rejected.
 
 ## Package-specific default toolchain
 
@@ -161,10 +246,12 @@ derived build dependencies (`gcc >= 15.1`, `mold >= 2.40`); do not repeat them
 unless the explicit `build_dependencies` constraint is at least as strong.
 The executable names still come exclusively from `/etc/sage/build.toml`.
 
-After a successful managed v2 build, Sage writes only its direct observations
-to the package manifest as `[[managed_build_tools]]`: role, exact configured
-executable, detected family, parsed version, and `version_argument = "--version"`.
-C/C++ builds record `cc`, `cxx`, and `linker`; Cargo also records
+After a successful managed v2 build, Sage writes only roles whose wrappers
+actually executed to `[[managed_build_tools]]`: role, exact configured
+executable, detected family, parsed version, execution count, and
+`version_argument = "--version"`. A pure-C build therefore need not contain a
+synthetic `cxx` entry. C/C++ builds may record `cc`, `cxx`, `linker-driver`, and
+`linker`; Cargo records `rustc`, its linker-driver, and (when it links) the
 `rustc`. These fields are absent from v1 and upstream-prebuilt repackages. They
 mean “configured and probed by Sage”, not “inferred as the producer of every
 payload file”.
@@ -182,11 +269,11 @@ allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 ```
 
-Sage runs CMake with Ninja, `/usr` prefix, Release mode, parallel build and a
-`DESTDIR` install. It passes the selected C/C++ compiler, linker, and all flag
-classes as Sage-generated CMake cache arguments. `install_targets`, when
-present, names custom CMake build targets to run under `DESTDIR` instead of
-the normal `cmake --install` step.
+Sage runs CMake with Ninja, `/usr` prefix, the canonical `/usr/lib` library
+directory, Release mode, parallel build and a `DESTDIR` install. It passes the
+selected C/C++ compiler, linker, and all flag classes as Sage-generated CMake
+cache arguments. `install_targets`, when present, names custom CMake build
+targets to run under `DESTDIR` instead of the normal `cmake --install` step.
 
 ## Meson
 
@@ -199,10 +286,11 @@ configure_options = [
 ]
 ```
 
-Sage runs `meson setup`, `meson compile`, and `meson install`; compiler and
-linker variables are present before setup so Meson observes one toolchain.
-Meson recipes leave `install_targets` empty because `meson install` does not
-accept target names.
+Sage runs `meson setup --prefix=/usr --libdir=lib`, `meson compile`, and
+`meson install`; compiler and linker variables are present before setup so
+Meson observes one toolchain. Recipes cannot override the prefix or library
+directory. Meson recipes leave `install_targets` empty because `meson install`
+does not accept target names.
 
 ## Xmake
 
@@ -231,6 +319,27 @@ Sage runs locked release build/install commands with Cargo tracking metadata
 disabled in the staged root. `RUSTFLAGS`, the Rust linker driver and its
 `-fuse-ld` argument all come from Sage's build policy. Cargo has no
 `configure_options`; its two target arrays hold Cargo build/install arguments.
+`--config`, `--config=...`, `--root`, `--root=...`, `--target-dir`, and
+`--target-dir=...` are rejected because they can redirect either toolchain
+selection or the install tree.
+
+## Reproducibility and execution evidence
+
+Managed v2 steps run through `fakeroot` and a required bubblewrap namespace in
+a clean environment. Sage sets
+`LC_ALL=C`, `LANG=C`, `TZ=UTC`, `SOURCE_DATE_EPOCH` (default 0), `umask 022`,
+private `HOME`/`TMPDIR`/Cargo directories, and disables global Git
+configuration. Caller PATH, proxy, locale and flag variables are not inherited.
+Compiler and linker wrappers record actual child invocations; common bare tool
+names in PATH are fenced, and a `-B` audit prefix makes compiler-driver links
+reach the selected linker wrapper. Bubblewrap also masks the canonical paths
+of common compiler/linker aliases (including versioned names), so an absolute
+path cannot silently select a second toolchain; if bubblewrap is unavailable,
+Sage refuses the v2 build. Sage fails v2 if no configured compiler
+executes, an unmanaged fenced tool is attempted, or a link has no selected
+backend execution. The manifest retains execution counts, supplied flag
+channels and captured child command lines. v1 and upstream-binary
+repackaging intentionally retain no compiler provenance.
 
 ## Make and non-standard projects
 

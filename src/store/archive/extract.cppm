@@ -441,11 +441,17 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         }
 
         if (is_symlink) {
+            auto safe_target = normalize_link_target(rel_path, info->symlink);
+            if (!safe_target) {
+                failed = true;
+                pool.drain();
+                return std::unexpected(safe_target.error());
+            }
             package::FileEntry entry;
             entry.path = rel_path;
             entry.type = package::FileType::Symlink;
             entry.mode = 0777;
-            entry.link_target = info->symlink;
+            entry.link_target = *safe_target;
             std::string redirect_leaf;
             record_entry(std::move(entry), rel_path, std::filesystem::path(rel_path).filename().string(), &redirect_leaf);
             const auto leaf = redirect_leaf.empty()
@@ -462,7 +468,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(parent.error());
             }
             (void)::unlinkat(*parent, leaf.c_str(), 0);
-            if (::symlinkat(info->symlink.c_str(), *parent, leaf.c_str()) != 0) {
+            if (::symlinkat(safe_target->c_str(), *parent, leaf.c_str()) != 0) {
                 failed = true;
                 pool.drain();
                 return std::unexpected(std::format(

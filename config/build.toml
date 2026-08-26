@@ -4,7 +4,7 @@ fakeroot = "fakeroot"
 
 cc = "clang"
 cxx = "clang++"
-linker = "lld"
+linker = "ld.lld"
 fallback_cc = "gcc"
 fallback_cxx = "g++"
 fallback_linker = "ld"

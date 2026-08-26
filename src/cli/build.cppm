@@ -66,12 +66,555 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
     return ToolProbe{std::move(family), "unknown"};
 }
 
+// The backend is allowed to install into the isolated staging root, but the
+// recipe remains the authority over which of those files become package
+// payload.  Apply the allowlist only after the backend has finished: this
+// keeps Autotools/CMake/Meson/etc. free to run their normal install logic while
+// making split packages explicit and reviewable.  All matching is against
+// canonical relative paths below pkg_dir; no pattern can escape that root.
+std::expected<void, std::string> apply_payload_policy(
+    const std::filesystem::path& pkg_dir,
+    const std::vector<std::string>& includes,
+    const std::vector<std::string>& excludes)
+{
+    if (includes.empty() && excludes.empty()) return {};
+    if (!std::filesystem::exists(pkg_dir))
+        return std::unexpected("Install payload staging root does not exist: "
+                               + pkg_dir.string());
+
+    struct Entry {
+        std::filesystem::path disk;
+        std::string relative;
+        bool directory{false};
+        bool symlink{false};
+    };
+    std::vector<Entry> entries;
+    std::error_code ec;
+    for (const auto& item : std::filesystem::recursive_directory_iterator(
+             pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+        if (ec) return std::unexpected("Cannot inspect staged payload: " + ec.message());
+        const auto relative = item.path().lexically_relative(pkg_dir).generic_string();
+        if (relative.empty() || relative == ".") continue;
+        const bool symlink = item.is_symlink(ec);
+        if (ec) return std::unexpected("Cannot inspect staged payload entry '" + relative
+                                      + "': " + ec.message());
+        const bool directory = !symlink && item.is_directory(ec);
+        if (ec) return std::unexpected("Cannot inspect staged payload entry '" + relative
+                                      + "': " + ec.message());
+        entries.push_back({item.path(), relative, directory, symlink});
+    }
+
+    const auto matches = [](const std::vector<std::string>& patterns,
+                            std::string_view path) {
+        return std::ranges::any_of(patterns, [&](const auto& pattern) {
+            return sage::util::glob_match(pattern, path);
+        });
+    };
+    std::vector<bool> include_seen(includes.size(), false);
+    std::size_t payload_entries = 0;
+    for (const auto& entry : entries) {
+        // Directories are retained only when at least one selected child
+        // remains; they are pruned in the reverse walk below.
+        if (entry.directory && !entry.symlink) continue;
+        bool selected = includes.empty();
+        for (std::size_t i = 0; i < includes.size(); ++i) {
+            if (!sage::util::glob_match(includes[i], entry.relative)) continue;
+            selected = true;
+            include_seen[i] = true;
+        }
+        if (matches(excludes, entry.relative)) selected = false;
+        if (!selected) {
+            std::filesystem::remove(entry.disk, ec);
+            if (ec) return std::unexpected("Cannot remove excluded staged payload '"
+                                           + entry.relative + "': " + ec.message());
+        } else {
+            ++payload_entries;
+        }
+    }
+
+    // Remove directories which became empty.  Never recurse through a
+    // symlink, and never remove the staging root itself.
+    std::ranges::sort(entries, [](const Entry& left, const Entry& right) {
+        return left.relative.size() > right.relative.size();
+    });
+    for (const auto& entry : entries) {
+        if (!entry.directory || entry.symlink) continue;
+        const bool empty = std::filesystem::is_empty(entry.disk, ec);
+        if (ec) return std::unexpected("Cannot inspect staged payload directory '"
+                                       + entry.relative + "': " + ec.message());
+        if (empty) {
+            std::filesystem::remove(entry.disk, ec);
+            if (ec) return std::unexpected("Cannot prune staged payload directory '"
+                                           + entry.relative + "': " + ec.message());
+        }
+    }
+    if (payload_entries == 0)
+        return std::unexpected("build.install_files selected no payload files");
+    for (std::size_t i = 0; i < include_seen.size(); ++i) {
+        if (!include_seen[i]) return std::unexpected(std::format(
+            "build.install_files pattern '{}' matched no installed payload",
+            includes[i]));
+    }
+    return {};
+}
+
+std::expected<void, std::string> apply_install_transforms(
+    const std::filesystem::path& source_dir,
+    const std::filesystem::path& pkg_dir,
+    const std::vector<sage::package::InstallCopy>& copies,
+    const std::vector<sage::package::InstallSymlink>& symlinks,
+    const std::vector<sage::package::InstallMove>& moves,
+    const std::vector<sage::package::InstallRemove>& removes,
+    const std::vector<sage::package::InstallGenerate>& generates)
+{
+    std::error_code ec;
+    const auto safe_relative = [](const std::filesystem::path& path) {
+        return !path.empty() && !path.is_absolute() && !path.has_root_path()
+            && std::ranges::none_of(path, [](const auto& part) { return part == ".."; });
+    };
+    for (const auto& copy : copies) {
+        const auto source = source_dir / copy.source;
+        const auto destination = pkg_dir / copy.destination;
+        if (!std::filesystem::is_regular_file(source, ec)) {
+            if (ec) return std::unexpected("Cannot inspect install copy source '"
+                                           + source.string() + "': " + ec.message());
+            return std::unexpected("Install copy source does not exist: "
+                                   + source.string());
+        }
+        std::filesystem::create_directories(destination.parent_path(), ec);
+        if (ec) return std::unexpected("Cannot create install copy directory for '"
+                                       + destination.string() + "': " + ec.message());
+        if (!std::filesystem::copy_file(source, destination,
+                std::filesystem::copy_options::overwrite_existing, ec)) {
+            if (ec) return std::unexpected("Cannot copy install artifact '"
+                                           + source.string() + "' to '"
+                                           + destination.string() + "': " + ec.message());
+            return std::unexpected("Cannot copy install artifact '" + source.string()
+                                   + "' to '" + destination.string() + "'");
+        }
+    }
+    for (const auto& move : moves) {
+        if (!safe_relative(move.source) || !safe_relative(move.destination))
+            return std::unexpected("Install move path escapes the staging root");
+        const auto source = pkg_dir / move.source;
+        const auto destination = pkg_dir / move.destination;
+        if (!std::filesystem::exists(source, ec)) {
+            if (ec) return std::unexpected("Cannot inspect install move source '"
+                                           + source.string() + "': " + ec.message());
+            return std::unexpected("Install move source does not exist: " + source.string());
+        }
+        std::filesystem::create_directories(destination.parent_path(), ec);
+        if (ec) return std::unexpected("Cannot create install move directory: " + ec.message());
+        std::filesystem::remove_all(destination, ec);
+        if (ec) return std::unexpected("Cannot replace install move destination '"
+                                       + destination.string() + "': " + ec.message());
+        std::filesystem::rename(source, destination, ec);
+        if (ec) return std::unexpected("Cannot move staged payload '" + source.string()
+                                       + "' to '" + destination.string() + "': " + ec.message());
+    }
+    for (const auto& remove : removes) {
+        if (!safe_relative(remove.path))
+            return std::unexpected("Install remove path escapes the staging root");
+        std::vector<std::filesystem::path> matches;
+        for (const auto& item : std::filesystem::recursive_directory_iterator(
+                 pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) return std::unexpected("Cannot inspect staged payload for removal: "
+                                           + ec.message());
+            const auto rel = item.path().lexically_relative(pkg_dir).generic_string();
+            if (sage::util::glob_match(remove.path, rel)) matches.push_back(item.path());
+        }
+        if (matches.empty()) return std::unexpected(
+            "Install remove pattern matched no staged payload: " + remove.path);
+        std::ranges::sort(matches, [](const auto& left, const auto& right) {
+            return left.string().size() > right.string().size();
+        });
+        for (const auto& path : matches) {
+            std::filesystem::remove_all(path, ec);
+            if (ec) return std::unexpected("Cannot remove generated payload '"
+                                           + path.string() + "': " + ec.message());
+        }
+    }
+    for (const auto& generate : generates) {
+        if (!safe_relative(generate.path))
+            return std::unexpected("Install generate path escapes the staging root");
+        const auto destination = pkg_dir / generate.path;
+        std::filesystem::create_directories(destination.parent_path(), ec);
+        if (ec) return std::unexpected("Cannot create generated payload directory: "
+                                       + ec.message());
+        std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+        if (!out) return std::unexpected("Cannot create generated payload: "
+                                         + destination.string());
+        out << generate.content;
+        out.close();
+        std::filesystem::permissions(destination,
+            static_cast<std::filesystem::perms>(generate.mode),
+            std::filesystem::perm_options::replace, ec);
+        if (ec) return std::unexpected("Cannot set generated payload mode for '"
+                                       + destination.string() + "': " + ec.message());
+    }
+    for (const auto& link : symlinks) {
+        if (!safe_relative(link.path))
+            return std::unexpected("Install symlink path escapes the staging root");
+        const std::filesystem::path target(link.target);
+        const auto resolved = (std::filesystem::path(link.path).parent_path()
+                               / target).lexically_normal();
+        if (target.is_absolute() || target.has_root_path() || resolved.is_absolute()
+            || std::ranges::any_of(resolved, [](const auto& part) { return part == ".."; }))
+            return std::unexpected("Install symlink target escapes the staging root: "
+                                   + link.target);
+        const auto destination = pkg_dir / link.path;
+        std::filesystem::create_directories(destination.parent_path(), ec);
+        if (ec) return std::unexpected("Cannot create install symlink directory for '"
+                                       + destination.string() + "': " + ec.message());
+        std::filesystem::remove(destination, ec);
+        if (ec) return std::unexpected("Cannot replace install symlink '"
+                                       + destination.string() + "': " + ec.message());
+        std::filesystem::create_symlink(link.target, destination, ec);
+        if (ec) return std::unexpected("Cannot create install symlink '"
+                                       + destination.string() + "' -> '"
+                                       + link.target + "': " + ec.message());
+    }
+    return {};
+}
+
 bool probe_fakeroot(std::string_view executable) {
     if (executable.empty()) return false;
     const auto command = sage::build::shell_quote(executable)
         + " --version >/dev/null 2>&1";
     return std::system(command.c_str()) == 0;
 }
+
+// Keep fakeroot's two control variables, but discard the caller's shell
+// environment before entering a recipe.  This prevents PATH, locale, Cargo
+// config, compiler flags and proxy variables from silently changing a build.
+// Sage's deterministic variables are exported by the managed plan (or by the
+// legacy phase adapter) inside the clean shell.
+std::string hermetic_shell(std::string_view script,
+                           std::string_view sandbox_prefix = {}) {
+    const std::string runner = sandbox_prefix.empty()
+        ? "/bin/sh" : std::string(sandbox_prefix) + " -- /bin/sh";
+    return "umask 022; exec env -i FAKEROOTKEY=\"$FAKEROOTKEY\" "
+        "LD_PRELOAD=\"$LD_PRELOAD\" "
+        "SAGE_TEST_FAKEROOT_ACTIVE=\"$SAGE_TEST_FAKEROOT_ACTIVE\" "
+        + runner + " -c "
+        + sage::build::shell_quote(script);
+}
+
+// fakeroot itself cannot create a user namespace when it is the outer
+// process (its LD_PRELOAD state is already active).  For the strict v2 path,
+// bubblewrap is therefore outermost and launches the configured fakeroot
+// inside the namespace; the recipe shell remains the fakeroot child.
+std::string sandboxed_fakeroot_shell(std::string_view fakeroot,
+                                     std::string_view script,
+                                     std::string_view sandbox_prefix) {
+    const char* inherited_path = std::getenv("PATH");
+    const std::string launcher_path = inherited_path && *inherited_path
+        ? inherited_path
+        : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const auto inner = "exec " + sage::build::shell_quote(fakeroot)
+        + " -- /bin/sh -c " + sage::build::shell_quote(script);
+    return "umask 022; exec env -i PATH="
+        + sage::build::shell_quote(launcher_path) + " "
+        + std::string(sandbox_prefix) + " -- /bin/sh -c "
+        + sage::build::shell_quote(inner);
+}
+
+struct ToolAudit {
+    std::filesystem::path root;
+    std::filesystem::path log;
+    std::filesystem::path events;
+    std::string cc;
+    std::string cxx;
+    std::string linker;
+    std::string rustc;
+    std::string path;
+    std::string sandbox;
+
+    ToolAudit() = default;
+    ToolAudit(const ToolAudit&) = delete;
+    ToolAudit& operator=(const ToolAudit&) = delete;
+    ToolAudit(ToolAudit&& other) noexcept
+        : root(std::move(other.root)), log(std::move(other.log)),
+          events(std::move(other.events)),
+          cc(std::move(other.cc)), cxx(std::move(other.cxx)),
+          linker(std::move(other.linker)), rustc(std::move(other.rustc)),
+          path(std::move(other.path)), sandbox(std::move(other.sandbox)) {
+        other.root.clear();
+    }
+    ToolAudit& operator=(ToolAudit&& other) noexcept {
+        if (this != &other) {
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+            root = std::move(other.root); log = std::move(other.log);
+            events = std::move(other.events);
+            cc = std::move(other.cc); cxx = std::move(other.cxx);
+            linker = std::move(other.linker); rustc = std::move(other.rustc);
+            path = std::move(other.path); sandbox = std::move(other.sandbox);
+            other.root.clear();
+        }
+        return *this;
+    }
+
+    ~ToolAudit() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+
+    static std::optional<std::filesystem::path> resolve(
+        std::string_view executable) {
+        if (executable.empty()) return std::nullopt;
+        const std::filesystem::path candidate(executable);
+        if (candidate.has_parent_path()) {
+            std::error_code ec;
+            auto absolute = std::filesystem::weakly_canonical(candidate, ec);
+            if (!ec && std::filesystem::is_regular_file(absolute, ec)) return absolute;
+            return std::nullopt;
+        }
+        const std::string search_path = std::getenv("PATH")
+            ? std::getenv("PATH")
+            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        size_t start = 0;
+        while (start <= search_path.size()) {
+            const auto colon = search_path.find(':', start);
+            const auto dir = search_path.substr(start,
+                colon == std::string::npos ? std::string::npos : colon - start);
+            std::filesystem::path found = std::filesystem::path(dir.empty() ? "." : dir)
+                / candidate;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(found, ec)) {
+                auto absolute = std::filesystem::weakly_canonical(found, ec);
+                if (!ec) return absolute;
+            }
+            if (colon == std::string::npos) break;
+            start = colon + 1;
+        }
+        return std::nullopt;
+    }
+
+    static bool write_executable(const std::filesystem::path& file,
+                                 std::string_view body) {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        out << body;
+        out.close();
+        std::error_code ec;
+        std::filesystem::permissions(file,
+            std::filesystem::perms::owner_read
+                | std::filesystem::perms::owner_write
+                | std::filesystem::perms::owner_exec
+                | std::filesystem::perms::group_read
+                | std::filesystem::perms::group_exec
+                | std::filesystem::perms::others_read
+                | std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::replace, ec);
+        return !ec;
+    }
+
+    bool marker(std::string_view name) const {
+        return executions(name) != 0;
+    }
+
+    std::uint64_t executions(std::string_view name) const {
+        std::uint64_t count = 0;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(events, ec)) {
+            if (entry.path().filename().string().starts_with(
+                    "mark-" + std::string(name) + "-")) ++count;
+        }
+        return count;
+    }
+
+    std::vector<std::string> commands() const {
+        std::vector<std::string> result;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(events, ec)) {
+            if (!entry.path().filename().string().starts_with("exec-")) continue;
+            std::ifstream in(entry.path());
+            std::ostringstream line;
+            line << in.rdbuf();
+            if (!line.str().empty()) result.push_back(line.str());
+        }
+        std::ranges::sort(result);
+        return result;
+    }
+
+    static std::optional<ToolAudit> create(const sage::build::Toolchain& tools,
+                                           const std::filesystem::path& parent) {
+        auto cc = resolve(tools.cc);
+        auto cxx = resolve(tools.cxx);
+        auto linker = resolve(tools.linker);
+        auto rustc = tools.rustc.empty() ? std::optional<std::filesystem::path>{}
+                                         : resolve(tools.rustc);
+        if (!cc || !cxx || (!tools.linker.empty() && !linker)
+            || (!tools.rustc.empty() && !rustc)) return std::nullopt;
+        ToolAudit audit;
+        audit.root = parent / "tool-audit";
+        audit.log = audit.root / "executions.log";
+        audit.events = audit.root / "events";
+        std::error_code ec;
+        std::filesystem::create_directories(audit.events, ec);
+        if (ec) return std::nullopt;
+        std::filesystem::permissions(audit.root,
+            std::filesystem::perms::owner_all | std::filesystem::perms::group_all
+                | std::filesystem::perms::others_all,
+            std::filesystem::perm_options::replace, ec);
+        if (ec) return std::nullopt;
+        std::filesystem::permissions(audit.events,
+            std::filesystem::perms::owner_all | std::filesystem::perms::group_all
+                | std::filesystem::perms::others_all,
+            std::filesystem::perm_options::replace, ec);
+        if (ec) return std::nullopt;
+        const auto events = sage::build::shell_quote(audit.events.string());
+        // Absolute-path compiler bypasses cannot be audited with PATH alone.
+        // Fail closed when bubblewrap is unavailable instead of claiming
+        // provenance that a recipe could evade.
+        const bool sandboxed = resolve("bwrap").has_value();
+        if (!sandboxed) return std::nullopt;
+        const auto execution_path = [&](std::string_view name,
+                                        const std::filesystem::path& real) {
+            (void)name;
+            return real.string();
+        };
+        const auto fmt = [](std::string_view pattern, auto&&... values) {
+            return std::vformat(pattern, std::make_format_args(values...));
+        };
+        const auto make_driver = [&](std::string_view role,
+                                     const std::filesystem::path& real,
+                                     std::string_view name) {
+            const auto script = fmt(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-{}-$$\n"
+                "link=1\nbackend=0\nfor arg do\n"
+                " case \"$arg\" in -c|-E|-S) link=0;; esac\n"
+                " case \"$arg\" in *-fuse-ld=*|*-fuse-ld-*) backend=1;; esac\n"
+                "done\nprintf '%s\\n' '{}' > {}/mark-{}-$$\n"
+                "[ \"$link\" -eq 1 ] && printf '%s\\n' x > {}/mark-linker-driver-$$\n"
+                "[ \"$link\" -eq 1 ] && printf '%s\\n' x > {}/mark-linker-driver:{}-$$\n"
+                "[ \"$backend\" -eq 1 ] && printf '%s\\n' x > {}/mark-linker-selected-$$\n"
+                "exec {} \"$@\"\n", events, role, role, events, role, events,
+                events, role, events,
+                sage::build::shell_quote(execution_path(name, real)));
+            return write_executable(audit.root / std::string(name), script);
+        };
+        if (!make_driver("cc", *cc, "sage-cc")
+            || !make_driver("cxx", *cxx, "sage-cxx")) return std::nullopt;
+        if (rustc && !make_driver("rustc", *rustc, "sage-rustc")) return std::nullopt;
+        if (linker) {
+            const auto script = fmt(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-linker-$$\n"
+                "printf '%s\\n' x > {}/mark-linker-$$\n"
+                "exec {} \"$@\"\n", events, events,
+                sage::build::shell_quote(execution_path("linker", *linker)));
+            if (!write_executable(audit.root / "sage-linker", script)) return std::nullopt;
+        }
+        const std::array<std::string_view, 15> base_fenced{
+            "cc", "c++", "gcc", "g++", "clang", "clang++", "ld", "ld.bfd",
+            "ld.gold", "ld.lld", "lld", "mold", "ld.mold", "rustc", "ccache"};
+        std::vector<std::string> fenced;
+        for (const auto name : base_fenced) fenced.emplace_back(name);
+        const auto looks_like_tool = [](std::string_view name) {
+            for (const auto prefix : {std::string_view{"cc"}, std::string_view{"c++"},
+                                      std::string_view{"gcc"}, std::string_view{"g++"},
+                                      std::string_view{"clang"}, std::string_view{"clang++"},
+                                      std::string_view{"ld"}, std::string_view{"lld"},
+                                      std::string_view{"mold"}, std::string_view{"rustc"}}) {
+                if (name.starts_with(prefix)
+                    && (name.size() == prefix.size()
+                        || name[prefix.size()] == '-'
+                        || std::isdigit(static_cast<unsigned char>(name[prefix.size()]))))
+                    return true;
+            }
+            return false;
+        };
+        for (const auto& directory : {std::filesystem::path{"/usr/bin"},
+                                      std::filesystem::path{"/bin"},
+                                      std::filesystem::path{"/usr/local/bin"}}) {
+            std::error_code scan_ec;
+            for (const auto& entry : std::filesystem::directory_iterator(directory, scan_ec)) {
+                const auto name = entry.path().filename().string();
+                if (looks_like_tool(name)
+                    && std::ranges::find(fenced, name) == fenced.end())
+                    fenced.push_back(name);
+            }
+        }
+        const auto deny = [&](std::string_view name) {
+            const auto script = fmt(
+                "#!/bin/sh\nprintf '%s\\n' x > {}/mark-unexpected-$$\nprintf '%s\\n' "
+                "'Sage rejected unmanaged tool {}' >&2\nexit 125\n", events, name);
+            return write_executable(audit.root / std::string(name), script);
+        };
+        const auto compiler_alias = [&](std::string_view name) -> std::string_view {
+            if (name.starts_with("rustc")) return audit.rustc;
+            if (name == "c++" || name.starts_with("c++-")
+                || name.starts_with("g++") || name.starts_with("clang++"))
+                return audit.cxx;
+            if (name == "cc" || name.starts_with("cc-")
+                || name.starts_with("gcc") || name.starts_with("clang"))
+                return audit.cc;
+            if (name == "ld" || name.starts_with("ld.") || name.starts_with("ld-")
+                || name == "lld" || name.starts_with("lld-")
+                || name == "mold" || name.starts_with("mold-"))
+                return audit.linker;
+            return {};
+        };
+        const auto alias = [&](std::string_view name, std::string_view target) {
+            if (target.empty()) return false;
+            const auto script = "#!/bin/sh\nexec "
+                + sage::build::shell_quote(target) + " \"$@\"\n";
+            return write_executable(audit.root / std::string(name), script);
+        };
+        for (const auto& name : fenced) {
+            const auto target = compiler_alias(name);
+            if (!(target.empty() ? deny(name) : alias(name, target)))
+                return std::nullopt;
+        }
+        // The selected backend is allowed through PATH and still logs its
+        // real execution.  GCC/Clang look up lld as ld.lld and mold as
+        // ld.mold when -fuse-ld is used.
+        const auto backend_names = tools.linker_family == "lld"
+            ? std::array<std::string_view, 2>{"ld.lld", "lld"}
+            : tools.linker_family == "mold"
+                ? std::array<std::string_view, 2>{"ld.mold", "mold"}
+                : std::array<std::string_view, 2>{"ld", "ld.bfd"};
+        for (const auto name : backend_names) {
+            if (linker) {
+                const auto script = fmt(
+                    "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-linker-$$\n"
+                    "printf '%s\\n' x > {}/mark-linker-$$\n"
+                    "exec {} \"$@\"\n", events, events,
+                    sage::build::shell_quote(execution_path("linker", *linker)));
+                if (!write_executable(audit.root / std::string(name), script))
+                    return std::nullopt;
+            }
+        }
+        if (sandboxed) {
+            audit.sandbox = "bwrap --die-with-parent --ro-bind / / --bind /tmp /tmp"
+                " --dev /dev --proc /proc";
+            const std::array<std::optional<std::filesystem::path>, 4> selected_real{
+                cc, cxx, linker, rustc};
+            for (const auto& name : fenced) {
+                if (auto resolved = resolve(name)) {
+                    if (std::ranges::any_of(selected_real, [&](const auto& selected) {
+                            return selected && *selected == *resolved;
+                        })) continue;
+                    audit.sandbox += " --bind "
+                        + sage::build::shell_quote((audit.root / std::string(name)).string())
+                        + " " + sage::build::shell_quote(resolved->string());
+                }
+            }
+        }
+        audit.cc = (audit.root / "sage-cc").string();
+        audit.cxx = (audit.root / "sage-cxx").string();
+        audit.linker = linker ? (audit.root / "sage-linker").string() : "";
+        audit.rustc = rustc ? (audit.root / "sage-rustc").string() : "";
+        std::set<std::string> tool_dirs;
+        for (const auto& real : {cc, cxx, linker, rustc})
+            if (real) tool_dirs.insert(real->parent_path().string());
+        audit.path = audit.root.string();
+        for (const auto& directory : tool_dirs) audit.path += ":" + directory;
+        audit.path += ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        return std::optional<ToolAudit>(std::move(audit));
+    }
+};
 
 export int cmd_build(const CliOptions& opts) {
     if (opts.args.empty()) {
@@ -210,6 +753,8 @@ export int cmd_build(const CliOptions& opts) {
     // packages from the wrong compiler.
     struct Toolchain {
         std::string cc, cxx, linker, rustc;
+        std::string cc_for_build, cxx_for_build, linker_for_build, rustc_for_build,
+            path_for_build;
         std::string compiler_version, cxx_version, linker_version, rustc_version;
         std::string compiler_family, cxx_family, linker_family, rustc_family;
     };
@@ -230,7 +775,12 @@ export int cmd_build(const CliOptions& opts) {
         if (r.schema_version == 2) {
             const auto& spec = r.managed_build;
             const auto& cf = compiler->family;
-            auto probed_linker = probe_tool(linker_name, true);
+            // `lld` is a generic dispatcher and exits non-zero on --version;
+            // the actual linker executable is ld.lld. Keep accepting the
+            // friendly config alias but record and execute the real driver.
+            const std::string actual_linker = linker_name == "lld"
+                ? "ld.lld" : linker_name;
+            auto probed_linker = probe_tool(actual_linker, true);
             if (!probed_linker) {
                 sage::util::log_warn("Linker '{}' not usable, skipping toolchain", linker_name);
                 return;
@@ -268,11 +818,11 @@ export int cmd_build(const CliOptions& opts) {
                 || linker.version == "unknown") {
                 if (opts.verbose) sage::util::log_info(
                     "Skipping toolchain whose --version output cannot be parsed: CC='{}' CXX='{}' LD='{}'",
-                    cc_name, cxx_name, linker_name);
+                    cc_name, cxx_name, actual_linker);
                 return;
             }
             auto requirement = sage::build::validate_toolchain(r,
-                {.cc = cc_name, .cxx = cxx_name, .linker = linker_name,
+                {.cc = cc_name, .cxx = cxx_name, .linker = actual_linker,
                  .rustc = spec.system == sage::package::BuildSystem::Cargo
                     ? bcfg.rustc : "",
                  .compiler_version = compiler->version,
@@ -291,7 +841,8 @@ export int cmd_build(const CliOptions& opts) {
         }
         candidates.push_back(Toolchain{
             .cc = cc_name, .cxx = cxx_name,
-            .linker = r.schema_version == 2 ? linker_name : "",
+            .linker = r.schema_version == 2
+                ? (linker_name == "lld" ? "ld.lld" : linker_name) : "",
             .rustc = r.managed_build.system == sage::package::BuildSystem::Cargo
                 ? bcfg.rustc : "",
             .compiler_version = std::move(compiler->version),
@@ -361,10 +912,60 @@ export int cmd_build(const CliOptions& opts) {
         }
     }
 
+    const auto hermetic_root = std::filesystem::temp_directory_path()
+        / std::format("sage-build-{}", sage::util::current_pid());
+    std::filesystem::path build_home = hermetic_root / "home";
+    std::filesystem::path build_temp = hermetic_root / "tmp";
+    std::error_code hermetic_ec;
+    std::filesystem::create_directories(build_home, hermetic_ec);
+    std::filesystem::create_directories(build_temp, hermetic_ec);
+    if (hermetic_ec) {
+        sage::util::log_error("Cannot create hermetic build environment: {}",
+                              hermetic_ec.message());
+        return 1;
+    }
+    struct HermeticCleanup {
+        std::filesystem::path root;
+        ~HermeticCleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+    } hermetic_cleanup{hermetic_root};
+
+    std::optional<ToolAudit> tool_audit;
+    if (r.schema_version == 2 && !candidates.empty()) {
+        auto& selected = candidates.front();
+        auto canonical = sage::build::Toolchain{
+            .cc = selected.cc, .cxx = selected.cxx, .linker = selected.linker,
+            .rustc = selected.rustc,
+            .compiler_version = selected.compiler_version,
+            .cxx_version = selected.cxx_version,
+            .linker_version = selected.linker_version,
+            .rustc_version = selected.rustc_version,
+            .compiler_family = selected.compiler_family,
+            .cxx_family = selected.cxx_family,
+            .linker_family = selected.linker_family,
+            .rustc_family = selected.rustc_family};
+        tool_audit = ToolAudit::create(canonical, hermetic_root);
+        if (!tool_audit) {
+            sage::util::log_error(
+                "Cannot create the v2 tool audit fence; refusing to build without actual execution evidence");
+            return 1;
+        }
+        selected.cc_for_build = tool_audit->cc;
+        selected.cxx_for_build = tool_audit->cxx;
+        selected.linker_for_build = tool_audit->linker;
+        selected.rustc_for_build = tool_audit->rustc;
+        selected.path_for_build = tool_audit->path;
+    }
+
     std::filesystem::path dist_dir = recipe_dir / "distfiles";
     std::filesystem::path src_dir = recipe_dir / "src";
     std::filesystem::path pkg_dir = recipe_dir / "pkg";
-
+    if (tool_audit && !tool_audit->sandbox.empty()) {
+        tool_audit->sandbox += " --bind " + sage::build::shell_quote(recipe_dir.string())
+            + " " + sage::build::shell_quote(recipe_dir.string());
+    }
     // Resume mode: keep an already-extracted (and possibly already built)
     // tree so incremental build systems only pay for what changed. Only
     // recipes with a primary archive have a src/ to resume on.
@@ -503,13 +1104,19 @@ export int cmd_build(const CliOptions& opts) {
                 std::string full_cmd = std::format(
                     "export CC=\"{}\" CXX=\"{}\" CPPFLAGS=\"{}\" CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" "
                     "MAKEFLAGS=\"{}\" CARGO_BUILD_JOBS=\"{}\" "
-                    "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}",
+                    "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\" "
+                    "PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\" "
+                    "HOME=\"{}\" TMPDIR=\"{}\" LC_ALL=C LANG=C TZ=UTC SOURCE_DATE_EPOCH=\"{}\" "
+                    "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "
+                    "TERM=dumb SHELL=/bin/sh USER=builder LOGNAME=builder PAGER=cat; "
+                    "cd \"{}\" && {}",
                     cand.cc, cand.cxx, bcfg.cppflags, eff_cflags, eff_cxxflags, bcfg.ldflags,
                     jobs_makeflags, compile_jobs,
                     pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(),
+                    build_home.string(), build_temp.string(), bcfg.source_date_epoch,
                     work_dir.string(), cmd_line);
                 const auto fakeroot_cmd = sage::build::fakeroot_command(
-                    bcfg.fakeroot, full_cmd);
+                    bcfg.fakeroot, hermetic_shell(full_cmd));
                 if (opts.verbose)
                     sage::util::log_info("CMD: {}", fakeroot_cmd);
                 int ret = std::system(fakeroot_cmd.c_str());
@@ -533,9 +1140,15 @@ export int cmd_build(const CliOptions& opts) {
                 && run_phase("install", r.install_cmds);
         } else {
             auto plan = sage::build::plan_v2(
-                r, bcfg, {.source = work_dir, .package = pkg_dir},
+                r, bcfg, {.source = work_dir, .package = pkg_dir,
+                           .home = build_home, .temp = build_temp},
                 {.cc = cand.cc, .cxx = cand.cxx, .linker = cand.linker,
                  .rustc = cand.rustc,
+                 .cc_for_build = cand.cc_for_build,
+                 .cxx_for_build = cand.cxx_for_build,
+                 .linker_for_build = cand.linker_for_build,
+                 .rustc_for_build = cand.rustc_for_build,
+                 .path_for_build = cand.path_for_build,
                  .compiler_version = cand.compiler_version,
                  .cxx_version = cand.cxx_version,
                  .linker_version = cand.linker_version,
@@ -604,8 +1217,11 @@ export int cmd_build(const CliOptions& opts) {
                 const auto full_cmd = exports + "cd "
                     + sage::build::shell_quote(step.work_dir.string())
                     + " && " + step.command;
-                const auto fakeroot_cmd = sage::build::fakeroot_command(
-                    bcfg.fakeroot, full_cmd);
+                const auto fakeroot_cmd = tool_audit && !tool_audit->sandbox.empty()
+                    ? sandboxed_fakeroot_shell(bcfg.fakeroot, full_cmd,
+                                               tool_audit->sandbox)
+                    : sage::build::fakeroot_command(bcfg.fakeroot,
+                        hermetic_shell(full_cmd));
                 if (opts.verbose) sage::util::log_info("CMD: {}", fakeroot_cmd);
                 if (std::system(fakeroot_cmd.c_str()) != 0) {
                     sage::util::log_error("Managed {} step failed: {}",
@@ -638,6 +1254,71 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
     }
+
+    // A backend's DESTDIR is an intermediate install tree, not the package
+    // boundary.  Enforce the recipe's explicit v2 payload policy before ELF
+    // scanning and archive creation so omitted files cannot reappear in the
+    // manifest through a later packaging pass.
+    if (r.schema_version == 2) {
+        const auto transform_source =
+            (!r.source_url.empty() ? src_dir : recipe_dir)
+            / r.managed_build.source_subdir;
+        auto transforms = apply_install_transforms(
+            transform_source, pkg_dir, r.managed_build.install_copies,
+            r.managed_build.install_symlinks,
+            r.managed_build.install_moves,
+            r.managed_build.install_removes,
+            r.managed_build.install_generates);
+        if (!transforms) {
+            sage::util::log_error("Invalid install transform for '{}': {}",
+                                  r.name, transforms.error());
+            return 1;
+        }
+        auto payload = apply_payload_policy(
+            pkg_dir, r.managed_build.install_files,
+            r.managed_build.install_excludes);
+        if (!payload) {
+            sage::util::log_error("Invalid staged payload for '{}': {}",
+                                  r.name, payload.error());
+            return 1;
+        }
+        if (!tool_audit) {
+            sage::util::log_error("Managed build has no execution audit");
+            return 1;
+        }
+        if (tool_audit->executions("unexpected") != 0) {
+            sage::util::log_error(
+                "The build attempted to execute a compiler/linker outside Sage's selected toolchain");
+            return 1;
+        }
+        const bool cargo = r.managed_build.system
+            == sage::package::BuildSystem::Cargo;
+        const auto compiler_execs = tool_audit->executions("cc")
+            + tool_audit->executions("cxx");
+        const auto rustc_execs = tool_audit->executions("rustc");
+        if ((cargo && rustc_execs == 0) || (!cargo && compiler_execs == 0)) {
+            sage::util::log_error(
+                "No Sage audit marker proves that the configured compiler executed");
+            return 1;
+        }
+        const auto link_driver_execs = tool_audit->executions("linker-driver");
+        const auto linker_execs = tool_audit->executions("linker");
+        if (link_driver_execs != 0 && linker_execs == 0) {
+            sage::util::log_error(
+                "A compiler linker-driver executed without the selected linker backend");
+            return 1;
+        }
+        bool has_elf = false;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir)) {
+            if (!entry.is_regular_file()) continue;
+            if (sage::util::scan_elf(entry.path())) { has_elf = true; break; }
+        }
+        if (has_elf && linker_execs == 0) {
+            sage::util::log_error(
+                "ELF payload exists but no selected linker execution was observed");
+            return 1;
+        }
+    }
     // 3. Automated ELF Scanner for DT_SONAME & DT_NEEDED
     sage::package::PackageManifest manifest;
     manifest.schema_version = r.schema_version;
@@ -654,27 +1335,57 @@ export int cmd_build(const CliOptions& opts) {
     manifest.triggers = r.triggers;
     if (r.schema_version == 2) {
         const auto& tools = candidates.front();
+        const auto normalize_audit_text = [&](std::string value) {
+            return sage::build::replace_all(std::move(value), hermetic_root.string(),
+                                            "<sage-build>");
+        };
+        for (auto command : tool_audit->commands())
+            manifest.managed_build_commands.push_back(normalize_audit_text(std::move(command)));
+        const auto normalize_parameters = [&](std::vector<std::string>& parameters) {
+            for (auto& parameter : parameters)
+                parameter = normalize_audit_text(std::move(parameter));
+        };
+        normalize_parameters(managed_cc_parameters);
+        normalize_parameters(managed_cxx_parameters);
+        normalize_parameters(managed_linker_parameters);
+        normalize_parameters(managed_rustc_parameters);
+        const auto add_tool = [&](std::string role, std::string executable,
+                                  std::string family, std::string version,
+                                  std::vector<std::string> parameters,
+                                  std::uint64_t executions) {
+            if (executions == 0) return;
+            manifest.managed_build_tools.push_back({
+                .role = std::move(role), .executable = std::move(executable),
+                .family = std::move(family), .version = std::move(version),
+                .executions = executions, .parameters = std::move(parameters)});
+        };
         if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
-            manifest.managed_build_tools = {
-                {.role = "linker", .executable = tools.linker,
-                 .family = tools.linker_family, .version = tools.linker_version,
-                 .parameters = managed_linker_parameters},
-                {.role = "rustc", .executable = tools.rustc,
-                 .family = tools.rustc_family, .version = tools.rustc_version,
-                 .parameters = managed_rustc_parameters},
-            };
+            add_tool("linker-driver", tools.cc, tools.compiler_family,
+                     tools.compiler_version, managed_linker_parameters,
+                     tool_audit->executions("linker-driver"));
+            add_tool("linker", tools.linker, tools.linker_family,
+                     tools.linker_version, managed_linker_parameters,
+                     tool_audit->executions("linker"));
+            add_tool("rustc", tools.rustc, tools.rustc_family,
+                     tools.rustc_version, managed_rustc_parameters,
+                     tool_audit->executions("rustc"));
         } else {
-            manifest.managed_build_tools = {
-                {.role = "cc", .executable = tools.cc,
-                 .family = tools.compiler_family, .version = tools.compiler_version,
-                 .parameters = managed_cc_parameters},
-                {.role = "cxx", .executable = tools.cxx,
-                 .family = tools.cxx_family, .version = tools.cxx_version,
-                 .parameters = managed_cxx_parameters},
-                {.role = "linker", .executable = tools.linker,
-                 .family = tools.linker_family, .version = tools.linker_version,
-                 .parameters = managed_linker_parameters},
-            };
+            add_tool("cc", tools.cc, tools.compiler_family, tools.compiler_version,
+                     managed_cc_parameters, tool_audit->executions("cc"));
+            add_tool("cxx", tools.cxx, tools.cxx_family, tools.cxx_version,
+                     managed_cxx_parameters, tool_audit->executions("cxx"));
+            const auto driver = tool_audit->executions("linker-driver");
+            add_tool("linker-driver",
+                     tool_audit->executions("linker-driver:cc")
+                         ? tools.cc : tools.cxx,
+                     tool_audit->executions("linker-driver:cc")
+                         ? tools.compiler_family : tools.cxx_family,
+                     tool_audit->executions("linker-driver:cc")
+                         ? tools.compiler_version : tools.cxx_version,
+                     managed_linker_parameters, driver);
+            add_tool("linker", tools.linker, tools.linker_family,
+                     tools.linker_version, managed_linker_parameters,
+                     tool_audit->executions("linker"));
         }
     }
 
@@ -795,16 +1506,92 @@ export int cmd_build(const CliOptions& opts) {
         }
     }
 
-    // 4. Archive Creation
-    std::string out_name = std::format("{}-{}-{}-{}.pkg.tar.zst", r.name, r.version.ver, r.version.rel, manifest.arch);
-    std::filesystem::path out_path = recipe_dir / out_name;
-    auto pack_res = sage::archive::create_package(manifest, pkg_dir, out_path);
-    if (!pack_res) {
-        sage::util::log_error("Package packaging failed: {}", pack_res.error());
-        return 1;
+    // 4. Archive creation.  A v2 recipe may name several output views of the
+    // same install tree.  Each view is copied before filtering, so one output
+    // cannot delete a file another output owns; every archive receives its own
+    // ELF-provided sonames and dependencies.
+    struct OutputPath {
+        std::string name;
+        std::filesystem::path data;
+    };
+    std::vector<OutputPath> output_paths;
+    if (r.schema_version == 2 && !r.managed_build.outputs.empty()) {
+        for (const auto& output : r.managed_build.outputs) {
+            const auto data = hermetic_root / ("output-" + output.name);
+            std::error_code output_ec;
+            std::filesystem::remove_all(data, output_ec);
+            std::filesystem::copy(pkg_dir, data,
+                std::filesystem::copy_options::recursive
+                    | std::filesystem::copy_options::copy_symlinks, output_ec);
+            if (output_ec) {
+                sage::util::log_error("Cannot clone payload for output '{}': {}",
+                                      output.name, output_ec.message());
+                return 1;
+            }
+            auto payload = apply_payload_policy(data, output.install_files,
+                                                 output.install_excludes);
+            if (!payload) {
+                sage::util::log_error("Invalid payload for output '{}': {}",
+                                      output.name, payload.error());
+                return 1;
+            }
+            output_paths.push_back({output.name, data});
+        }
+    } else {
+        output_paths.push_back({r.name, pkg_dir});
     }
 
-    sage::util::log_success("Package built successfully: {}", out_path.string());
+    for (const auto& output : output_paths) {
+        auto output_manifest = manifest;
+        output_manifest.name = output.name;
+        if (output.name != r.name) {
+            output_manifest.provides = r.provides;
+            output_manifest.dependencies = r.host_deps;
+            std::set<std::string> output_self_sonames;
+            std::set<std::string> output_needed_sonames;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(output.data)) {
+                if (entry.is_symlink()) {
+                    const auto base = entry.path().filename().string();
+                    if (base.starts_with("lib") && base.find(".so") != std::string::npos)
+                        output_self_sonames.insert(base);
+                    continue;
+                }
+                if (!entry.is_regular_file()) continue;
+                const auto base = entry.path().filename().string();
+                if (base.starts_with("lib") && base.find(".so") != std::string::npos)
+                    output_self_sonames.insert(base);
+                auto elf = sage::util::scan_elf(entry.path());
+                if (!elf) continue;
+                if (!elf->soname.empty()) output_self_sonames.insert(elf->soname);
+                output_needed_sonames.insert(elf->needed.begin(), elf->needed.end());
+            }
+            for (const auto& soname : output_self_sonames)
+                output_manifest.provides.push_back("so:" + soname);
+            for (const auto& soname : output_needed_sonames)
+                if (!output_self_sonames.contains(soname))
+                    output_manifest.dependencies.push_back(
+                        sage::package::Dependency::parse("so:" + soname));
+            std::unordered_set<std::string> seen_provides;
+            std::erase_if(output_manifest.provides, [&](const std::string& value) {
+                return !seen_provides.insert(value).second;
+            });
+            std::unordered_set<std::string> seen_dependencies;
+            std::erase_if(output_manifest.dependencies,
+                [&](const sage::package::Dependency& value) {
+                    return !seen_dependencies.insert(value.to_string()).second;
+                });
+        }
+        std::string out_name = std::format("{}-{}-{}-{}.pkg.tar.zst",
+            output_manifest.name, r.version.ver, r.version.rel, output_manifest.arch);
+        std::filesystem::path out_path = recipe_dir / out_name;
+        auto pack_res = sage::archive::create_package(output_manifest, output.data, out_path);
+        if (!pack_res) {
+            sage::util::log_error("Package '{}' packaging failed: {}",
+                                  output.name, pack_res.error());
+            return 1;
+        }
+        sage::util::log_success("Package built successfully: {}", out_path.string());
+    }
     return 0;
 }
 export int cmd_repo(const CliOptions& opts) {
