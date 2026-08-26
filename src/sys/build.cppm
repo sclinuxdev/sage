@@ -574,13 +574,13 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             // invocation in that environment unless --root is explicit, so
             // Sage owns this backend requirement on all three steps.
             step("configure", source, "xmake f --root -m release" +
-                (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(tools.cc) +
-                " --cxx=" + shell_quote(tools.cxx) + " --ld=" +
+                (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(cc_exec) +
+                " --cxx=" + shell_quote(cxx_exec) + " --ld=" +
                 // Xmake's ld slot is a compiler driver: a raw GNU ld cannot
                 // consume driver options such as -m64 or linked libraries.
                 // The probed linker is still selected truthfully by the
                 // Sage-owned -fuse-ld flag carried in ldflags.
-                shell_quote(tools.cxx) + " --cflags=" + shell_quote(cfg.cflags) +
+                shell_quote(cxx_exec) + " --cflags=" + shell_quote(cfg.cflags) +
                 " --cxflags=" + shell_quote(cfg.cppflags) +
                 " --cxxflags=" + shell_quote(cxxflags) +
                 " --ldflags=" + shell_quote(ldflags));

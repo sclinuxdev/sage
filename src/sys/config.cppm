@@ -83,6 +83,10 @@ struct BuildConfig {
     // phase/managed build step is routed through it; Sage never silently
     // degrades to an unvirtualized build environment.
     std::string fakeroot{"fakeroot"};
+    // Complete read-only build root exposed by bubblewrap. `/` preserves the
+    // native bootstrap default; distributors can point this at a populated
+    // package sysroot to prevent a build from reading an unrelated host root.
+    std::filesystem::path sysroot{"/"};
     std::string cc{"clang"};
     std::string cxx{"clang++"};
     std::string linker{"lld"};
@@ -121,6 +125,12 @@ struct BuildConfig {
         BuildConfig cfg;
         cfg.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
         if (auto v = tbl["fakeroot"].value<std::string_view>()) cfg.fakeroot = std::string(*v);
+        if (auto v = tbl["sysroot"].value<std::string_view>()) {
+            cfg.sysroot = std::filesystem::path(std::string(*v));
+            if (cfg.sysroot.empty() || !cfg.sysroot.is_absolute()
+                || cfg.sysroot.has_root_name())
+                return std::unexpected("sysroot must be an absolute path");
+        }
         if (auto v = tbl["cc"].value<std::string_view>()) cfg.cc = std::string(*v);
         if (auto v = tbl["cxx"].value<std::string_view>()) cfg.cxx = std::string(*v);
         if (auto v = tbl["linker"].value<std::string_view>()) cfg.linker = std::string(*v);

@@ -1,3 +1,17 @@
+module;
+#include <cerrno>
+#include <csignal>
+#include <cstddef>
+#include <cstring>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 export module sage.cli.build;
 
 // Package authoring: recipe builds and local repository indexing.
@@ -28,7 +42,13 @@ std::optional<ToolProbe> probe_tool(std::string_view tool, bool linker = false) 
         ~Remover() { std::error_code ec; std::filesystem::remove(p, ec); }
     } remover{out};
 
-    int rc = std::system(std::format("\"{}\" --version > \"{}\" 2>&1", tool, out.string()).c_str());
+    // Version probing is part of the reproducibility boundary.  A target
+    // sysroot may not ship the caller's locale (for example C.UTF-8), and
+    // shells can print a locale warning before the tool's real first line.
+    // Force the portable C locale so that the version parser observes the
+    // selected executable rather than an environment diagnostic.
+    int rc = std::system(std::format("LC_ALL=C LANG=C \"{}\" --version > \"{}\" 2>&1",
+                                     tool, out.string()).c_str());
     if (rc != 0) return std::nullopt;
     std::ifstream f(out);
     std::stringstream captured;
@@ -323,6 +343,9 @@ struct ToolAudit {
     std::filesystem::path root;
     std::filesystem::path log;
     std::filesystem::path events;
+    std::filesystem::path process_exec_log;
+    std::filesystem::path sysroot;
+    std::map<std::string, std::vector<std::string>> expected_real_execs;
     std::string cc;
     std::string cxx;
     std::string linker;
@@ -336,6 +359,9 @@ struct ToolAudit {
     ToolAudit(ToolAudit&& other) noexcept
         : root(std::move(other.root)), log(std::move(other.log)),
           events(std::move(other.events)),
+          process_exec_log(std::move(other.process_exec_log)),
+          sysroot(std::move(other.sysroot)),
+          expected_real_execs(std::move(other.expected_real_execs)),
           cc(std::move(other.cc)), cxx(std::move(other.cxx)),
           linker(std::move(other.linker)), rustc(std::move(other.rustc)),
           path(std::move(other.path)), sandbox(std::move(other.sandbox)) {
@@ -347,6 +373,9 @@ struct ToolAudit {
             std::filesystem::remove_all(root, ec);
             root = std::move(other.root); log = std::move(other.log);
             events = std::move(other.events);
+            process_exec_log = std::move(other.process_exec_log);
+            sysroot = std::move(other.sysroot);
+            expected_real_execs = std::move(other.expected_real_execs);
             cc = std::move(other.cc); cxx = std::move(other.cxx);
             linker = std::move(other.linker); rustc = std::move(other.rustc);
             path = std::move(other.path); sandbox = std::move(other.sandbox);
@@ -385,6 +414,40 @@ struct ToolAudit {
                 auto absolute = std::filesystem::weakly_canonical(found, ec);
                 if (!ec) return absolute;
             }
+            if (colon == std::string::npos) break;
+            start = colon + 1;
+        }
+        return std::nullopt;
+    }
+
+    // Resolve the administrator's spelling without collapsing a driver
+    // symlink.  Clang deliberately uses argv[0] (clang vs clang++) to select
+    // C versus C++ defaults, while `resolve()` above must canonicalize the
+    // path for the actual-exec proof.
+    static std::optional<std::filesystem::path> resolve_spelling(
+        std::string_view executable) {
+        if (executable.empty()) return std::nullopt;
+        const std::filesystem::path candidate(executable);
+        const auto absolute_file = [](const std::filesystem::path& path)
+            -> std::optional<std::filesystem::path> {
+            std::error_code ec;
+            auto absolute = std::filesystem::absolute(path, ec);
+            if (ec || !std::filesystem::is_regular_file(absolute, ec))
+                return std::nullopt;
+            return absolute.lexically_normal();
+        };
+        if (candidate.has_parent_path()) return absolute_file(candidate);
+        const std::string search_path = std::getenv("PATH")
+            ? std::getenv("PATH")
+            : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        size_t start = 0;
+        while (start <= search_path.size()) {
+            const auto colon = search_path.find(':', start);
+            const auto dir = search_path.substr(start,
+                colon == std::string::npos ? std::string::npos : colon - start);
+            if (auto found = absolute_file(
+                    std::filesystem::path(dir.empty() ? "." : dir) / candidate))
+                return found;
             if (colon == std::string::npos) break;
             start = colon + 1;
         }
@@ -438,23 +501,62 @@ struct ToolAudit {
         return result;
     }
 
+    std::vector<std::string> process_execs() const {
+        std::vector<std::string> result;
+        std::ifstream in(process_exec_log);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) result.push_back(std::move(line));
+        }
+        return result;
+    }
+
     static std::optional<ToolAudit> create(const sage::build::Toolchain& tools,
-                                           const std::filesystem::path& parent) {
+                                           const std::filesystem::path& parent,
+                                           const std::filesystem::path& build_sysroot) {
         auto cc = resolve(tools.cc);
         auto cxx = resolve(tools.cxx);
         auto linker = resolve(tools.linker);
+        auto cc_driver = resolve_spelling(tools.cc);
+        auto cxx_driver = resolve_spelling(tools.cxx);
+        auto linker_driver = resolve_spelling(tools.linker);
         auto rustc = tools.rustc.empty() ? std::optional<std::filesystem::path>{}
                                          : resolve(tools.rustc);
         if ((!tools.cc.empty() && !cc) || (!tools.cxx.empty() && !cxx)
             || (!tools.linker.empty() && !linker)
             || (!tools.rustc.empty() && !rustc)) return std::nullopt;
+        std::error_code sysroot_ec;
+        const auto sysroot_root = std::filesystem::weakly_canonical(
+            build_sysroot, sysroot_ec);
+        if (build_sysroot.empty() || !build_sysroot.is_absolute()
+            || sysroot_ec || !std::filesystem::is_directory(sysroot_root, sysroot_ec))
+            return std::nullopt;
+        if (build_sysroot != "/") {
+            const auto inside = [&](const std::optional<std::filesystem::path>& path) {
+                if (!path) return true;
+                std::error_code path_ec;
+                const auto canonical = std::filesystem::weakly_canonical(*path, path_ec);
+                if (path_ec) return false;
+                return canonical == sysroot_root
+                    || canonical.string().starts_with(sysroot_root.string() + "/");
+            };
+            if (!inside(cc) || !inside(cxx) || !inside(linker) || !inside(rustc))
+                return std::nullopt;
+        }
         ToolAudit audit;
         audit.root = parent / "tool-audit";
         audit.log = audit.root / "executions.log";
         audit.events = audit.root / "events";
+        audit.process_exec_log = audit.root / "process-exec.log";
+        audit.sysroot = build_sysroot;
         std::error_code ec;
         std::filesystem::create_directories(audit.events, ec);
         if (ec) return std::nullopt;
+        {
+            std::ofstream process_log(audit.process_exec_log,
+                std::ios::out | std::ios::trunc);
+            if (!process_log) return std::nullopt;
+        }
         std::filesystem::permissions(audit.root,
             std::filesystem::perms::owner_all | std::filesystem::perms::group_all
                 | std::filesystem::perms::others_all,
@@ -477,17 +579,79 @@ struct ToolAudit {
         const auto execution_path = [&](std::string_view role,
                                         const std::filesystem::path& real) {
             (void)role;
-            // The namespace later bind-mounts the host root at this mirror.
-            // Keeping the compiler's original directory layout is important
+            // The namespace later bind-mounts the configured sysroot at this
+            // mirror. Keeping the compiler's original directory layout is important
             // for GCC's cc1 lookup and for Clang's resource-dir discovery.
-            return (real_root / real.relative_path()).string();
+            return (real_root / real.lexically_relative(sysroot_root)).string();
+        };
+        const auto execution_paths = [&](std::string_view role,
+                                         const std::filesystem::path& real) {
+            std::vector<std::string> paths{execution_path(role, real)};
+            std::ifstream in(real);
+            std::string first;
+            if (!in || !std::getline(in, first) || !first.starts_with("#!"))
+                return paths;
+            const auto dir = real.parent_path();
+            std::string line;
+            while (std::getline(in, line)) {
+                constexpr std::string_view marker = "exec \"$dir/";
+                const auto begin = line.find(marker);
+                if (begin == std::string::npos) continue;
+                const auto target_begin = begin + marker.size();
+                const auto target_end = line.find('"', target_begin);
+                if (target_end == std::string::npos || target_end == target_begin)
+                    continue;
+                std::error_code ec;
+                const auto target = std::filesystem::weakly_canonical(
+                    dir / line.substr(target_begin, target_end - target_begin), ec);
+                const auto relative = target.lexically_relative(sysroot_root);
+                if (ec || relative.empty() || relative == ".."
+                    || relative.string().starts_with("../")
+                    || !std::filesystem::is_regular_file(target, ec)) continue;
+                const auto path = execution_path(role, target);
+                if (std::ranges::find(paths, path) == paths.end())
+                    paths.push_back(path);
+            }
+            return paths;
+        };
+        const auto namespace_path = [&](const std::filesystem::path& real) {
+            return (std::filesystem::path("/")
+                / real.lexically_relative(sysroot_root)).lexically_normal();
         };
         const auto fmt = [](std::string_view pattern, auto&&... values) {
             return std::vformat(pattern, std::make_format_args(values...));
         };
+        // Execute the canonical file from the read-only host-root mirror,
+        // but retain the administrator's driver spelling in argv[0].  The
+        // canonical compiler path itself may be a bind-mounted Sage wrapper
+        // (for example /usr/bin/gcc -> .../gcc), so following that symlink in
+        // the namespace would recurse into the wrapper forever.  A relative
+        // symlink under tool-audit keeps resolution inside host-root and does
+        // not cross the namespace's bind mounts.
+        const auto real_driver_link = [&](std::string_view role,
+                                          const std::filesystem::path& real,
+                                          const std::filesystem::path& spelling)
+            -> std::optional<std::filesystem::path> {
+            const auto basename = spelling.filename().string();
+            if (basename.empty()) return std::nullopt;
+            const auto link = audit.root / "driver-bin" / std::string(role) / basename;
+            std::filesystem::create_directories(link.parent_path(), ec);
+            if (ec) return std::nullopt;
+            const auto target = std::filesystem::path(execution_path(role, real));
+            const auto relative = target.lexically_relative(link.parent_path());
+            if (relative.empty() || relative.is_absolute()) return std::nullopt;
+            std::filesystem::remove(link, ec);
+            if (ec) return std::nullopt;
+            std::filesystem::create_symlink(relative, link, ec);
+            if (ec) return std::nullopt;
+            return link;
+        };
         const auto make_driver = [&](std::string_view role,
-                                     const std::filesystem::path& real,
+                                     const std::filesystem::path& real_driver,
+                                     const std::filesystem::path& spelling,
                                      std::string_view name) {
+            const auto driver_link = real_driver_link(role, real_driver, spelling);
+            if (!driver_link) return false;
             const auto script = fmt(
                 "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-{}-$$\n"
                 "link=1\nbackend=0\nfor arg do\n"
@@ -499,20 +663,27 @@ struct ToolAudit {
                 "[ \"$backend\" -eq 1 ] && printf '%s\\n' x > {}/mark-linker-selected-$$\n"
                 "exec {} \"$@\"\n", events, role, role, events, role, events,
                 events, role, events,
-                sage::build::shell_quote(execution_path(role, real)));
+                sage::build::shell_quote(driver_link->string()));
             return write_executable(audit.root / std::string(name), script);
         };
-        if (cc && !make_driver("cc", *cc, "sage-cc")) return std::nullopt;
-        if (cxx && !make_driver("cxx", *cxx, "sage-cxx")) return std::nullopt;
-        if (rustc && !make_driver("rustc", *rustc, "sage-rustc")) return std::nullopt;
+        if (cc && cc_driver && !make_driver("cc", *cc, *cc_driver, "sage-cc")) return std::nullopt;
+        if (cxx && cxx_driver && !make_driver("cxx", *cxx, *cxx_driver, "sage-cxx")) return std::nullopt;
+        if (rustc && !make_driver("rustc", *rustc, *rustc, "sage-rustc")) return std::nullopt;
         if (linker) {
+            const auto linker_link = real_driver_link(
+                "linker", *linker, linker_driver.value_or(*linker));
+            if (!linker_link) return std::nullopt;
             const auto script = fmt(
                 "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-linker-$$\n"
                 "printf '%s\\n' x > {}/mark-linker-$$\n"
                 "exec {} \"$@\"\n", events, events,
-                sage::build::shell_quote(execution_path("linker", *linker)));
+                sage::build::shell_quote(linker_link->string()));
             if (!write_executable(audit.root / "sage-linker", script)) return std::nullopt;
         }
+        if (cc) audit.expected_real_execs.emplace("cc", execution_paths("cc", *cc));
+        if (cxx) audit.expected_real_execs.emplace("cxx", execution_paths("cxx", *cxx));
+        if (linker) audit.expected_real_execs.emplace("linker", execution_paths("linker", *linker));
+        if (rustc) audit.expected_real_execs.emplace("rustc", execution_paths("rustc", *rustc));
         const std::array<std::string_view, 15> base_fenced{
             "cc", "c++", "gcc", "g++", "clang", "clang++", "ld", "ld.bfd",
             "ld.gold", "ld.lld", "lld", "mold", "ld.mold", "rustc", "ccache"};
@@ -550,23 +721,26 @@ struct ToolAudit {
             return write_executable(audit.root / std::string(name), script);
         };
         const auto compiler_alias = [&](std::string_view name) -> std::string_view {
-            if (name.starts_with("rustc")) return audit.rustc;
+            if (name.starts_with("rustc")) return rustc ? "sage-rustc" : "";
             if (name == "c++" || name.starts_with("c++-")
                 || name.starts_with("g++") || name.starts_with("clang++"))
-                return audit.cxx;
+                return cxx ? "sage-cxx" : "";
             if (name == "cc" || name.starts_with("cc-")
                 || name.starts_with("gcc") || name.starts_with("clang"))
-                return audit.cc;
+                return cc ? "sage-cc" : "";
             if (name == "ld" || name.starts_with("ld.") || name.starts_with("ld-")
                 || name == "lld" || name.starts_with("lld-")
                 || name == "mold" || name.starts_with("mold-"))
-                return audit.linker;
+                return linker ? "sage-linker" : "";
             return {};
         };
         const auto alias = [&](std::string_view name, std::string_view target) {
             if (target.empty()) return false;
+            const auto target_path = target.starts_with("sage-")
+                ? (audit.root / std::string(target)).string()
+                : std::string(target);
             const auto script = "#!/bin/sh\nexec "
-                + sage::build::shell_quote(target) + " \"$@\"\n";
+                + sage::build::shell_quote(target_path) + " \"$@\"\n";
             return write_executable(audit.root / std::string(name), script);
         };
         for (const auto& name : fenced) {
@@ -574,6 +748,21 @@ struct ToolAudit {
             if (!(target.empty() ? deny(name) : alias(name, target)))
                 return std::nullopt;
         }
+        // Canonical compiler paths can be shared by multiple driver
+        // spellings (clang/clang++, gcc/g++).  A single bind target therefore
+        // dispatches on argv[0], preserving the requested C versus C++ role
+        // even when the kernel resolves the symlink before exec.
+        const auto compiler_dispatch = "#!/bin/sh\ncase \"$0\" in\n"
+            "*c++*|*g++*|*clang++*) target="
+            + sage::build::shell_quote((audit.root / "sage-cxx").string())
+            + ";;\n* ) target="
+            + sage::build::shell_quote((audit.root / "sage-cc").string())
+            + ";;\nesac\n"
+            "if [ ! -x \"$target\" ]; then printf '%s\\n' x > "
+            + sage::build::shell_quote((audit.events / "mark-unexpected-").string())
+            + "$$; exit 125; fi\nexec \"$target\" \"$@\"\n";
+        if (!write_executable(audit.root / "sage-compiler-dispatch", compiler_dispatch))
+            return std::nullopt;
         // The selected backend is allowed through PATH and still logs its
         // real execution.  GCC/Clang look up lld as ld.lld and mold as
         // ld.mold when -fuse-ld is used.
@@ -584,11 +773,14 @@ struct ToolAudit {
                 : std::array<std::string_view, 2>{"ld", "ld.bfd"};
         for (const auto name : backend_names) {
             if (linker) {
+                const auto backend_link = real_driver_link(
+                    "linker-backend", *linker, linker_driver.value_or(*linker));
+                if (!backend_link) return std::nullopt;
                 const auto script = fmt(
                     "#!/bin/sh\nprintf '%s ' \"$@\" > {}/exec-linker-$$\n"
                     "printf '%s\\n' x > {}/mark-linker-$$\n"
                     "exec {} \"$@\"\n", events, events,
-                    sage::build::shell_quote(execution_path("linker", *linker)));
+                    sage::build::shell_quote(backend_link->string()));
                 if (!write_executable(audit.root / std::string(name), script))
                     return std::nullopt;
             }
@@ -597,7 +789,8 @@ struct ToolAudit {
         if (sandboxed) {
             const auto parent_name = parent.string();
             audit.sandbox = "bwrap --die-with-parent --new-session --unshare-net"
-                " --ro-bind / / --tmpfs /tmp"
+                " --ro-bind " + sage::build::shell_quote(build_sysroot.string())
+                + " / --tmpfs /tmp"
                 " --dir " + sage::build::shell_quote(parent_name)
                 + " --dir " + sage::build::shell_quote((parent / "home").string())
                 + " --dir " + sage::build::shell_quote((parent / "tmp").string())
@@ -608,35 +801,71 @@ struct ToolAudit {
                 + " " + sage::build::shell_quote((parent / "tmp").string())
                 + " --bind " + sage::build::shell_quote(audit.root.string())
                 + " " + sage::build::shell_quote(audit.root.string())
-                + " --ro-bind / " + sage::build::shell_quote(real_root.string())
+                + " --ro-bind " + sage::build::shell_quote(build_sysroot.string())
+                + " " + sage::build::shell_quote(real_root.string())
                 + " --dev /dev --proc /proc";
             for (const auto& name : fenced) {
                 if (auto resolved = resolve(name)) {
-                    if (!bound_targets.insert(resolved->string()).second) continue;
+                    const auto target = namespace_path(*resolved);
+                    if (!bound_targets.insert(target.string()).second) continue;
                     // Bind selected and non-selected aliases alike. Selected
-                    // wrappers execute the mirrored host-root path above, so
+                    // wrappers execute the mirrored sysroot path above, so
                     // an absolute compiler/linker path cannot bypass observation.
+                    const bool is_linker_name = name == "ld"
+                        || name.starts_with("ld.") || name.starts_with("ld-")
+                        || name == "lld" || name.starts_with("lld-")
+                        || name == "mold" || name.starts_with("mold-");
+                    const bool is_rustc_name = name.starts_with("rustc");
+                    const auto source = is_linker_name
+                        ? audit.root / std::string(name)
+                        : is_rustc_name
+                            ? (rustc ? audit.root / "sage-rustc"
+                                     : audit.root / std::string(name))
+                            : audit.root / "sage-compiler-dispatch";
                     audit.sandbox += " --bind "
-                        + sage::build::shell_quote((audit.root / std::string(name)).string())
-                        + " " + sage::build::shell_quote(resolved->string());
+                        + sage::build::shell_quote(source.string())
+                        + " " + sage::build::shell_quote(target.string());
                 }
             }
             const auto bind_selected = [&](const std::optional<std::filesystem::path>& real,
                                            std::string_view wrapper) {
-                if (!real || !bound_targets.insert(real->string()).second) return;
+                if (!real) return;
+                const auto target = namespace_path(*real);
+                if (!bound_targets.insert(target.string()).second) return;
                 audit.sandbox += " --bind "
                     + sage::build::shell_quote((audit.root / std::string(wrapper)).string())
-                    + " " + sage::build::shell_quote(real->string());
+                    + " " + sage::build::shell_quote(target.string());
             };
             bind_selected(cc, "sage-cc");
             bind_selected(cxx, "sage-cxx");
             bind_selected(linker, "sage-linker");
             bind_selected(rustc, "sage-rustc");
         }
-        audit.cc = cc ? (audit.root / "sage-cc").string() : "";
-        audit.cxx = cxx ? (audit.root / "sage-cxx").string() : "";
+        // Keep the selected executable's conventional basename in the
+        // command presented to build systems.  Xmake (and similar tools)
+        // choose their compiler capability module from that basename; passing
+        // `sage-cxx` makes it treat a perfectly valid clang++ wrapper as an
+        // unknown compiler and can reject C++23 modules before compiling.
+        // Each alias still dispatches to the role wrapper above, so the
+        // execution marker and full-process audit remain intact.
+        const auto selected_alias = [&](const std::optional<std::filesystem::path>& real,
+                                        std::string_view requested,
+                                        std::string_view role_wrapper) {
+            if (!real) return std::string{};
+            // `resolve()` canonicalizes symlinks for the actual-exec proof
+            // (clang++ commonly resolves to clang-22), but build systems use
+            // the requested basename to select the C vs C++ driver. Preserve
+            // that spelling for the audit alias.
+            const auto name = std::filesystem::path(requested).filename().string();
+            const auto path = audit.root / name;
+            if (!std::filesystem::exists(path)
+                && !alias(name, role_wrapper)) return std::string{};
+            return path.string();
+        };
+        audit.cc = selected_alias(cc, tools.cc, "sage-cc");
+        audit.cxx = selected_alias(cxx, tools.cxx, "sage-cxx");
         audit.linker = linker ? (audit.root / "sage-linker").string() : "";
-        audit.rustc = rustc ? (audit.root / "sage-rustc").string() : "";
+        audit.rustc = selected_alias(rustc, tools.rustc, "sage-rustc");
         std::set<std::string> tool_dirs;
         for (const auto& real : {cc, cxx, linker, rustc})
             if (real) tool_dirs.insert(real->parent_path().string());
@@ -646,6 +875,179 @@ struct ToolAudit {
         return std::optional<ToolAudit>(std::move(audit));
     }
 };
+
+// Trace the complete process tree for every managed step.  PATH wrappers are
+// still useful for role attribution, but they cannot prove that a child did
+// not invoke an absolute path or a helper which clears LD_PRELOAD.  The
+// ptrace/seccomp pair below observes both successful exec transitions and the
+// execve/execveat syscall boundary for every descendant, including processes
+// created by fakeroot and bubblewrap.
+struct ProcessExecAudit {
+    static bool install_seccomp() noexcept {
+        const sock_filter filter[] = {
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                     static_cast<std::uint32_t>(offsetof(struct seccomp_data, nr))),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                     static_cast<std::uint32_t>(__NR_execve), 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                     static_cast<std::uint32_t>(__NR_execveat), 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRACE),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        const sock_fprog program{
+            .len = static_cast<unsigned short>(std::size(filter)),
+            .filter = const_cast<sock_filter*>(filter),
+        };
+        return ::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+            && ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) == 0;
+    }
+
+    static std::string process_cmdline(pid_t pid) {
+        std::ifstream in(std::format("/proc/{}/cmdline", pid), std::ios::binary);
+        std::string value((std::istreambuf_iterator<char>(in)), {});
+        for (auto& c : value) if (c == '\0') c = ' ';
+        while (!value.empty() && value.back() == ' ') value.pop_back();
+        return value;
+    }
+
+    static std::string process_executable(pid_t pid) {
+        std::error_code ec;
+        auto path = std::filesystem::read_symlink(
+            std::filesystem::path("/proc") / std::to_string(pid) / "exe", ec);
+        return ec ? std::string{"<unavailable>"} : path.string();
+    }
+
+    static std::expected<int, std::string> run(std::string_view command,
+                                                const std::filesystem::path& log) {
+        const auto command_copy = std::string(command);
+        const pid_t child = ::fork();
+        if (child < 0) return std::unexpected(
+            std::format("cannot fork build audit supervisor: {}", std::strerror(errno)));
+        if (child == 0) {
+            if (::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0
+                || !install_seccomp()) _exit(125);
+            ::raise(SIGSTOP);
+            ::execl("/bin/sh", "/bin/sh", "-c", command_copy.c_str(), nullptr);
+            _exit(127);
+        }
+
+        std::ofstream audit_log(log, std::ios::out | std::ios::app);
+        if (!audit_log) {
+            ::kill(child, SIGKILL);
+            return std::unexpected("cannot open process exec audit log: " + log.string());
+        }
+        int status = 0;
+        if (::waitpid(child, &status, 0) < 0 || !WIFSTOPPED(status)) {
+            ::kill(child, SIGKILL);
+            return std::unexpected("build audit child did not enter tracing stop");
+        }
+        constexpr long trace_options = PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK
+            | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC | PTRACE_O_TRACESECCOMP
+            | PTRACE_O_EXITKILL;
+        if (::ptrace(PTRACE_SETOPTIONS, child, nullptr,
+                     reinterpret_cast<void*>(trace_options)) != 0) {
+            ::kill(child, SIGKILL);
+            return std::unexpected(std::format(
+                "cannot enable process exec tracing: {}", std::strerror(errno)));
+        }
+        if (::ptrace(PTRACE_CONT, child, nullptr, nullptr) != 0) {
+            ::kill(child, SIGKILL);
+            return std::unexpected("cannot continue build audit child");
+        }
+
+        std::set<pid_t> tracees{child};
+        bool root_done = false;
+        int root_status = 125 << 8;
+        for (;;) {
+            const pid_t pid = ::waitpid(-1, &status, __WALL);
+            if (pid < 0) {
+                if (errno == ECHILD) break;
+                if (errno == EINTR) continue;
+                return std::unexpected(std::format(
+                    "process exec audit wait failed: {}", std::strerror(errno)));
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                tracees.erase(pid);
+                if (pid == child) {
+                    root_done = true;
+                    root_status = status;
+                    // fakeroot starts a helper daemon which can outlive the
+                    // shell in a PID namespace.  It is still a traced
+                    // descendant, so wait for it forever would make a
+                    // successful phase appear hung.  Terminate only the
+                    // descendants of this audit root, then reap them below.
+                    for (const auto descendant : tracees)
+                        ::kill(descendant, SIGKILL);
+                }
+                continue;
+            }
+            if (!WIFSTOPPED(status)) continue;
+            const auto event = static_cast<unsigned>(status) >> 16;
+            if (event == PTRACE_EVENT_SECCOMP) {
+                audit_log << "execve-boundary pid=" << pid << " syscall=execve/execveat\n";
+            } else if (event == PTRACE_EVENT_EXEC) {
+                audit_log << "execve pid=" << pid << " path="
+                          << process_executable(pid) << " argv="
+                          << process_cmdline(pid) << "\n";
+            }
+            // A ptrace fork/clone event stops both the event parent and the
+            // newly-created child.  The child is not continued implicitly;
+            // leaving it stopped deadlocks fakeroot/build-system helpers and
+            // makes a complete process-tree audit unusable for real builds.
+            if (event == PTRACE_EVENT_CLONE || event == PTRACE_EVENT_FORK
+                || event == PTRACE_EVENT_VFORK) {
+                unsigned long child_word = 0;
+                if (::ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &child_word) == 0
+                    && child_word != 0) {
+                    const auto descendant = static_cast<pid_t>(child_word);
+                    tracees.insert(descendant);
+                    ::ptrace(PTRACE_SETOPTIONS, descendant, nullptr,
+                             reinterpret_cast<void*>(trace_options));
+                    ::ptrace(PTRACE_CONT, descendant, nullptr, nullptr);
+                }
+            }
+            // Options are inherited by traced descendants on Linux, but
+            // setting them again is harmless and covers kernels that only
+            // copy the tracing relationship at clone time.
+            ::ptrace(PTRACE_SETOPTIONS, pid, nullptr,
+                     reinterpret_cast<void*>(trace_options));
+            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+        }
+        if (!root_done) return std::unexpected("build audit supervisor lost its root child");
+        if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
+        return 128 + WTERMSIG(root_status);
+    }
+};
+
+bool compiler_like_executable(std::string_view path) {
+    const auto base = std::filesystem::path(path).filename().string();
+    if (base == "cc1" || base == "cc1plus" || base == "collect2"
+        || base == "as" || base == "ar" || base == "ranlib"
+        || base == "gcc-ar" || base == "gcc-nm" || base == "gcc-ranlib"
+        || base == "llvm-ar" || base == "llvm-nm" || base == "llvm-ranlib"
+        // clang-scan-deps is an analysis helper launched by the selected
+        // clang driver, not an alternative compiler/linker.  It must be
+        // visible to module dependency generation without being mistaken for
+        // an unmanaged compiler implementation.
+        || base == "clang-scan-deps"
+        // Every dynamically linked executable enters through the system ELF
+        // loader; it is not a linker invocation and is outside Sage's tool
+        // selection boundary.
+        || base.starts_with("ld-linux")) return false;
+    for (const auto prefix : {std::string_view{"cc"}, std::string_view{"c++"},
+                              std::string_view{"gcc"}, std::string_view{"g++"},
+                              std::string_view{"clang"}, std::string_view{"clang++"},
+                              std::string_view{"ld"}, std::string_view{"lld"},
+                              std::string_view{"mold"}, std::string_view{"rustc"}}) {
+        if (base.starts_with(prefix)
+            && (base.size() == prefix.size() || base[prefix.size()] == '-'
+                || base[prefix.size()] == '.'
+                || std::isdigit(static_cast<unsigned char>(base[prefix.size()]))))
+            return true;
+    }
+    return false;
+}
 
 export int cmd_build(const CliOptions& opts) {
     if (opts.args.empty()) {
@@ -754,6 +1156,25 @@ export int cmd_build(const CliOptions& opts) {
             "or set fakeroot in {}",
             bcfg.fakeroot, cfg.build_config_path.string());
         return 1;
+    }
+    if (bcfg.sysroot != "/") {
+        auto fakeroot_path = ToolAudit::resolve(bcfg.fakeroot);
+        std::error_code root_ec;
+        const auto root = std::filesystem::weakly_canonical(bcfg.sysroot, root_ec);
+        std::error_code fakeroot_ec;
+        const auto fakeroot = fakeroot_path
+            ? std::filesystem::weakly_canonical(*fakeroot_path, fakeroot_ec)
+            : std::filesystem::path{};
+        std::error_code directory_ec;
+        if (root_ec || fakeroot.empty()
+            || fakeroot_ec || !std::filesystem::is_directory(root, directory_ec)
+            || !(fakeroot == root
+                || fakeroot.string().starts_with(root.string() + "/"))) {
+            sage::util::log_error(
+                "Configured fakeroot '{}' must be inside the complete build sysroot '{}'",
+                bcfg.fakeroot, bcfg.sysroot.string());
+            return 1;
+        }
     }
 
     // Per-recipe [build] overrides replace the global baseline; cxxflags
@@ -987,7 +1408,7 @@ export int cmd_build(const CliOptions& opts) {
             .cxx_family = selected.cxx_family,
             .linker_family = selected.linker_family,
             .rustc_family = selected.rustc_family};
-        tool_audit = ToolAudit::create(canonical, hermetic_root);
+        tool_audit = ToolAudit::create(canonical, hermetic_root, bcfg.sysroot);
         if (!tool_audit) {
             sage::util::log_error(
                 "Cannot create the v2 tool audit fence; refusing to build without actual execution evidence");
@@ -1038,12 +1459,18 @@ export int cmd_build(const CliOptions& opts) {
         // create its parent in the namespace) rather than exposing its whole
         // host directory.
         if (auto fakeroot_path = ToolAudit::resolve(bcfg.fakeroot)) {
-            const auto parent = fakeroot_path->parent_path();
-            const bool hidden_tmp = parent.string().starts_with("/tmp/");
+            std::error_code sysroot_ec;
+            const auto sysroot_root = std::filesystem::weakly_canonical(
+                bcfg.sysroot, sysroot_ec);
+            const auto relative_root = sysroot_ec ? bcfg.sysroot : sysroot_root;
+            const auto namespace_fakeroot = (std::filesystem::path("/")
+                / fakeroot_path->lexically_relative(relative_root)).lexically_normal();
+            const auto namespace_parent = namespace_fakeroot.parent_path();
+            const bool hidden_tmp = namespace_parent.string().starts_with("/tmp/");
             tool_audit->sandbox += (hidden_tmp
-                ? " --dir " + sage::build::shell_quote(parent.string()) : "")
+                ? " --dir " + sage::build::shell_quote(namespace_parent.string()) : "")
                 + " --ro-bind " + sage::build::shell_quote(fakeroot_path->string())
-                + " " + sage::build::shell_quote(fakeroot_path->string());
+                + " " + sage::build::shell_quote(namespace_fakeroot.string());
         }
     }
     // Resume mode: keep an already-extracted (and possibly already built)
@@ -1339,18 +1766,30 @@ export int cmd_build(const CliOptions& opts) {
                 const auto full_cmd = exports + "cd "
                     + sage::build::shell_quote(step.work_dir.string())
                     + " && " + step.command;
+                const auto configured_fakeroot = ToolAudit::resolve(bcfg.fakeroot)
+                    .value_or(std::filesystem::path(bcfg.fakeroot));
+                std::error_code sysroot_ec;
+                const auto sysroot_root = std::filesystem::weakly_canonical(
+                    bcfg.sysroot, sysroot_ec);
+                const auto relative_root = sysroot_ec ? bcfg.sysroot : sysroot_root;
+                const auto sandbox_fakeroot = (std::filesystem::path("/")
+                    / configured_fakeroot.lexically_relative(relative_root)).lexically_normal();
                 const auto fakeroot_cmd = tool_audit && !tool_audit->sandbox.empty()
                     ? sandboxed_fakeroot_shell(
-                        ToolAudit::resolve(bcfg.fakeroot)
-                            .value_or(std::filesystem::path(bcfg.fakeroot)).string(),
+                        sandbox_fakeroot.string(),
                         full_cmd,
                                                tool_audit->sandbox)
                     : sage::build::fakeroot_command(bcfg.fakeroot,
                         hermetic_shell(full_cmd));
                 if (opts.verbose) sage::util::log_info("CMD: {}", fakeroot_cmd);
-                if (std::system(fakeroot_cmd.c_str()) != 0) {
+                const auto command_result = ProcessExecAudit::run(
+                    fakeroot_cmd, tool_audit->process_exec_log);
+                if (!command_result || *command_result != 0) {
                     sage::util::log_error("Managed {} step failed: {}",
                         step.name, step.command);
+                    if (!command_result)
+                        sage::util::log_error("Process exec audit failed: {}",
+                                              command_result.error());
                     phases_ok = false;
                     break;
                 }
@@ -1408,6 +1847,86 @@ export int cmd_build(const CliOptions& opts) {
         if (!tool_audit) {
             sage::util::log_error("Managed build has no execution audit");
             return 1;
+        }
+        const auto process_execs = tool_audit->process_execs();
+        if (process_execs.empty()) {
+            sage::util::log_error(
+                "Managed build produced no process exec audit records");
+            return 1;
+        }
+        const auto process_exec_text = [&] {
+            std::string text;
+            for (const auto& event : process_execs) text += event + "\n";
+            return text;
+        }();
+        const auto require_real_exec = [&](std::string_view role,
+                                           std::uint64_t executions) {
+            if (executions == 0) return true;
+            const auto expected_it = tool_audit->expected_real_execs.find(std::string(role));
+            if (expected_it == tool_audit->expected_real_execs.end()) return false;
+            const auto& expected = expected_it->second;
+            const auto path_equal = [](std::string_view actual,
+                                       std::string_view path) {
+                // When Sage itself runs in a chroot, the outer ptrace
+                // observer sees the host mount prefix (for example
+                // /mnt/tmp/...) while Sage sees /tmp/... .  The audit
+                // directory's random component and host-root suffix are
+                // still exact, so accepting that single prefix rewrite
+                // preserves identity without accepting another file.
+                return actual == path
+                    || (actual.size() > path.size()
+                        && actual.ends_with(path));
+            };
+            const auto observed = [&](const std::string& path) {
+                for (size_t begin = 0;;) {
+                    const auto found = process_exec_text.find("path=", begin);
+                    if (found == std::string::npos) return false;
+                    const auto path_begin = found + 5;
+                    const auto path_end = process_exec_text.find_first_of(" \n", path_begin);
+                    if (path_equal(process_exec_text.substr(path_begin,
+                            path_end == std::string::npos
+                                ? std::string::npos : path_end - path_begin), path))
+                        return true;
+                    begin = path_begin;
+                }
+            };
+            if (!std::ranges::any_of(expected, observed)) {
+                std::string expected_paths;
+                for (const auto& value : expected)
+                    expected_paths += (expected_paths.empty() ? "" : ",") + value;
+                sage::util::log_error(
+                    "Selected Sage {} did not reach a real execve transition: {}\nExpected paths: {}\nAudit:\n{}",
+                    role, expected.front(), expected_paths, process_exec_text);
+                return false;
+            }
+            return true;
+        };
+        if (!require_real_exec("cc", tool_audit->executions("cc"))
+            || !require_real_exec("cxx", tool_audit->executions("cxx"))
+            || !require_real_exec("linker", tool_audit->executions("linker"))
+            || !require_real_exec("rustc", tool_audit->executions("rustc")))
+            return 1;
+        for (const auto& event : process_execs) {
+            const auto path_marker = event.find(" path=");
+            if (path_marker == std::string::npos) continue;
+            const auto begin = path_marker + 6;
+            const auto end = event.find(' ', begin);
+            const auto path = event.substr(begin,
+                end == std::string::npos ? std::string::npos : end - begin);
+            if (!compiler_like_executable(path)) continue;
+            bool selected = false;
+            for (const auto& [_, expected] : tool_audit->expected_real_execs)
+                if (std::ranges::any_of(expected, [&](const auto& value) {
+                        return path == value
+                            || (path.size() > value.size()
+                                && path.ends_with(value));
+                    })) selected = true;
+            if (!selected) {
+                sage::util::log_error(
+                    "Process exec audit observed an unmanaged compiler/linker: {}",
+                    path);
+                return 1;
+            }
         }
         if (tool_audit->executions("unexpected") != 0) {
             sage::util::log_error(

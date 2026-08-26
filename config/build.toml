@@ -1,6 +1,9 @@
 # Sage build execution, toolchain and parallelism policy.
 schema_version = 1
 fakeroot = "fakeroot"
+# Full read-only root exposed to v2 builds. Point this at a populated package
+# sysroot for hermetic builds; `/` is the native bootstrap default.
+sysroot = "/"
 
 cc = "clang"
 cxx = "clang++"

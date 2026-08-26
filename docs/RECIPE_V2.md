@@ -19,6 +19,7 @@ selection:
 ```toml
 schema_version = 1
 fakeroot = "fakeroot"            # exact command/path; required for recipe execution
+sysroot = "/"                    # complete read-only root exposed to v2
 cc = "clang"
 cxx = "clang++"
 linker = "ld.lld"              # lld/ld.lld | mold | ld, or an executable path
@@ -49,11 +50,17 @@ there is no silent unvirtualized fallback. `fakeroot` is execution machinery,
 not compiler provenance, so it is never written to the package's managed
 compiler/linker records.
 
-This does not grant privileges and is not a sandbox or container. It
+Fakeroot itself does not grant privileges and is not a sandbox or container; it
 virtualizes selected file metadata calls through `LD_PRELOAD`. The upstream
 fakeroot manual also warns that configure-style system probes can be confused
 inside fakeroot; recipes which hit that implementation limitation must fail
 visibly rather than bypassing the configured environment.
+
+For v2, `sysroot` is the complete read-only filesystem mounted as `/` inside
+bubblewrap. `/` is only the native bootstrap default; a distributor should
+point it at a populated package sysroot to prevent host files outside that tree
+from entering a build. Sage requires this path to exist and requires the
+configured toolchain and build utilities to be present in it.
 
 For v2, a recipe may restrict compatible compiler/linker families and may
 declare one package-specific default suite as described below. It never names
@@ -62,6 +69,12 @@ when it is the triple matching that declaration; it never changes compiler
 after a build has started. The selected linker is exported as `LD`; Sage also
 adds the matching compiler-driver option (`-fuse-ld=lld`, `mold`, or `bfd`) to
 managed linker/Rust arguments.
+
+That makes `build.toml` the authority for selection, not by itself proof of
+execution. A `clang --version` probe proves the identity and minimum version
+of the candidate Sage selected; the ptrace/seccomp audit below separately
+proves that the same executable actually crossed `execve` during this build.
+Both checks are required before v2 provenance is written.
 
 ## Common metadata
 
@@ -374,12 +387,18 @@ Compiler and linker wrappers record actual child invocations; common bare tool
 names in PATH are fenced, and a `-B` audit prefix makes compiler-driver links
 reach the selected linker wrapper. Bubblewrap also masks the canonical paths
 of common compiler/linker aliases (including versioned names), so an absolute
-path cannot silently select a second toolchain; if bubblewrap is unavailable,
-Sage refuses the v2 build. Sage fails v2 if no configured compiler
-executes, an unmanaged fenced tool is attempted, or a link has no selected
-backend execution. The manifest retains execution counts, supplied flag
-channels and captured child command lines. v1 and upstream-binary
-repackaging intentionally retain no compiler provenance.
+path cannot silently select a second toolchain. Every managed step is also
+run under a ptrace supervisor with a seccomp filter for `execve` and
+`execveat`; the supervisor follows fork/clone descendants and records every
+successful executable transition in a temporary `process-exec.log`. The build
+fails if the selected executable never reaches a real exec transition or if a
+compiler-like executable outside Sage's selected paths is observed. If
+bubblewrap, ptrace, or seccomp is unavailable, Sage refuses the v2 build.
+The temporary full-process audit is deliberately not copied into the package
+manifest because PIDs and scheduling order would make otherwise identical
+archives differ; the manifest retains only deterministic tool execution
+counts, Sage-supplied flag channels and wrapper command lines. v1 and
+upstream-binary repackaging intentionally retain no compiler provenance.
 
 ## Make and non-standard projects
 

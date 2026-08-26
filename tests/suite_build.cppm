@@ -51,12 +51,16 @@ cflags = "-O3 -march=x86-64-v3"
             "jobs = 4\ncompile_jobs = 2\n");
         auto legacy_jobs_cfg = sage::config::BuildConfig::parse_toml("jobs = 4\n");
         auto auto_jobs_cfg = sage::config::BuildConfig::parse_toml("compile_jobs = 0\n");
+        auto sysroot_cfg = sage::config::BuildConfig::parse_toml("sysroot = \"/opt/sage-sysroot\"\n");
+        auto relative_sysroot_cfg = sage::config::BuildConfig::parse_toml("sysroot = \"sysroot\"\n");
         auto invalid_jobs_cfg = sage::config::BuildConfig::parse_toml(
             "compile_jobs = -1\n");
         if (!jobs_cfg || jobs_cfg->jobs != 4 || jobs_cfg->compile_jobs != 2
             || jobs_cfg->configured_compile_jobs() != 2
             || !legacy_jobs_cfg || legacy_jobs_cfg->configured_compile_jobs() != 4
             || !auto_jobs_cfg || auto_jobs_cfg->configured_compile_jobs() != 0
+            || !sysroot_cfg || sysroot_cfg->sysroot != "/opt/sage-sysroot"
+            || relative_sysroot_cfg
             || invalid_jobs_cfg || empty_cfg->jobs != 0
             || empty_cfg->compile_jobs.has_value()) {
             sage::util::log_error("BuildConfig compile_jobs parsing drifted");
@@ -759,7 +763,10 @@ install:
         const auto v2_policy = read_text(
             temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/policy");
         if (!v2_built
-            || !v2_policy.contains("/tool-audit/sage-cc|")
+            // The audit alias keeps the selected compiler's requested
+            // basename (gcc/clang/...) so build systems retain their driver
+            // semantics; it still resolves to Sage's role wrapper.
+            || !v2_policy.contains("/tool-audit/gcc|")
             || !v2_policy.contains("/tool-audit/sage-linker|-DV2_POLICY=1")
             || !read_text(temp_dir / "bcfg-v2-make-x/usr/share/v2makecanary/jobs")
                 .contains("-j2")
@@ -859,6 +866,10 @@ version = "1.0.0"
             ? std::ranges::find(cargo_built->managed_build_tools, "cxx",
                 &sage::package::ManagedBuildTool::role)
             : std::vector<sage::package::ManagedBuildTool>::iterator{};
+        const auto cargo_linker_driver = cargo_built
+            ? std::ranges::find(cargo_built->managed_build_tools, "linker-driver",
+                &sage::package::ManagedBuildTool::role)
+            : std::vector<sage::package::ManagedBuildTool>::iterator{};
         const auto cargo_linker = cargo_built
             ? std::ranges::find(cargo_built->managed_build_tools, "linker",
                 &sage::package::ManagedBuildTool::role)
@@ -867,18 +878,21 @@ version = "1.0.0"
             || cargo_rustc == cargo_built->managed_build_tools.end()
             || cargo_cc != cargo_built->managed_build_tools.end()
             || cargo_cxx != cargo_built->managed_build_tools.end()
+            || cargo_linker_driver == cargo_built->managed_build_tools.end()
+            || cargo_linker_driver->executable != "gcc"
+            || cargo_linker_driver->family != "gcc"
             || cargo_linker == cargo_built->managed_build_tools.end()
             || cargo_linker->executable != "ld"
             || !std::ranges::any_of(cargo_linker->parameters,
                 [](const auto& value) {
-                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/sage-cc")
+                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/gcc")
                         && value.contains("-C link-arg=-fuse-ld=bfd");
                 })
             || cargo_rustc->executable != "rustc"
             || cargo_rustc->family != "rustc" || cargo_rustc->version.empty()
             || !std::ranges::any_of(cargo_rustc->parameters,
                 [](const auto& value) {
-                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/sage-cc")
+                    return value.starts_with("RUSTFLAGS=-C linker=<sage-build>/tool-audit/gcc")
                         && value.contains("-C link-arg=-fuse-ld=bfd");
                 })
             || !std::filesystem::exists(
