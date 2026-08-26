@@ -38,6 +38,10 @@ struct ManagedBuildTool {
     std::string executable; // exact build.toml command/path Sage invoked
     std::string family;     // gcc | clang | ld | lld | mold
     std::string version;
+    // Non-empty environment/config channels Sage actually handed to the
+    // managed backend for this tool, e.g. CFLAGS=..., KCFLAGS=... or
+    // LDFLAGS=.... These are plan observations, not binary inference.
+    std::vector<std::string> parameters;
 
     bool operator==(const ManagedBuildTool&) const = default;
 };
@@ -238,6 +242,14 @@ struct PackageManifest {
                 observed.executable = (*tool)["executable"].value_or("");
                 observed.family = (*tool)["family"].value_or("");
                 observed.version = (*tool)["version"].value_or("");
+                if (auto* parameters = tool->get_as<vendor::toml::array>("parameters")) {
+                    for (auto&& parameter : *parameters) {
+                        auto value = parameter.value<std::string_view>();
+                        if (!value || value->empty()) return std::unexpected(
+                            "managed_build_tools parameters must be non-empty strings");
+                        observed.parameters.emplace_back(*value);
+                    }
+                }
                 const std::string version_argument =
                     (*tool)["version_argument"].value_or("");
                 const bool known_role = observed.role == "cc"
@@ -367,7 +379,16 @@ struct PackageManifest {
             ss << "executable = \"" << quote(tool.executable) << "\"\n";
             ss << "family = \"" << quote(tool.family) << "\"\n";
             ss << "version = \"" << quote(tool.version) << "\"\n";
-            ss << "version_argument = \"--version\"\n\n";
+            ss << "version_argument = \"--version\"\n";
+            if (!tool.parameters.empty()) {
+                ss << "parameters = [";
+                for (size_t i = 0; i < tool.parameters.size(); ++i) {
+                    ss << (i ? ", " : "") << "\""
+                       << quote(tool.parameters[i]) << "\"";
+                }
+                ss << "]\n";
+            }
+            ss << "\n";
         }
 
         // Array-of-tables, not bare paths: the per-file hash and mode are what

@@ -541,6 +541,10 @@ channel = "system"
 [build]
 system = "make"
 
+[build.flag_env]
+cflags = ["KCFLAGS"]
+ldflags = ["KBUILD_LDFLAGS"]
+
 [build.toolchain.compiler]
 family = "gcc"
 package = "gcc"
@@ -592,7 +596,17 @@ install:
             || !observed_cxx || observed_cxx->executable != "g++"
             || observed_cxx->family != "gcc" || observed_cxx->version.empty()
             || !observed_ld || observed_ld->executable != "ld"
-            || observed_ld->family != "ld" || observed_ld->version.empty()) {
+            || observed_ld->family != "ld" || observed_ld->version.empty()
+            || !std::ranges::contains(observed_cc->parameters,
+                "CFLAGS=-DV2_POLICY=1")
+            || !std::ranges::contains(observed_cc->parameters,
+                "KCFLAGS=-DV2_POLICY=1")
+            || !std::ranges::contains(observed_cxx->parameters,
+                "CXXFLAGS=-DV2_POLICY=1")
+            || !std::ranges::contains(observed_ld->parameters,
+                "LDFLAGS=-fuse-ld=bfd")
+            || !std::ranges::contains(observed_ld->parameters,
+                "KBUILD_LDFLAGS=-fuse-ld=bfd")) {
             sage::util::log_error("Managed v2 Make build did not use Sage policy");
             return 1;
         }
@@ -671,6 +685,8 @@ version = "1.0.0"
             || cargo_rustc == cargo_built->managed_build_tools.end()
             || cargo_rustc->executable != "rustc"
             || cargo_rustc->family != "rustc" || cargo_rustc->version.empty()
+            || !std::ranges::contains(cargo_rustc->parameters,
+                "RUSTFLAGS=-C linker=gcc -C link-arg=-fuse-ld=bfd")
             || !std::filesystem::exists(
                 temp_dir / "bcfg-v2-cargo-x/usr/bin/v2cargocanary")) {
             sage::util::log_error(

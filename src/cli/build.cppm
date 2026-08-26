@@ -414,6 +414,13 @@ export int cmd_build(const CliOptions& opts) {
         if (!fetch_source(extra.url, extra.sha256, path)) return 1;
     }
 
+    // These are populated only from the v2 plan Sage actually executes. They
+    // remain empty for v1, and empty flag channels are deliberately omitted.
+    std::vector<std::string> managed_cc_parameters;
+    std::vector<std::string> managed_cxx_parameters;
+    std::vector<std::string> managed_linker_parameters;
+    std::vector<std::string> managed_rustc_parameters;
+
     // 2. Prepare, Build & Install Phases -- exactly one toolchain, the first
     // usable candidate. A build failure is caused by the compiler or the
     // configured flags often enough that silently retrying under another
@@ -537,6 +544,35 @@ export int cmd_build(const CliOptions& opts) {
             ran_cppflags = plan->environment.at("CPPFLAGS");
             ran_ldflags = plan->environment.at("LDFLAGS");
             ran_rustflags = plan->environment.at("RUSTFLAGS");
+            auto capture_parameter = [&](std::vector<std::string>& parameters,
+                                         std::string_view name) {
+                auto it = plan->environment.find(std::string(name));
+                if (it == plan->environment.end() || it->second.empty()) return;
+                auto observed = std::format("{}={}", name, it->second);
+                if (std::ranges::find(parameters, observed) == parameters.end())
+                    parameters.push_back(std::move(observed));
+            };
+            capture_parameter(managed_cc_parameters, "CPPFLAGS");
+            capture_parameter(managed_cc_parameters, "CFLAGS");
+            capture_parameter(managed_cxx_parameters, "CPPFLAGS");
+            capture_parameter(managed_cxx_parameters, "CXXFLAGS");
+            capture_parameter(managed_linker_parameters, "LDFLAGS");
+            if (r.managed_build.system == sage::package::BuildSystem::Cargo)
+                capture_parameter(managed_rustc_parameters, "RUSTFLAGS");
+            for (const auto& name : r.managed_build.cppflags_env) {
+                capture_parameter(managed_cc_parameters, name);
+                capture_parameter(managed_cxx_parameters, name);
+            }
+            for (const auto& name : r.managed_build.cflags_env)
+                capture_parameter(managed_cc_parameters, name);
+            for (const auto& name : r.managed_build.cxxflags_env)
+                capture_parameter(managed_cxx_parameters, name);
+            for (const auto& name : r.managed_build.ldflags_env)
+                capture_parameter(managed_linker_parameters, name);
+            if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
+                for (const auto& name : r.managed_build.rustflags_env)
+                    capture_parameter(managed_rustc_parameters, name);
+            }
             plan->environment["RECIPE_DIR"] = recipe_dir.string();
             plan->environment["SRCDIR"] = work_dir.string();
             plan->environment["PKGDIR"] = pkg_dir.string();
@@ -602,16 +638,20 @@ export int cmd_build(const CliOptions& opts) {
         const auto& tools = candidates.front();
         manifest.managed_build_tools = {
             {.role = "cc", .executable = tools.cc,
-             .family = tools.compiler_family, .version = tools.compiler_version},
+             .family = tools.compiler_family, .version = tools.compiler_version,
+             .parameters = managed_cc_parameters},
             {.role = "cxx", .executable = tools.cxx,
-             .family = tools.cxx_family, .version = tools.cxx_version},
+             .family = tools.cxx_family, .version = tools.cxx_version,
+             .parameters = managed_cxx_parameters},
             {.role = "linker", .executable = tools.linker,
-             .family = tools.linker_family, .version = tools.linker_version},
+             .family = tools.linker_family, .version = tools.linker_version,
+             .parameters = managed_linker_parameters},
         };
         if (r.managed_build.system == sage::package::BuildSystem::Cargo) {
             manifest.managed_build_tools.push_back(
                 {.role = "rustc", .executable = tools.rustc,
-                 .family = tools.rustc_family, .version = tools.rustc_version});
+                 .family = tools.rustc_family, .version = tools.rustc_version,
+                 .parameters = managed_rustc_parameters});
         }
     }
 

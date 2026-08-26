@@ -219,6 +219,15 @@ struct ChannelIndex {
                             observed.executable = (*tool)["executable"].value_or("");
                             observed.family = (*tool)["family"].value_or("");
                             observed.version = (*tool)["version"].value_or("");
+                            if (auto* parameters = tool->get_as<vendor::toml::array>(
+                                    "parameters")) {
+                                for (auto&& parameter : *parameters) {
+                                    auto value = parameter.value<std::string_view>();
+                                    if (!value || value->empty()) return std::unexpected(
+                                        "Managed build tool parameters in channel index must be non-empty strings");
+                                    observed.parameters.emplace_back(*value);
+                                }
+                            }
                             const std::string version_argument =
                                 (*tool)["version_argument"].value_or("");
                             const bool known =

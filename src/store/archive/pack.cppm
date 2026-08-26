@@ -275,6 +275,14 @@ inline std::expected<void, std::string> generate_repo_index(
             ss << "family = \"" << quote(tool.family) << "\"\n";
             ss << "version = \"" << quote(tool.version) << "\"\n";
             ss << "version_argument = \"--version\"\n";
+            if (!tool.parameters.empty()) {
+                ss << "parameters = [";
+                for (size_t i = 0; i < tool.parameters.size(); ++i) {
+                    ss << (i ? ", " : "") << "\""
+                       << quote(tool.parameters[i]) << "\"";
+                }
+                ss << "]\n";
+            }
         }
         ss << "\n";
     }

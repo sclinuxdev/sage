@@ -224,6 +224,8 @@ export int cmd_query(const CliOptions& opts) {
                 std::println("Build {:<7} {} [{} {}] (version source: {} --version)",
                     tool.role + ":", tool.executable, tool.family, tool.version,
                     tool.executable);
+                for (const auto& parameter : tool.parameters)
+                    std::println("  configured {}", parameter);
             }
         } else {
             sage::util::log_error("Package '{}' is not installed", pkg_name);
