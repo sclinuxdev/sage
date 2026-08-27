@@ -125,7 +125,7 @@ inline std::expected<std::string, std::string> fetch_string(std::string_view url
 inline std::expected<void, std::string> download_file(
     std::string_view url,
     const std::filesystem::path& dest_path,
-    ProgressCallback progress_cb = nullptr,
+    ProgressCallback progress_cb = ProgressCallback{},
     size_t num_threads = 4) 
 {
     (void)num_threads;
