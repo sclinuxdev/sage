@@ -231,13 +231,22 @@ run_reproducibility_check(const sage::package::Recipe& r,
         }
 
         const auto repro_transform_source = repro_src / r.managed_build.source_subdir;
-        apply_install_transforms(
-            repro_transform_source, repro_pkg, r.managed_build.install_copies,
-            r.managed_build.install_symlinks,
-            r.managed_build.install_moves,
-            r.managed_build.install_removes,
-            r.managed_build.install_generates);
-        apply_file_permissions(repro_pkg, r.managed_build.file_permissions);
+        if (auto transforms = apply_install_transforms(
+                repro_transform_source, repro_pkg, r.managed_build.install_copies,
+                r.managed_build.install_symlinks,
+                r.managed_build.install_moves,
+                r.managed_build.install_removes,
+                r.managed_build.install_generates); !transforms) {
+            sage::util::log_error("Reproducibility pass install transform failed: {}",
+                                  transforms.error());
+            return std::unexpected(1);
+        }
+        if (auto permissions = apply_file_permissions(
+                repro_pkg, r.managed_build.file_permissions); !permissions) {
+            sage::util::log_error("Reproducibility pass file permissions failed: {}",
+                                  permissions.error());
+            return std::unexpected(1);
+        }
         if (auto repro_content = apply_content_policy(
                 repro_pkg, r.managed_build.content); !repro_content) {
             sage::util::log_error("Reproducibility pass content policy failed: {}",
@@ -256,17 +265,34 @@ run_reproducibility_check(const sage::package::Recipe& r,
                     std::filesystem::copy(repro_pkg, repro_pkg_data,
                         std::filesystem::copy_options::recursive
                             | std::filesystem::copy_options::copy_symlinks, repro_ec);
-                    apply_payload_policy(repro_pkg_data, output_spec->install_files,
-                                         output_spec->install_excludes,
-                                         output_spec->optional_excludes);
-                    apply_install_transforms(
-                        repro_transform_source, repro_pkg_data,
-                        output_spec->install_copies,
-                        output_spec->install_symlinks,
-                        output_spec->install_moves,
-                        output_spec->install_removes,
-                        output_spec->install_generates);
-                    apply_file_permissions(repro_pkg_data, output_spec->file_permissions);
+                    if (auto payload = apply_payload_policy(
+                            repro_pkg_data, output_spec->install_files,
+                            output_spec->install_excludes,
+                            output_spec->optional_excludes); !payload) {
+                        sage::util::log_error(
+                            "Reproducibility pass payload policy failed: {}",
+                            payload.error());
+                        return std::unexpected(1);
+                    }
+                    if (auto transforms = apply_install_transforms(
+                            repro_transform_source, repro_pkg_data,
+                            output_spec->install_copies,
+                            output_spec->install_symlinks,
+                            output_spec->install_moves,
+                            output_spec->install_removes,
+                            output_spec->install_generates); !transforms) {
+                        sage::util::log_error(
+                            "Reproducibility pass install transform failed: {}",
+                            transforms.error());
+                        return std::unexpected(1);
+                    }
+                    if (auto permissions = apply_file_permissions(
+                            repro_pkg_data, output_spec->file_permissions); !permissions) {
+                        sage::util::log_error(
+                            "Reproducibility pass file permissions failed: {}",
+                            permissions.error());
+                        return std::unexpected(1);
+                    }
                     if (auto repro_sysusers = apply_sysusers_fragment(
                             repro_pkg_data, pkg_name, r.sysusers); !repro_sysusers) {
                         sage::util::log_error(
@@ -276,9 +302,15 @@ run_reproducibility_check(const sage::package::Recipe& r,
                     }
                 }
             } else {
-                apply_payload_policy(repro_pkg_data, r.managed_build.install_files,
-                                     r.managed_build.install_excludes,
-                                     r.managed_build.optional_excludes);
+                if (auto payload = apply_payload_policy(
+                        repro_pkg_data, r.managed_build.install_files,
+                        r.managed_build.install_excludes,
+                        r.managed_build.optional_excludes); !payload) {
+                    sage::util::log_error(
+                        "Reproducibility pass payload policy failed: {}",
+                        payload.error());
+                    return std::unexpected(1);
+                }
                 if (auto repro_sysusers = apply_sysusers_fragment(
                         repro_pkg_data, pkg_name, r.sysusers); !repro_sysusers) {
                     sage::util::log_error(
