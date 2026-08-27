@@ -77,7 +77,7 @@ inline std::expected<void, std::string> parse_managed_build(
              "outputs", "steps", "patches", "patch_checksums", "patch_strip",
              "allowed_compilers", "allowed_linkers", "variables", "flag_env",
              "tool_env", "toolchain", "tools", "flag_policy", "content",
-             "network",
+             "network", "header_only",
              "cmake", "meson", "cargo", "autotools", "make", "xmake"},
             "build"); !result)
         return std::unexpected(result.error());
@@ -130,6 +130,11 @@ inline std::expected<void, std::string> parse_managed_build(
                     "build.tools=true is valid only for script recipes");
             r.managed_build.script_managed_tools = true;
         }
+    }
+    if (bld->contains("header_only")) {
+        auto ho = (*bld)["header_only"].value<bool>();
+        if (!ho) return std::unexpected("build.header_only must be a boolean");
+        r.managed_build.header_only = *ho;
     }
     if (bld->contains("network")) {
         auto network = (*bld)["network"].value<bool>();

@@ -189,6 +189,7 @@ has exactly one effective SHA-256 before the `patch` command runs.
 [build]
 system = "cmake"               # autotools | cmake | meson | xmake | cargo | go | make | script
 payload = "all"                 # required payload boundary
+header_only = false             # exempt pure headers/data from compiler audit; forbids ELF binaries
 kernel = false                  # true for Linux Kbuild projects using the Make backend
 source_subdir = "src"          # optional, relative to unpacked source root
 build_dir = "build"            # cmake/meson build directory
@@ -211,6 +212,19 @@ tools = false                # script only: opt into the managed C/C++ toolchain
 network = false              # opt-in network for the build sandbox (default off)
 # [build.flag_policy] and [build.content] are documented in their own sections.
 ```
+
+### Declarative vendor pre-fetching (`[[vendor]]`)
+
+To support offline, reproducible builds for ecosystems with vendored dependencies (e.g. Go, Cargo, Node.js), recipes can declare `[[vendor]]` archives:
+
+```toml
+[[vendor]]
+url = "https://example.com/ripgrep-vendor-14.1.0.tar.zst"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+target = "vendor"              # optional target subdirectory, defaults to "vendor"
+```
+
+Sage pre-fetches and verifies the vendor archive SHA-256 before entering the build sandbox. During build staging, the archive is unpacked into `target` (default `vendor/` in the source root). For Cargo builds, Sage automatically configures offline crates-io source replacement via `.cargo/config.toml`; for Go builds, `-mod=vendor` is enabled automatically.
 
 `file_permissions` entries accept either numeric `uid`/`gid` or symbolic
 `user`/`group` names (resolved at build time, mutually exclusive with the

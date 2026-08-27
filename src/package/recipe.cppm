@@ -47,7 +47,7 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
         if (auto result = reject_unknown(tbl,
                 {"schema_version", "package", "upstream", "source",
                  "build", "capability_hooks", "triggers", "sysusers",
-                 "alternatives"}, "recipe"); !result)
+                 "alternatives", "vendor"}, "recipe"); !result)
             return std::unexpected(result.error());
     }
 
@@ -343,6 +343,40 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
         for (const auto& source : r.extra_sources) {
             if (source.url.empty() || !valid_sha256(source.sha256)) {
                 return std::unexpected("Recipe v2 [[source]] entries require a URL and a 64-hex sha256");
+            }
+        }
+
+        if (tbl.contains("vendor") && !tbl.get_as<vendor::toml::array>("vendor")
+            && !tbl.get_as<vendor::toml::table>("vendor"))
+            return std::unexpected("vendor must be a table or array of tables");
+        const auto parse_vendor_item = [&](const vendor::toml::table& v, std::string_view scope)
+            -> std::expected<void, std::string> {
+            if (auto result = reject_unknown(v, {"url", "sha256", "target"}, scope); !result)
+                return std::unexpected(result.error());
+            auto u = v["url"].value<std::string_view>();
+            auto h = v["sha256"].value<std::string_view>();
+            auto tgt = v["target"].value<std::string_view>().value_or("vendor");
+            if (!u || u->empty() || !h || !valid_sha256(*h))
+                return std::unexpected(std::format("{} requires a URL and a 64-hex sha256", scope));
+            if (tgt.empty() || tgt.starts_with('/')
+                || std::ranges::any_of(std::filesystem::path(std::string(tgt)),
+                    [](const auto& part) { return part == ".."; }))
+                return std::unexpected(std::format("{} target must be a relative path without '..'", scope));
+            r.vendors.push_back(VendorSpec{.url = std::string(*u), .sha256 = std::string(*h), .target = std::string(tgt)});
+            return {};
+        };
+        if (auto* v = tbl.get_as<vendor::toml::table>("vendor")) {
+            if (auto result = parse_vendor_item(*v, "vendor"); !result)
+                return std::unexpected(result.error());
+        }
+        if (auto* arr = tbl.get_as<vendor::toml::array>("vendor")) {
+            for (auto&& el : *arr) {
+                if (auto* v = el.as_table()) {
+                    if (auto result = parse_vendor_item(*v, "vendor[]"); !result)
+                        return std::unexpected(result.error());
+                } else {
+                    return std::unexpected("vendor entries must be tables");
+                }
             }
         }
 

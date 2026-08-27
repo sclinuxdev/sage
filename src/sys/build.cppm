@@ -128,8 +128,7 @@ inline bool canonical_autotools_install_option(std::string_view option) {
     if (key == "--infodir") return under("/usr/share/info");
     if (key == "--localedir") return under("/usr/share/locale");
     if (key == "--mandir") return under("/usr/share/man");
-    if (key == "--docdir" || key == "--htmldir" || key == "--dvidir"
-        || key == "--pdfdir" || key == "--psdir") return under("/usr/share/doc");
+    if (key == "--docdir" || key == "--htmldir" || key == "--dvidir" || key == "--pdfdir" || key == "--psdir") return under("/usr/share/doc");
     if (key == "--sysconfdir") return exact("/etc");
     if (key == "--sharedstatedir") return under("/var/lib");
     if (key == "--localstatedir") return under("/var");
@@ -600,6 +599,16 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         "find " + shell_quote(paths.source.string())
         + " -depth -exec touch -h -d "
         + shell_quote("@" + std::to_string(cfg.source_date_epoch)) + " {} +");
+    if (spec.system == package::BuildSystem::Cargo) {
+        std::error_code vendor_ec;
+        if (std::filesystem::is_directory(source / "vendor", vendor_ec) || !recipe.vendors.empty()) {
+            step("cargo-vendor-config", source,
+                "mkdir -p " + shell_quote((paths.home / ".cargo").string())
+                + " && printf '[source.crates-io]\\nreplace-with = \"vendored-sources\"\\n\\n[source.vendored-sources]\\ndirectory = \"%s\"\\n' "
+                + shell_quote((source / "vendor").string())
+                + " > " + shell_quote((paths.home / ".cargo/config.toml").string()));
+        }
+    }
     custom_steps("prepare");
 
     std::vector<std::string> all_build_targets = spec.build_targets;
@@ -701,14 +710,11 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             custom_steps("pre-build");
             step("build", autotools_cwd, "make" + make_managed_vars + make_vars +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", autotools_cwd, "make" + make_managed_vars + make_vars + " DESTDIR=" +
                 shell_quote(paths.package.string()) + " " +
                 (install_targets.empty() ? "install" : install_targets));
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::CMake: {
@@ -776,14 +782,11 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("build", source, "ninja -C " + shell_quote(build.string()) +
                 " -j " + std::to_string(jobs) +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", source, "DESTDIR=" + shell_quote(paths.package.string()) +
                 " ninja -C " + shell_quote(build.string()) +
                 (install_targets.empty() ? " install" : " " + install_targets));
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Meson: {
@@ -832,13 +835,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             step("build", source, "meson compile -C " + shell_quote(build.string()) +
                 " -j " + std::to_string(jobs) +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", source, "DESTDIR=" + shell_quote(paths.package.string()) +
                 " meson install -C " + shell_quote(build.string()) + " --no-rebuild");
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Xmake: {
@@ -880,13 +880,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             custom_steps("pre-build");
             step("build", source, "xmake -j " + std::to_string(jobs) + " --root" +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", source, "xmake install --root -o " +
                 shell_quote((paths.package / "usr").string()));
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Cargo: {
@@ -925,14 +922,11 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             custom_steps("pre-build");
             step("build", source, "cargo build --release" + locked_flag + cargo_build_flags +
                 (build_targets.empty() ? "" : " " + build_targets));
-            custom_steps("post-build");
-            custom_steps("check");
-            custom_steps("pre-install");
+            for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
             step("install", source, "cargo install --path . --root " +
                 shell_quote((paths.package / "usr").string()) + locked_flag + " --no-track" +
                 cargo_build_flags + (install_targets.empty() ? "" : " " + install_targets));
-            custom_steps("install");
-            custom_steps("post-install");
+            for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }
         case package::BuildSystem::Go: {

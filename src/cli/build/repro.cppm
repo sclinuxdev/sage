@@ -38,7 +38,8 @@ run_reproducibility_check(const sage::package::Recipe& r,
                           const sage::config::BuildConfig& bcfg,
                           const std::string& target_triplet,
                           const std::string& active_cache_mode,
-                          const std::filesystem::path& cache_dir)
+                          const std::filesystem::path& cache_dir,
+                          const std::vector<std::pair<std::filesystem::path, std::string>>& vendor_paths = {})
 {
     (void)target_root;
     const int requested_compile_jobs = bcfg.configured_compile_jobs();
@@ -65,6 +66,15 @@ run_reproducibility_check(const sage::package::Recipe& r,
             auto extracted = extract_source_archive(archive_path, repro_src);
             if (!extracted) {
                 sage::util::log_error("Reproducibility pass failed to unpack source: {}", extracted.error());
+                return std::unexpected(1);
+            }
+        }
+        for (const auto& [vpath, target_rel] : vendor_paths) {
+            const auto target_dir = repro_src / target_rel;
+            std::filesystem::create_directories(target_dir, repro_ec);
+            auto vext = extract_source_archive(vpath, target_dir);
+            if (!vext) {
+                sage::util::log_error("Reproducibility pass failed to unpack vendor {}: {}", vpath.filename().string(), vext.error());
                 return std::unexpected(1);
             }
         }

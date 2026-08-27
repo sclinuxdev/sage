@@ -399,6 +399,27 @@ export inline int cmd_build(const CliOptions& opts) {
         auto& path = extra_paths.emplace_back();
         if (!fetch_source(extra.url, extra.sha256, path)) return 1;
     }
+    std::vector<std::pair<std::filesystem::path, std::string>> vendor_paths;
+    for (const auto& v : r.vendors) {
+        std::filesystem::path vpath;
+        if (!fetch_source(v.url, v.sha256, vpath)) return 1;
+        vendor_paths.emplace_back(std::move(vpath), v.target.empty() ? "vendor" : v.target);
+    }
+
+    auto unpack_vendors = [&](const std::filesystem::path& base_dir) -> bool {
+        for (const auto& [vpath, target_rel] : vendor_paths) {
+            const auto target_dir = base_dir / target_rel;
+            std::error_code vec;
+            std::filesystem::create_directories(target_dir, vec);
+            sage::util::log_info("Unpacking vendor archive to {}...", target_dir.string());
+            auto extracted = extract_source_archive(vpath, target_dir);
+            if (!extracted) {
+                sage::util::log_error("Failed to unpack vendor archive {}: {}", vpath.filename().string(), extracted.error());
+                return false;
+            }
+        }
+        return true;
+    };
 
     // These are populated only from the v2 plan Sage actually executes. They
     // remain empty for v1, and empty flag channels are deliberately omitted.
@@ -408,25 +429,17 @@ export inline int cmd_build(const CliOptions& opts) {
     std::vector<std::string> managed_rustc_parameters;
 
     // 2. Prepare, Build & Install Phases -- exactly one toolchain, the first
-    // usable candidate. A build failure is caused by the compiler or the
-    // configured flags often enough that silently retrying under another
-    // compiler would manufacture a package nobody asked for: sage stops and
-    // says what ran instead. The fallback pair still exists at probe time
-    // (an absent primary is skipped before any compilation starts).
+    // usable candidate.
     {
         const Toolchain& cand = candidates.front();
 
         std::error_code ec;
         std::filesystem::remove_all(pkg_dir, ec);
         std::filesystem::create_directories(pkg_dir);
-        // A pristine tree per attempt: the primary archive is re-extracted and
-        // the extra sources re-staged, so patches consumed during prepare are
-        // applied to an untouched tree on every retry. --reuse-src opts out:
-        // the existing tree is kept as-is for incremental build systems.
         if (resume_src) {
             sage::util::log_info("Reusing existing source tree at {} (--reuse-src)",
                                  src_dir.string());
-        } else if (!archive_path.empty() || !extra_paths.empty()) {
+        } else if (!archive_path.empty() || !extra_paths.empty() || !vendor_paths.empty()) {
             std::filesystem::remove_all(src_dir, ec);
             std::filesystem::create_directories(src_dir / "distfiles");
             if (!archive_path.empty()) {
@@ -441,6 +454,7 @@ export inline int cmd_build(const CliOptions& opts) {
                     return 1;
                 }
             }
+            if (!unpack_vendors(src_dir)) return 1;
             for (const auto& path : extra_paths) {
                 std::error_code copy_ec;
                 std::filesystem::copy_file(path, src_dir / "distfiles" / path.filename(),
@@ -452,9 +466,6 @@ export inline int cmd_build(const CliOptions& opts) {
                 }
             }
         } else if (r.schema_version == 2 && r.source_url.empty()) {
-            // Local v2 projects are immutable recipe inputs. Copy everything
-            // except Sage metadata/staging directories into a writable source
-            // tree so arbitrary prepare/build/install steps can modify it.
             std::filesystem::remove_all(src_dir, ec);
             std::filesystem::create_directories(src_dir, ec);
             for (const auto& entry : std::filesystem::directory_iterator(recipe_dir)) {
@@ -471,6 +482,7 @@ export inline int cmd_build(const CliOptions& opts) {
                     return 1;
                 }
             }
+            if (!unpack_vendors(src_dir)) return 1;
         }
         if (r.schema_version == 2) {
             // Local patch attachments live beside recipe.toml in the source
@@ -855,14 +867,9 @@ export inline int cmd_build(const CliOptions& opts) {
                 "The build attempted to execute a compiler/linker outside Sage's selected toolchain");
             return 1;
         }
-        const bool cargo = r.managed_build.system
-            == sage::package::BuildSystem::Cargo;
-        const bool go_backend = r.managed_build.system
-            == sage::package::BuildSystem::Go;
-        // A script recipe that declared build.tools = true is audited like
-        // any managed backend; only the tools-free script variant is exempt.
-        const bool script = r.managed_build.system
-            == sage::package::BuildSystem::Script
+        const bool cargo = r.managed_build.system == sage::package::BuildSystem::Cargo;
+        const bool go_backend = r.managed_build.system == sage::package::BuildSystem::Go;
+        const bool script = r.managed_build.system == sage::package::BuildSystem::Script
             && !r.managed_build.script_managed_tools;
         // The go toolchain is not PATH-fenced: prove it executed through the
         // ptrace process log instead, and keep its observed command lines as
@@ -890,12 +897,14 @@ export inline int cmd_build(const CliOptions& opts) {
         const auto compiler_execs = tool_audit->executions("cc")
             + tool_audit->executions("cxx");
         const auto rustc_execs = tool_audit->executions("rustc");
-        if ((!script && cargo && rustc_execs == 0)
-            || (!script && !cargo && !go_backend && compiler_execs == 0)
-            || (!script && go_backend && go_executions == 0)) {
-            sage::util::log_error(
-                "No Sage audit marker proves that the configured compiler executed");
-            return 1;
+        if (!r.managed_build.header_only) {
+            if ((!script && cargo && rustc_execs == 0)
+                || (!script && !cargo && !go_backend && compiler_execs == 0)
+                || (!script && go_backend && go_executions == 0)) {
+                sage::util::log_error(
+                    "No Sage audit marker proves that the configured compiler executed");
+                return 1;
+            }
         }
         const auto link_driver_execs = tool_audit->executions("linker-driver");
         const auto linker_execs = tool_audit->executions("linker");
@@ -915,7 +924,12 @@ export inline int cmd_build(const CliOptions& opts) {
             if (!entry.is_regular_file()) continue;
             if (sage::util::scan_elf(entry.path())) { has_elf = true; break; }
         }
-        if (!script && !go_backend && has_elf && linker_execs == 0) {
+        if (r.managed_build.header_only && has_elf) {
+            sage::util::log_error(
+                "build.header_only=true is declared, but ELF binary payload was found");
+            return 1;
+        }
+        if (!script && !go_backend && !r.managed_build.header_only && has_elf && linker_execs == 0) {
             sage::util::log_error(
                 "ELF payload exists but no selected linker execution was observed");
             return 1;
@@ -942,7 +956,7 @@ export inline int cmd_build(const CliOptions& opts) {
         auto repro_res = run_reproducibility_check(
             r, elf_result.manifest, candidates, recipe_dir, archive_path, extra_paths,
             created_packages, opts.target_root,
-            bcfg, target_triplet, active_cache_mode, cache_dir);
+            bcfg, target_triplet, active_cache_mode, cache_dir, vendor_paths);
         if (!repro_res) return repro_res.error();
     }
     return 0;

@@ -2379,6 +2379,125 @@ install = [
         std::filesystem::remove_all(temp_dir);
         sage::util::log_success("15. Multi-Source Fetch, Verification & Staging OK");
     }
+    {
+        // 16. Header-only Exemption & [[vendor]] Declarative Dependencies
+        auto temp_dir = std::filesystem::temp_directory_path()
+            / std::format("sage_header_vendor_test_{}", sage::util::current_pid());
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir, ec);
+        std::filesystem::create_directories(temp_dir, ec);
+
+        // Test 16a: Header-only Recipe v2
+        auto ho_dir = temp_dir / "headerpkg";
+        std::filesystem::create_directories(ho_dir / "include/mylib");
+        {
+            std::ofstream h(ho_dir / "include/mylib/header.h");
+            h << "#pragma once\ninline int answer() { return 42; }\n";
+        }
+        {
+            std::ofstream r(ho_dir / "recipe.toml");
+            r << R"(schema_version = 2
+[package]
+name = "headerpkg"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "any"
+
+[build]
+system = "script"
+payload = "all"
+header_only = true
+steps = [{ name = "stage", phase = "install", command = "true" }]
+install_copies = [{ from = "include/mylib/header.h", to = "usr/include/mylib/header.h" }]
+)";
+        }
+
+        CliOptions ho_build;
+        ho_build.args = {ho_dir.string()};
+        ho_build.target_root = temp_dir / "target";
+        if (cmd_build(ho_build) != 0) {
+            sage::util::log_error("Failed to build header_only recipe");
+            return 1;
+        }
+
+        auto ho_pkg = ho_dir / "headerpkg-1.0.0-1-any.pkg.tar.zst";
+        auto ho_unpacked = sage::archive::extract_package(ho_pkg, temp_dir / "ho_unpacked");
+        if (!ho_unpacked || !std::filesystem::exists(temp_dir / "ho_unpacked/usr/include/mylib/header.h")) {
+            sage::util::log_error("Header-only package contents missing or invalid");
+            return 1;
+        }
+
+        // Test 16b: Declarative [[vendor]] Pre-fetching and Unpacking
+        auto dist_dir = temp_dir / "dist";
+        std::filesystem::create_directories(dist_dir);
+        auto make_tar_gz = [&](const std::filesystem::path& src_dir, std::string_view entry, const std::filesystem::path& out_tar_gz) {
+            std::string cmd = std::format("tar -czf {} -C {} {}",
+                sage::build::shell_quote(out_tar_gz.string()),
+                sage::build::shell_quote(src_dir.string()),
+                sage::build::shell_quote(entry));
+            return std::system(cmd.c_str()) == 0;
+        };
+
+        auto vendor_staging = temp_dir / "vstaging/vendordep";
+        std::filesystem::create_directories(vendor_staging);
+        {
+            std::ofstream vf(vendor_staging / "lib.rs");
+            vf << "pub fn vendor_hello() {}\n";
+        }
+        auto vendor_tar = dist_dir / "vendordep-1.0.0.tar.gz";
+        if (!make_tar_gz(temp_dir / "vstaging", "vendordep", vendor_tar)) {
+            sage::util::log_error("Failed to create mock vendor tarball");
+            return 1;
+        }
+        auto vendor_sha = *sage::util::compute_file_sha256(vendor_tar);
+
+        auto vendorpkg_dir = temp_dir / "vendorpkg";
+        std::filesystem::create_directories(vendorpkg_dir);
+        {
+            std::ofstream r(vendorpkg_dir / "recipe.toml");
+            r << std::format(R"(schema_version = 2
+[package]
+name = "vendorpkg"
+version = "1.0.0"
+release = "1"
+license = "MIT"
+channel = "system"
+arch = "any"
+
+[[vendor]]
+url = "file://{}"
+sha256 = "{}"
+target = "vendor"
+
+[build]
+system = "script"
+payload = "all"
+header_only = true
+steps = [{{ name = "stage", phase = "install", command = "true" }}]
+install_copies = [{{ from = "vendor/lib.rs", to = "usr/share/vendor/lib.rs" }}]
+)", vendor_tar.string(), vendor_sha);
+        }
+
+        CliOptions vendor_build;
+        vendor_build.args = {vendorpkg_dir.string()};
+        vendor_build.target_root = temp_dir / "target";
+        if (cmd_build(vendor_build) != 0) {
+            sage::util::log_error("Failed to build recipe with [[vendor]] archive");
+            return 1;
+        }
+
+        auto vendor_pkg = vendorpkg_dir / "vendorpkg-1.0.0-1-any.pkg.tar.zst";
+        auto vendor_unpacked = sage::archive::extract_package(vendor_pkg, temp_dir / "vendor_unpacked");
+        if (!vendor_unpacked || !std::filesystem::exists(temp_dir / "vendor_unpacked/usr/share/vendor/lib.rs")) {
+            sage::util::log_error("Vendor archive files were not extracted or staged properly");
+            return 1;
+        }
+
+        std::filesystem::remove_all(temp_dir);
+        sage::util::log_success("16. Header-only Exemption & [[vendor]] Declarative Dependencies OK");
+    }
     return 0;
 }
 

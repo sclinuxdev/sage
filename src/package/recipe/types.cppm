@@ -295,6 +295,9 @@ struct ManagedBuildSpec {
     // toolchain (language runtimes with native extensions). Sage then audits
     // the build exactly like any managed backend instead of rejecting it.
     bool script_managed_tools{false};
+    // Header-only / pure-data package: exempts the build from mandatory compiler
+    // execution audit while asserting that no compiled ELF binaries are produced.
+    bool header_only{false};
     // Opt-in network for the build sandbox. Default false keeps the hermetic
     // no-network boundary; declaring true is what lets a Go/Cargo recipe fetch
     // its module dependencies during the build.
@@ -309,6 +312,14 @@ struct ManagedBuildSpec {
     std::optional<XmakeBackendSpec> xmake;
 };
 
+// Declarative vendor dependency archive (e.g. for offline Go/Cargo/Node builds).
+// Verified by SHA-256 and unpacked into `target` directory (default "vendor").
+struct VendorSpec {
+    std::string url;
+    std::string sha256;
+    std::string target{"vendor"};
+};
+
 struct Recipe {
     uint32_t schema_version{1};
     std::string name;
@@ -321,6 +332,7 @@ struct Recipe {
     std::string source_url;
     std::string source_sha256;
     std::vector<ExtraSource> extra_sources;
+    std::vector<VendorSpec> vendors;
     UpstreamSpec upstream;
     ManagedBuildSpec managed_build;
     // Build-only requirements; check_deps are resolved against the configured
@@ -356,7 +368,6 @@ struct Recipe {
     std::vector<SysUserEntry> sysusers;
     // Cross-package symlink arbitration (v2, root [[alternatives]] array).
     std::vector<AlternativeEntry> alternatives;
-
 
     static std::expected<Recipe, std::string> parse_toml(std::string_view toml_content);
 };
