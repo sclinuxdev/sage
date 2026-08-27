@@ -279,7 +279,7 @@ std::expected<void, std::string> publish_ensure_dir(
 #endif
     detail::UniqueFd current(::fcntl(root_fd, F_DUPFD_CLOEXEC, 0));
     if (current.get() < 0)
-        return std::unexpected("Cannot duplicate target root descriptor");
+        return std::unexpected(std::string{"Cannot duplicate target root descriptor"});
     for (const auto& component : components) {
         int next = ::openat(current.get(), component.c_str(), walk_flags);
         if (next < 0 && errno == ENOENT) {
@@ -558,7 +558,7 @@ public:
         }
         struct stat status {};
         if (::fstat(file.get(), &status) != 0 || status.st_size < 0)
-            return std::unexpected("Cannot stat journal");
+            return std::unexpected(std::string{"Cannot stat journal"});
         std::string text;
         text.resize(static_cast<std::size_t>(status.st_size));
         std::size_t done = 0;

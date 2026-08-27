@@ -35,7 +35,7 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
     Recipe r;
     if (tbl.contains("schema_version")
         && !tbl["schema_version"].value<std::int64_t>())
-        return std::unexpected("schema_version must be an integer");
+        return std::unexpected(std::string{"schema_version must be an integer"});
     r.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
     if (r.schema_version != 1 && r.schema_version != 2) {
         return std::unexpected(std::format(
@@ -75,12 +75,12 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
         auto architecture = validate_package_architecture(r.arch);
         if (!architecture) return std::unexpected(architecture.error());
     } else {
-        return std::unexpected("Missing [package] section in recipe");
+        return std::unexpected(std::string{"Missing [package] section in recipe"});
     }
 
     if (r.schema_version == 2 && tbl.contains("upstream")
         && !tbl.get_as<vendor::toml::table>("upstream"))
-        return std::unexpected("recipe.upstream must be a table");
+        return std::unexpected(std::string{"recipe.upstream must be a table"});
     if (auto* upstream = tbl.get_as<vendor::toml::table>("upstream")) {
         if (r.schema_version == 2) {
             if (auto result = reject_unknown(*upstream,
@@ -89,12 +89,12 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
         }
         if (upstream->contains("url")) {
             auto u = (*upstream)["url"].value<std::string_view>();
-            if (!u || u->empty()) return std::unexpected("upstream.url must be a non-empty string");
+            if (!u || u->empty()) return std::unexpected(std::string{"upstream.url must be a non-empty string"});
             r.upstream.url = std::string(*u);
         }
         if (upstream->contains("version_regex")) {
             auto re = (*upstream)["version_regex"].value<std::string_view>();
-            if (!re || re->empty()) return std::unexpected("upstream.version_regex must be a non-empty string");
+            if (!re || re->empty()) return std::unexpected(std::string{"upstream.version_regex must be a non-empty string"});
             r.upstream.version_regex = std::string(*re);
         }
     }
@@ -246,17 +246,17 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
                 && entry.name.find_first_of(" \t") == std::string::npos;
             if (!well_formed)
                 return std::unexpected(
-                    "package.provides entries must be names or 'name <op> version': "
+                    std::string{"package.provides entries must be names or 'name <op> version': "}
                     + prov);
         }
 
         if (tbl.contains("sysusers")
             && !tbl.get_as<vendor::toml::array>("sysusers"))
-            return std::unexpected("sysusers must be an array of tables");
+            return std::unexpected(std::string{"sysusers must be an array of tables"});
         if (auto* arr = tbl.get_as<vendor::toml::array>("sysusers")) {
             for (auto&& element : *arr) {
                 auto* item = element.as_table();
-                if (!item) return std::unexpected("sysusers entries must be inline tables");
+                if (!item) return std::unexpected(std::string{"sysusers entries must be inline tables"});
                 if (auto result = reject_unknown(*item,
                         {"type", "name", "id", "description", "home", "shell", "group"},
                         "sysusers[]"); !result)
@@ -264,10 +264,10 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
                 auto type = (*item)["type"].value<std::string_view>();
                 auto name = (*item)["name"].value<std::string_view>();
                 if (!type || (*type != "user" && *type != "group"))
-                    return std::unexpected("sysusers entries require type = \"user\" or \"group\"");
+                    return std::unexpected(std::string{"sysusers entries require type = \"user\" or \"group\""});
                 if (!name || name->empty() || name->find('/') != std::string::npos
                     || *name == "." || *name == "..")
-                    return std::unexpected("sysusers entries require a simple non-empty name");
+                    return std::unexpected(std::string{"sysusers entries require a simple non-empty name"});
                 SysUserEntry entry;
                 entry.type = std::string(*type);
                 entry.name = std::string(*name);
@@ -297,11 +297,11 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
 
         if (tbl.contains("alternatives")
             && !tbl.get_as<vendor::toml::array>("alternatives"))
-            return std::unexpected("alternatives must be an array of tables");
+            return std::unexpected(std::string{"alternatives must be an array of tables"});
         if (auto* arr = tbl.get_as<vendor::toml::array>("alternatives")) {
             for (auto&& element : *arr) {
                 auto* item = element.as_table();
-                if (!item) return std::unexpected("alternatives entries must be inline tables");
+                if (!item) return std::unexpected(std::string{"alternatives entries must be inline tables"});
                 if (auto result = reject_unknown(*item,
                         {"link", "target", "priority"}, "alternatives[]"); !result)
                     return std::unexpected(result.error());
@@ -310,14 +310,14 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
                 if (!link || link->empty() || link->starts_with('/')
                     || std::ranges::any_of(std::filesystem::path(std::string(*link)),
                         [](const auto& part) { return part == ".."; }))
-                    return std::unexpected("alternatives entries require a relative link path");
+                    return std::unexpected(std::string{"alternatives entries require a relative link path"});
                 if (!target || target->empty() || target->starts_with('/'))
-                    return std::unexpected("alternatives entries require a relative target");
+                    return std::unexpected(std::string{"alternatives entries require a relative target"});
                 int priority = 50;
                 if (item->contains("priority")) {
                     auto value = (*item)["priority"].value<std::int64_t>();
                     if (!value || *value < 0 || *value > 1000)
-                        return std::unexpected("alternatives priority must be between 0 and 1000");
+                        return std::unexpected(std::string{"alternatives priority must be between 0 and 1000"});
                     priority = static_cast<int>(*value);
                 }
                 r.alternatives.push_back(AlternativeEntry{
@@ -338,17 +338,17 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
             });
         };
         if (!r.source_url.empty() && !valid_sha256(r.source_sha256)) {
-            return std::unexpected("Recipe v2 requires a 64-hex source.sha256 when source.url is present");
+            return std::unexpected(std::string{"Recipe v2 requires a 64-hex source.sha256 when source.url is present"});
         }
         for (const auto& source : r.extra_sources) {
             if (source.url.empty() || !valid_sha256(source.sha256)) {
-                return std::unexpected("Recipe v2 [[source]] entries require a URL and a 64-hex sha256");
+                return std::unexpected(std::string{"Recipe v2 [[source]] entries require a URL and a 64-hex sha256"});
             }
         }
 
         if (tbl.contains("vendor") && !tbl.get_as<vendor::toml::array>("vendor")
             && !tbl.get_as<vendor::toml::table>("vendor"))
-            return std::unexpected("vendor must be a table or array of tables");
+            return std::unexpected(std::string{"vendor must be a table or array of tables"});
         const auto parse_vendor_item = [&](const vendor::toml::table& v, std::string_view scope)
             -> std::expected<void, std::string> {
             if (auto result = reject_unknown(v, {"url", "sha256", "target"}, scope); !result)
@@ -375,7 +375,7 @@ inline std::expected<Recipe, std::string> Recipe::parse_toml(std::string_view to
                     if (auto result = parse_vendor_item(*v, "vendor[]"); !result)
                         return std::unexpected(result.error());
                 } else {
-                    return std::unexpected("vendor entries must be tables");
+                    return std::unexpected(std::string{"vendor entries must be tables"});
                 }
             }
         }

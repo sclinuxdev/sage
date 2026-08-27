@@ -32,7 +32,6 @@ scan_and_validate_elf(const sage::package::Recipe& r,
                       const std::filesystem::path& pkg_dir,
                       const std::filesystem::path& src_dir,
                       const std::filesystem::path& recipe_dir,
-                      const std::filesystem::path& target_root,
                       bool no_elf_check,
                       const sage::config::BuildConfig& bcfg,
                       const sage::config::SystemConfig& cfg,
@@ -203,7 +202,8 @@ scan_and_validate_elf(const sage::package::Recipe& r,
                 : cfg.db_path;
             if (auto sdb = sage::db::Database::open(sysroot_db_path, true)) {
                 if (auto pkgs = sdb->list_installed_packages()) {
-                    for (const auto& pkg : *pkgs) {
+                    for (std::size_t i = 0; i < pkgs->size(); ++i) {
+                        const auto& pkg = (*pkgs)[i];
                         attestation.sysroot_packages.push_back({
                             .name = pkg.name,
                             .version = pkg.version.ver,

@@ -68,7 +68,7 @@ inline std::expected<void, std::string> parse_backend_specs(
     };
 
             if (bld.contains("cmake") && !bld.get_as<vendor::toml::table>("cmake"))
-                return std::unexpected("build.cmake must be a table");
+                return std::unexpected(std::string{"build.cmake must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("cmake")) {
                 if (auto result = reject_unknown(*spec,
                         {"definitions", "features", "build_type", "raw_options"},
@@ -83,7 +83,7 @@ inline std::expected<void, std::string> parse_backend_specs(
                     return std::unexpected(result.error());
                 if (spec->contains("build_type")) {
                     auto bt = (*spec)["build_type"].value<std::string_view>();
-                    if (!bt || bt->empty()) return std::unexpected("build.cmake.build_type must be a non-empty string");
+                    if (!bt || bt->empty()) return std::unexpected(std::string{"build.cmake.build_type must be a non-empty string"});
                     cmake_spec.build_type = std::string(*bt);
                 }
                 if (auto result = parse_string_array_strict(*spec, "raw_options",
@@ -93,7 +93,7 @@ inline std::expected<void, std::string> parse_backend_specs(
             }
 
             if (bld.contains("meson") && !bld.get_as<vendor::toml::table>("meson"))
-                return std::unexpected("build.meson must be a table");
+                return std::unexpected(std::string{"build.meson must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("meson")) {
                 if (auto result = reject_unknown(*spec,
                         {"options", "build_type", "raw_options"},
@@ -105,7 +105,7 @@ inline std::expected<void, std::string> parse_backend_specs(
                     return std::unexpected(result.error());
                 if (spec->contains("build_type")) {
                     auto bt = (*spec)["build_type"].value<std::string_view>();
-                    if (!bt || bt->empty()) return std::unexpected("build.meson.build_type must be a non-empty string");
+                    if (!bt || bt->empty()) return std::unexpected(std::string{"build.meson.build_type must be a non-empty string"});
                     meson_spec.build_type = std::string(*bt);
                 }
                 if (auto result = parse_string_array_strict(*spec, "raw_options",
@@ -115,7 +115,7 @@ inline std::expected<void, std::string> parse_backend_specs(
             }
 
             if (bld.contains("cargo") && !bld.get_as<vendor::toml::table>("cargo"))
-                return std::unexpected("build.cargo must be a table");
+                return std::unexpected(std::string{"build.cargo must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("cargo")) {
                 if (auto result = reject_unknown(*spec,
                         {"features", "default_features", "locked", "raw_options"},
@@ -127,12 +127,12 @@ inline std::expected<void, std::string> parse_backend_specs(
                     return std::unexpected(result.error());
                 if (spec->contains("default_features")) {
                     auto df = (*spec)["default_features"].value<bool>();
-                    if (!df) return std::unexpected("build.cargo.default_features must be a boolean");
+                    if (!df) return std::unexpected(std::string{"build.cargo.default_features must be a boolean"});
                     cargo_spec.default_features = *df;
                 }
                 if (spec->contains("locked")) {
                     auto lk = (*spec)["locked"].value<bool>();
-                    if (!lk) return std::unexpected("build.cargo.locked must be a boolean");
+                    if (!lk) return std::unexpected(std::string{"build.cargo.locked must be a boolean"});
                     cargo_spec.locked = *lk;
                 }
                 if (auto result = parse_string_array_strict(*spec, "raw_options",
@@ -142,7 +142,7 @@ inline std::expected<void, std::string> parse_backend_specs(
             }
 
             if (bld.contains("autotools") && !bld.get_as<vendor::toml::table>("autotools"))
-                return std::unexpected("build.autotools must be a table");
+                return std::unexpected(std::string{"build.autotools must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("autotools")) {
                 if (auto result = reject_unknown(*spec,
                         {"enable", "disable", "with", "without", "raw_options"},
@@ -168,7 +168,7 @@ inline std::expected<void, std::string> parse_backend_specs(
             }
 
             if (bld.contains("make") && !bld.get_as<vendor::toml::table>("make"))
-                return std::unexpected("build.make must be a table");
+                return std::unexpected(std::string{"build.make must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("make")) {
                 if (auto result = reject_unknown(*spec,
                         {"targets", "install_targets", "variables", "raw_options"},
@@ -191,7 +191,7 @@ inline std::expected<void, std::string> parse_backend_specs(
             }
 
             if (bld.contains("xmake") && !bld.get_as<vendor::toml::table>("xmake"))
-                return std::unexpected("build.xmake must be a table");
+                return std::unexpected(std::string{"build.xmake must be a table"});
             if (auto* spec = bld.get_as<vendor::toml::table>("xmake")) {
                 if (auto result = reject_unknown(*spec,
                         {"configs", "mode", "raw_options"},
@@ -203,7 +203,7 @@ inline std::expected<void, std::string> parse_backend_specs(
                     return std::unexpected(result.error());
                 if (spec->contains("mode")) {
                     auto md = (*spec)["mode"].value<std::string_view>();
-                    if (!md || md->empty()) return std::unexpected("build.xmake.mode must be a non-empty string");
+                    if (!md || md->empty()) return std::unexpected(std::string{"build.xmake.mode must be a non-empty string"});
                     xmake_spec.mode = std::string(*md);
                 }
                 if (auto result = parse_string_array_strict(*spec, "raw_options",

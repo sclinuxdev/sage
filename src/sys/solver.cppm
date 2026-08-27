@@ -325,15 +325,13 @@ private:
             changed = false;
             for (const auto& incomp : incompatibilities_) {
                 int satisfied_count = 0;
-                int contradicted_count = 0;
                 int undecided_count = 0;
                 const Term* undecided_term = nullptr;
 
                 for (const auto& term : incomp->terms) {
                     int eval = evaluate_term(term);
                     if (eval == 1) ++satisfied_count;
-                    else if (eval == -1) ++contradicted_count;
-                    else {
+                    else if (eval == 0) {
                         ++undecided_count;
                         undecided_term = &term;
                     }

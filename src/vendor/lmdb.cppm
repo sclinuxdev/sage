@@ -193,7 +193,7 @@ public:
         std::string_view key) const noexcept
     {
         if (!valid_ || !txn.handle()) {
-            return std::unexpected("Invalid DBI or transaction");
+            return std::unexpected(std::string{"Invalid DBI or transaction"});
         }
         MDB_val k = to_val(key);
         MDB_val v{};
@@ -214,7 +214,7 @@ public:
         unsigned int flags = 0) const noexcept 
     {
         if (!valid_ || !txn.handle()) {
-            return std::unexpected("Invalid DBI or transaction");
+            return std::unexpected(std::string{"Invalid DBI or transaction"});
         }
         MDB_val k = to_val(key);
         MDB_val v = to_val(val);
@@ -227,7 +227,7 @@ public:
 
     std::expected<void, std::string> del(MdbTxn& txn, std::string_view key) const noexcept {
         if (!valid_ || !txn.handle()) {
-            return std::unexpected("Invalid DBI or transaction");
+            return std::unexpected(std::string{"Invalid DBI or transaction"});
         }
         MDB_val k = to_val(key);
         int rc = mdb_del(txn.handle(), dbi_, &k, nullptr);
@@ -285,7 +285,7 @@ public:
         std::string_view& key,
         std::string_view& val) noexcept
     {
-        if (!cursor_) return std::unexpected("Invalid cursor");
+        if (!cursor_) return std::unexpected(std::string{"Invalid cursor"});
         MDB_val k = to_val(key);
         MDB_val v = to_val(val);
         int rc = mdb_cursor_get(cursor_, &k, &v, op);

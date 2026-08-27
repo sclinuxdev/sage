@@ -91,19 +91,19 @@ struct CgroupScope {
         const std::filesystem::path base_cgroup = "/sys/fs/cgroup";
         std::ifstream controllers_file(base_cgroup / "cgroup.controllers");
         if (!controllers_file) return std::unexpected(
-            "cgroups v2 is unavailable: cannot read cgroup.controllers "
-            "(tip: in container/unprivileged environments, ensure cgroups v2 delegation is enabled or unset memory_limit/pids_limit)");
+            std::string{"cgroups v2 is unavailable: cannot read cgroup.controllers "
+                "(tip: in container/unprivileged environments, ensure cgroups v2 delegation is enabled or unset memory_limit/pids_limit)"});
         std::set<std::string> controllers;
         for (std::string controller; controllers_file >> controller;)
             controllers.insert(std::move(controller));
         if (!mem_limit.empty() && !controllers.contains("memory"))
             return std::unexpected(
-                "configured memory_limit requires the cgroups v2 memory controller "
-                "(tip: ensure 'memory' is delegated in cgroup.subtree_control or disable memory_limit)");
+                std::string{"configured memory_limit requires the cgroups v2 memory controller "
+                    "(tip: ensure 'memory' is delegated in cgroup.subtree_control or disable memory_limit)"});
         if (pids_limit > 0 && !controllers.contains("pids"))
             return std::unexpected(
-                "configured pids_limit requires the cgroups v2 pids controller "
-                "(tip: ensure 'pids' is delegated in cgroup.subtree_control or disable pids_limit)");
+                std::string{"configured pids_limit requires the cgroups v2 pids controller "
+                    "(tip: ensure 'pids' is delegated in cgroup.subtree_control or disable pids_limit)"});
 
         std::filesystem::path slice =
             base_cgroup / std::format("sage-build-{}", pid);
@@ -140,10 +140,10 @@ struct CgroupScope {
         {
             std::ofstream procs_file(slice / "cgroup.procs");
             if (!procs_file) return std::unexpected(
-                "cannot open build cgroup cgroup.procs");
+                std::string{"cannot open build cgroup cgroup.procs"});
             procs_file << pid << '\n';
             if (!procs_file) return std::unexpected(
-                "cannot move build audit supervisor into its cgroup");
+                std::string{"cannot move build audit supervisor into its cgroup"});
         }
         return std::optional<CgroupScope>(std::move(scope));
     }
@@ -243,10 +243,10 @@ struct ProcessExecAudit {
             ::kill(child, SIGKILL);
             if (WIFEXITED(status) && WEXITSTATUS(status) == 125) {
                 return std::unexpected(
-                    "build audit child failed ptrace(PTRACE_TRACEME) or seccomp initialization; "
-                    "ensure environment allows ptrace (e.g. container --cap-add=SYS_PTRACE or Yama ptrace_scope)");
+                    std::string{"build audit child failed ptrace(PTRACE_TRACEME) or seccomp initialization; "
+                        "ensure environment allows ptrace (e.g. container --cap-add=SYS_PTRACE or Yama ptrace_scope)"});
             }
-            return std::unexpected("build audit child did not enter tracing stop");
+            return std::unexpected(std::string{"build audit child did not enter tracing stop"});
         }
         constexpr long trace_options = PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK
             | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC | PTRACE_O_TRACESECCOMP
@@ -259,7 +259,7 @@ struct ProcessExecAudit {
         }
         if (::ptrace(PTRACE_CONT, child, nullptr, nullptr) != 0) {
             ::kill(child, SIGKILL);
-            return std::unexpected("cannot continue build audit child");
+            return std::unexpected(std::string{"cannot continue build audit child"});
         }
 
         std::set<pid_t> tracees{child};
@@ -320,7 +320,7 @@ struct ProcessExecAudit {
                      reinterpret_cast<void*>(trace_options));
             ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
         }
-        if (!root_done) return std::unexpected("build audit supervisor lost its root child");
+        if (!root_done) return std::unexpected(std::string{"build audit supervisor lost its root child"});
         if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
         return 128 + WTERMSIG(root_status);
     }

@@ -17,9 +17,9 @@ using std::uint64_t;
 // Plain-value description of one tar member. Libarchive types never cross
 // this boundary; the business layer reasons about this struct only.
 struct EntryInfo {
-    std::string pathname;
-    std::string symlink;
-    std::string hardlink;
+    std::string pathname{};
+    std::string symlink{};
+    std::string hardlink{};
     uint64_t size{0};
     uint32_t perm{0644};
     unsigned int filetype{0};
@@ -27,9 +27,9 @@ struct EntryInfo {
 };
 
 struct WriteEntry {
-    std::string_view pathname;
-    std::string_view symlink;
-    std::string_view hardlink;
+    std::string_view pathname{};
+    std::string_view symlink{};
+    std::string_view hardlink{};
     uint64_t size{0};
     uint32_t perm{0644};
     uint32_t uid{0};
@@ -74,7 +74,7 @@ public:
     static std::expected<ArchiveReader, std::string> open_fd(int fd, size_t block_size = 64 * 1024) {
         ArchiveReader reader;
         reader.handle_ = ::archive_read_new();
-        if (!reader.handle_) return std::unexpected("Cannot allocate libarchive reader");
+        if (!reader.handle_) return std::unexpected(std::string{"Cannot allocate libarchive reader"});
         ::archive_read_support_filter_all(reader.handle_);
         ::archive_read_support_format_all(reader.handle_);
         if (::archive_read_open_fd(reader.handle_, fd, block_size) != ARCHIVE_OK) {
@@ -153,7 +153,7 @@ public:
         const std::filesystem::path& output_path, int compression_level = 9) {
         ArchiveWriter writer;
         writer.handle_ = ::archive_write_new();
-        if (!writer.handle_) return std::unexpected("Cannot allocate libarchive writer");
+        if (!writer.handle_) return std::unexpected(std::string{"Cannot allocate libarchive writer"});
         if (::archive_write_set_format_pax_restricted(writer.handle_) != ARCHIVE_OK
             || ::archive_write_add_filter_zstd(writer.handle_) != ARCHIVE_OK
             || ::archive_write_set_options(
@@ -177,7 +177,7 @@ public:
             void operator()(::archive_entry* e) const noexcept { ::archive_entry_free(e); }
         };
         std::unique_ptr<::archive_entry, EntryDeleter> entry(::archive_entry_new());
-        if (!entry) return std::unexpected("Cannot allocate libarchive entry");
+        if (!entry) return std::unexpected(std::string{"Cannot allocate libarchive entry"});
         auto* raw = entry.get();
         ::archive_entry_set_pathname(raw, std::string(meta.pathname).c_str());
         ::archive_entry_set_perm(raw, static_cast<mode_t>(meta.perm));

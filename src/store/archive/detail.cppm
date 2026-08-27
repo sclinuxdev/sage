@@ -32,7 +32,7 @@ inline std::expected<std::string, std::string> normalize_data_path(std::string_v
     auto text = normalized.generic_string();
     while (text.size() > 1 && text.back() == '/') text.pop_back();
     if (text.empty() || text == "." || text == "/") {
-        return std::unexpected("Package data path is empty");
+        return std::unexpected(std::string{"Package data path is empty"});
     }
     return text;
 }
@@ -120,7 +120,7 @@ inline void close_fd(int fd) noexcept { ::close(fd); }
 inline std::expected<int, std::string> open_anchored_dir(
     int root_fd, const std::vector<std::string>& components) {
     int current = ::dup(root_fd);
-    if (current < 0) return std::unexpected("Cannot duplicate target root descriptor");
+    if (current < 0) return std::unexpected(std::string{"Cannot duplicate target root descriptor"});
     for (const auto& name : components) {
         int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
 #ifdef O_CLOEXEC
@@ -218,7 +218,7 @@ inline std::expected<UniqueFd, std::string> open_anchored_dir_strict(
     int root_fd, const std::vector<std::string>& components) {
     int duplicated = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
     if (duplicated < 0)
-        return std::unexpected("Cannot duplicate root descriptor");
+        return std::unexpected(std::string{"Cannot duplicate root descriptor"});
     UniqueFd current(duplicated);
     for (const auto& name : components) {
         int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
@@ -243,7 +243,7 @@ inline std::expected<UniqueFd, std::string> create_anchored_dir_chain(
     const auto components = rel_components(relative);
     int duplicated = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
     if (duplicated < 0)
-        return std::unexpected("Cannot duplicate root descriptor");
+        return std::unexpected(std::string{"Cannot duplicate root descriptor"});
     UniqueFd current(duplicated);
     for (const auto& name : components) {
         int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
@@ -461,7 +461,7 @@ struct SourceIdentity {
         }
         struct stat status {};
         if (::fstat(fd.get(), &status) != 0 || !S_ISREG(status.st_mode)) {
-            return std::unexpected("Package archive is not a regular file");
+            return std::unexpected(std::string{"Package archive is not a regular file"});
         }
         auto ns = [](const timespec& ts) {
             return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000
@@ -574,7 +574,7 @@ public:
                 + std::string(std::strerror(errno)));
         }
         if (!S_ISREG(source_status.st_mode) || source_status.st_size < 0) {
-            return std::unexpected("Package archive is not a regular file");
+            return std::unexpected(std::string{"Package archive is not a regular file"});
         }
 
         detail::UniqueFd root(detail::open_root_fd(target_root));

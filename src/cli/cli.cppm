@@ -179,7 +179,7 @@ inline std::expected<void, std::string> validate_operation_user(
 {
     if (effective_uid == 0) return {};
     return std::unexpected(
-        "install, remove, rebuild, and recover operations require root privileges");
+        std::string{"install, remove, rebuild, and recover operations require root privileges"});
 }
 
 inline std::expected<bool, std::string> probe_package_database(

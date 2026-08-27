@@ -191,7 +191,7 @@ after = ["net"]
     auto svc_exec_again = svc_plan_again
         ? sage::rebuild::ReconcileEngine::execute(
               *svc_db, *svc_plan_again, svc_root, false, svc_cfg->providers)
-        : std::expected<void, std::string>(std::unexpected("plan failed"));
+        : std::expected<void, std::string>(std::unexpected(std::string{"plan failed"}));
     if (!svc_exec_again) {
         sage::util::log_error("Second reconcile over a settled root failed: {}",
             svc_exec_again.error());
@@ -271,7 +271,7 @@ after = ["net"]
             *svc_db, *svc_cfg, false);
         if (!plan) return std::unexpected(plan.error());
         if (plan->has_changes) {
-            return std::unexpected("service reconcile unexpectedly planned a provider change");
+            return std::unexpected(std::string{"service reconcile unexpectedly planned a provider change"});
         }
         return sage::rebuild::ReconcileEngine::execute(
             *svc_db, *plan, svc_root, false, svc_cfg->providers);

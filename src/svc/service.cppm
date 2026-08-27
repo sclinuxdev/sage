@@ -88,7 +88,7 @@ inline std::expected<void, std::string> validate_service_name(std::string_view n
         });
     if (unsafe) {
         return std::unexpected(
-            "Service name must be a safe, non-empty path component");
+            std::string{"Service name must be a safe, non-empty path component"});
     }
     return {};
 }
@@ -144,7 +144,7 @@ struct ServiceSpec {
             if (s.schema_version == 2) {
                 if (!s.exec_start.empty() || !s.exec_stop.empty() || !s.exec_reload.empty()) {
                     return std::unexpected(
-                        "service.toml schema 2 uses command arrays, not exec_* strings");
+                        std::string{"service.toml schema 2 uses command arrays, not exec_* strings"});
                 }
                 s.exec_start = util::join(s.command, " ");
                 s.exec_stop = util::join(s.stop_command, " ");
@@ -172,15 +172,15 @@ struct ServiceSpec {
                 }
             }
         } else {
-            return std::unexpected("Missing [service] section in service.toml");
+            return std::unexpected(std::string{"Missing [service] section in service.toml"});
         }
 
         auto valid_name = validate_service_name(s.name);
         if (!valid_name) return std::unexpected(valid_name.error());
         if (s.exec_start.empty()) {
             return std::unexpected(s.schema_version == 2
-                ? "Service 'name' and non-empty 'command' are required"
-                : "Service 'name' and 'exec_start' are required");
+                ? std::string{"Service 'name' and non-empty 'command' are required"}
+                : std::string{"Service 'name' and 'exec_start' are required"});
         }
         return s;
     }
@@ -308,7 +308,7 @@ inline std::expected<std::filesystem::path, std::string> service_destination(
         case InitType::Dinit:   return sysroot / "etc/dinit.d" / name;
         case InitType::S6:      return sysroot / "etc/s6/services" / name / "run";
         case InitType::Loom:    return sysroot / "usr/lib/loom/services" / (std::string(name) + ".toml");
-        default:                return std::unexpected("Unsupported init system");
+        default:                return std::unexpected(std::string{"Unsupported init system"});
     }
 }
 
@@ -324,9 +324,9 @@ inline std::expected<std::string, std::string> render_service(
         case InitType::S6:      return spec.render_s6();
         case InitType::Loom:
             return std::unexpected(
-                "Loom generation requires the original Sage service document");
+                std::string{"Loom generation requires the original Sage service document"});
         default:
-            return std::unexpected("Unsupported init system");
+            return std::unexpected(std::string{"Unsupported init system"});
     }
 }
 
@@ -396,7 +396,7 @@ inline std::expected<std::filesystem::path, std::string> generate_loom_service(
                 "Cannot write temporary Loom service input: {}", std::strerror(errno)));
         }
         if (result == 0) {
-            return std::unexpected("Short write to temporary Loom service input");
+            return std::unexpected(std::string{"Short write to temporary Loom service input"});
         }
         written += static_cast<size_t>(result);
     }

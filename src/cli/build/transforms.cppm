@@ -101,7 +101,7 @@ inline std::expected<void, std::string> apply_payload_policy(
         }
     }
     if (payload_entries == 0)
-        return std::unexpected("build.install_files selected no payload files");
+        return std::unexpected(std::string{"build.install_files selected no payload files"});
     for (std::size_t i = 0; i < include_seen.size(); ++i) {
         if (!include_seen[i]) return std::unexpected(std::format(
             "build.install_files pattern '{}' matched no installed payload",
@@ -220,7 +220,7 @@ inline std::expected<void, std::string> apply_install_transforms(
     for (const auto& copy : copies) {
         if (!existing_inside(source_dir, copy.source)
             || !path_inside(pkg_dir, copy.destination))
-            return std::unexpected("Install copy path follows a symlink outside its root");
+            return std::unexpected(std::string{"Install copy path follows a symlink outside its root"});
         const auto source = source_dir / copy.source;
         const auto destination = pkg_dir / copy.destination;
         auto destination_status = std::filesystem::symlink_status(destination, ec);
@@ -251,7 +251,7 @@ inline std::expected<void, std::string> apply_install_transforms(
     }
     for (const auto& move : moves) {
         if (!path_inside(pkg_dir, move.source) || !path_inside(pkg_dir, move.destination))
-            return std::unexpected("Install move path follows a symlink outside the staging root");
+            return std::unexpected(std::string{"Install move path follows a symlink outside the staging root"});
         const auto source = pkg_dir / move.source;
         const auto destination = pkg_dir / move.destination;
         if (!std::filesystem::exists(source, ec)) {
@@ -270,7 +270,7 @@ inline std::expected<void, std::string> apply_install_transforms(
     }
     for (const auto& remove : removes) {
         if (!safe_relative(remove.path))
-            return std::unexpected("Install remove path escapes the staging root");
+            return std::unexpected(std::string{"Install remove path escapes the staging root"});
         std::vector<std::filesystem::path> matches;
         for (const auto& item : std::filesystem::recursive_directory_iterator(
                  pkg_dir, std::filesystem::directory_options::skip_permission_denied, ec)) {
@@ -303,7 +303,7 @@ inline std::expected<void, std::string> apply_install_transforms(
     }
     for (const auto& generate : generates) {
         if (!path_inside(pkg_dir, generate.path))
-            return std::unexpected("Install generate path follows a symlink outside the staging root");
+            return std::unexpected(std::string{"Install generate path follows a symlink outside the staging root"});
         const auto destination = pkg_dir / generate.path;
         auto destination_status = std::filesystem::symlink_status(destination, ec);
         if (ec && ec != std::errc::no_such_file_or_directory)
@@ -329,7 +329,7 @@ inline std::expected<void, std::string> apply_install_transforms(
     }
     for (const auto& link : symlinks) {
         if (!path_inside(pkg_dir, link.path))
-            return std::unexpected("Install symlink path follows a symlink outside the staging root");
+            return std::unexpected(std::string{"Install symlink path follows a symlink outside the staging root"});
         const std::filesystem::path target(link.target);
         const auto resolved = (std::filesystem::path(link.path).parent_path()
                                / target).lexically_normal();

@@ -140,7 +140,7 @@ struct BuildConfig {
             cfg.sysroot = std::filesystem::path(std::string(*v));
             if (cfg.sysroot.empty() || !cfg.sysroot.is_absolute()
                 || cfg.sysroot.has_root_name())
-                return std::unexpected("sysroot must be an absolute path");
+                return std::unexpected(std::string{"sysroot must be an absolute path"});
         }
         if (auto v = tbl["cc"].value<std::string_view>()) cfg.cc = std::string(*v);
         if (auto v = tbl["cxx"].value<std::string_view>()) cfg.cxx = std::string(*v);
@@ -156,26 +156,26 @@ struct BuildConfig {
         if (auto v = tbl["rustflags"].value<std::string_view>()) cfg.rustflags = std::string(*v);
         if (tbl.contains("compiler_cache")
             && !tbl["compiler_cache"].value<std::string_view>())
-            return std::unexpected("compiler_cache must be a string");
+            return std::unexpected(std::string{"compiler_cache must be a string"});
         if (auto v = tbl["compiler_cache"].value<std::string_view>()) {
             cfg.compiler_cache = std::string(*v);
             if (cfg.compiler_cache != "ccache" && cfg.compiler_cache != "sccache"
                 && cfg.compiler_cache != "auto" && cfg.compiler_cache != "none")
                 return std::unexpected(
-                    "compiler_cache must be ccache, sccache, auto, or none");
+                    std::string{"compiler_cache must be ccache, sccache, auto, or none"});
         }
         if (tbl.contains("ccache_dir")
             && !tbl["ccache_dir"].value<std::string_view>())
-            return std::unexpected("ccache_dir must be a string");
+            return std::unexpected(std::string{"ccache_dir must be a string"});
         if (auto v = tbl["ccache_dir"].value<std::string_view>()) {
             cfg.ccache_dir = std::filesystem::path(std::string(*v));
             if (cfg.ccache_dir.empty() || !cfg.ccache_dir.is_absolute()
                 || cfg.ccache_dir.has_root_name())
-                return std::unexpected("ccache_dir must be an absolute path");
+                return std::unexpected(std::string{"ccache_dir must be an absolute path"});
         }
         if (tbl.contains("memory_limit")
             && !tbl["memory_limit"].value<std::string_view>())
-            return std::unexpected("memory_limit must be a string");
+            return std::unexpected(std::string{"memory_limit must be a string"});
         if (auto v = tbl["memory_limit"].value<std::string_view>()) {
             cfg.memory_limit = std::string(*v);
             if (!cfg.memory_limit.empty() && cfg.memory_limit != "max"
@@ -183,17 +183,17 @@ struct BuildConfig {
                        return std::isdigit(static_cast<unsigned char>(c));
                    }))
                 return std::unexpected(
-                    "memory_limit must be a byte count, \"max\", or empty");
+                    std::string{"memory_limit must be a byte count, \"max\", or empty"});
         }
         if (tbl.contains("pids_limit")
             && !tbl["pids_limit"].value<std::int64_t>())
-            return std::unexpected("pids_limit must be an integer");
+            return std::unexpected(std::string{"pids_limit must be an integer"});
         if (auto v = tbl["pids_limit"].value<std::int64_t>()) {
-            if (*v < 0) return std::unexpected("pids_limit must be non-negative");
+            if (*v < 0) return std::unexpected(std::string{"pids_limit must be non-negative"});
             cfg.pids_limit = static_cast<std::uint64_t>(*v);
         }
         if (auto v = tbl["source_date_epoch"].value<std::int64_t>()) {
-            if (*v < 0) return std::unexpected("source_date_epoch must be non-negative");
+            if (*v < 0) return std::unexpected(std::string{"source_date_epoch must be non-negative"});
             cfg.source_date_epoch = *v;
         }
         auto parse_jobs = [&](std::string_view key)

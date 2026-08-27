@@ -7,42 +7,42 @@ import sage.config;
 export namespace sage::build {
 
 struct Toolchain {
-    std::string cc;
-    std::string cxx;
-    std::string linker;
-    std::string rustc;
-    std::string go;
-    std::string target_triplet;
+    std::string cc{};
+    std::string cxx{};
+    std::string linker{};
+    std::string rustc{};
+    std::string go{};
+    std::string target_triplet{};
     // The first four fields are the canonical executables Sage probed.  The
     // *_for_build fields are deliberately separate: during a build Sage may
     // substitute an audit wrapper or a compiler-cache wrapper, while manifests
     // continue to name the executable whose --version was actually inspected.
-    std::string cc_for_build;
-    std::string cxx_for_build;
-    std::string linker_for_build;
-    std::string rustc_for_build;
-    std::string cc_cache_for_build;
-    std::string cxx_cache_for_build;
-    std::string cache_for_build;
-    std::string compiler_cache_mode;
-    std::string path_for_build;
-    std::string compiler_version;
-    std::string cxx_version;
-    std::string linker_version;
-    std::string rustc_version;
-    std::string go_version;
-    std::string compiler_family;
-    std::string cxx_family;
-    std::string linker_family;
-    std::string rustc_family;
-    std::string go_family;
+    std::string cc_for_build{};
+    std::string cxx_for_build{};
+    std::string linker_for_build{};
+    std::string rustc_for_build{};
+    std::string cc_cache_for_build{};
+    std::string cxx_cache_for_build{};
+    std::string cache_for_build{};
+    std::string compiler_cache_mode{};
+    std::string path_for_build{};
+    std::string compiler_version{};
+    std::string cxx_version{};
+    std::string linker_version{};
+    std::string rustc_version{};
+    std::string go_version{};
+    std::string compiler_family{};
+    std::string cxx_family{};
+    std::string linker_family{};
+    std::string rustc_family{};
+    std::string go_family{};
 };
 
 struct BuildPaths {
-    std::filesystem::path source;
-    std::filesystem::path package;
-    std::filesystem::path home;
-    std::filesystem::path temp;
+    std::filesystem::path source{};
+    std::filesystem::path package{};
+    std::filesystem::path home{};
+    std::filesystem::path temp{};
 };
 
 struct BuildStep {
@@ -259,28 +259,28 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     const BuildPaths& paths, const Toolchain& tools, unsigned jobs)
 {
     if (recipe.schema_version != 2)
-        return std::unexpected("Managed build planning requires recipe schema_version 2");
+        return std::unexpected(std::string{"Managed build planning requires recipe schema_version 2"});
 
     const auto& spec = recipe.managed_build;
     if (auto requirement = validate_toolchain(recipe, tools); !requirement)
         return std::unexpected(requirement.error());
     if (spec.kernel && spec.system != package::BuildSystem::Make)
         return std::unexpected(
-            "build.kernel=true requires the Make/Kbuild backend");
+            std::string{"build.kernel=true requires the Make/Kbuild backend"});
     if (spec.system == package::BuildSystem::Cargo
         && (tools.rustc.empty() || tools.rustc_family != "rustc"
             || tools.rustc_version.empty() || tools.rustc_version == "unknown")) {
         return std::unexpected(
-            "Cargo recipes require a Sage-configured rustc with a parseable --version result");
+            std::string{"Cargo recipes require a Sage-configured rustc with a parseable --version result"});
     }
     if (spec.system == package::BuildSystem::Go) {
         if (!spec.configure_options.empty()) return std::unexpected(
-            "Go has no configure step; use build_targets/install_targets");
+            std::string{"Go has no configure step; use build_targets/install_targets"});
         if (!spec.build_dir.empty()) return std::unexpected(
-            "Go builds run from the module root; build.build_dir must stay empty");
+            std::string{"Go builds run from the module root; build.build_dir must stay empty"});
         if (tools.go_version.empty() || tools.go_version == "unknown")
             return std::unexpected(
-                "Go recipes require a go toolchain with a parseable 'go version' result");
+                std::string{"Go recipes require a go toolchain with a parseable 'go version' result"});
     }
     auto safe_relative = [](const std::filesystem::path& path) {
         return !path.is_absolute() && std::ranges::none_of(path, [](const auto& part) {
@@ -289,7 +289,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     };
     if (!safe_relative(spec.source_subdir) || !safe_relative(spec.build_dir))
         return std::unexpected(
-            "build.source_subdir and build.build_dir must stay inside the source tree");
+            std::string{"build.source_subdir and build.build_dir must stay inside the source tree"});
     const auto valid_sha256 = [](std::string_view value) {
         return value.size() == 64 && std::ranges::all_of(value, [](char c) {
             return std::isxdigit(static_cast<unsigned char>(c));
@@ -297,23 +297,23 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     };
     if (!spec.patches.empty() && spec.patches_spec.size() != spec.patches.size())
         return std::unexpected(
-            "Recipe v2 patches must be normalized into PatchSpec entries");
+            std::string{"Recipe v2 patches must be normalized into PatchSpec entries"});
     std::set<std::string> patch_names;
     for (const auto& patch : spec.patches_spec) {
         if (patch.file.empty() || std::filesystem::path(patch.file).filename() != patch.file
             || !patch_names.insert(patch.file).second)
             return std::unexpected(
-                "build.patches entries must be unique distfiles basenames");
+                std::string{"build.patches entries must be unique distfiles basenames"});
         if (patch.strip < 0 || patch.strip > 9 || !valid_sha256(patch.sha256))
             return std::unexpected(
-                "Every build.patches entry requires a strip value from 0 to 9 and a 64-hex SHA-256");
+                std::string{"Every build.patches entry requires a strip value from 0 to 9 and a 64-hex SHA-256"});
     }
     if (!recipe.check_deps.empty()
         && !std::ranges::any_of(spec.steps, [](const package::ManagedBuildStep& step) {
                return step.phase == "check";
            }))
         return std::unexpected(
-            "package.check_dependencies require at least one build.steps phase='check'");
+            std::string{"package.check_dependencies require at least one build.steps phase='check'"});
     auto allowed = [](std::string_view selected,
                       const std::vector<std::string>& choices) {
         return choices.empty() || std::ranges::contains(choices, selected);
@@ -826,7 +826,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 if (banned) return std::unexpected("Meson toolchain and compiler/linker arguments are Sage-managed: " + option);
             }
             if (!spec.install_targets.empty()) return std::unexpected(
-                "Meson install does not accept build.install_targets");
+                std::string{"Meson install does not accept build.install_targets"});
             const auto options = join_args(meson_opts);
             step("configure", source, "meson setup " + shell_quote(build.string()) +
                 " --prefix=/usr --libdir=lib --buildtype=" + meson_build_type +
@@ -868,7 +868,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                 if (banned) return std::unexpected("Xmake compiler, linker and toolchain are Sage-managed: " + option);
             }
             if (!spec.install_targets.empty()) return std::unexpected(
-                "Xmake install does not accept build.install_targets");
+                std::string{"Xmake install does not accept build.install_targets"});
             const auto options = join_args(xmake_opts);
             step("configure", source, "xmake f --root -m " + xmake_mode +
                 (options.empty() ? "" : " " + options) + " --cc=" + shell_quote(cc_exec) +
@@ -888,7 +888,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         }
         case package::BuildSystem::Cargo: {
             if (!spec.configure_options.empty()) return std::unexpected(
-                "Cargo has no configure step; use build_targets/install_targets");
+                std::string{"Cargo has no configure step; use build_targets/install_targets"});
             for (const auto* values : {&spec.build_targets, &spec.install_targets})
                 if (std::ranges::any_of(*values, [](const std::string& value) {
                         return value == "--config" || value.starts_with("--config=")
@@ -896,7 +896,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                             || value == "--target-dir" || value.starts_with("--target-dir=");
                     }))
                     return std::unexpected(
-                        "Cargo config/root/target-dir are Sage-managed and cannot be overridden");
+                        std::string{"Cargo config/root/target-dir are Sage-managed and cannot be overridden"});
             std::string cargo_build_flags;
             bool locked = true;
             if (spec.cargo) {
@@ -937,8 +937,8 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                         || value == "-overlay" || value.starts_with("-overlay=")
                         || value == "-toolexec" || value.starts_with("-toolexec="))
                         return std::unexpected(
-                            "Go -C/-mod/-overlay/-toolexec are Sage-managed and "
-                            "cannot be overridden");
+                            std::string{"Go -C/-mod/-overlay/-toolexec are Sage-managed and "
+                                "cannot be overridden"});
             const auto go_build_args = join_args(spec.build_targets);
             const auto go_install_args = join_args(spec.install_targets);
             custom_steps("pre-build");
@@ -951,7 +951,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         }
         case package::BuildSystem::Make: {
             if (!spec.configure_options.empty()) return std::unexpected(
-                "Make has no configure step; use build.variables and targets");
+                std::string{"Make has no configure step; use build.variables and targets"});
             std::string make_raw;
             if (spec.make && !spec.make->raw_options.empty()) {
                 make_raw = " " + join_args(spec.make->raw_options);
@@ -969,12 +969,12 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             if (!spec.configure_options.empty() || !spec.build_targets.empty()
                 || !spec.install_targets.empty())
                 return std::unexpected(
-                    "Script recipes use build.steps instead of backend targets");
+                    std::string{"Script recipes use build.steps instead of backend targets"});
             for (const auto* phase : {"pre-build", "post-build", "check", "pre-install", "install", "post-install"})
                 custom_steps(phase);
             break;
         case package::BuildSystem::Legacy:
-            return std::unexpected("Recipe v2 cannot use the legacy build system");
+            return std::unexpected(std::string{"Recipe v2 cannot use the legacy build system"});
     }
     return plan;
 }

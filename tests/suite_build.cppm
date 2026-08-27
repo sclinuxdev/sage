@@ -729,7 +729,7 @@ configure_options = ["--exec-prefix=/tmp/escape"]
                      .linker_version = "22.1", .compiler_family = "clang",
                      .cxx_family = "clang", .linker_family = "lld"}, 1)
                 : std::expected<sage::build::BuildPlan, std::string>(
-                    std::unexpected("parse"));
+                    std::unexpected(std::string{"parse"}));
             if (planned_bad) {
                 sage::util::log_error("v2 accepted a backend installation-directory override");
                 return 1;
@@ -1243,13 +1243,13 @@ command = "set -eu; test ! -w /etc; mkdir -p usr/share/v2script; printf '%s|%s|%
         std::filesystem::copy_file(script_archive, copy_archive_1, std::filesystem::copy_options::overwrite_existing);
         const auto script_hash_1 = script_built
             ? sage::util::compute_file_sha256(copy_archive_1)
-            : std::expected<std::string, std::string>(std::unexpected("not-built"));
+            : std::expected<std::string, std::string>(std::unexpected(std::string{"not-built"}));
         auto script_built_again = build_with_root(
             script_dir, script_root, temp_dir / "bcfg-v2-script-x2",
             "v2scriptcanary-1.0.0-1-x86_64.pkg.tar.zst");
         const auto script_hash_2 = script_built_again
             ? sage::util::compute_file_sha256(script_archive)
-            : std::expected<std::string, std::string>(std::unexpected("not-built"));
+            : std::expected<std::string, std::string>(std::unexpected(std::string{"not-built"}));
         if (!script_built || !script_built_again || !script_hash_1 || !script_hash_2
             || *script_hash_1 != *script_hash_2
             || !script_built->managed_build_tools.empty()
@@ -1353,7 +1353,7 @@ command = "mkdir -p usr/share/check-canary; printf x > usr/share/check-canary/re
             ? sage::package::BuildAttestation::parse_toml(
                 check_built->attestation_toml)
             : std::expected<sage::package::BuildAttestation, std::string>(
-                std::unexpected("not-built"));
+                std::unexpected(std::string{"not-built"}));
         if (!check_built || !check_attestation
             || check_attestation->check_dependencies
                 != std::vector<std::string>{"pkg-config >= 1"}) {

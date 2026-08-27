@@ -205,7 +205,8 @@ export int cmd_install(
 
     std::vector<sage::package::PackageManifest> unique_to_install;
     std::unordered_set<std::string> seen_install_names;
-    for (const auto& pkg : *solve_res) {
+    for (std::size_t i = 0; i < solve_res->size(); ++i) {
+        const auto& pkg = (*solve_res)[i];
         if (seen_install_names.insert(pkg.name).second) {
             unique_to_install.push_back(pkg);
         }
@@ -216,11 +217,13 @@ export int cmd_install(
     // may have selected them as candidates. Only repo-newer versions are installed
     // (upgrades); everything else is already satisfied by the current system.
     std::unordered_map<std::string, sage::package::PackageManifest> installed_by_name;
-    for (auto& p : installed_packages) {
+    for (std::size_t i = 0; i < installed_packages.size(); ++i) {
+        auto& p = installed_packages[i];
         installed_by_name.emplace(p.name, std::move(p));
     }
     std::vector<sage::package::PackageManifest> to_install;
-    for (auto& pkg : unique_to_install) {
+    for (std::size_t i = 0; i < unique_to_install.size(); ++i) {
+        auto& pkg = unique_to_install[i];
         auto it = installed_by_name.find(pkg.name);
         const bool exact_direct_request = direct_package_names.contains(pkg.name);
         if (!exact_direct_request
@@ -250,7 +253,8 @@ export int cmd_install(
                 if (cfg.is_exclusive_capability(prov)) claimed.emplace(prov, name);
             }
         }
-        for (const auto& pkg : unique_to_install) {
+        for (std::size_t i = 0; i < unique_to_install.size(); ++i) {
+            const auto& pkg = unique_to_install[i];
             for (const auto& prov : pkg.provides) {
                 if (!cfg.is_exclusive_capability(prov)) continue;
                 auto [it, fresh] = claimed.emplace(prov, pkg.name);
@@ -267,7 +271,8 @@ export int cmd_install(
     }
 
     sage::util::log_info("Resolved {} packages to install into target root '{}':", unique_to_install.size(), opts.target_root.string());
-    for (const auto& pkg : unique_to_install) {
+    for (std::size_t i = 0; i < unique_to_install.size(); ++i) {
+        const auto& pkg = unique_to_install[i];
         std::println("  + {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
     }
 
@@ -435,7 +440,8 @@ export int cmd_install(
     // ownership checks tolerate precisely those in-transaction handovers.
     sage::db::ReleasedClaims batch_released_claims;
     std::unordered_map<std::string, std::vector<std::string>> previous_paths_by_name;
-    for (const auto& pkg : unique_to_install) {
+    for (std::size_t i = 0; i < unique_to_install.size(); ++i) {
+        const auto& pkg = unique_to_install[i];
         if (!installed_by_name.contains(pkg.name)) continue;
         std::unordered_set<std::string> kept_paths;
         for (const auto& f :

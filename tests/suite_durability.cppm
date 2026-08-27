@@ -76,7 +76,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
                 sage::archive::render_journal(ctx, txn->journal_entries()));
             if (!sha) return std::unexpected(sha.error());
             auto wtxn = recovery_db.begin_write_txn();
-            if (!wtxn) return std::unexpected("recovery fixture write txn failed");
+            if (!wtxn) return std::unexpected(std::string{"recovery fixture write txn failed"});
             auto put = recovery_db.put_operation(*wtxn,
                 {std::string{id}, "install",
                  std::string{sage::db::phase_filesystem_pending},
@@ -84,7 +84,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
             if (!put) return put;
             // The instance dies here after persist_journal(): the destructor
             // must preserve the evidence directory for recovery.
-            if (!wtxn->commit()) return std::unexpected("recovery fixture commit failed");
+            if (!wtxn->commit()) return std::unexpected(std::string{"recovery fixture commit failed"});
             return {};
         };
         const std::string recoverable_id(32, 'a');
@@ -117,7 +117,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
             auto record_after = settled_txn
                 ? recovery_db.get_operation(*settled_txn, recoverable_id)
                 : std::expected<std::optional<sage::db::FilesystemOperationRecord>, std::string>(
-                    std::unexpected("read txn failed"));
+                    std::unexpected(std::string{"read txn failed"}));
             if (!record_after || record_after->has_value()
                 || !sage::archive::list_transaction_dirs(recovery_root).empty()) {
                 sage::util::log_error("Finalized operation left a record or staging behind");
@@ -168,7 +168,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
         auto abandoned_record = abandoned_txn
             ? recovery_db.get_operation(*abandoned_txn, abandoned_id)
             : std::expected<std::optional<sage::db::FilesystemOperationRecord>, std::string>(
-                std::unexpected("read txn failed"));
+                    std::unexpected(std::string{"read txn failed"}));
         if (!abandoned || abandoned->finalized != 0
             || std::filesystem::exists(recovery_root / "usr/bin/tool-b")
             || !abandoned_record || abandoned_record->has_value()
@@ -609,11 +609,11 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
         auto split_compiler_record = split_db
             ? split_db->get_package("split-toolchain-compiler")
             : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-                std::unexpected("database open failed"));
+                std::unexpected(std::string{"database open failed"}));
         auto split_libs_record = split_db
             ? split_db->get_package("split-toolchain-libs")
             : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-                std::unexpected("database open failed"));
+                std::unexpected(std::string{"database open failed"}));
         if (!split_compiler_record || !*split_compiler_record
             || !split_libs_record || !*split_libs_record) {
             sage::util::log_error("Failed split removal discarded installed database records");
@@ -648,7 +648,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
     auto removed_split_packages = removed_split_db
         ? removed_split_db->list_installed_packages()
         : std::expected<std::vector<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!removed_split_packages || removed_split_packages->size() != 1
         || removed_split_packages->front().name != "split-trigger-guard") {
         sage::util::log_error("Failed trigger changed the committed removal state");
@@ -699,7 +699,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
     auto common_owners = shared_db
         ? shared_db->get_path_owners("usr/share/common")
         : std::expected<std::vector<std::string>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!common_owners || common_owners->size() != 2) {
         sage::util::log_error("Shared directory was not registered with both owners");
         return 1;
@@ -832,7 +832,7 @@ export int run_durable_install_tests(const std::filesystem::path& temp_dir,
             tool_target / "var/lib/sage/data.mdb", true);
         auto tool_pkg = tool_db ? tool_db->get_package("dtool")
             : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-                std::unexpected("database open failed"));
+                std::unexpected(std::string{"database open failed"}));
         tool_record = tool_pkg ? *tool_pkg : std::nullopt;
     }
     if (!tool_record

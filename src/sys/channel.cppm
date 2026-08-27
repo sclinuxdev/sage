@@ -173,7 +173,7 @@ struct ChannelIndex {
                         if (*epoch < 0
                             || static_cast<unsigned long long>(*epoch)
                                 > std::numeric_limits<uint32_t>::max()) {
-                            return std::unexpected("Package epoch is outside the uint32 range");
+                            return std::unexpected(std::string{"Package epoch is outside the uint32 range"});
                         }
                         m.version.epoch = static_cast<uint32_t>(*epoch);
                     }
@@ -213,7 +213,7 @@ struct ChannelIndex {
                         for (auto&& item : *tools) {
                             auto* tool = item.as_table();
                             if (!tool) return std::unexpected(
-                                "managed_build_tools index entries must be tables");
+                                std::string{"managed_build_tools index entries must be tables"});
                             package::ManagedBuildTool observed;
                             observed.role = (*tool)["role"].value_or("");
                             observed.executable = (*tool)["executable"].value_or("");
@@ -227,7 +227,7 @@ struct ChannelIndex {
                                 for (auto&& parameter : *parameters) {
                                     auto value = parameter.value<std::string_view>();
                                     if (!value || value->empty()) return std::unexpected(
-                                        "Managed build tool parameters in channel index must be non-empty strings");
+                                        std::string{"Managed build tool parameters in channel index must be non-empty strings"});
                                     observed.parameters.emplace_back(*value);
                                 }
                             }
@@ -248,11 +248,11 @@ struct ChannelIndex {
                                 || observed.version.empty() || observed.executions == 0
                                 || version_argument != "--version") {
                                 return std::unexpected(
-                                    "Incomplete managed_build_tools entry in channel index");
+                                    std::string{"Incomplete managed_build_tools entry in channel index"});
                             }
                             if (!roles.insert(observed.role).second)
                                 return std::unexpected(
-                                    "Duplicate managed build tool role in channel index");
+                                    std::string{"Duplicate managed build tool role in channel index"});
                             m.managed_build_tools.push_back(std::move(observed));
                         }
                     }
@@ -261,14 +261,14 @@ struct ChannelIndex {
                         for (auto&& command : *commands) {
                             auto value = command.value<std::string_view>();
                             if (!value || value->empty()) return std::unexpected(
-                                "Managed build command in channel index must be non-empty");
+                                std::string{"Managed build command in channel index must be non-empty"});
                             m.managed_build_commands.emplace_back(*value);
                         }
                     }
                     if (!m.managed_build_tools.empty()
                         && m.managed_build_commands.empty())
                         return std::unexpected(
-                            "Managed build tools in channel index have no execution audit");
+                            std::string{"Managed build tools in channel index have no execution audit"});
                     if (!m.name.empty()) {
                         idx.available_packages.push_back(std::move(m));
                     }
@@ -577,7 +577,7 @@ public:
         std::filesystem::path sh_path = profile_d / "sage-channels.sh";
         std::ofstream sh(sh_path);
         if (!sh.is_open()) {
-            return std::unexpected("Cannot write /etc/profile.d/sage-channels.sh");
+            return std::unexpected(std::string{"Cannot write /etc/profile.d/sage-channels.sh"});
         }
 
         sh << "#!/bin/sh\n";

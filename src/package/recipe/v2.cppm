@@ -67,7 +67,7 @@ inline std::expected<void, std::string> parse_managed_build(
     };
 
     auto* bld = tbl.get_as<vendor::toml::table>("build");
-    if (!bld) return std::unexpected("Recipe v2 requires a [build] table");
+    if (!bld) return std::unexpected(std::string{"Recipe v2 requires a [build] table"});
     if (auto result = reject_unknown(*bld,
             {"system", "payload", "kernel", "source_subdir", "build_dir",
              "configure_options", "build_targets", "install_targets",
@@ -88,63 +88,63 @@ inline std::expected<void, std::string> parse_managed_build(
     };
     if (has_commands(tbl) || has_commands(*bld)) {
         return std::unexpected(
-            "Recipe v2 forbids prepare/build/install shell command arrays");
+            std::string{"Recipe v2 forbids prepare/build/install shell command arrays"});
     }
     if (auto* pkg = tbl.get_as<vendor::toml::table>("package");
         pkg && has_commands(*pkg)) {
         return std::unexpected(
-            "Recipe v2 forbids prepare/build/install shell command arrays");
+            std::string{"Recipe v2 forbids prepare/build/install shell command arrays"});
     }
     for (const auto* src : src_scopes) {
         if (has_commands(*src)) return std::unexpected(
-            "Recipe v2 forbids prepare/build/install shell command arrays");
+            std::string{"Recipe v2 forbids prepare/build/install shell command arrays"});
     }
     auto system = parse_build_system((*bld)["system"].value_or(""));
     if (!system) return std::unexpected(system.error());
     r.managed_build.system = *system;
     const auto payload_value = (*bld)["payload"].value<std::string_view>();
     if (!payload_value) return std::unexpected(
-        "Recipe v2 requires build.payload = \"all\", \"allowlist\", or \"outputs\"");
+        std::string{"Recipe v2 requires build.payload = \"all\", \"allowlist\", or \"outputs\""});
     if (*payload_value == "all") r.managed_build.payload = PayloadMode::All;
     else if (*payload_value == "allowlist")
         r.managed_build.payload = PayloadMode::Allowlist;
     else if (*payload_value == "outputs")
         r.managed_build.payload = PayloadMode::Outputs;
     else return std::unexpected(
-        "build.payload must be \"all\", \"allowlist\", or \"outputs\"");
+        std::string{"build.payload must be \"all\", \"allowlist\", or \"outputs\""});
     if (auto value = (*bld)["kernel"].value<bool>())
         r.managed_build.kernel = *value;
     else if (bld->contains("kernel"))
-        return std::unexpected("build.kernel must be a boolean");
+        return std::unexpected(std::string{"build.kernel must be a boolean"});
     if (r.managed_build.kernel
         && r.managed_build.system != BuildSystem::Make)
         return std::unexpected(
-            "build.kernel=true requires system = \"make\"");
+            std::string{"build.kernel=true requires system = \"make\""});
     if (bld->contains("tools")) {
         auto tools = (*bld)["tools"].value<bool>();
         if (!tools) return std::unexpected(
-            "build.tools must be a boolean");
+            std::string{"build.tools must be a boolean"});
         if (*tools) {
             if (r.managed_build.system != BuildSystem::Script)
                 return std::unexpected(
-                    "build.tools=true is valid only for script recipes");
+                    std::string{"build.tools=true is valid only for script recipes"});
             r.managed_build.script_managed_tools = true;
         }
     }
     if (bld->contains("header_only")) {
         auto ho = (*bld)["header_only"].value<bool>();
-        if (!ho) return std::unexpected("build.header_only must be a boolean");
+        if (!ho) return std::unexpected(std::string{"build.header_only must be a boolean"});
         r.managed_build.header_only = *ho;
     }
     if (bld->contains("network")) {
         auto network = (*bld)["network"].value<bool>();
         if (!network) return std::unexpected(
-            "build.network must be a boolean");
+            std::string{"build.network must be a boolean"});
         r.managed_build.network = *network;
     }
     if (bld->contains("flag_policy")
         && !bld->get_as<vendor::toml::table>("flag_policy"))
-        return std::unexpected("build.flag_policy must be a table");
+        return std::unexpected(std::string{"build.flag_policy must be a table"});
     if (auto* policy = bld->get_as<vendor::toml::table>("flag_policy")) {
         if (auto result = reject_unknown(*policy,
                 {"lto", "march", "as-needed"}, "build.flag_policy"); !result)
@@ -174,7 +174,7 @@ inline std::expected<void, std::string> parse_managed_build(
     }
     if (bld->contains("content")
         && !bld->get_as<vendor::toml::table>("content"))
-        return std::unexpected("build.content must be a table");
+        return std::unexpected(std::string{"build.content must be a table"});
     if (auto* content = bld->get_as<vendor::toml::table>("content")) {
         if (auto result = reject_unknown(*content,
                 {"strip", "man_compress", "shebangs", "locales"},
@@ -185,21 +185,21 @@ inline std::expected<void, std::string> parse_managed_build(
             if (!value || (*value != "none" && *value != "unneeded"
                            && *value != "debug"))
                 return std::unexpected(
-                    "build.content.strip must be none, unneeded, or debug");
+                    std::string{"build.content.strip must be none, unneeded, or debug"});
             r.managed_build.content.strip = std::string(*value);
         }
         if (content->contains("man_compress")) {
             auto value = (*content)["man_compress"].value<std::string_view>();
             if (!value || (*value != "none" && *value != "gzip"))
                 return std::unexpected(
-                    "build.content.man_compress must be none or gzip");
+                    std::string{"build.content.man_compress must be none or gzip"});
             r.managed_build.content.man_compress = std::string(*value);
         }
         if (content->contains("shebangs")) {
             auto value = (*content)["shebangs"].value<std::string_view>();
             if (!value || *value != "absolute")
                 return std::unexpected(
-                    "build.content.shebangs must be \"absolute\"");
+                    std::string{"build.content.shebangs must be \"absolute\""});
             r.managed_build.content.shebangs = std::string(*value);
         }
         if (auto result = parse_string_array_strict(*content, "locales",
@@ -209,7 +209,7 @@ inline std::expected<void, std::string> parse_managed_build(
             if (locale.empty() || locale.find('/') != std::string::npos
                 || locale == "." || locale == "..")
                 return std::unexpected(
-                    "build.content.locales entries must be plain locale names");
+                    std::string{"build.content.locales entries must be plain locale names"});
         }
     }
     auto source_subdir = require_string(*bld, "source_subdir", "build", false);
@@ -223,10 +223,10 @@ inline std::expected<void, std::string> parse_managed_build(
         : std::move(*build_dir);
     if (bld->contains("patch_strip")
         && !(*bld)["patch_strip"].value<std::int64_t>())
-        return std::unexpected("build.patch_strip must be an integer");
+        return std::unexpected(std::string{"build.patch_strip must be an integer"});
     r.managed_build.patch_strip = static_cast<int>((*bld)["patch_strip"].value_or(1LL));
     if (r.managed_build.patch_strip < 0 || r.managed_build.patch_strip > 9)
-        return std::unexpected("build.patch_strip must be between 0 and 9");
+        return std::unexpected(std::string{"build.patch_strip must be between 0 and 9"});
     if (auto result = parse_string_array_strict(*bld, "configure_options",
             "build", r.managed_build.configure_options); !result)
         return std::unexpected(result.error());
@@ -307,7 +307,7 @@ inline std::expected<void, std::string> parse_managed_build(
     }
 
     if (bld->contains("steps") && !bld->get_as<vendor::toml::array>("steps"))
-        return std::unexpected("build.steps must be an array");
+        return std::unexpected(std::string{"build.steps must be an array"});
     if (auto* arr = bld->get_as<vendor::toml::array>("steps")) {
         static constexpr std::array<std::string_view, 7> phases{
             "prepare", "pre-build", "post-build", "check",
@@ -317,7 +317,7 @@ inline std::expected<void, std::string> parse_managed_build(
         for (auto&& element : *arr) {
             auto* item = element.as_table();
             if (!item) return std::unexpected(
-                "build.steps entries must be inline tables");
+                std::string{"build.steps entries must be inline tables"});
             if (auto result = reject_unknown(*item,
                     {"name", "phase", "cwd", "command", "unsafe_shell"},
                     "build.steps[]"); !result)
@@ -329,7 +329,7 @@ inline std::expected<void, std::string> parse_managed_build(
             if (!name || !phase || !command || name->empty()
                 || phase->empty() || command->empty()) {
                 return std::unexpected(
-                    "build.steps entries require name, phase and command");
+                    std::string{"build.steps entries require name, phase and command"});
             }
             if (!std::ranges::contains(phases, *phase)) {
                 return std::unexpected(std::format(
@@ -342,7 +342,7 @@ inline std::expected<void, std::string> parse_managed_build(
             bool unsafe_shell = false;
             if (item->contains("unsafe_shell")) {
                 auto val = (*item)["unsafe_shell"].value<bool>();
-                if (!val) return std::unexpected("build.steps.unsafe_shell must be a boolean");
+                if (!val) return std::unexpected(std::string{"build.steps.unsafe_shell must be a boolean"});
                 unsafe_shell = *val;
             }
             r.managed_build.steps.push_back(ManagedBuildStep{
@@ -361,24 +361,24 @@ inline std::expected<void, std::string> parse_managed_build(
             return dep.empty();
         }))
         return std::unexpected(
-            "package.check_dependencies entries must be non-empty strings");
+            std::string{"package.check_dependencies entries must be non-empty strings"});
     if (!r.check_deps.empty() && !has_check_step)
         return std::unexpected(
-            "package.check_dependencies require at least one build.steps phase='check'");
+            std::string{"package.check_dependencies require at least one build.steps phase='check'"});
     if (r.managed_build.system == BuildSystem::Script
         && r.managed_build.steps.empty())
         return std::unexpected(
-            "Script recipes require at least one build.steps entry");
+            std::string{"Script recipes require at least one build.steps entry"});
 
     std::set<std::string> patch_names;
     auto add_patch = [&](std::string file, int strip, std::string sha)
         -> std::expected<void, std::string> {
         if (file.empty() || std::filesystem::path(file).filename() != file)
             return std::unexpected(
-                "build.patches entries require a basename 'file' string");
+                std::string{"build.patches entries require a basename 'file' string"});
         if (!patch_names.insert(file).second)
             return std::unexpected(
-                "build.patches cannot declare the same file more than once: "
+                std::string{"build.patches cannot declare the same file more than once: "}
                 + file);
         r.managed_build.patches.push_back(file);
         r.managed_build.patches_spec.push_back(PatchSpec{
@@ -389,7 +389,7 @@ inline std::expected<void, std::string> parse_managed_build(
     };
     if (bld->contains("patches")) {
         auto* arr = bld->get_as<vendor::toml::array>("patches");
-        if (!arr) return std::unexpected("build.patches must be an array");
+        if (!arr) return std::unexpected(std::string{"build.patches must be an array"});
         for (const auto& elem : *arr) {
             if (auto str = elem.value<std::string_view>()) {
                 if (auto result = add_patch(std::string(*str),
@@ -402,34 +402,34 @@ inline std::expected<void, std::string> parse_managed_build(
                     return std::unexpected(result.error());
                 auto f = (*ptbl)["file"].value<std::string_view>();
                 if (!f) return std::unexpected(
-                    "build.patches entries require a basename 'file' string");
+                    std::string{"build.patches entries require a basename 'file' string"});
                 int strip = r.managed_build.patch_strip;
                 if (ptbl->contains("strip")) {
                     auto strip_value = (*ptbl)["strip"].value<std::int64_t>();
                     if (!strip_value || *strip_value < 0 || *strip_value > 9)
                         return std::unexpected(
-                            "build.patches entry 'strip' must be between 0 and 9");
+                            std::string{"build.patches entry 'strip' must be between 0 and 9"});
                     strip = static_cast<int>(*strip_value);
                 }
                 if (!ptbl->contains("sha256"))
                     return std::unexpected(
-                        "structured build.patches entries require sha256");
+                        std::string{"structured build.patches entries require sha256"});
                 auto sha_value = (*ptbl)["sha256"].value<std::string_view>();
                 if (!sha_value || !valid_sha256(*sha_value))
                     return std::unexpected(
-                        "build.patches entry 'sha256' must be a 64-hex SHA-256");
+                        std::string{"build.patches entry 'sha256' must be a 64-hex SHA-256"});
                 if (auto result = add_patch(std::string(*f), strip,
                         normalize_sha256(std::string(*sha_value))); !result)
                     return std::unexpected(result.error());
             } else {
                 return std::unexpected(
-                    "build.patches must be an array of strings or tables");
+                    std::string{"build.patches must be an array of strings or tables"});
             }
         }
     }
     if (bld->contains("patch_checksums")
         && !bld->get_as<vendor::toml::table>("patch_checksums"))
-        return std::unexpected("build.patch_checksums must be a table");
+        return std::unexpected(std::string{"build.patch_checksums must be a table"});
     if (auto* checksums = bld->get_as<vendor::toml::table>("patch_checksums")) {
         for (const auto& [name, value] : *checksums) {
             auto sha = value.value<std::string_view>();
@@ -437,7 +437,7 @@ inline std::expected<void, std::string> parse_managed_build(
                 || std::filesystem::path(name.str()).filename() != name.str()
                 || !sha || !valid_sha256(*sha))
                 return std::unexpected(
-                    "build.patch_checksums entries require a basename and 64-hex SHA-256");
+                    std::string{"build.patch_checksums entries require a basename and 64-hex SHA-256"});
             r.managed_build.patch_checksums.emplace(
                 name.str(), normalize_sha256(std::string(*sha)));
         }
@@ -473,7 +473,7 @@ inline std::expected<void, std::string> parse_managed_build(
         }
         if (patch.sha256.empty())
             return std::unexpected(
-                "Every build.patches entry requires a SHA-256 declaration");
+                std::string{"Every build.patches entry requires a SHA-256 declaration"});
     }
 
     if (auto result = parse_string_array_strict(*bld, "allowed_compilers",
@@ -483,16 +483,16 @@ inline std::expected<void, std::string> parse_managed_build(
             "build", r.managed_build.allowed_linkers); !result)
         return std::unexpected(result.error());
     if (bld->contains("variables") && !bld->get_as<vendor::toml::table>("variables"))
-        return std::unexpected("build.variables must be a table");
+        return std::unexpected(std::string{"build.variables must be a table"});
     if (auto* vars = bld->get_as<vendor::toml::table>("variables")) {
         for (auto&& [key, value] : *vars) {
             if (auto s = value.value<std::string_view>())
                 r.managed_build.variables.emplace(std::string(key.str()), *s);
-            else return std::unexpected("build.variables values must be strings");
+            else return std::unexpected(std::string{"build.variables values must be strings"});
         }
     }
     if (bld->contains("flag_env") && !bld->get_as<vendor::toml::table>("flag_env"))
-        return std::unexpected("build.flag_env must be a table");
+        return std::unexpected(std::string{"build.flag_env must be a table"});
     if (auto* flags = bld->get_as<vendor::toml::table>("flag_env")) {
         if (auto result = reject_unknown(*flags,
                 {"cflags", "cxxflags", "cppflags", "ldflags", "rustflags"},
@@ -515,7 +515,7 @@ inline std::expected<void, std::string> parse_managed_build(
             return std::unexpected(result.error());
     }
     if (bld->contains("tool_env") && !bld->get_as<vendor::toml::table>("tool_env"))
-        return std::unexpected("build.tool_env must be a table");
+        return std::unexpected(std::string{"build.tool_env must be a table"});
     if (auto* tools = bld->get_as<vendor::toml::table>("tool_env")) {
         if (auto result = reject_unknown(*tools, {"cc", "cxx", "linker"},
                 "build.tool_env"); !result)
@@ -599,7 +599,7 @@ inline std::expected<void, std::string> parse_managed_build(
         if (!output_names.insert(output.name).second)
             return std::unexpected("build.outputs contains duplicate name: " + output.name);
         if (output.name.find('/') != std::string::npos || output.name == "." || output.name == "..")
-            return std::unexpected("build.outputs names must be simple package names");
+            return std::unexpected(std::string{"build.outputs names must be simple package names"});
         if (auto result = validate_payload_patterns(output.install_files, "outputs.install_files"); !result)
             return std::unexpected(result.error());
         if (auto result = validate_payload_patterns(output.install_excludes, "outputs.install_excludes"); !result)
@@ -607,7 +607,7 @@ inline std::expected<void, std::string> parse_managed_build(
         if (auto result = validate_payload_patterns(output.optional_excludes, "outputs.optional_excludes"); !result)
             return std::unexpected(result.error());
         if (output.install_files.empty())
-            return std::unexpected("build.outputs entries require install_files");
+            return std::unexpected(std::string{"build.outputs entries require install_files"});
         for (const auto& copy : output.install_copies) {
             if (auto result = validate_payload_path(copy.source, "outputs.install_copies.from", false); !result)
                 return std::unexpected(result.error());
@@ -658,25 +658,25 @@ inline std::expected<void, std::string> parse_managed_build(
         && (!r.managed_build.install_files.empty()
             || !r.managed_build.install_excludes.empty()))
         return std::unexpected(
-            "build.outputs and top-level install_files/install_excludes are mutually exclusive");
+            std::string{"build.outputs and top-level install_files/install_excludes are mutually exclusive"});
     if (r.managed_build.payload == PayloadMode::All
         && (!r.managed_build.install_files.empty()
             || !r.managed_build.install_excludes.empty()
             || !r.managed_build.outputs.empty()))
         return std::unexpected(
-            "build.payload=all cannot be combined with an allowlist or outputs");
+            std::string{"build.payload=all cannot be combined with an allowlist or outputs"});
     if (r.managed_build.payload == PayloadMode::Allowlist
         && r.managed_build.install_files.empty())
         return std::unexpected(
-            "build.payload=allowlist requires non-empty build.install_files");
+            std::string{"build.payload=allowlist requires non-empty build.install_files"});
     if (r.managed_build.payload == PayloadMode::Outputs
         && r.managed_build.outputs.empty())
         return std::unexpected(
-            "build.payload=outputs requires at least one build.outputs entry");
+            std::string{"build.payload=outputs requires at least one build.outputs entry"});
     if (!r.managed_build.outputs.empty()
         && r.managed_build.payload != PayloadMode::Outputs)
         return std::unexpected(
-            "build.outputs requires build.payload=outputs");
+            std::string{"build.outputs requires build.payload=outputs"});
     for (const auto& link : r.managed_build.install_symlinks) {
         if (auto result = validate_payload_path(link.path, "install_symlinks.path", false); !result)
             return std::unexpected(result.error());
@@ -700,7 +700,7 @@ inline std::expected<void, std::string> parse_managed_build(
     }
 
     if (bld->contains("toolchain") && !bld->get_as<vendor::toml::table>("toolchain"))
-        return std::unexpected("build.toolchain must be a table");
+        return std::unexpected(std::string{"build.toolchain must be a table"});
     if (auto* suite = bld->get_as<vendor::toml::table>("toolchain")) {
         if (auto result = reject_unknown(*suite,
                 {"compiler", "linker", "rust", "go"}, "build.toolchain"); !result)
@@ -737,13 +737,13 @@ inline std::expected<void, std::string> parse_managed_build(
             return std::unexpected(result.error());
         if (suite->contains("rust")) {
             if (r.managed_build.system != BuildSystem::Cargo)
-                return std::unexpected("build.toolchain.rust is valid only for Cargo recipes");
+                return std::unexpected(std::string{"build.toolchain.rust is valid only for Cargo recipes"});
             if (auto result = parse_tool("rust", r.managed_build.rust, {"rustc"}); !result)
                 return std::unexpected(result.error());
         }
         if (suite->contains("go")) {
             if (r.managed_build.system != BuildSystem::Go)
-                return std::unexpected("build.toolchain.go is valid only for Go recipes");
+                return std::unexpected(std::string{"build.toolchain.go is valid only for Go recipes"});
             if (auto result = parse_tool("go", r.managed_build.go, {"go"}); !result)
                 return std::unexpected(result.error());
         }
@@ -751,11 +751,11 @@ inline std::expected<void, std::string> parse_managed_build(
         if (!r.managed_build.compiler.family.empty()
             && !r.managed_build.allowed_compilers.empty()
             && !std::ranges::contains(r.managed_build.allowed_compilers, r.managed_build.compiler.family))
-            return std::unexpected("Default compiler family is absent from allowed_compilers");
+            return std::unexpected(std::string{"Default compiler family is absent from allowed_compilers"});
         if (!r.managed_build.linker.family.empty()
             && !r.managed_build.allowed_linkers.empty()
             && !std::ranges::contains(r.managed_build.allowed_linkers, r.managed_build.linker.family))
-            return std::unexpected("Default linker family is absent from allowed_linkers");
+            return std::unexpected(std::string{"Default linker family is absent from allowed_linkers"});
 
         auto require_package = [&](const ToolRequirement& requirement) {
             const auto minimum = Version::parse(requirement.minimum_version);

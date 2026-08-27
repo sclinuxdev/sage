@@ -131,7 +131,8 @@ export inline int cmd_build(const CliOptions& opts) {
                                  configured.name, published.error());
             continue;
         }
-        for (const auto& package : published->available_packages) {
+        for (std::size_t pkg_i = 0; pkg_i < published->available_packages.size(); ++pkg_i) {
+            const auto& package = published->available_packages[pkg_i];
             if (package.name != r.name
                 || package.channel != r.channel
                 || package.version.epoch != r.version.epoch
@@ -196,10 +197,6 @@ export inline int cmd_build(const CliOptions& opts) {
         r.schema_version == 2
         && (r.managed_build.system != sage::package::BuildSystem::Script
             || r.managed_build.script_managed_tools);
-    const bool script_recipe =
-        r.schema_version == 2
-        && r.managed_build.system == sage::package::BuildSystem::Script
-        && !r.managed_build.script_managed_tools;
     const auto requested_cache = needs_managed_toolchain
         ? bcfg.compiler_cache_mode() : std::string_view{"none"};
     auto cache_mode_res = select_compiler_cache(
@@ -241,7 +238,7 @@ export inline int cmd_build(const CliOptions& opts) {
     // fails must fail the recipe rather than silently produce core system
     // packages from the wrong compiler.
     auto candidates_res = discover_candidate_toolchains(
-        r, recipe_dir, bcfg, target_triplet, opts.verbose);
+        r, bcfg, opts.verbose);
     if (!candidates_res) return candidates_res.error();
     auto candidates = std::move(*candidates_res);
 
@@ -939,16 +936,13 @@ export inline int cmd_build(const CliOptions& opts) {
         r, candidates, tool_audit, go_command_lines, go_executions,
         managed_cc_parameters, managed_cxx_parameters,
         managed_linker_parameters, managed_rustc_parameters,
-        hermetic_root, pkg_dir, src_dir, recipe_dir, opts.target_root, opts.no_elf_check,
+        hermetic_root, pkg_dir, src_dir, recipe_dir, opts.no_elf_check,
         bcfg, cfg, host_arch, target_arch, host_triplet, target_triplet);
     if (!elf_res) return elf_res.error();
     const auto& elf_result = *elf_res;
 
     auto pack_res = pack_build_outputs(
-        r, elf_result, hermetic_root, pkg_dir, src_dir, recipe_dir,
-        managed_cc_parameters, managed_cxx_parameters,
-        managed_linker_parameters, managed_rustc_parameters,
-        opts.target_root);
+        r, elf_result, hermetic_root, pkg_dir, src_dir, recipe_dir);
     if (!pack_res) return pack_res.error();
     const auto created_packages = std::move(*pack_res);
 

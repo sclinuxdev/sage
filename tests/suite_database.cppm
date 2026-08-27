@@ -360,13 +360,13 @@ release = "10"
                 migration_old.name,
                 expected_migration_identity)
             : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-                std::unexpected("transaction failed"));
+                std::unexpected(std::string{"transaction failed"}));
         auto stale_owner_check = install_txn
             ? migration_db->check_file_conflicts(
                 *install_txn,
                 std::optional<std::string_view>{stale_owner},
                 migration_new.files)
-            : std::expected<void, std::string>(std::unexpected("transaction failed"));
+            : std::expected<void, std::string>(std::unexpected(std::string{"transaction failed"}));
         if (stale_snapshot || stale_owner_check) {
             sage::util::log_error("Concurrent same-name channel migration bypassed identity revalidation");
             return 1;
@@ -518,11 +518,11 @@ release = "10"
     auto corrupt_package = corrupt_db
         ? corrupt_db->get_package("broken")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     auto mismatched_package = corrupt_db
         ? corrupt_db->get_package("aaa-mismatch")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!corrupt_db
         || corrupt_db->list_installed_packages()
         || corrupt_package

@@ -46,11 +46,11 @@ inline std::expected<void, std::string> parse_v2_outputs(
     };
 
     if (bld.contains("outputs") && !bld.get_as<vendor::toml::array>("outputs"))
-        return std::unexpected("build.outputs must be an array");
+        return std::unexpected(std::string{"build.outputs must be an array"});
     if (auto* arr = bld.get_as<vendor::toml::array>("outputs")) {
         for (auto&& element : *arr) {
             auto* item = element.as_table();
-            if (!item) return std::unexpected("build.outputs entries must be tables");
+            if (!item) return std::unexpected(std::string{"build.outputs entries must be tables"});
             if (auto result = reject_unknown_keys(*item,
                     {"name", "description", "license", "version", "release",
                      "channel", "arch", "inherit", "dependencies", "provides",
@@ -62,7 +62,7 @@ inline std::expected<void, std::string> parse_v2_outputs(
                 return std::unexpected(result.error());
             auto name = (*item)["name"].value<std::string_view>();
             if (!name || name->empty()) return std::unexpected(
-                "build.outputs entries require a non-empty name");
+                std::string{"build.outputs entries require a non-empty name"});
             InstallOutput output;
             output.name = std::string(*name);
             const auto parse_output_string =
@@ -140,8 +140,8 @@ inline std::expected<void, std::string> parse_v2_outputs(
                         || entry.name == ".."
                         || entry.name.find_first_of(" \t") != std::string::npos)
                         return std::unexpected(
-                            "build.outputs.provides entries must be names or "
-                            "'name <op> version': " + prov);
+                            std::string{"build.outputs.provides entries must be names or "
+                                "'name <op> version': "} + prov);
                 }
             }
             if (item->contains("conffiles")) {

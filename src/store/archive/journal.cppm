@@ -279,7 +279,7 @@ inline std::expected<ParsedJournal, std::string> parse_journal(std::string_view 
     }
 
     if (!have_kind)
-        return std::unexpected("Journal is missing the 'kind' field");
+        return std::unexpected(std::string{"Journal is missing the 'kind' field"});
     return out;
 }
 

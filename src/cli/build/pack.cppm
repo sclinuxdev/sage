@@ -18,16 +18,9 @@ pack_build_outputs(const sage::package::Recipe& r,
                    const std::filesystem::path& hermetic_root,
                    const std::filesystem::path& pkg_dir,
                    const std::filesystem::path& src_dir,
-                   const std::filesystem::path& recipe_dir,
-                   const std::vector<std::string>& managed_cc_parameters,
-                   const std::vector<std::string>& managed_cxx_parameters,
-                   const std::vector<std::string>& managed_linker_parameters,
-                   const std::vector<std::string>& managed_rustc_parameters,
-                   const std::filesystem::path& target_root)
+                   const std::filesystem::path& recipe_dir)
 {
     const auto& manifest = elf_result.manifest;
-    const auto& external_sonames = elf_result.external_sonames;
-    const auto& needed_by = elf_result.needed_by;
     // 4. Archive creation.  A v2 recipe may name several output views of the
     // same install tree.  Each view is copied before filtering, so one output
     // cannot delete a file another output owns; every archive receives its own

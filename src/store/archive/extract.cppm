@@ -174,7 +174,7 @@ inline std::expected<void, std::string> sync_extracted_root(
 #endif
     detail::UniqueFd root(::open(target_root.c_str(), flags));
     if (root.get() < 0) {
-        return std::unexpected("Cannot open target root for durability sync");
+        return std::unexpected(std::string{"Cannot open target root for durability sync"});
     }
 #ifdef __linux__
     if (::syncfs(root.get()) != 0) {
@@ -210,7 +210,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             || identity->inode != expected_inspection->source_inode
             || identity->size != expected_inspection->source_size
             || identity->mtime_ns != expected_inspection->source_mtime_ns)) {
-        return std::unexpected("Package archive changed after ownership preflight");
+        return std::unexpected(std::string{"Package archive changed after ownership preflight"});
     }
 
     // Open and locate the metadata section first: manifest parsing must gate
@@ -356,7 +356,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         if (!manifest_parsed) {
             failed = true;
             pool.drain();
-            return std::unexpected("Package archive carries payload before .METADATA/manifest.toml");
+            return std::unexpected(std::string{"Package archive carries payload before .METADATA/manifest.toml"});
         }
 
         auto normalized = normalize_data_path(
@@ -539,7 +539,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         if (done != payload.size()) {
             failed = true;
             pool.drain();
-            return std::unexpected("Truncated member payload in package archive");
+            return std::unexpected(std::string{"Truncated member payload in package archive"});
         }
 
         package::FileEntry entry;

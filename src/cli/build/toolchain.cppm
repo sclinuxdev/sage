@@ -11,21 +11,34 @@ import :probe;
 namespace sage::cli {
 
 struct Toolchain {
-    std::string cc, cxx, linker, rustc, go;
-    std::string cc_for_build, cxx_for_build, linker_for_build, rustc_for_build,
-        cc_cache_for_build, cxx_cache_for_build, cache_for_build,
-        path_for_build;
-    std::string compiler_version, cxx_version, linker_version, rustc_version,
-        go_version;
-    std::string compiler_family, cxx_family, linker_family, rustc_family,
-        go_family;
+    std::string cc{};
+    std::string cxx{};
+    std::string linker{};
+    std::string rustc{};
+    std::string go{};
+    std::string cc_for_build{};
+    std::string cxx_for_build{};
+    std::string linker_for_build{};
+    std::string rustc_for_build{};
+    std::string cc_cache_for_build{};
+    std::string cxx_cache_for_build{};
+    std::string cache_for_build{};
+    std::string path_for_build{};
+    std::string compiler_version{};
+    std::string cxx_version{};
+    std::string linker_version{};
+    std::string rustc_version{};
+    std::string go_version{};
+    std::string compiler_family{};
+    std::string cxx_family{};
+    std::string linker_family{};
+    std::string rustc_family{};
+    std::string go_family{};
 };
 
 inline std::expected<std::vector<Toolchain>, int>
 discover_candidate_toolchains(const sage::package::Recipe& r,
-                              const std::filesystem::path& recipe_dir,
                               const sage::config::BuildConfig& bcfg,
-                              const std::string& target_triplet,
                               bool verbose)
 {
     const bool script_recipe =

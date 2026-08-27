@@ -143,7 +143,7 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
     auto selected_version = version_db
         ? version_db->get_package("versioned-package")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!selected_version || !*selected_version
         || (**selected_version).version != version_2.version) {
         sage::util::log_error("Installed database version differs from extracted archive version");
@@ -219,7 +219,7 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
         auto direct_version = direct_db
             ? direct_db->get_package("versioned-package")
             : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-                std::unexpected("database open failed"));
+                std::unexpected(std::string{"database open failed"}));
         if (!direct_version || !*direct_version
             || (**direct_version).version != version_1.version) {
             sage::util::log_error("Direct archive manifest identity was not preserved in the database");
@@ -279,7 +279,7 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
     auto upgraded_version = upgraded_db
         ? upgraded_db->get_package("versioned-package")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!upgraded_version || !*upgraded_version
         || (**upgraded_version).version != version_2.version) {
         sage::util::log_error("Same-package upgrade did not record the extracted version");
@@ -299,7 +299,7 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
     auto downgraded_version = downgraded_db
         ? downgraded_db->get_package("versioned-package")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!downgraded_version || !*downgraded_version
         || (**downgraded_version).version != version_1.version) {
         sage::util::log_error("Direct archive downgrade did not update installed metadata");
@@ -334,7 +334,7 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
     auto alternate_record = alternate_db
         ? alternate_db->get_package("versioned-package")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     if (!alternate_record || !*alternate_record
         || sage::package::package_identity(**alternate_record)
             != sage::package::package_identity(alternate_identity)
@@ -412,11 +412,11 @@ export int run_e2e_install_remove_tests(const std::filesystem::path& temp_dir,
     auto owner_a_record = owner_db
         ? owner_db->get_package("owner-a")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+            std::unexpected(std::string{"database open failed"}));
     auto owner_b_record = owner_db
         ? owner_db->get_package("owner-b")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
-            std::unexpected("database open failed"));
+                std::unexpected(std::string{"database open failed"}));
     if (!owner_db || !owner_a_record || !*owner_a_record
         || !owner_b_record || *owner_b_record
         || sole_owner(*owner_db, "usr/bin/shared-file") != "owner-a:system"

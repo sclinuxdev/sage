@@ -46,20 +46,27 @@ int run_cli(int argc, char* argv[]) {
     if (!parsed) return 0;
     const auto& opts = *parsed;
 
-    const auto spec = std::ranges::find(commands, opts.command, &CommandSpec::name);
-    if (spec == commands.end()) {
-        std::println(std::cerr, "Unknown command: '{}'", opts.command);
+    const CommandSpec* selected = nullptr;
+    for (const auto& cmd : commands) {
+        if (cmd.name == opts.command) {
+            selected = &cmd;
+            break;
+        }
+    }
+
+    if (!selected) {
+        sage::util::log_error("Unknown command: '{}'", opts.command);
         print_help();
         return 1;
     }
 
     std::optional<OperationContext> operation;
-    if (spec->state_lock) {
+    if (selected->state_lock) {
         auto operation_res = acquire_operation_context(opts);
         if (!operation_res) return operation_res.error();
         operation = std::move(*operation_res);
     }
-    return spec->run(opts, operation ? &*operation : nullptr);
+    return selected->run(opts, operation ? &*operation : nullptr);
 }
 
 } // namespace sage::cli

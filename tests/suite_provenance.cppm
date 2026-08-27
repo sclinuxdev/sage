@@ -173,7 +173,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
         ? sage::archive::extract_package(
             replacement_archive, binding_root, &manifest, &*preflight_package)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     if (binding_result || std::filesystem::exists(binding_root / "usr/bin/injected")) {
         sage::util::log_error("Archive replacement bypassed ownership preflight");
         return 1;
@@ -334,7 +334,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto invalid_manifest_root = temp_dir / "invalid-manifest-root";
     auto invalid_manifest_result = invalid_manifest_pkg
         ? sage::archive::extract_package(*invalid_manifest_pkg, invalid_manifest_root)
-        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected(std::string{"fixture failed"}));
     if (invalid_manifest_result
         || std::filesystem::exists(invalid_manifest_root / "usr/bin/dummy")
         || std::filesystem::exists(invalid_manifest_root / long_rel)) {
@@ -353,7 +353,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto escaped_path = temp_dir / "escaped-by-package";
     auto traversal_result = traversal_pkg
         ? sage::archive::extract_package(*traversal_pkg, traversal_root)
-        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected(std::string{"fixture failed"}));
     if (traversal_result || std::filesystem::exists(escaped_path)) {
         sage::util::log_error("Package data path escaped the target root");
         return 1;
@@ -369,7 +369,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto symlink_pivot_root = temp_dir / "symlink-pivot-root";
     auto symlink_pivot_result = symlink_pivot_pkg
         ? sage::archive::extract_package(*symlink_pivot_pkg, symlink_pivot_root)
-        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected(std::string{"fixture failed"}));
     if (symlink_pivot_result) {
         sage::util::log_error("Archive symlink parent traversal was not rejected");
         return 1;
@@ -424,7 +424,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto reserved_temp_result = reserved_temp_pkg
         ? sage::archive::extract_package(*reserved_temp_pkg, reserved_temp_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     // Streaming rejection happens at the offending member; earlier members
     // are already on disk (pacman behaves the same way).
     if (reserved_temp_result
@@ -496,7 +496,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto regular_parent_result = regular_parent_pkg
         ? sage::archive::extract_package(*regular_parent_pkg, regular_parent_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     // The parent path was already seen as a non-directory member: structural
     // rejection must fire before any write under it is attempted.
     if (regular_parent_result
@@ -520,7 +520,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto usr_merge_result = usr_merge_pkg
         ? sage::archive::extract_package(*usr_merge_pkg, usr_merge_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     if (usr_merge_result
         || usr_merge_result.error().find("must use canonical usr/ paths")
             == std::string::npos
@@ -577,7 +577,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto usr_sbin_result = usr_sbin_pkg
         ? sage::archive::extract_package(*usr_sbin_pkg, usr_sbin_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     if (usr_sbin_result
         || usr_sbin_result.error().find("compatibility path") == std::string::npos) {
         sage::util::log_error("Package accepted an usr/sbin payload path");
@@ -595,7 +595,7 @@ export int run_archive_integrity_tests(std::filesystem::path& temp_dir,
     auto usr_lib64_result = usr_lib64_pkg
         ? sage::archive::extract_package(*usr_lib64_pkg, usr_lib64_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
-            std::unexpected("fixture failed"));
+            std::unexpected(std::string{"fixture failed"}));
     if (usr_lib64_result
         || usr_lib64_result.error().find("compatibility path") == std::string::npos) {
         sage::util::log_error("Package accepted an usr/lib64 payload path");
@@ -1059,13 +1059,20 @@ install = [
                 .mode = 0755,
                 .uid = 1001,
                 .gid = 1001,
-                .caps = "cap_net_raw=+ep"
+                .caps = "cap_net_raw=+ep",
+                .sha256 = "",
+                .type = sage::package::FileType::Regular,
+                .link_target = ""
             },
             {
                 .path = "etc/daemon.conf",
                 .mode = 0600,
                 .uid = 0,
-                .gid = 100
+                .gid = 100,
+                .caps = "",
+                .sha256 = "",
+                .type = sage::package::FileType::Regular,
+                .link_target = ""
             }
         };
         auto extattr_pkg = temp_dir / "extattr-test-1.0.0-1-x86_64.pkg.tar.zst";

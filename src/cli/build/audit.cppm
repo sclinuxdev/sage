@@ -642,7 +642,7 @@ std::expected<void, std::string> apply_content_policy(
     if (content.strip != "none") {
         auto strip = ToolAudit::resolve("strip");
         if (!strip) return std::unexpected(
-            "build.content.strip requires the strip utility inside the build environment");
+            std::string{"build.content.strip requires the strip utility inside the build environment"});
         const std::string mode = content.strip == "debug"
             ? "--strip-debug" : "--strip-unneeded";
         for (const auto& entry : std::filesystem::recursive_directory_iterator(
@@ -662,7 +662,7 @@ std::expected<void, std::string> apply_content_policy(
     if (content.man_compress == "gzip") {
         auto gzip = ToolAudit::resolve("gzip");
         if (!gzip) return std::unexpected(
-            "build.content.man_compress requires the gzip utility inside the build environment");
+            std::string{"build.content.man_compress requires the gzip utility inside the build environment"});
         const auto man_root = pkg_dir / "usr/share/man";
         if (std::filesystem::is_directory(man_root, ec)) {
             for (const auto& entry : std::filesystem::recursive_directory_iterator(
@@ -822,7 +822,7 @@ std::expected<std::string, std::string> select_compiler_cache(
     }
     if (requested != "ccache" && requested != "sccache")
         return std::unexpected(
-            "compiler_cache must be ccache, sccache, auto, or none");
+            std::string{"compiler_cache must be ccache, sccache, auto, or none"});
     if (!available(requested))
         return std::unexpected(std::format(
             "Configured compiler cache '{}' is not available inside build sysroot '{}'",
@@ -849,7 +849,7 @@ std::expected<void, std::string> validate_check_dependencies(
     for (const auto& raw : recipe.check_deps) {
         auto request = sage::package::Dependency::parse(raw);
         if (request.name.empty()) return std::unexpected(
-            "check_dependencies contains a dependency with an empty package name");
+            std::string{"check_dependencies contains a dependency with an empty package name"});
         requests.push_back(std::move(request));
     }
     sage::solver::DependencySolver solver(*installed, cfg.providers);

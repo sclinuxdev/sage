@@ -52,7 +52,8 @@ export int cmd_remove(
         return 1;
     }
     std::map<std::string, sage::package::PackageManifest> installed_map;
-    for (const auto& pkg : *all_installed) {
+    for (std::size_t i = 0; i < all_installed->size(); ++i) {
+        const auto& pkg = (*all_installed)[i];
         installed_map[pkg.name] = pkg;
     }
 

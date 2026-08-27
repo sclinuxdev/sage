@@ -31,7 +31,7 @@ collect_installed(const CliOptions& opts, std::string_view pattern) {
     auto list = db_res->list_installed_packages();
     if (!list) return std::unexpected(list.error());
     std::erase_if(*list, [&](const auto& pkg) { return !inventory_matches(pkg.name, pattern); });
-    std::ranges::sort(*list, {}, &sage::package::PackageManifest::name);
+    std::sort(list->begin(), list->end(), [](const auto& a, const auto& b) { return a.name < b.name; });
     return std::move(*list);
 }
 
@@ -198,11 +198,10 @@ export int cmd_query(const CliOptions& opts) {
             sage::util::log_error("Installed package database is inconsistent: {}", list.error());
             return 1;
         }
-        // LMDB hands these back in key order already, but sorting explicitly
-        // keeps the listing stable if the key layout ever changes.
-        std::ranges::sort(*list, {}, &sage::package::PackageManifest::name);
+        std::sort(list->begin(), list->end(), [](const auto& a, const auto& b) { return a.name < b.name; });
         std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list->size());
-        for (const auto& pkg : *list) {
+        for (std::size_t i = 0; i < list->size(); ++i) {
+            const auto& pkg = (*list)[i];
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
         }
     } else if (sub == "info" && opts.args.size() >= 2) {
@@ -290,7 +289,8 @@ export int cmd_verify(const CliOptions& opts) {
     size_t missing = 0;
     size_t unhashed = 0;
 
-    for (const auto& pkg : targets) {
+    for (std::size_t pkg_i = 0; pkg_i < targets.size(); ++pkg_i) {
+        const auto& pkg = targets[pkg_i];
         for (const auto& f : pkg.files) {
             if (f.type != sage::package::FileType::Regular) continue;
             // The shared install-info index is appended to by every info

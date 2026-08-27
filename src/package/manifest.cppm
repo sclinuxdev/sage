@@ -220,14 +220,14 @@ struct BuildAttestation {
             if (att_tbl->contains("check_dependencies")
                 && !att_tbl->get_as<vendor::toml::array>("check_dependencies"))
                 return std::unexpected(
-                    "attestation.check_dependencies must be an array");
+                    std::string{"attestation.check_dependencies must be an array"});
             att.exec_audit_digest = (*att_tbl)["exec_audit_digest"].value_or("");
             if (auto* checks = att_tbl->get_as<vendor::toml::array>(
                     "check_dependencies")) {
                 for (auto&& el : *checks) {
                     auto value = el.value<std::string_view>();
                     if (!value || value->empty()) return std::unexpected(
-                        "attestation.check_dependencies entries must be non-empty strings");
+                        std::string{"attestation.check_dependencies entries must be non-empty strings"});
                     att.check_dependencies.emplace_back(*value);
                 }
             }
@@ -410,7 +410,7 @@ struct PackageManifest {
                 if (*epoch < 0
                     || static_cast<unsigned long long>(*epoch)
                         > std::numeric_limits<uint32_t>::max()) {
-                    return std::unexpected("Package epoch is outside the uint32 range");
+                    return std::unexpected(std::string{"Package epoch is outside the uint32 range"});
                 }
                 m.version.epoch = static_cast<uint32_t>(*epoch);
             }
@@ -423,10 +423,10 @@ struct PackageManifest {
             m.service_toml = (*pkg)["service_toml"].value_or("");
             m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
         } else {
-            return std::unexpected("Missing [package] section in manifest");
+            return std::unexpected(std::string{"Missing [package] section in manifest"});
         }
 
-        if (m.name.empty()) return std::unexpected("Package name cannot be empty");
+        if (m.name.empty()) return std::unexpected(std::string{"Package name cannot be empty"});
 
         auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {
             if (auto* arr = t.get_as<vendor::toml::array>(key)) {
@@ -527,14 +527,14 @@ struct PackageManifest {
             for (auto&& element : *arr) {
                 auto* item = element.as_table();
                 if (!item) return std::unexpected(
-                    "sysusers entries must be tables");
+                    std::string{"sysusers entries must be tables"});
                 SysUserEntry entry;
                 entry.type = (*item)["type"].value_or("");
                 entry.name = (*item)["name"].value_or("");
                 if ((entry.type != "user" && entry.type != "group")
                     || entry.name.empty())
                     return std::unexpected(
-                        "sysusers entries require type = user|group and a name");
+                        std::string{"sysusers entries require type = user|group and a name"});
                 if (auto id = (*item)["id"].value<std::int64_t>())
                     entry.id = static_cast<uint32_t>(*id);
                 entry.description = (*item)["description"].value_or("");
@@ -548,7 +548,7 @@ struct PackageManifest {
             for (auto&& element : *arr) {
                 auto* item = element.as_table();
                 if (!item) return std::unexpected(
-                    "alternatives entries must be tables");
+                    std::string{"alternatives entries must be tables"});
                 AlternativeEntry entry;
                 entry.link = (*item)["link"].value_or("");
                 entry.target = (*item)["target"].value_or("");
@@ -556,19 +556,19 @@ struct PackageManifest {
                     (*item)["priority"].value_or(50LL));
                 if (entry.link.empty() || entry.target.empty())
                     return std::unexpected(
-                        "alternatives entries require link and target");
+                        std::string{"alternatives entries require link and target"});
                 m.alternatives.push_back(std::move(entry));
             }
         }
 
         if (auto* tools = tbl.get_as<vendor::toml::array>("managed_build_tools")) {
             if (m.schema_version < 2) return std::unexpected(
-                "managed_build_tools are valid only in package manifest schema v2");
+                std::string{"managed_build_tools are valid only in package manifest schema v2"});
             std::set<std::string> roles;
             for (auto&& item : *tools) {
                 auto* tool = item.as_table();
                 if (!tool) return std::unexpected(
-                    "managed_build_tools entries must be tables");
+                    std::string{"managed_build_tools entries must be tables"});
                 ManagedBuildTool observed;
                 observed.role = (*tool)["role"].value_or("");
                 observed.executable = (*tool)["executable"].value_or("");
@@ -581,7 +581,7 @@ struct PackageManifest {
                     for (auto&& parameter : *parameters) {
                         auto value = parameter.value<std::string_view>();
                         if (!value || value->empty()) return std::unexpected(
-                            "managed_build_tools parameters must be non-empty strings");
+                            std::string{"managed_build_tools parameters must be non-empty strings"});
                         observed.parameters.emplace_back(*value);
                     }
                 }
@@ -608,7 +608,7 @@ struct PackageManifest {
                     || (version_argument != "--version"
                         && !(observed.role == "go" && version_argument == "version"))) {
                     return std::unexpected(
-                        "managed_build_tools require an actually executed role, executable, family, version, executions and version_argument='--version'");
+                        std::string{"managed_build_tools require an actually executed role, executable, family, version, executions and version_argument='--version'"});
                 }
                 if (!roles.insert(observed.role).second) return std::unexpected(
                     "managed_build_tools contains a duplicate role: "
@@ -621,11 +621,11 @@ struct PackageManifest {
             if (auto* commands = owner.get_as<vendor::toml::array>(
                     "managed_build_commands")) {
                 if (m.schema_version < 2) return std::unexpected(
-                    "managed_build_commands are valid only in package manifest schema v2");
+                    std::string{"managed_build_commands are valid only in package manifest schema v2"});
                 for (auto&& command : *commands) {
                     auto value = command.value<std::string_view>();
                     if (!value || value->empty()) return std::unexpected(
-                        "managed_build_commands entries must be non-empty strings");
+                        std::string{"managed_build_commands entries must be non-empty strings"});
                     m.managed_build_commands.emplace_back(*value);
                 }
             }
@@ -642,7 +642,7 @@ struct PackageManifest {
         if (m.schema_version >= 2 && !m.managed_build_tools.empty()
             && m.managed_build_commands.empty())
             return std::unexpected(
-                "managed_build_tools require captured managed_build_commands");
+                std::string{"managed_build_tools require captured managed_build_commands"});
 
         if (auto att = tbl["attestation_toml"].value<std::string_view>()) {
             m.attestation_toml = std::string(*att);

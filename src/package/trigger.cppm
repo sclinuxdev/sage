@@ -41,9 +41,9 @@ inline std::string escape_toml_basic_string(std::string_view value) {
 // switched from mkinitcpio to dracut.
 
 struct CapabilityHook {
-    std::string capability;          // e.g. "virtual/initramfs-generator"
-    std::string exec;                // absolute path inside the target root
-    std::vector<std::string> args;
+    std::string capability{};          // e.g. "virtual/initramfs-generator"
+    std::string exec{};                // absolute path inside the target root
+    std::vector<std::string> args{};
 
     [[nodiscard]] std::string command_line() const {
         std::string cmd = exec;
@@ -71,12 +71,12 @@ struct CapabilityHook {
 // is resolved at fire time through the active provider's CapabilityHook.
 
 struct Trigger {
-    std::string name;
-    std::vector<std::string> on_paths;
-    std::vector<std::string> on_capability;
-    std::string exec;                 // absolute path inside the target root
-    std::vector<std::string> args;
-    std::string run_capability;       // resolved via the provider's hook
+    std::string name{};
+    std::vector<std::string> on_paths{};
+    std::vector<std::string> on_capability{};
+    std::string exec{};                 // absolute path inside the target root
+    std::vector<std::string> args{};
+    std::string run_capability{};       // resolved via the provider's hook
     // Lower runs first. Ordering is not cosmetic: the initramfs must exist
     // before the bootloader is asked to reference it, and ldconfig must have
     // run before anything that dlopen()s.

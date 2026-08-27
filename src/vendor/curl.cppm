@@ -66,10 +66,10 @@ public:
     }
 
     std::expected<void, std::string> perform() {
-        if (!handle_) return std::unexpected("Uninitialized CURL handle");
+        if (!handle_) return std::unexpected(std::string{"Uninitialized CURL handle"});
         CURLcode res = curl_easy_perform(handle_);
         if (res != CURLE_OK) {
-            return std::unexpected(curl_easy_strerror(res));
+            return std::unexpected(std::string{curl_easy_strerror(res)});
         }
         return {};
     }
@@ -102,7 +102,7 @@ inline std::expected<std::string, std::string> fetch_string(std::string_view url
     }
 
     CurlEasy curl;
-    if (!curl) return std::unexpected("Failed to initialize curl");
+    if (!curl) return std::unexpected(std::string{"Failed to initialize curl"});
 
     std::string response;
     std::string url_str(url);
@@ -153,7 +153,7 @@ inline std::expected<void, std::string> download_file(
     std::string last_error = "Unknown download error";
     for (int retry = 0; retry < 5; ++retry) {
         int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) return std::unexpected("Failed to open destination file for write");
+        if (fd < 0) return std::unexpected(std::string{"Failed to open destination file for write"});
 
         struct SingleCtx {
             int fd;

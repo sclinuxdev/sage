@@ -34,12 +34,12 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
 
     unsigned char e_ident[EI_NIDENT];
     if (!file.read(reinterpret_cast<char*>(e_ident), EI_NIDENT)) {
-        return std::unexpected("File too small for ELF header");
+        return std::unexpected(std::string{"File too small for ELF header"});
     }
 
     if (e_ident[EI_MAG0] != ELFMAG0 || e_ident[EI_MAG1] != ELFMAG1 ||
         e_ident[EI_MAG2] != ELFMAG2 || e_ident[EI_MAG3] != ELFMAG3) {
-        return std::unexpected("Not an ELF binary");
+        return std::unexpected(std::string{"Not an ELF binary"});
     }
 
     bool is_64 = (e_ident[EI_CLASS] == ELFCLASS64);
@@ -50,7 +50,7 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
     if (is_64) {
         Elf64_Ehdr ehdr;
         if (!file.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr))) {
-            return std::unexpected("Failed to read ELF64 header");
+            return std::unexpected(std::string{"Failed to read ELF64 header"});
         }
 
         meta.is_shared = (ehdr.e_type == ET_DYN);
@@ -228,7 +228,7 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
     } else {
         Elf32_Ehdr ehdr;
         if (!file.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr))) {
-            return std::unexpected("Failed to read ELF32 header");
+            return std::unexpected(std::string{"Failed to read ELF32 header"});
         }
 
         meta.is_shared = (ehdr.e_type == ET_DYN);
@@ -426,14 +426,14 @@ read_elf_sections(
     }
     unsigned char ident[EI_NIDENT];
     if (!file.read(reinterpret_cast<char*>(ident), EI_NIDENT)) {
-        return std::unexpected("File too small for ELF header");
+        return std::unexpected(std::string{"File too small for ELF header"});
     }
     if (ident[EI_MAG0] != ELFMAG0 || ident[EI_MAG1] != ELFMAG1
         || ident[EI_MAG2] != ELFMAG2 || ident[EI_MAG3] != ELFMAG3) {
-        return std::unexpected("Not an ELF binary");
+        return std::unexpected(std::string{"Not an ELF binary"});
     }
     if (ident[EI_DATA] != ELFDATA2LSB) {
-        return std::unexpected("Big-endian ELF is not supported here");
+        return std::unexpected(std::string{"Big-endian ELF is not supported here"});
     }
     const bool is64 = (ident[EI_CLASS] == ELFCLASS64);
     file.seekg(0, std::ios::beg);
@@ -442,20 +442,20 @@ read_elf_sections(
     if (is64) {
         Elf64_Ehdr ehdr;
         if (!file.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr)))
-            return std::unexpected("Truncated ELF64 header");
+            return std::unexpected(std::string{"Truncated ELF64 header"});
         shoff = ehdr.e_shoff; shentsize = ehdr.e_shentsize;
         shnum = ehdr.e_shnum; shstrndx = ehdr.e_shstrndx;
     } else {
         Elf32_Ehdr ehdr;
         if (!file.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr)))
-            return std::unexpected("Truncated ELF32 header");
+            return std::unexpected(std::string{"Truncated ELF32 header"});
         shoff = ehdr.e_shoff; shentsize = ehdr.e_shentsize;
         shnum = ehdr.e_shnum; shstrndx = ehdr.e_shstrndx;
     }
     if (!shoff || !shnum || !shentsize
         || shnum > (1u << 16)
         || shentsize < (is64 ? sizeof(Elf64_Shdr) : sizeof(Elf32_Shdr))) {
-        return std::unexpected("No usable section header table");
+        return std::unexpected(std::string{"No usable section header table"});
     }
 
     auto read_shdr = [&](uint64_t index)
@@ -466,13 +466,13 @@ read_elf_sections(
         if (is64) {
             Elf64_Shdr h;
             if (!file.read(reinterpret_cast<char*>(&h), sizeof(h)))
-                return std::unexpected("Truncated section header");
+                return std::unexpected(std::string{"Truncated section header"});
             return std::array<uint64_t, 5>{h.sh_name, h.sh_type, h.sh_flags,
                                            h.sh_offset, h.sh_size};
         }
         Elf32_Shdr h;
         if (!file.read(reinterpret_cast<char*>(&h), sizeof(h)))
-            return std::unexpected("Truncated section header");
+            return std::unexpected(std::string{"Truncated section header"});
         return std::array<uint64_t, 5>{h.sh_name, h.sh_type, h.sh_flags,
                                        h.sh_offset, h.sh_size};
     };
@@ -483,7 +483,7 @@ read_elf_sections(
     std::string names(st[4], '\0');
     file.seekg(static_cast<std::streamoff>(st[3]), std::ios::beg);
     if (!file.read(names.data(), static_cast<std::streamsize>(st[4])))
-        return std::unexpected("Truncated section name table");
+        return std::unexpected(std::string{"Truncated section name table"});
 
     auto name_at = [&](uint64_t off) -> std::string_view {
         if (off >= names.size()) return {};

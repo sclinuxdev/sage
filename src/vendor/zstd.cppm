@@ -24,7 +24,7 @@ decompress_buffer(std::string_view src, size_t uncompressed_size, size_t cap) {
     const auto take = out.truncated ? cap : uncompressed_size;
     out.bytes.resize(take);
     ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    if (!dctx) return std::unexpected("zstd: cannot create DCtx");
+    if (!dctx) return std::unexpected(std::string{"zstd: cannot create DCtx"});
     const size_t rc = ZSTD_decompressDCtx(
         dctx, out.bytes.data(), take, src.data(), src.size());
     ZSTD_freeDCtx(dctx);
@@ -71,10 +71,10 @@ public:
         ZSTD_inBuffer& in, 
         ZSTD_outBuffer& out) noexcept 
     {
-        if (!dctx_) return std::unexpected("Uninitialized ZSTD DCtx");
+        if (!dctx_) return std::unexpected(std::string{"Uninitialized ZSTD DCtx"});
         size_t ret = ZSTD_decompressStream(dctx_, &out, &in);
         if (ZSTD_isError(ret)) {
-            return std::unexpected(ZSTD_getErrorName(ret));
+            return std::unexpected(std::string{ZSTD_getErrorName(ret)});
         }
         return ret;
     }
@@ -85,7 +85,7 @@ public:
     // this module instead of leaking past the vendor boundary.
     std::expected<std::string, std::string> decompress_lead(
         std::istream& in, size_t max_bytes) {
-        if (!dctx_) return std::unexpected("Uninitialized ZSTD DCtx");
+        if (!dctx_) return std::unexpected(std::string{"Uninitialized ZSTD DCtx"});
         std::string out(max_bytes, '\0');
         ZSTD_outBuffer out_buf{out.data(), out.size(), 0};
         std::vector<char> chunk(64 << 10);
@@ -149,10 +149,10 @@ public:
         ZSTD_outBuffer& out, 
         ZSTD_EndDirective end_op = ZSTD_e_continue) noexcept 
     {
-        if (!cctx_) return std::unexpected("Uninitialized ZSTD CCtx");
+        if (!cctx_) return std::unexpected(std::string{"Uninitialized ZSTD CCtx"});
         size_t ret = ZSTD_compressStream2(cctx_, &out, &in, end_op);
         if (ZSTD_isError(ret)) {
-            return std::unexpected(ZSTD_getErrorName(ret));
+            return std::unexpected(std::string{ZSTD_getErrorName(ret)});
         }
         return ret;
     }
@@ -183,7 +183,7 @@ inline std::expected<std::vector<std::uint8_t>, std::string> decompress_block(
 {
     unsigned long long const r_size = ZSTD_getFrameContentSize(src.data(), src.size());
     if (r_size == ZSTD_CONTENTSIZE_ERROR || r_size == ZSTD_CONTENTSIZE_UNKNOWN) {
-        return std::unexpected("Invalid or unknown ZSTD content size");
+        return std::unexpected(std::string{"Invalid or unknown ZSTD content size"});
     }
     std::vector<std::uint8_t> dest(static_cast<std::size_t>(r_size));
     std::size_t actual = ZSTD_decompress(dest.data(), dest.size(), src.data(), src.size());

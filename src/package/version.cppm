@@ -123,7 +123,7 @@ struct Version {
 // exactly the same positive-decimal contract.
 inline std::expected<uint64_t, std::string> parse_release(std::string_view release) {
     uint64_t value = 0;
-    if (release.empty()) return std::unexpected("Release must be a positive decimal integer");
+    if (release.empty()) return std::unexpected(std::string{"Release must be a positive decimal integer"});
     auto [end, error] = std::from_chars(release.data(), release.data() + release.size(), value);
     if (error != std::errc{} || end != release.data() + release.size() || value == 0) {
         return std::unexpected(std::format(
@@ -173,7 +173,7 @@ inline std::expected<std::string, std::string> parse_release_field(
     const auto* node = table.get("release");
     if (!node) return std::string(fallback);
     auto release = node->value<std::string_view>();
-    if (!release) return std::unexpected("Release must be a TOML string when present");
+    if (!release) return std::unexpected(std::string{"Release must be a TOML string when present"});
     if (auto parsed = parse_release(*release); !parsed) {
         return std::unexpected(parsed.error());
     }

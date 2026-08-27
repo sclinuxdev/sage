@@ -48,7 +48,7 @@ inline std::expected<void, std::string> extract_source_archive(
     };
     const auto clean_name = [](std::string_view raw)
         -> std::expected<std::filesystem::path, std::string> {
-        if (raw.empty()) return std::unexpected("Source archive contains an empty path");
+        if (raw.empty()) return std::unexpected(std::string{"Source archive contains an empty path"});
         const std::filesystem::path path{std::string(raw)};
         if (path.is_absolute() || path.has_root_path()
             || std::ranges::any_of(path, [](const auto& part) { return part == ".."; }))
@@ -56,7 +56,7 @@ inline std::expected<void, std::string> extract_source_archive(
                                    + std::string(raw));
         const auto normalized = path.lexically_normal();
         if (normalized.empty() || normalized == ".")
-            return std::unexpected("Source archive contains an empty normalized path");
+            return std::unexpected(std::string{"Source archive contains an empty normalized path"});
         return normalized;
     };
     const auto drain = [](sage::vendor::libarchive::ArchiveReader& reader)
@@ -121,13 +121,13 @@ inline std::expected<void, std::string> extract_source_archive(
             if (relative == common_root) relative.clear();
             else if (relative.starts_with(prefix)) relative.erase(0, prefix.size());
             else return std::unexpected(
-                "Source archive has inconsistent top-level paths");
+                std::string{"Source archive has inconsistent top-level paths"});
         }
         if (relative.empty()) {
             if ((*header)->filetype == sage::vendor::libarchive::type_regular) {
                 auto result = drain(second->second);
                 if (!result) return std::unexpected(
-                    "Cannot discard source archive root payload");
+                    std::string{"Cannot discard source archive root payload"});
             }
             continue;
         }
