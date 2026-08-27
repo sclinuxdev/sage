@@ -307,6 +307,10 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         return fd;
     };
     bool failed = false;
+    const auto drain_pool = [&] {
+        if (auto drained = pool.drain(); !drained)
+            util::log_error("Archive write cleanup failed: {}", drained.error());
+    };
 
     auto record_entry = [&](package::FileEntry entry, std::string_view rel_raw,
                             std::string_view leaf_name, std::string* redirect_leaf) {
@@ -328,7 +332,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         auto header = reader_res->next_header();
         if (!header) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(header.error());
         }
         if (!header->has_value()) break;
@@ -337,7 +341,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         auto captured = detail::capture_metadata_member(*reader_res, *info, meta);
         if (!captured) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(captured.error());
         }
         if (*captured) {
@@ -345,7 +349,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 auto adopted = adopt_manifest();
                 if (!adopted) {
                     failed = true;
-                    pool.drain();
+                    drain_pool();
                     return std::unexpected(adopted.error());
                 }
                 manifest_parsed = true;
@@ -355,7 +359,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         if (!info->pathname.starts_with("data/") || info->pathname.size() == 5) continue;
         if (!manifest_parsed) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(std::string{"Package archive carries payload before .METADATA/manifest.toml"});
         }
 
@@ -363,7 +367,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             std::string_view(info->pathname).substr(5));
         if (!normalized) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(normalized.error());
         }
         std::string rel_path = std::move(*normalized);
@@ -375,7 +379,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 
         if (typeflag == '?') {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(std::format(
                 "Unsupported tar entry type '{}' for '{}'", typeflag, info->pathname));
         }
@@ -386,14 +390,14 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             is_symlink ? std::string_view(info->symlink) : std::string_view{}, *package_name);
         if (!check) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(check.error());
         }
         {
             std::lock_guard lock(state_mutex);
             if (!seen_paths.emplace(clean_path, typeflag).second) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(
                     "Package archive contains duplicate data path: " + clean_path);
             }
@@ -405,7 +409,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 auto ancestor = seen_paths.find(parent.generic_string());
                 if (ancestor != seen_paths.end() && ancestor->second != '5') {
                     failed = true;
-                    pool.drain();
+                    drain_pool();
                     return std::unexpected(std::format(
                         "Package data path '{}' traverses non-directory archive entry '{}'",
                         clean_path, ancestor->first));
@@ -427,13 +431,13 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             auto parent = detail::open_anchored_dir(root_fd.get(), components);
             if (!parent) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(parent.error());
             }
             if (::mkdirat(*parent, components_view.filename().c_str(), 0755) != 0
                 && errno != EEXIST) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(std::format(
                     "Cannot create directory '{}': {}", rel_path, std::strerror(errno)));
             }
@@ -445,7 +449,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             auto safe_target = normalize_link_target(rel_path, info->symlink);
             if (!safe_target) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(safe_target.error());
             }
             package::FileEntry entry;
@@ -465,13 +469,13 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             auto parent = detail::open_anchored_dir(root_fd.get(), components);
             if (!parent) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(parent.error());
             }
             (void)::unlinkat(*parent, leaf.c_str(), 0);
             if (::symlinkat(safe_target->c_str(), *parent, leaf.c_str()) != 0) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(std::format(
                     "Cannot create symlink '{}' -> '{}': {}",
                     rel_path, info->symlink, std::strerror(errno)));
@@ -486,7 +490,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             auto safe_target = normalize_data_path(htarget);
             if (!safe_target) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(safe_target.error());
             }
             package::FileEntry entry;
@@ -506,13 +510,13 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             auto parent = detail::open_anchored_dir(root_fd.get(), components);
             if (!parent) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(parent.error());
             }
             (void)::unlinkat(*parent, leaf.c_str(), 0);
             if (::linkat(root_fd.get(), safe_target->c_str(), *parent, leaf.c_str(), 0) != 0) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 detail::close_fd(*parent);
                 return std::unexpected(std::format(
                     "Cannot create hardlink '{}' -> '{}': {}",
@@ -530,7 +534,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 std::span<uint8_t>(payload.data() + done, payload.size() - done));
             if (!chunk) {
                 failed = true;
-                pool.drain();
+                drain_pool();
                 return std::unexpected(chunk.error());
             }
             if (*chunk == 0) break;
@@ -538,7 +542,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         }
         if (done != payload.size()) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(std::string{"Truncated member payload in package archive"});
         }
 
@@ -557,7 +561,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         auto parent_fd = write_parent(rel_path);
         if (!parent_fd) {
             failed = true;
-            pool.drain();
+            drain_pool();
             return std::unexpected(parent_fd.error());
         }
 

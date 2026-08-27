@@ -17,28 +17,43 @@ namespace color {
     inline constexpr std::string_view white   = "\033[37m";
 }
 
+inline void write_line(std::ostream& stream, std::string_view text) {
+    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    stream.put('\n');
+}
+
+template <typename... Args>
+inline void print_line(std::format_string<Args...> fmt, Args&&... args) {
+    write_line(std::cout, std::format(fmt, std::forward<Args>(args)...));
+}
+
+template <typename... Args>
+inline void print_error_line(std::format_string<Args...> fmt, Args&&... args) {
+    write_line(std::cerr, std::format(fmt, std::forward<Args>(args)...));
+}
+
 template <typename... Args>
 inline void log_info(std::format_string<Args...> fmt, Args&&... args) {
-    std::string msg = std::format(fmt, std::forward<Args>(args)...);
-    std::println("{}{}::{}{}", color::cyan, color::bold, color::reset, msg);
+    const auto msg = std::format(fmt, std::forward<Args>(args)...);
+    write_line(std::cout, std::format("{}{}::{}{}", color::cyan, color::bold, color::reset, msg));
 }
 
 template <typename... Args>
 inline void log_success(std::format_string<Args...> fmt, Args&&... args) {
-    std::string msg = std::format(fmt, std::forward<Args>(args)...);
-    std::println("{}{}✓{}{}", color::green, color::bold, color::reset, msg);
+    const auto msg = std::format(fmt, std::forward<Args>(args)...);
+    write_line(std::cout, std::format("{}{}✓{}{}", color::green, color::bold, color::reset, msg));
 }
 
 template <typename... Args>
 inline void log_warn(std::format_string<Args...> fmt, Args&&... args) {
-    std::string msg = std::format(fmt, std::forward<Args>(args)...);
-    std::println(std::cerr, "{}{}warning:{}{}", color::yellow, color::bold, color::reset, msg);
+    const auto msg = std::format(fmt, std::forward<Args>(args)...);
+    write_line(std::cerr, std::format("{}{}warning:{}{}", color::yellow, color::bold, color::reset, msg));
 }
 
 template <typename... Args>
 inline void log_error(std::format_string<Args...> fmt, Args&&... args) {
-    std::string msg = std::format(fmt, std::forward<Args>(args)...);
-    std::println(std::cerr, "{}{}error:{}{}", color::red, color::bold, color::reset, msg);
+    const auto msg = std::format(fmt, std::forward<Args>(args)...);
+    write_line(std::cerr, std::format("{}{}error:{}{}", color::red, color::bold, color::reset, msg));
 }
 
 } // namespace sage::util
