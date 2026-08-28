@@ -1,0 +1,14 @@
+[package]
+name = "sage-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain models, version algebra, and locking primitives for Sage"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+fs2 = { workspace = true }
+nix = { workspace = true }

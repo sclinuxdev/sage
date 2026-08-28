@@ -1,0 +1,16 @@
+[package]
+name = "sage-db"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LMDB state storage, transaction journaling, and ownership tracking for Sage"
+
+[dependencies]
+sage-core = { workspace = true }
+heed = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

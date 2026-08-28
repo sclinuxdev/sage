@@ -1,0 +1,67 @@
+# 规范: 二进制包归档格式 (`*.pkg.tar.zst`)
+
+- **扩展名**: `<name>-<version>-<release>-<arch>.pkg.tar.zst`
+- **压缩算法**: Zstandard (zstd) 流式压缩
+- **设计目标**: 极速流式检视、低开销元数据解析与确定性解包。
+
+---
+
+## 1. 归档内部层级结构
+
+```text
+pkgname-1.0.0-1-amd64.pkg.tar.zst
+├── .METADATA/                    # 严格置于归档最前端
+│   ├── manifest.toml             # 包核心元数据 (Schema v1)
+│   ├── files.idx                 # 逐文件路径、大小、mode、SHA-256 索引
+│   ├── service.toml              # 通用服务定义 (可选)
+│   └── triggers.toml             # 自定义触发器 (可选)
+└── data/                         # 根文件系统有效载荷 (Payload)
+    ├── usr/
+    │   ├── bin/
+    │   └── lib/
+    └── etc/
+```
+
+---
+
+## 2. 元数据清单 (`.METADATA/manifest.toml` v1)
+
+```toml
+schema_version = 1
+
+name = "ripgrep"
+slot = "0"                        # 原生多版本 slot
+version = "14.1.0"
+release = 1
+epoch = 0
+arch = "amd64"
+channel = "system"
+description = "Fast line-oriented search tool"
+license = "MIT OR Unlicense"
+installed_size = 5384912
+build_time = 1700000000
+
+dependencies = [
+    "virtual/libc",
+    "so:libpcre2-8.so.0"
+]
+provides = ["rg"]
+conflicts = []
+```
+
+---
+
+## 3. 文件索引清单 (`.METADATA/files.idx`)
+
+采用紧凑的 TSV / 纯文本格式逐行记录：
+```text
+# path\tmode\tsize\tsha256
+usr/bin/rg	0755	5380000	33c616959def5f80a763a51cf1feed8c8ea9db583556862e3c6a84fa42f95499
+usr/share/man/man1/rg.1	0644	4912	0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+---
+
+## 4. 恒定代价检视保证 ($O(1)$ Inspect)
+
+打包时将 `.METADATA/` 目录的内容严格写入 Tar 归档的最开始位置。`sage-archive` 在检视或读取元数据时，仅需流式读取前数十 KB 数据并在遇到第一个 `data/` 条目时立即中止解压，消耗接近 $O(1)$ 的时间和极小内存。

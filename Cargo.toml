@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sage",
+    "crates/sage-core",
+    "crates/sage-db",
+    "crates/sage-archive",
+    "crates/sage-solver",
+    "crates/sage-sys",
+    "crates/sage-build",
+    "crates/sage-repo",
+]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+authors = ["Sage Developers"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sclinuxdev/sage"
+
+[workspace.dependencies]
+sage-core = { path = "crates/sage-core", version = "0.4.0" }
+sage-db = { path = "crates/sage-db", version = "0.4.0" }
+sage-archive = { path = "crates/sage-archive", version = "0.4.0" }
+sage-solver = { path = "crates/sage-solver", version = "0.4.0" }
+sage-sys = { path = "crates/sage-sys", version = "0.4.0" }
+sage-build = { path = "crates/sage-build", version = "0.4.0" }
+sage-repo = { path = "crates/sage-repo", version = "0.4.0" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+bincode = "1.3"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+indicatif = { version = "0.17", features = ["rayon"] }
+heed = "0.21"
+pubgrub = "0.3"
+tar = "0.4"
+zstd = "0.13"
+rayon = "1.10"
+nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
+goblin = "0.9"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tempfile = "3.16"
+glob = "0.3"
+walkdir = "2.5"
+fs2 = "0.4"

@@ -1,0 +1,20 @@
+schema_version = 1
+name = "cargo"
+description = "Rust Cargo build class"
+
+implicit_build_dependencies = ["rustc", "cargo"]
+allowed_compilers = ["rustc", "clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[env]
+CARGO_BUILD_JOBS = "${JOBS}"
+RUSTFLAGS = "${RUSTFLAGS}"
+
+[phases]
+src_compile = """
+cargo build --release --locked
+"""
+
+src_install = """
+cargo install --locked --root "${DESTDIR}/usr" --path .
+"""

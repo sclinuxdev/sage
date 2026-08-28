@@ -1,0 +1,132 @@
+# 规范: 包配方与单配方多包拆分 (`recipe.toml` v1)
+
+- **文件位置**: `recipes/<category>/<pkgname>/<arch>/<pkgname>-<version>-<release>/recipe.toml` (例如 `recipes/devel/gcc/amd64/gcc-16.2.0-1/recipe.toml`)
+- **Schema 版本**: `1`
+- **核心目标**: 支持单次密闭编译、零重复构建，并依据 Glob 规则声明式**将产物拆分为多个独立子包** (如 `bin`, `libs`, `dev`, `doc`)。
+
+---
+
+## 1. 单配方拆分多包机制 (Single-Recipe Multi-Subpackages)
+
+在传统构建中，拆分主程序、运行库与开发头文件往往需要多次重复编译。Sage 引入声明式 **`[[subpackages]]`** 切分机制：
+
+```text
+               ┌──────────────────────────────────────────────┐
+               │    源码编译与安装至统一 DESTDIR (单次编译)     │
+               └──────────────────────┬───────────────────────┘
+                                      │
+               ┌──────────────────────┴───────────────────────┐
+               │         sage-build Payload 声明式切分         │
+               ├──────────────────────┬───────────────────────┤
+               │                      │                       │
+               ▼                      ▼                       ▼
+    [[subpackages]] (libs)  [[subpackages]] (dev)    [package] (主包)
+    files = ["usr/lib/*.so.*"]  files = ["usr/include/**",  剩余未切分文件
+                            "usr/lib/*.so", "pkgconfig"] (如 usr/bin/...)
+               │                      │                       │
+               ▼                      ▼                       ▼
+     *.pkg.tar.zst          *.pkg.tar.zst          *.pkg.tar.zst
+```
+
+### 切分与隔离守则：
+1. **优先切分**: `[[subpackages]]` 按声明顺序从 `DESTDIR` 中认领匹配的文件并移入各自的归档暂存区。
+2. **零文件冲突与无交叉污染**: 被子包认领的文件自动从主包文件池中剔除，确保生成的多个 `*.pkg.tar.zst` 之间**文件集合严格互斥**。
+3. **独立 ELF 符号扫描**: 每个子包独立运行 `ElfScanner`，例如主包工具自动生成对 `libs` 子包导出的 `so:libfoo.so` 的依赖。
+
+---
+
+## 2. 完整实战配方示例 (`libarchive` 多包拆分)
+
+```toml
+schema_version = 1
+
+# 主软件包 (包含可执行命令工具: bsdtar, bsdcpio)
+[package]
+name = "libarchive"
+version = "3.8.9"
+release = 1
+epoch = 0
+description = "Multi-format archive and compression library tools"
+license = "BSD-2-Clause AND BSD-3-Clause"
+channel = "system"
+arch = "amd64"
+
+dependencies = [
+    "libarchive-libs >= 3.8.9",
+    "virtual/libc"
+]
+
+[source]
+url = "https://github.com/libarchive/libarchive/releases/download/v3.8.9/libarchive-3.8.9.tar.xz"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[build]
+inherit = ["cmake"]
+
+[build.args]
+cmake_args = "-DENABLE_TEST=OFF -DENABLE_TAR=ON -DENABLE_CPIO=ON"
+
+# 主包保留未被子包领走的二进制文件 (usr/bin/bsdtar, usr/bin/bsdcpio 等)
+[build.payload]
+default = "remaining"
+
+# -------------------------------------------------------------
+# 子包 1: 运行时共享库 (libarchive-libs)
+# -------------------------------------------------------------
+[[subpackages]]
+name = "libarchive-libs"
+description = "libarchive runtime shared library (libarchive.so.*)"
+license = "BSD-2-Clause"
+
+dependencies = [
+    "virtual/libc",
+    "zlib-libs >= 1.3.1",
+    "zstd-libs >= 1.5.7"
+]
+
+[subpackages.payload]
+files = [
+    "usr/lib/*.so.*"
+]
+
+# -------------------------------------------------------------
+# 子包 2: 开发头文件与链接符号 (libarchive-dev)
+# -------------------------------------------------------------
+[[subpackages]]
+name = "libarchive-dev"
+description = "libarchive headers, pkgconfig and linker symlinks"
+license = "BSD-2-Clause"
+
+dependencies = [
+    "libarchive-libs >= 3.8.9"
+]
+
+[subpackages.payload]
+files = [
+    "usr/include/**",
+    "usr/lib/*.a",
+    "usr/lib/*.so",
+    "usr/lib/pkgconfig/**",
+    "usr/lib/cmake/**",
+    "usr/share/man/man3/**"
+]
+```
+
+---
+
+## 3. 字段语义表
+
+### 3.1 `[package]` (主包)
+- `name`: 主包名称。
+- `version` / `release` / `epoch`: 全局版本元数据（所有子包默认继承）。
+- `channel`: 默认通道作用域（子包可覆盖）。
+- `dependencies`: 主包专属运行时依赖。
+
+### 3.2 `[[subpackages]]` (独立拆分子包)
+- `name`: 子包名称（如 `foo-libs`, `foo-dev`, `foo-doc`）。
+- `description`: 子包专属描述（可选，默认继承主包）。
+- `dependencies`: 子包专属依赖（如 `foo-dev` 依赖 `foo-libs`）。
+- `provides`: 子包显式提供的额外虚拟符号。
+- `[subpackages.payload]`:
+  - `files`: Glob 模式列表，匹配归属于该子包的文件。
+  - `excludes`: 额外排除的 Glob 列表。

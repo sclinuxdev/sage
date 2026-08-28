@@ -1,0 +1,31 @@
+schema_version = 1
+name = "init-systemd"
+description = "Systemd Service Generator and Controller Class"
+
+[service_generator]
+target_path = "/usr/lib/systemd/system/${service.name}.service"
+mode = 0644
+
+enable_cmd = "/bin/systemctl enable ${service.name}.service"
+disable_cmd = "/bin/systemctl disable ${service.name}.service"
+start_cmd = "/bin/systemctl start ${service.name}.service"
+stop_cmd = "/bin/systemctl stop ${service.name}.service"
+restart_cmd = "/bin/systemctl restart ${service.name}.service"
+reload_cmd = "/bin/systemctl reload-or-restart ${service.name}.service"
+
+template = """
+[Unit]
+Description=${service.description}
+After=${service.after_space}
+
+[Service]
+Type=${service.type}
+ExecStart=${service.command_str}
+User=${service.user}
+Group=${service.group}
+WorkingDirectory=${service.working_dir}
+Restart=${service.restart}
+
+[Install]
+WantedBy=multi-user.target
+"""

@@ -1,0 +1,17 @@
+[package]
+name = "sage-build"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermetic sandbox build runner, rclass executor, payload carver, and ELF scanner for Sage"
+
+[dependencies]
+sage-core = { workspace = true }
+sage-archive = { workspace = true }
+goblin = { workspace = true }
+glob = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

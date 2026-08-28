@@ -1,0 +1,15 @@
+[package]
+name = "sage-solver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PubGrub dependency solver adapter and causality tree diagnosis for Sage"
+
+[dependencies]
+sage-core = { workspace = true }
+sage-db = { workspace = true }
+pubgrub = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

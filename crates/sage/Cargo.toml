@@ -1,0 +1,27 @@
+[package]
+name = "sage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ultra-fast declarative package manager CLI for Linux"
+
+[[bin]]
+name = "sage"
+path = "src/main.rs"
+
+[dependencies]
+sage-core = { workspace = true }
+sage-db = { workspace = true }
+sage-archive = { workspace = true }
+sage-solver = { workspace = true }
+sage-sys = { workspace = true }
+sage-build = { workspace = true }
+sage-repo = { workspace = true }
+clap = { workspace = true }
+indicatif = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

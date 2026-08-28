@@ -1,0 +1,20 @@
+[package]
+name = "sage-repo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Repository LMDB index synchronization, Ed25519 verification, and chunked download engine for Sage"
+
+[dependencies]
+sage-core = { workspace = true }
+sage-archive = { workspace = true }
+sage-db = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
