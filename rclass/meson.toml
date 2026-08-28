@@ -14,10 +14,27 @@ allowed_linkers = ["lld", "mold", "ld"]
 [phases]
 src_unpack = """
 tab=$(printf '\t')
-while IFS="$tab" read -r archive strip destination; do
-    target="${SRC_DIR}/$destination"; mkdir -p "$target"
-    input="${SRC_DIR}/.distfiles/$archive"
-    if [ -d "$input" ]; then cp -a "$input"/. "$target"/; else tar -xf "$input" --strip-components="$strip" -C "$target"; fi
+while IFS="$tab" read -r source kind strip destination; do
+    input="${SRC_DIR}/.distfiles/$source"
+    target="${SRC_DIR}/$destination"
+    case "$kind" in
+        archive)
+            mkdir -p "$target"
+            tar -xf "$input" --strip-components="$strip" -C "$target"
+            ;;
+        tree)
+            mkdir -p "$target"
+            cp -a "$input"/. "$target"/
+            ;;
+        file)
+            mkdir -p "$(dirname "$target")"
+            cp -a "$input" "$target"
+            ;;
+        *)
+            echo "unsupported source manifest kind: $kind" >&2
+            exit 1
+            ;;
+    esac
 done < "${SRC_DIR}/.distfiles/manifest"
 """
 src_prepare = """

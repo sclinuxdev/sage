@@ -1468,6 +1468,11 @@ async fn build_recipe(
                     .download_url(&input.url, &staged, &input.sha256)
                     .await?;
             }
+            sage_build::SourceKind::File => {
+                engine
+                    .download_url(&input.url, &staged, &input.sha256)
+                    .await?;
+            }
             sage_build::SourceKind::Git => {
                 let git = config.git.clone();
                 let input = input.clone();

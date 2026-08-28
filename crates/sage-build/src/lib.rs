@@ -79,6 +79,7 @@ pub enum SourceKind {
     #[default]
     Archive,
     Git,
+    File,
 }
 
 fn default_source_destination() -> PathBuf {
@@ -495,15 +496,20 @@ impl RecipeSpec {
     pub fn source_manifest(&self) -> String {
         let mut manifest = String::new();
         for (index, source) in self.source_inputs().enumerate() {
-            let strip = if source.kind == SourceKind::Git {
+            let strip = if matches!(source.kind, SourceKind::Git | SourceKind::File) {
                 0
             } else {
                 source
                     .strip_components
                     .unwrap_or(if index == 0 { 1 } else { 0 })
             };
+            let kind = match source.kind {
+                SourceKind::Archive => "archive",
+                SourceKind::Git => "tree",
+                SourceKind::File => "file",
+            };
             manifest.push_str(&format!(
-                "{}\t{strip}\t{}\n",
+                "{}\t{kind}\t{strip}\t{}\n",
                 source_archive_name(index),
                 source.destination.display()
             ));
@@ -592,6 +598,23 @@ impl SourceSpec {
                 {
                     return Err(BuildError::InvalidSpec(
                         "Git sources require a full commit ID and a network URL".into(),
+                    ));
+                }
+            }
+            SourceKind::File => {
+                if self.sha256.len() != 64
+                    || !self
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    || !self.commit.is_empty()
+                    || self.submodules
+                    || self.strip_components.is_some()
+                    || self.destination == Path::new(".")
+                {
+                    return Err(BuildError::InvalidSpec(
+                        "file sources require one SHA-256, a destination, and no extraction fields"
+                            .into(),
                     ));
                 }
             }
@@ -1770,6 +1793,49 @@ sha256="{}"
     }
 
     #[test]
+    fn verified_file_sources_are_copied_without_archive_extraction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recipe.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"schema_version=1
+[package]
+name="patched"
+version="1"
+release=1
+description="patched"
+license="MIT"
+channel="system"
+arch="any"
+
+[[sources]]
+url="https://example.invalid/source.tar.xz"
+sha256="{}"
+
+[[sources]]
+kind="file"
+url="https://example.invalid/fix.patch"
+sha256="{}"
+destination=".source-patches/001"
+"#,
+                "00".repeat(32),
+                "11".repeat(32)
+            ),
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(path).unwrap();
+        assert_eq!(recipe.source_inputs().nth(1).unwrap().kind, SourceKind::File);
+        assert_eq!(
+            recipe.source_manifest(),
+            concat!(
+                "000-source\tarchive\t1\t.\n",
+                "001-source\tfile\t0\t.source-patches/001\n",
+            )
+        );
+    }
+
+    #[test]
     fn git_sources_require_pins_and_join_the_ordered_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recipe.toml");
@@ -1797,7 +1863,10 @@ destination="vendor/project"
         let source = recipe.source_inputs().next().unwrap();
         assert_eq!(source.kind, SourceKind::Git);
         assert!(source.submodules);
-        assert_eq!(recipe.source_manifest(), "000-source\t0\tvendor/project\n");
+        assert_eq!(
+            recipe.source_manifest(),
+            "000-source\ttree\t0\tvendor/project\n"
+        );
 
         let invalid = fs::read_to_string(&path)
             .unwrap()

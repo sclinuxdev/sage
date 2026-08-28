@@ -159,6 +159,22 @@ manifest and independently verifies all five archives before any extraction begi
 Files in the recipe's `patches/` directory are copied into the sandbox and applied
 with `patch -p1` in bytewise filename order during `src_prepare`.
 
+Independently published raw inputs such as upstream patch-series files use
+`kind = "file"`. They require a lowercase SHA-256 and a non-root `destination`,
+are copied without extraction, and retain declaration order:
+
+```toml
+[[sources]]
+kind = "file"
+url = "https://example.org/project/fix-001.patch"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+destination = ".source-patches/001"
+```
+
+The standard autotools class applies `.source-patches/*` bytewise and exposes
+`source_patch_strip` for upstream series that do not use the repository's fixed
+`patches/` convention.
+
 Git inputs use the same ordered source array but replace archive integrity with an
 exact full object ID:
 
