@@ -13,8 +13,16 @@ sage-archive = { workspace = true }
 sage-db = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+heed = { workspace = true }
+zstd = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+memmap2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

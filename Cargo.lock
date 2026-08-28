@@ -957,6 +957,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1504,15 +1513,21 @@ name = "sage-repo"
 version = "0.4.0"
 dependencies = [
  "ed25519-dalek",
+ "heed",
  "hex",
+ "memmap2",
  "reqwest",
  "sage-archive",
  "sage-core",
  "sage-db",
+ "serde",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
