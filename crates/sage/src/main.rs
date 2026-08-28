@@ -149,6 +149,9 @@ async fn main() -> Result<()> {
     } else {
         sage_core::HostLock::acquire_exclusive(lock_path)?
     };
+    if !cli.dry_run && !read_only {
+        settle_journals(&cli.root)?;
+    }
 
     match cli.command {
         Commands::Install {
@@ -250,6 +253,36 @@ async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Re
 
 fn under_root(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+fn settle_journals(root: &Path) -> Result<()> {
+    let path = under_root(root, Path::new("/var/lib/sage"));
+    if !path.exists() {
+        return Ok(());
+    }
+    let database = sage_db::SageDatabase::open(path)?;
+    for journal in database.pending_journals()? {
+        let present = journal
+            .affected_packages
+            .iter()
+            .map(|key| database.package(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let complete = match journal.stage.as_str() {
+            "publish" => present.iter().all(Option::is_some),
+            "remove" => present.iter().all(Option::is_none),
+            _ => false,
+        };
+        if complete {
+            database.finish_journal(&journal.op_id)?;
+            eprintln!("Recovered completed operation {}", journal.op_id);
+        } else {
+            eprintln!(
+                "Resuming convergence with unfinished operation {} ({})",
+                journal.op_id, journal.stage
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
