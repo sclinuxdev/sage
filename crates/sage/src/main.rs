@@ -776,9 +776,6 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     desired.sort();
     desired.dedup();
     apply_packages(root, &desired, Some("system"), false, dry_run).await?;
-    if no_prune {
-        return Ok(());
-    }
     let available = load_available(root)?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = if dry_run {
@@ -786,7 +783,8 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     } else {
         sage_db::SageDatabase::open(&db_path)?.packages()?
     };
-    let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, false)?;
+    let plan =
+        sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
     let names: Vec<_> = plan.remove.into_iter().map(|key| key.name).collect();
     if !names.is_empty() {
         remove_packages(root, &names, Some("main/system"), dry_run)?;
@@ -807,6 +805,15 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         }
     }
     render_services(root, &config, dry_run)?;
+    if !dry_run {
+        let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+        sage_sys::TriggerEngine::execute_triggers_for(
+            &triggers,
+            &[PathBuf::from("etc/sage/system.toml")],
+            root,
+            sage_sys::TriggerEvent::Rebuild,
+        )?;
+    }
     Ok(())
 }
 
