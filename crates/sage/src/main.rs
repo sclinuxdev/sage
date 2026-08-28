@@ -347,8 +347,11 @@ async fn apply_packages(
         .map(|name| sage_core::PackageKey::new(&channel, name, sage_core::DEFAULT_SLOT))
         .collect();
     let db_path = under_root(root, Path::new("/var/lib/sage"));
-    let database = sage_db::SageDatabase::open(&db_path)?;
-    let installed = database.packages()?;
+    let installed = if dry_run {
+        sage_db::read_packages(&db_path)?
+    } else {
+        sage_db::SageDatabase::open(&db_path)?.packages()?
+    };
     let solution = if prefer_latest {
         sage_solver::SageSolver::new(&available.universe).resolve(&requested)?
     } else {
@@ -380,6 +383,7 @@ async fn apply_packages(
     if dry_run || changes.is_empty() {
         return Ok(());
     }
+    let database = sage_db::SageDatabase::open(&db_path)?;
     publish_packages(root, &database, &available, &changes).await
 }
 
@@ -519,8 +523,13 @@ async fn upgrade_packages(
     let available = load_available(root)?;
     let canonical = canonical_channel(&available, channel)?;
     let names = if names.is_empty() {
-        sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?
-            .packages()?
+        let db_path = under_root(root, Path::new("/var/lib/sage"));
+        let packages = if dry_run {
+            sage_db::read_packages(&db_path)?
+        } else {
+            sage_db::SageDatabase::open(&db_path)?.packages()?
+        };
+        packages
             .into_iter()
             .filter(|package| package.key.channel == canonical)
             .map(|package| package.key.name)
@@ -537,8 +546,12 @@ fn remove_packages(
     channel: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
-    let installed = database.packages()?;
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let installed = if dry_run {
+        sage_db::read_packages(&db_path)?
+    } else {
+        sage_db::SageDatabase::open(&db_path)?.packages()?
+    };
     let canonical = channel.map_or_else(
         || "main/system".into(),
         |value| {
@@ -550,15 +563,16 @@ fn remove_packages(
         },
     );
     let selected: Vec<_> = installed
-        .into_iter()
+        .iter()
         .filter(|package| {
             package.key.channel == canonical && names.iter().any(|name| name == &package.key.name)
         })
+        .cloned()
         .collect();
     if selected.len() != names.len() {
         bail!("one or more requested packages are not installed in {canonical}");
     }
-    for dependent in database.packages()? {
+    for dependent in &installed {
         if selected.iter().any(|removed| {
             dependent.key != removed.key
                 && dependent.dependencies.iter().any(|dependency| {
@@ -579,6 +593,7 @@ fn remove_packages(
     if dry_run {
         return Ok(());
     }
+    let database = sage_db::SageDatabase::open(&db_path)?;
     let timestamp = unix_timestamp()?;
     let op_id = format!("remove-{}-{timestamp}", std::process::id());
     database.write_journal(&sage_db::JournalRecord {
@@ -686,18 +701,30 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         return Ok(());
     }
     let available = load_available(root)?;
-    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
-    let installed = database.packages()?;
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let installed = if dry_run {
+        sage_db::read_packages(&db_path)?
+    } else {
+        sage_db::SageDatabase::open(&db_path)?.packages()?
+    };
     let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, false)?;
     let names: Vec<_> = plan.remove.into_iter().map(|key| key.name).collect();
     if !names.is_empty() {
         remove_packages(root, &names, Some("main/system"), dry_run)?;
     }
+    let database = if dry_run {
+        None
+    } else {
+        Some(sage_db::SageDatabase::open(&db_path)?)
+    };
     for (interface, key) in plan.provider_bindings {
         if dry_run {
             println!("Would bind virtual/{interface} to {key}");
         } else {
-            database.set_system_provider(&interface, &key)?;
+            database
+                .as_ref()
+                .expect("non-dry rebuild opens the database")
+                .set_system_provider(&interface, &key)?;
         }
     }
     render_services(root, &config, dry_run)?;
@@ -818,17 +845,17 @@ fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
 }
 
 fn query_state(root: &Path, action: QueryAction) -> Result<()> {
-    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
     match action {
         QueryAction::Installed => {
-            for package in database.packages()? {
+            for package in sage_db::read_packages(&db_path)? {
                 println!("{}\t{}\t{}", package.key, package.version, package.arch);
             }
         }
         QueryAction::Owner { path } => {
             let relative = path.strip_prefix(root).unwrap_or(&path);
             let relative = relative.strip_prefix("/").unwrap_or(relative);
-            for owner in database.owners(&relative.to_string_lossy())? {
+            for owner in sage_db::read_owners(&db_path, &relative.to_string_lossy())? {
                 println!("{owner}");
             }
         }
@@ -839,8 +866,9 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
                 format!("main/{channel}")
             };
             let key = sage_core::PackageKey::new(channel, package, sage_core::DEFAULT_SLOT);
-            let record = database
-                .package(&key)?
+            let record = sage_db::read_packages(&db_path)?
+                .into_iter()
+                .find(|record| record.key == key)
                 .with_context(|| format!("package {key} is not installed"))?;
             println!("Package: {}", record.key);
             println!("Version: {}", record.version);

@@ -1,7 +1,7 @@
 //! Transactional LMDB state, ownership indexes, and crash journals.
 
 use heed::types::{Bytes, Str};
-use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 use sage_core::{CoreError, Dependency, PackageKey, Version};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -241,6 +241,60 @@ impl SageDatabase {
     }
 }
 
+/// Reads installed packages without creating or writing the state environment.
+pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: this environment performs no writes and retains LMDB locking.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let packages: Database<Str, Bytes> =
+        env.open_database(&txn, Some("packages"))?.ok_or_else(|| {
+            DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing packages table",
+            ))
+        })?;
+    let mut records = Vec::new();
+    for item in packages.iter(&txn)? {
+        let (_, bytes) = item?;
+        records.push(decode(bytes)?);
+    }
+    Ok(records)
+}
+
+/// Reads one file-owner list without opening a write transaction.
+pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: this environment is strictly read-only and keeps LMDB locking enabled.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let files: Database<Str, Bytes> = env.open_database(&txn, Some("files"))?.ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing files table",
+        ))
+    })?;
+    Ok(files
+        .get(&txn, file)?
+        .map(decode)
+        .transpose()?
+        .unwrap_or_default())
+}
+
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DbError> {
     Ok(bincode::serialize(value)?)
 }
@@ -306,6 +360,9 @@ mod tests {
         let db = SageDatabase::open(dir.path()).unwrap();
         let rg = package("ripgrep", "usr/bin/rg");
         db.install(&rg, false).unwrap();
+        drop(db);
+        assert_eq!(read_packages(dir.path()).unwrap(), vec![rg.clone()]);
+        let db = SageDatabase::open(dir.path()).unwrap();
         assert_eq!(db.package(&rg.key).unwrap(), Some(rg.clone()));
         assert_eq!(db.owners("usr/bin/rg").unwrap(), vec![rg.key.clone()]);
         assert_eq!(db.providers("cmd:ripgrep").unwrap(), vec![rg.key.clone()]);
