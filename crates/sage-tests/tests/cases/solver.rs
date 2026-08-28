@@ -46,6 +46,28 @@ mod solver_tests {
     }
 
     #[test]
+    fn virtual_dependencies_filter_concrete_provider_versions() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release(
+            "main/system",
+            "app",
+            "1-1",
+            &["virtual/libc >= 2-1"],
+        ));
+        let mut old = release("main/system", "glibc", "1-1", &[]);
+        old.provides.push("virtual/libc".into());
+        universe.insert(old);
+        let mut current = release("main/system", "musl", "2-1", &[]);
+        current.provides.push("virtual/libc".into());
+        universe.insert(current);
+        let solution = SageSolver::new(&universe)
+            .resolve(&[PackageKey::new("main/system", "app", "0")])
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/system", "musl", "0")));
+        assert!(!solution.contains_key(&PackageKey::new("main/system", "glibc", "0")));
+    }
+
+    #[test]
     fn locked_satisfying_version_wins_over_newest() {
         let mut universe = PackageUniverse::default();
         universe.insert(release("main/system", "lib", "1.0-1", &[]));
@@ -115,5 +137,18 @@ mod solver_tests {
             .resolve(&[app.clone(), PackageKey::new("main/system", "lib", "0")])
             .unwrap();
         assert_eq!(solution[&app], "1-1".parse().unwrap());
+    }
+
+    #[test]
+    fn malformed_conflicts_are_rejected_instead_of_ignored() {
+        let mut universe = PackageUniverse::default();
+        let mut app = release("main/system", "app", "1-1", &[]);
+        app.conflicts.push("lib >= invalid".into());
+        universe.insert(app);
+        let error = SageSolver::new(&universe)
+            .resolve(&[PackageKey::new("main/system", "app", "0")])
+            .unwrap_err();
+        assert!(matches!(error, SolverError::InvalidMetadata(_)));
+        assert!(error.to_string().contains("lib >= invalid"));
     }
 }

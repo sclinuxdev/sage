@@ -225,6 +225,7 @@ mod sys_tests {
             installed_size: 0,
             dependencies: vec![],
             provides: vec![],
+            conflicts: vec![],
             files: vec![],
             config_hashes: BTreeMap::new(),
         };
@@ -270,6 +271,7 @@ mod sys_tests {
             installed_size: 0,
             dependencies: vec![],
             provides: vec!["virtual/libc".into()],
+            conflicts: vec![],
             files: vec![],
             config_hashes: BTreeMap::new(),
         };

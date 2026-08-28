@@ -1,5 +1,4 @@
 pub use sage_repo::{ReleaseLocation, ReleaseSource};
-
 async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/channels.toml"));
     let config = sage_repo::ChannelsConfig::load(&config_path)
@@ -43,17 +42,14 @@ async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Re
 fn under_root(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
 }
-
 fn alternative_declaration_path(key: &sage_core::PackageKey) -> PathBuf {
     let digest = hex::encode(Sha256::digest(key.canonical_id().as_bytes()));
     PathBuf::from("usr/share/sage/alternatives").join(format!("{digest}.toml"))
 }
-
 fn sysusers_declaration_path(key: &sage_core::PackageKey) -> PathBuf {
     let digest = hex::encode(Sha256::digest(key.canonical_id().as_bytes()));
     PathBuf::from("usr/share/sage/sysusers").join(format!("{digest}.toml"))
 }
-
 fn read_documents(root: &Path, relative: &Path) -> Result<Vec<Vec<u8>>> {
     let directory = under_root(root, relative);
     if !directory.exists() {
@@ -67,7 +63,6 @@ fn read_documents(root: &Path, relative: &Path) -> Result<Vec<Vec<u8>>> {
         .map(|entry| std::fs::read(entry.path()).map_err(Into::into))
         .collect()
 }
-
 fn alternatives_from_documents(documents: &[Vec<u8>]) -> Result<Vec<sage_sys::Alternative>> {
     let mut alternatives = Vec::new();
     for document in documents {
@@ -75,14 +70,12 @@ fn alternatives_from_documents(documents: &[Vec<u8>]) -> Result<Vec<sage_sys::Al
     }
     Ok(alternatives)
 }
-
 fn trigger_documents(root: &Path) -> Result<Vec<Vec<u8>>> {
     sage_sys::TriggerEngine::load_triggers(root)?
         .into_iter()
         .map(|trigger| Ok(toml::to_string(&trigger)?.into_bytes()))
         .collect()
 }
-
 /// One-shot sysroot-local crash injection; the next startup exercises recovery.
 fn crash_point(root: &Path, stage: &str) -> Result<()> {
     let marker = under_root(root, Path::new("/run/sage/crash-point"));
@@ -95,7 +88,6 @@ fn crash_point(root: &Path, stage: &str) -> Result<()> {
     }
     Ok(())
 }
-
 async fn settle_journals(root: &Path) -> Result<()> {
     let path = under_root(root, Path::new("/var/lib/sage"));
     if !path.exists() {
@@ -122,13 +114,11 @@ async fn settle_journals(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 pub struct AvailablePackages {
     pub universe: sage_solver::PackageUniverse,
     pub releases: BTreeMap<(sage_core::PackageKey, sage_core::Version), ReleaseSource>,
     pub aliases: BTreeMap<String, String>,
 }
-
 pub fn load_available_with_pool(
     root: &Path,
     architecture: Option<&str>,
@@ -243,7 +233,6 @@ pub fn load_available_with_pool(
         aliases,
     })
 }
-
 fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
     let selected = selected.unwrap_or("system");
     available
@@ -252,7 +241,6 @@ fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> R
         .cloned()
         .with_context(|| format!("channel '{selected}' has no synchronized index"))
 }
-
 async fn apply_packages(
     root: &Path,
     names: &[String],
@@ -263,7 +251,7 @@ async fn apply_packages(
 ) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let mut config = sage_sys::SystemConfig::load(&config_path)?;
-    let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
+    let mut available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let channel = canonical_channel(&available, channel)?;
     let requested: Vec<_> = names
         .iter()
@@ -275,18 +263,41 @@ async fn apply_packages(
     } else {
         sage_db::SageDatabase::open(&db_path)?.packages()?
     };
-    let solution = if prefer_latest {
-        sage_solver::SageSolver::new(&available.universe)
-            .prefer_providers(config.provider_preferences("main/system")?)
-            .resolve(&requested)?
-    } else {
-        let locks = installed
-            .iter()
-            .map(|package| (package.key.clone(), package.version.clone()));
-        sage_solver::SageSolver::with_locked(&available.universe, locks)
-            .prefer_providers(config.provider_preferences("main/system")?)
-            .resolve(&requested)?
-    };
+    // Installed packages remain solver roots even when unrelated to the new
+    // request. This makes their conflicts active and keeps orphaned releases
+    // present through compact records reconstructed from LMDB.
+    for package in &installed {
+        if !available
+            .universe
+            .versions(&package.key)
+            .any(|version| version == &package.version)
+        {
+            let mut release = sage_core::Package::from_release(
+                package.key.clone(),
+                package.version.clone(),
+                package.dependencies.clone(),
+                package.provides.clone(),
+            );
+            release.arch.clone_from(&package.arch);
+            release.conflicts.clone_from(&package.conflicts);
+            release.installed_size = package.installed_size;
+            available.universe.insert(release);
+        }
+    }
+    let roots = requested
+        .iter()
+        .cloned()
+        .chain(installed.iter().map(|package| package.key.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let locks = installed
+        .iter()
+        .filter(|package| !prefer_latest || !requested.contains(&package.key))
+        .map(|package| (package.key.clone(), package.version.clone()));
+    let solution = sage_solver::SageSolver::with_locked(&available.universe, locks)
+        .prefer_providers(config.provider_preferences("main/system")?)
+        .resolve(&roots)?;
     let current: BTreeMap<_, _> = installed
         .iter()
         .map(|package| (package.key.clone(), package.version.clone()))
@@ -332,7 +343,6 @@ async fn apply_packages(
     }
     Ok(())
 }
-
 fn installation_order(
     available: &AvailablePackages,
     changes: BTreeMap<sage_core::PackageKey, sage_core::Version>,
@@ -371,14 +381,13 @@ fn installation_order(
             });
             (!blocked).then(|| key.clone())
         });
-        let Some(key) = ready else {
-            bail!("selected package graph contains an installation cycle");
-        };
+        // Package publication has no dependency-time lifecycle scripts, so a
+        // cycle is safe: break it by canonical key for reproducible results.
+        let key = ready.unwrap_or_else(|| pending.keys().next().unwrap().clone());
         ordered.push((key.clone(), pending.remove(&key).unwrap()));
     }
     Ok(ordered)
 }
-
 async fn publish_packages(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -388,12 +397,21 @@ async fn publish_packages(
 ) -> Result<()> {
     let timestamp = unix_timestamp()?;
     let op_id = format!("install-{}-{timestamp}", std::process::id());
+    // Recovery must not consult records that installation may already have replaced.
+    let previous_packages = changes
+        .iter()
+        .map(|(key, _)| database.package(key))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let mut journal = sage_db::JournalRecord::new(
         op_id,
         "packages",
         sage_db::JournalAction::Install {
             architecture: architecture.into(),
             changes: changes.to_vec(),
+            previous_packages,
             modified_paths: Vec::new(),
             previous_alternative_documents: read_documents(
                 root,
@@ -404,7 +422,6 @@ async fn publish_packages(
     database.write_journal(&journal)?;
     resume_install(root, database, available, &mut journal).await
 }
-
 async fn resume_install(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -412,12 +429,21 @@ async fn resume_install(
     journal: &mut sage_db::JournalRecord,
 ) -> Result<()> {
     journal.validate()?;
-    let (architecture, changes) = match &journal.action {
+    let (architecture, changes, previous_packages) = match &journal.action {
         sage_db::JournalAction::Install {
             architecture,
             changes,
+            previous_packages,
             ..
-        } => (architecture.clone(), changes.clone()),
+        } => (
+            architecture.clone(),
+            changes.clone(),
+            previous_packages
+                .iter()
+                .cloned()
+                .map(|package| (package.key.clone(), package))
+                .collect::<BTreeMap<_, _>>(),
+        ),
         _ => bail!("install recovery received a removal journal"),
     };
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
@@ -518,7 +544,7 @@ async fn resume_install(
                 bail!("file conflict for {path}: {owners:?}");
             }
         }
-        let previous_package = database.package(key)?;
+        let previous_package = previous_packages.get(key).cloned();
         let previous = previous_package
             .as_ref()
             .map(|package| package.config_hashes.clone())
@@ -570,6 +596,7 @@ async fn resume_install(
                 installed_size: source.release.package.installed_size,
                 dependencies: source.release.package.dependencies.clone(),
                 provides: source.release.package.provides.clone(),
+                conflicts: source.release.package.conflicts.clone(),
                 files: ownership.clone(),
                 config_hashes,
             },
@@ -643,7 +670,6 @@ async fn resume_install(
     database.finish_journal(&journal.op_id)?;
     Ok(())
 }
-
 async fn upgrade_packages(
     root: &Path,
     names: &[String],
@@ -673,7 +699,6 @@ async fn upgrade_packages(
     };
     apply_packages(root, &names, Some(&canonical), true, false, dry_run).await
 }
-
 fn remove_packages(
     root: &Path,
     names: &[String],
@@ -737,9 +762,10 @@ fn remove_packages(
     if update_saved && canonical == "main/system" {
         let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
         let mut config = sage_sys::SystemConfig::load(&config_path)?;
-        for name in names {
-            config.packages.remove(name);
-        }
+        config.packages.retain(|selector| {
+            sage_core::PackageKey::in_channel(&canonical, selector)
+                .map_or(true, |key| !requested.contains(&key))
+        });
         write_atomic_under_root(
             root,
             Path::new("etc/sage/system.toml"),
@@ -765,7 +791,6 @@ fn remove_packages(
     database.write_journal(&journal)?;
     resume_remove(root, &database, &mut journal)
 }
-
 fn resume_remove(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -850,7 +875,6 @@ fn resume_remove(
     database.finish_journal(&journal.op_id)?;
     Ok(())
 }
-
 fn should_preserve_config(
     path: &Path,
     physical: &str,
@@ -868,7 +892,6 @@ fn should_preserve_config(
     let bytes = std::fs::read(path)?;
     Ok(hex::encode(Sha256::digest(bytes)) != *expected)
 }
-
 fn remove_file_beneath(root: &Path, path: &Path) -> Result<()> {
     let parent = path.parent().context("installed path has no parent")?;
     let canonical_root = std::fs::canonicalize(root)?;
@@ -885,7 +908,6 @@ fn remove_file_beneath(root: &Path, path: &Path) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-
 fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
     if relative.components().any(|component| {
         matches!(
@@ -914,7 +936,6 @@ fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result
     std::fs::rename(temporary, target)?;
     Ok(())
 }
-
 async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
@@ -967,7 +988,6 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     }
     Ok(())
 }
-
 fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) -> Result<()> {
     let provider = config
         .providers
@@ -1073,13 +1093,11 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
     write_atomic_under_root(root, state_relative, toml::to_string_pretty(&state)?.as_bytes())?;
     Ok(())
 }
-
 fn unix_timestamp() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
 }
-
 fn list_channels(root: &Path) -> Result<()> {
     let config =
         sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
@@ -1110,7 +1128,6 @@ fn list_channels(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
     if channel.is_empty()
         || !channel
@@ -1157,7 +1174,6 @@ fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
     }
     Ok(())
 }
-
 fn query_state(root: &Path, action: QueryAction) -> Result<()> {
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     match action {

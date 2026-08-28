@@ -1,5 +1,4 @@
 //! Transactional LMDB state, ownership indexes, and crash journals.
-
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 use sage_core::{CoreError, Dependency, PackageKey, Version};
@@ -10,9 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-
 const MAP_SIZE: usize = 8 * 1024 * 1024 * 1024;
-
 /// Persistent-state failures.
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -32,7 +29,6 @@ pub enum DbError {
     #[error("operation journal '{0}' failed its integrity check")]
     InvalidJournal(String),
 }
-
 /// Complete installed state required for removal and reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledPackage {
@@ -42,17 +38,19 @@ pub struct InstalledPackage {
     pub installed_size: u64,
     pub dependencies: Vec<Dependency>,
     pub provides: Vec<String>,
+    pub conflicts: Vec<String>,
     pub files: Vec<String>,
     /// Original package hashes for three-way configuration upgrades.
     pub config_hashes: BTreeMap<String, String>,
 }
-
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
     Install {
         architecture: String,
         changes: Vec<(PackageKey, Version)>,
+        /// Pre-upgrade records retained until obsolete paths are removed.
+        previous_packages: Vec<InstalledPackage>,
         modified_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
     },
@@ -63,7 +61,6 @@ pub enum JournalAction {
         alternative_documents: Vec<Vec<u8>>,
     },
 }
-
 /// Durable operation marker used for idempotent forward recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
@@ -72,7 +69,6 @@ pub struct JournalRecord {
     pub journal_sha256: String,
     pub action: JournalAction,
 }
-
 impl JournalRecord {
     /// Creates a sealed journal that startup can integrity-check.
     pub fn new(op_id: String, stage: &str, action: JournalAction) -> Self {
@@ -85,30 +81,27 @@ impl JournalRecord {
         record.seal();
         record
     }
-
     pub fn advance(&mut self, stage: &str) {
         self.stage = stage.into();
         self.seal();
     }
-
     pub fn validate(&self) -> Result<(), DbError> {
-        if self.journal_sha256 == action_digest(&self.action)? {
+        if self.journal_sha256 == record_digest(&self.op_id, &self.stage, &self.action)? {
             Ok(())
         } else {
             Err(DbError::InvalidJournal(self.op_id.clone()))
         }
     }
-
     fn seal(&mut self) {
-        self.journal_sha256 = action_digest(&self.action)
+        self.journal_sha256 = record_digest(&self.op_id, &self.stage, &self.action)
             .expect("serializing an in-memory journal action cannot fail");
     }
 }
-
-fn action_digest(action: &JournalAction) -> Result<String, DbError> {
-    Ok(hex::encode(Sha256::digest(bincode::serialize(action)?)))
+fn record_digest(op_id: &str, stage: &str, action: &JournalAction) -> Result<String, DbError> {
+    Ok(hex::encode(Sha256::digest(bincode::serialize(&(
+        op_id, stage, action,
+    ))?)))
 }
-
 /// Named LMDB tables sharing one ACID environment.
 pub struct SageDatabase {
     env: Env,
@@ -119,7 +112,6 @@ pub struct SageDatabase {
     operations: Database<Str, Bytes>,
     db_path: PathBuf,
 }
-
 impl SageDatabase {
     /// Opens the state directory and creates all schema-v1 tables atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
@@ -150,18 +142,15 @@ impl SageDatabase {
             db_path,
         })
     }
-
     /// Returns the environment directory for diagnostics and cache management.
     pub fn path(&self) -> &Path {
         &self.db_path
     }
-
     /// Fetches one installed package with a single B+ tree lookup.
     pub fn package(&self, key: &PackageKey) -> Result<Option<InstalledPackage>, DbError> {
         let txn = self.env.read_txn()?;
         get_owned(&self.packages, &txn, &key.canonical_id())
     }
-
     /// Returns every installed package in LMDB key order.
     pub fn packages(&self) -> Result<Vec<InstalledPackage>, DbError> {
         let txn = self.env.read_txn()?;
@@ -175,7 +164,6 @@ impl SageDatabase {
             .collect::<Result<Vec<_>, DbError>>()?;
         Ok(packages)
     }
-
     /// Publishes a package and all reverse indexes in one write transaction.
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
@@ -220,7 +208,6 @@ impl SageDatabase {
         txn.commit()?;
         Ok(())
     }
-
     /// Removes a package and prunes empty ownership/provider entries atomically.
     pub fn remove(&self, key: &PackageKey) -> Result<Option<InstalledPackage>, DbError> {
         let mut txn = self.env.write_txn()?;
@@ -238,17 +225,14 @@ impl SageDatabase {
         txn.commit()?;
         Ok(Some(package))
     }
-
     pub fn owners(&self, path: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.files, &txn, path)?.unwrap_or_default())
     }
-
     pub fn providers(&self, symbol: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.provides, &txn, symbol)?.unwrap_or_default())
     }
-
     /// Pins a system interface such as `virtual/libc` to one package instance.
     pub fn set_system_provider(&self, interface: &str, key: &PackageKey) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
@@ -256,7 +240,6 @@ impl SageDatabase {
         txn.commit()?;
         Ok(())
     }
-
     pub fn system_provider(&self, interface: &str) -> Result<Option<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;
         Ok(self
@@ -265,7 +248,6 @@ impl SageDatabase {
             .map(str::parse)
             .transpose()?)
     }
-
     /// Starts or advances an operation by replacing its durable journal record.
     pub fn write_journal(&self, record: &JournalRecord) -> Result<(), DbError> {
         record.validate()?;
@@ -274,14 +256,12 @@ impl SageDatabase {
         txn.commit()?;
         Ok(())
     }
-
     pub fn finish_journal(&self, op_id: &str) -> Result<bool, DbError> {
         let mut txn = self.env.write_txn()?;
         let removed = self.operations.delete(&mut txn, op_id)?;
         txn.commit()?;
         Ok(removed)
     }
-
     /// Lists unfinished operations for the startup forward-recovery pass.
     pub fn pending_journals(&self) -> Result<Vec<JournalRecord>, DbError> {
         let txn = self.env.read_txn()?;
@@ -296,7 +276,6 @@ impl SageDatabase {
         Ok(records)
     }
 }
-
 /// Reads installed packages without creating or writing the state environment.
 pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
     if !path.exists() {
@@ -324,7 +303,6 @@ pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
     }
     Ok(records)
 }
-
 /// Reads one file-owner list without opening a write transaction.
 pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {
     if !path.exists() {
@@ -350,15 +328,12 @@ pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> 
         .transpose()?
         .unwrap_or_default())
 }
-
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DbError> {
     Ok(bincode::serialize(value)?)
 }
-
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DbError> {
     Ok(bincode::deserialize(bytes)?)
 }
-
 fn get_owned<T: DeserializeOwned>(
     database: &Database<Str, Bytes>,
     txn: &RoTxn<'_>,
@@ -366,7 +341,6 @@ fn get_owned<T: DeserializeOwned>(
 ) -> Result<Option<T>, DbError> {
     database.get(txn, key)?.map(decode).transpose()
 }
-
 fn put_encoded<T: Serialize + ?Sized>(
     database: &Database<Str, Bytes>,
     txn: &mut RwTxn<'_>,
@@ -376,7 +350,6 @@ fn put_encoded<T: Serialize + ?Sized>(
     database.put(txn, key, &encode(value)?)?;
     Ok(())
 }
-
 fn remove_member(
     database: &Database<Str, Bytes>,
     txn: &mut RwTxn<'_>,

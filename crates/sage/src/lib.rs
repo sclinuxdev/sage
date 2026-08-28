@@ -3,13 +3,11 @@
 //! Provides fast, pure CLI argument parsing based on `clap` derive,
 //! supporting package installation, atomic upgrades, source builds,
 //! repository index generation, and declarative system reconciliation.
-
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
 #[derive(Parser)]
 #[command(
     name = "sage",
@@ -20,19 +18,15 @@ pub struct Cli {
     /// Enable verbose diagnostic logs.
     #[arg(short, long, global = true)]
     pub verbose: bool,
-
     /// Execute dry-run without mutating filesystem state.
     #[arg(long, global = true)]
     pub dry_run: bool,
-
     /// Target filesystem sysroot prefix.
     #[arg(long, global = true, default_value = "/")]
     pub root: PathBuf,
-
     #[command(subcommand)]
     pub command: Commands,
 }
-
 #[derive(Subcommand)]
 pub enum Commands {
     /// Solve and install specified packages into system or versioned sub-channel.
@@ -117,7 +111,6 @@ pub enum Commands {
         action: QueryAction,
     },
 }
-
 #[derive(Subcommand)]
 pub enum RepoAction {
     /// Index a pool of *.pkg.tar.zst packages into index.mdb and create signature.
@@ -127,19 +120,16 @@ pub enum RepoAction {
         sign_key: Option<PathBuf>,
     },
 }
-
 #[derive(Subcommand)]
 pub enum ChannelAction {
     /// List configured root channels and subchannels.
     List,
 }
-
 #[derive(Subcommand)]
 pub enum ToolchainAction {
     /// Populate the active profile from a versioned toolchain.
     Use { channel: String },
 }
-
 #[derive(Subcommand)]
 pub enum QueryAction {
     /// List all installed package instances.
@@ -153,17 +143,14 @@ pub enum QueryAction {
         channel: String,
     },
 }
-
 pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
-
 /// Executes one parsed command through the binary's production interface.
 pub async fn execute(cli: Cli) -> Result<()> {
     if cli.verbose {
         tracing_subscriber::fmt::init();
     }
-
     let read_only = matches!(
         &cli.command,
         Commands::Channel {
@@ -179,7 +166,6 @@ pub async fn execute(cli: Cli) -> Result<()> {
     if !cli.dry_run && !read_only {
         settle_journals(&cli.root).await?;
     }
-
     match cli.command {
         Commands::Install {
             packages,
@@ -270,9 +256,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         },
         Commands::Query { action } => query_state(&cli.root, action)?,
     }
-
     Ok(())
 }
-
 include!("package_ops.rs");
 include!("build_ops.rs");

@@ -344,7 +344,11 @@ target_root="/"
                 arch: "amd64",
                 dependency: Some("dep"),
                 conflict: None,
-                files: &[("usr/bin/app-1", "v1"), ("etc/app.conf", "v1")],
+                files: &[
+                    ("usr/bin/app-1", "v1"),
+                    ("usr/share/app-obsolete", "obsolete"),
+                    ("etc/app.conf", "v1"),
+                ],
             },
         )
         .await;
@@ -486,6 +490,17 @@ target_root="/"
         ))
         .await
         .is_err());
+        inject(root.path(), "lmdb-publication");
+        assert!(execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["app:2".into()],
+                channel: None,
+                no_save: true,
+            },
+        ))
+        .await
+        .is_err());
         inject(root.path(), "alternatives");
         assert!(execute(cli(
             root.path(),
@@ -526,6 +541,7 @@ target_root="/"
             std::fs::read_to_string(root.path().join("etc/app.conf.sage-new")).unwrap(),
             "v2"
         );
+        assert!(!root.path().join("usr/share/app-obsolete").exists());
 
         inject(root.path(), "removal");
         assert!(execute(cli(
@@ -555,5 +571,102 @@ target_root="/"
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn installed_conflicts_cycles_and_canonical_removal_are_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let recipes = tempfile::tempdir().unwrap();
+        let pool = tempfile::tempdir().unwrap();
+        configure_root(root.path());
+        let key = root.path().join("signing.key");
+        std::fs::write(&key, [9_u8; 32]).unwrap();
+        for package in [
+            TestPackage {
+                name: "resident",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: None,
+                conflict: Some("newcomer"),
+                files: &[("usr/lib/resident", "resident")],
+            },
+            TestPackage {
+                name: "newcomer",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: None,
+                conflict: None,
+                files: &[("usr/lib/newcomer", "newcomer")],
+            },
+            TestPackage {
+                name: "cycle-a",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: Some("cycle-b"),
+                conflict: None,
+                files: &[("usr/lib/cycle-a", "a")],
+            },
+            TestPackage {
+                name: "cycle-b",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: Some("cycle-a"),
+                conflict: None,
+                files: &[("usr/lib/cycle-b", "b")],
+            },
+        ] {
+            build_data_package(root.path(), recipes.path(), pool.path(), package).await;
+        }
+        publish_repository(root.path(), pool.path(), &key).await;
+
+        execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["resident".into()],
+                channel: None,
+                no_save: false,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["newcomer".into()],
+                channel: None,
+                no_save: true,
+            },
+        ))
+        .await
+        .is_err());
+        execute(cli(
+            root.path(),
+            Commands::Remove {
+                packages: vec!["resident:0".into()],
+                channel: None,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(!std::fs::read_to_string(root.path().join("etc/sage/system.toml"))
+            .unwrap()
+            .contains("resident"));
+
+        execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["cycle-a".into()],
+                channel: None,
+                no_save: true,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(root.path().join("usr/lib/cycle-a").exists());
+        assert!(root.path().join("usr/lib/cycle-b").exists());
     }
 }

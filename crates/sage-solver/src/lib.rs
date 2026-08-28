@@ -1,39 +1,35 @@
 //! Slot-aware PubGrub dependency resolution with channel inheritance.
-
 use pubgrub::{
     resolve, DefaultStringReporter, Dependencies, DependencyProvider, Map,
     PackageResolutionStatistics, PubGrubError, Ranges, Reporter,
 };
 use sage_core::{ConstraintOp, Dependency, Package, PackageKey, Version, DEFAULT_SLOT};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use thiserror::Error;
-
 type VersionRange = Ranges<Version>;
 type DependencyMap = Map<PackageKey, VersionRange>;
 /// Selected version for each channel/name/slot identity.
 pub type Solution = BTreeMap<PackageKey, Version>;
-
 /// Failures returned with a human-readable PubGrub causality report.
 #[derive(Debug, Error)]
 pub enum SolverError {
     #[error("dependency resolution failed:\n{0}")]
     NoSolution(String),
+    #[error("invalid package metadata: {0}")]
+    InvalidMetadata(String),
     #[error("internal solver error: {0}")]
     Internal(String),
 }
-
 /// Solver releases use the canonical package record without a conversion layer.
 pub type PackageRelease = Package;
-
 /// Compact package universe assembled from mmap-backed repository point queries.
 #[derive(Debug, Default)]
 pub struct PackageUniverse {
     releases: BTreeMap<PackageKey, BTreeMap<Version, PackageRelease>>,
     providers: HashMap<String, Vec<PackageKey>>,
 }
-
 impl PackageUniverse {
     /// Inserts or replaces a release while maintaining the virtual-provider index.
     pub fn insert(&mut self, release: PackageRelease) {
@@ -50,7 +46,6 @@ impl PackageUniverse {
             .or_default()
             .insert(coordinate.version, release);
     }
-
     pub fn versions(&self, key: &PackageKey) -> impl DoubleEndedIterator<Item = &Version> {
         self.releases
             .get(key)
@@ -58,14 +53,12 @@ impl PackageUniverse {
             .flat_map(|items| items.keys())
     }
 }
-
 /// Resolver configuration including versions pinned by the installed system.
 pub struct SageSolver<'a> {
     universe: &'a PackageUniverse,
     locked: BTreeMap<PackageKey, Version>,
     preferred_providers: BTreeMap<String, PackageKey>,
 }
-
 impl<'a> SageSolver<'a> {
     pub fn new(universe: &'a PackageUniverse) -> Self {
         Self {
@@ -74,7 +67,6 @@ impl<'a> SageSolver<'a> {
             preferred_providers: BTreeMap::new(),
         }
     }
-
     pub fn with_locked(
         universe: &'a PackageUniverse,
         locked: impl IntoIterator<Item = (PackageKey, Version)>,
@@ -85,7 +77,6 @@ impl<'a> SageSolver<'a> {
             preferred_providers: BTreeMap::new(),
         }
     }
-
     /// Ranks configured providers without preventing PubGrub backtracking.
     pub fn prefer_providers(
         mut self,
@@ -94,7 +85,6 @@ impl<'a> SageSolver<'a> {
         self.preferred_providers = providers.into_iter().collect();
         self
     }
-
     /// Resolves all requested roots together so shared dependencies cannot diverge.
     pub fn resolve(&self, requested: &[PackageKey]) -> Result<Solution, SolverError> {
         let dependencies = requested
@@ -104,7 +94,6 @@ impl<'a> SageSolver<'a> {
             .collect();
         self.resolve_root(dependencies)
     }
-
     /// Resolves arbitrary root constraints in one pass. Source builds use this
     /// for explicit and rclass-provided build dependencies without installing
     /// them into the host package database.
@@ -131,13 +120,11 @@ impl<'a> SageSolver<'a> {
         }
         self.resolve_root_with(&root, &root_version, dependencies)
     }
-
     fn resolve_root(&self, dependencies: DependencyMap) -> Result<Solution, SolverError> {
         let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
         let root_version = Version::new(0, "0", 0);
         self.resolve_root_with(&root, &root_version, dependencies)
     }
-
     fn resolve_root_with(
         &self,
         root: &PackageKey,
@@ -151,7 +138,7 @@ impl<'a> SageSolver<'a> {
             root,
             root_version,
             dependencies,
-        );
+        )?;
         match resolve(&provider, root.clone(), root_version.clone()) {
             Ok(selected) => Ok(selected
                 .into_iter()
@@ -167,12 +154,10 @@ impl<'a> SageSolver<'a> {
         }
     }
 }
-
 struct SageProvider {
     releases: BTreeMap<PackageKey, BTreeMap<Version, DependencyMap>>,
     locked: BTreeMap<PackageKey, Version>,
 }
-
 impl SageProvider {
     fn build(
         universe: &PackageUniverse,
@@ -181,7 +166,7 @@ impl SageProvider {
         root: &PackageKey,
         root_version: &Version,
         root_dependencies: DependencyMap,
-    ) -> Self {
+    ) -> Result<Self, SolverError> {
         let mut releases = BTreeMap::new();
         let mut conflicts = Vec::new();
         for (key, versions) in &universe.releases {
@@ -189,6 +174,8 @@ impl SageProvider {
                 let mut dependencies = DependencyMap::default();
                 for dependency in &release.dependencies {
                     let target = dependency_key(key, dependency);
+                    // The private proxy key encodes this exact requirement;
+                    // candidates are filtered below using the real provider version.
                     let range = if is_virtual(dependency) {
                         VersionRange::full()
                     } else {
@@ -204,18 +191,41 @@ impl SageProvider {
                     .or_insert_with(BTreeMap::new)
                     .insert(version.clone(), dependencies);
                 for declaration in &release.conflicts {
-                    if let Ok(conflict) = declaration.parse::<Dependency>() {
-                        conflicts.push((key.clone(), version.clone(), conflict));
-                    }
+                    let conflict = declaration.parse::<Dependency>().map_err(|error| {
+                        SolverError::InvalidMetadata(format!(
+                            "invalid conflict '{declaration}' in {key} {version}: {error}"
+                        ))
+                    })?;
+                    conflicts.push((key.clone(), version.clone(), conflict));
                 }
             }
         }
+        releases
+            .entry(root.clone())
+            .or_insert_with(BTreeMap::new)
+            .insert(root_version.clone(), root_dependencies);
         // Proxy releases turn a virtual dependency into a PubGrub choice among
-        // exact concrete releases, then stay out of the returned solution.
-        for (symbol, providers) in &universe.providers {
+        // exact concrete releases. Each constrained virtual requirement gets a
+        // private key, so its candidate set can be filtered before resolution.
+        let virtuals: BTreeSet<_> = releases
+            .values()
+            .flat_map(|versions| versions.values())
+            .flat_map(|dependencies| dependencies.keys())
+            .filter_map(virtual_requirement)
+            .collect();
+        for (target, channel, requirement) in virtuals {
+            let Some(providers) = universe.providers.get(&requirement.name) else {
+                continue;
+            };
             for (provider_index, key) in providers.iter().enumerate() {
+                if key.channel != channel {
+                    continue;
+                }
                 for (version_index, version) in universe.versions(key).enumerate() {
-                    let preference = if preferred_providers.get(symbol) == Some(key) {
+                    if !dependency_range(&requirement).contains(version) {
+                        continue;
+                    }
+                    let preference = if preferred_providers.get(&requirement.name) == Some(key) {
                         3
                     } else if locked.contains_key(key) {
                         2
@@ -225,7 +235,7 @@ impl SageProvider {
                     let proxy_version =
                         Version::new(preference, format!("{provider_index}.{version_index}"), 0);
                     releases
-                        .entry(virtual_key(&key.channel, symbol))
+                        .entry(target.clone())
                         .or_insert_with(BTreeMap::new)
                         .insert(
                             proxy_version,
@@ -240,7 +250,6 @@ impl SageProvider {
         // Opposite private-marker versions put conflicts in PubGrub's normal
         // backtracking and incompatibility report.
         for (index, (owner, owner_version, conflict)) in conflicts.into_iter().enumerate() {
-            let target = dependency_key(&owner, &conflict);
             let marker = PackageKey::new("__sage", format!("conflict/{index}"), DEFAULT_SLOT);
             let zero = Version::new(0, "0", 0);
             let one = Version::new(0, "1", 0);
@@ -253,25 +262,35 @@ impl SageProvider {
                 .and_then(|versions| versions.get_mut(&owner_version))
                 .expect("conflict owner was inserted above")
                 .insert(marker.clone(), VersionRange::singleton(one));
-            if let Some(versions) = releases.get_mut(&target) {
-                for (version, dependencies) in versions {
-                    if dependency_range(&conflict).contains(version) {
-                        dependencies.insert(marker.clone(), VersionRange::singleton(zero.clone()));
+            let targets: Vec<_> = if is_virtual(&conflict) {
+                universe
+                    .providers
+                    .get(&conflict.name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|key| key.channel == system_channel(&owner.channel))
+                    .cloned()
+                    .collect()
+            } else {
+                vec![dependency_key(&owner, &conflict)]
+            };
+            for target in targets {
+                if let Some(versions) = releases.get_mut(&target) {
+                    for (version, dependencies) in versions {
+                        if dependency_range(&conflict).contains(version) {
+                            dependencies
+                                .insert(marker.clone(), VersionRange::singleton(zero.clone()));
+                        }
                     }
                 }
             }
         }
-        releases
-            .entry(root.clone())
-            .or_insert_with(BTreeMap::new)
-            .insert(root_version.clone(), root_dependencies);
-        Self {
+        Ok(Self {
             releases,
             locked: locked.clone(),
-        }
+        })
     }
 }
-
 impl DependencyProvider for SageProvider {
     type P = PackageKey;
     type V = Version;
@@ -279,7 +298,6 @@ impl DependencyProvider for SageProvider {
     type Priority = (bool, u32, Reverse<usize>);
     type M = String;
     type Err = Infallible;
-
     fn prioritize(
         &self,
         package: &Self::P,
@@ -302,7 +320,6 @@ impl DependencyProvider for SageProvider {
             Reverse(count),
         )
     }
-
     fn choose_version(
         &self,
         package: &Self::P,
@@ -322,7 +339,6 @@ impl DependencyProvider for SageProvider {
             .find(|version| range.contains(version))
             .cloned())
     }
-
     fn get_dependencies(
         &self,
         package: &Self::P,
@@ -340,10 +356,9 @@ impl DependencyProvider for SageProvider {
         )
     }
 }
-
 fn dependency_key(parent: &PackageKey, dependency: &Dependency) -> PackageKey {
     if is_virtual(dependency) {
-        return virtual_key(&system_channel(&parent.channel), &dependency.name);
+        return virtual_key(&system_channel(&parent.channel), dependency);
     }
     PackageKey::new(
         dependency.channel.as_deref().unwrap_or(&parent.channel),
@@ -351,21 +366,30 @@ fn dependency_key(parent: &PackageKey, dependency: &Dependency) -> PackageKey {
         dependency.slot.as_deref().unwrap_or(DEFAULT_SLOT),
     )
 }
-
 fn is_virtual(dependency: &Dependency) -> bool {
     dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:")
 }
-
-fn virtual_key(channel: &str, symbol: &str) -> PackageKey {
-    PackageKey::new("__sage", format!("{channel}/{symbol}"), DEFAULT_SLOT)
+fn virtual_key(channel: &str, dependency: &Dependency) -> PackageKey {
+    PackageKey::new("__sage", format!("{channel}/{dependency}"), DEFAULT_SLOT)
 }
-
+fn virtual_requirement(key: &PackageKey) -> Option<(PackageKey, String, Dependency)> {
+    (key.channel == "__sage").then_some(())?;
+    let boundary = key
+        .name
+        .find("/virtual/")
+        .or_else(|| key.name.find("/so:"))?;
+    let (channel, dependency) = key.name.split_at(boundary);
+    Some((
+        key.clone(),
+        channel.into(),
+        dependency.strip_prefix('/')?.parse().ok()?,
+    ))
+}
 fn system_channel(channel: &str) -> String {
     channel
         .rsplit_once('/')
         .map_or_else(|| "system".into(), |(root, _)| format!("{root}/system"))
 }
-
 fn dependency_range(dependency: &Dependency) -> VersionRange {
     let Some(version) = dependency.version.clone() else {
         return VersionRange::full();
