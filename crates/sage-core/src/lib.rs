@@ -260,7 +260,7 @@ fn compare_numeric(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 /// Operator applied to an optional dependency version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ConstraintOp {
     Any,
     Equal,
@@ -289,8 +289,23 @@ impl ConstraintOp {
     }
 }
 
+impl fmt::Display for ConstraintOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Any => "",
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+        };
+        f.write_str(value)
+    }
+}
+
 /// Dependency with optional channel, slot, and version restrictions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Dependency {
     pub name: String,
     pub slot: Option<String>,
@@ -340,6 +355,156 @@ impl FromStr for Dependency {
             op,
             version,
         })
+    }
+}
+
+impl fmt::Display for Dependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(channel) = &self.channel {
+            write!(f, "{channel}/")?;
+        }
+        f.write_str(&self.name)?;
+        if let Some(slot) = &self.slot {
+            write!(f, ":{slot}")?;
+        }
+        if self.op != ConstraintOp::Any {
+            let Some(version) = &self.version else {
+                return Err(fmt::Error);
+            };
+            write!(f, " {} {version}", self.op)?;
+        }
+        Ok(())
+    }
+}
+
+/// Toolchain process observed while producing one package artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBuildTool {
+    pub role: String,
+    pub executable: String,
+    pub family: String,
+    pub version: String,
+    pub version_argument: String,
+    /// Non-empty Sage-configured flag channels stored as `NAME=value`.
+    #[serde(default)]
+    pub parameters: Vec<String>,
+}
+
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
+/// Canonical package record shared by recipes, archives, indexes, and solving.
+///
+/// Dependencies are serialized as their compact string syntax at TOML and
+/// binary storage seams, but are parsed exactly once when the record is read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Package {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    pub name: String,
+    #[serde(default = "default_slot")]
+    pub slot: String,
+    pub version: String,
+    pub release: u32,
+    #[serde(default)]
+    pub epoch: u32,
+    pub arch: String,
+    pub channel: String,
+    pub description: String,
+    pub license: String,
+    #[serde(default, with = "dependency_strings")]
+    pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub installed_size: u64,
+    #[serde(default)]
+    pub build_time: u64,
+    #[serde(default)]
+    pub managed_build_tools: Vec<ManagedBuildTool>,
+}
+
+impl Package {
+    /// Returns the package identity and version represented by this record.
+    pub fn coordinate(&self) -> PackageCoordinate {
+        PackageCoordinate::new(
+            PackageKey::new(&self.channel, &self.name, &self.slot),
+            Version::new(self.epoch, &self.version, self.release),
+        )
+    }
+
+    /// Returns this package's coordinate with an index-selected channel.
+    pub fn coordinate_for_channel(&self, channel: &str) -> PackageCoordinate {
+        PackageCoordinate::new(
+            PackageKey::new(channel, &self.name, &self.slot),
+            Version::new(self.epoch, &self.version, self.release),
+        )
+    }
+
+    /// Clones the package while assigning the channel used by a repository index.
+    pub fn for_channel(&self, channel: &str) -> Self {
+        let mut package = self.clone();
+        package.channel = channel.into();
+        package
+    }
+
+    /// Builds the compact package record needed by a solver-only caller.
+    pub fn from_release(
+        key: PackageKey,
+        version: Version,
+        dependencies: Vec<Dependency>,
+        provides: Vec<String>,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            name: key.name,
+            slot: key.slot,
+            version: version.upstream,
+            release: version.release,
+            epoch: version.epoch,
+            arch: String::new(),
+            channel: key.channel,
+            description: String::new(),
+            license: String::new(),
+            dependencies,
+            provides,
+            conflicts: Vec::new(),
+            features: Vec::new(),
+            installed_size: 0,
+            build_time: 0,
+            managed_build_tools: Vec::new(),
+        }
+    }
+}
+
+mod dependency_strings {
+    use super::Dependency;
+    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(dependencies: &[Dependency], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Dependency>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.parse().map_err(D::Error::custom))
+            .collect()
     }
 }
 

@@ -101,8 +101,7 @@ fn enabled() -> bool {
 /// Release record stored in the repository packages table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedRelease {
-    pub manifest: sage_archive::PackageManifest,
-    pub dependencies: Vec<sage_core::Dependency>,
+    pub package: sage_core::Package,
     pub archive: String,
     pub sha256: String,
 }
@@ -110,13 +109,28 @@ pub struct IndexedRelease {
 impl IndexedRelease {
     /// Returns the coordinate encoded by the indexed package manifest.
     pub fn coordinate(&self) -> sage_core::PackageCoordinate {
-        self.manifest.coordinate()
+        self.package.coordinate()
     }
 
     /// Returns the coordinate with the canonical channel assigned by its index.
     pub fn coordinate_for_channel(&self, channel: &str) -> sage_core::PackageCoordinate {
-        self.manifest.coordinate_for_channel(channel)
+        self.package.coordinate_for_channel(channel)
     }
+}
+
+/// Retrieval location attached to a package after resolution.
+#[derive(Debug, Clone)]
+pub enum ReleaseLocation {
+    Remote(String),
+    Local(PathBuf),
+}
+
+/// Repository release plus the transport and installation context supplied by the caller.
+#[derive(Debug, Clone)]
+pub struct ReleaseSource {
+    pub release: IndexedRelease,
+    pub location: ReleaseLocation,
+    pub target_root: PathBuf,
 }
 
 /// Files emitted by one repository indexing pass.
@@ -154,13 +168,6 @@ pub fn build_index(
         let inspection = sage_archive::inspect_package(path)
             .map_err(|error| RepoError::InvalidConfig(error.to_string()))?;
         let key = format!("{}:{}", inspection.manifest.name, inspection.manifest.slot);
-        let dependencies = inspection
-            .manifest
-            .dependencies
-            .iter()
-            .map(|dependency| dependency.parse())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error: sage_core::CoreError| RepoError::InvalidConfig(error.to_string()))?;
         for symbol in &inspection.manifest.provides {
             let entries = providers.entry(symbol.clone()).or_default();
             if !entries.contains(&key) {
@@ -168,8 +175,7 @@ pub fn build_index(
             }
         }
         releases.entry(key).or_default().push(IndexedRelease {
-            manifest: inspection.manifest,
-            dependencies,
+            package: inspection.manifest,
             archive: path.file_name().unwrap().to_string_lossy().into_owned(),
             sha256: hash_file(path)?,
         });
@@ -198,7 +204,7 @@ pub fn build_index(
             packages.put(&mut txn, key, &bincode::serialize(versions)?)?;
             let latest_dependencies = versions
                 .last()
-                .map(|release| &release.dependencies)
+                .map(|release| &release.package.dependencies)
                 .unwrap();
             dependencies.put(&mut txn, key, &bincode::serialize(latest_dependencies)?)?;
         }
@@ -236,11 +242,7 @@ pub fn build_index(
 }
 
 fn release_version(release: &IndexedRelease) -> sage_core::Version {
-    sage_core::Version::new(
-        release.manifest.epoch,
-        &release.manifest.version,
-        release.manifest.release,
-    )
+    release.package.coordinate().version
 }
 
 fn sign_file(path: &Path, key: &SigningKey) -> Result<Signature, RepoError> {

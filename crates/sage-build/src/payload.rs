@@ -42,9 +42,15 @@ impl PayloadCarver {
         let main_patterns = compile_patterns(&recipe.build.payload.files)?;
         let main_excludes = compile_patterns(&recipe.build.payload.excludes)?;
         let mut areas = Vec::with_capacity(recipe.subpackages.len() + 1);
+        let main_dependencies: Vec<String> = recipe
+            .package
+            .dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         areas.push(staging(
             &recipe.package.name,
-            &recipe.package.dependencies,
+            &main_dependencies,
             &recipe.package.provides,
         )?);
         for subpackage in &recipe.subpackages {

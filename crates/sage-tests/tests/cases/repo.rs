@@ -92,7 +92,7 @@ provides=["cmd:demo"]
             env.open_database(&txn, Some("packages")).unwrap().unwrap();
         let releases: Vec<IndexedRelease> =
             bincode::deserialize(packages.get(&txn, "demo:0").unwrap().unwrap()).unwrap();
-        assert_eq!(releases[0].manifest.name, "demo");
+        assert_eq!(releases[0].package.name, "demo");
         assert!(artifacts.compressed.exists() && artifacts.signature.exists());
         drop(txn);
         drop(env);

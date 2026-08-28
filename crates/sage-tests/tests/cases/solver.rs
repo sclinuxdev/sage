@@ -3,15 +3,15 @@ mod solver_tests {
     use sage_solver::*;
 
     fn release(channel: &str, name: &str, version: &str, dependencies: &[&str]) -> PackageRelease {
-        PackageRelease {
-            key: PackageKey::new(channel, name, "0"),
-            version: version.parse().unwrap(),
-            dependencies: dependencies
+        sage_core::Package::from_release(
+            PackageKey::new(channel, name, "0"),
+            version.parse().unwrap(),
+            dependencies
                 .iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
-            provides: vec![],
-        }
+            vec![],
+        )
     }
 
     #[test]

@@ -403,6 +403,7 @@ destination="vendor/project"
         let recipe = RecipeSpec {
             schema_version: 1,
             package: RecipePackage {
+                schema_version: 1,
                 name: name.into(),
                 slot: sage_core::DEFAULT_SLOT.into(),
                 version: "1".into(),
@@ -412,8 +413,16 @@ destination="vendor/project"
                 license: "MIT".into(),
                 channel: "system".into(),
                 arch: "any".into(),
-                dependencies: consumes.iter().map(|value| (*value).into()).collect(),
+                dependencies: consumes
+                    .iter()
+                    .map(|value| value.parse().unwrap())
+                    .collect(),
                 provides: vec![],
+                conflicts: vec![],
+                features: vec![],
+                installed_size: 0,
+                build_time: 0,
+                managed_build_tools: vec![],
             },
             source: None,
             sources: vec![],
@@ -624,6 +633,7 @@ shell="/usr/bin/nologin"
         let recipe = RecipeSpec {
             schema_version: 1,
             package: RecipePackage {
+                schema_version: 1,
                 name: "x".into(),
                 slot: sage_core::DEFAULT_SLOT.into(),
                 version: "1.0".into(),
@@ -635,6 +645,11 @@ shell="/usr/bin/nologin"
                 arch: "amd64".into(),
                 dependencies: vec![],
                 provides: vec![],
+                conflicts: vec![],
+                features: vec![],
+                installed_size: 0,
+                build_time: 0,
+                managed_build_tools: vec![],
             },
             source: Some(SourceSpec {
                 kind: SourceKind::Archive,

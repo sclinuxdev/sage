@@ -3,7 +3,6 @@
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::sys::stat::{fchmod, mkdirat, Mode};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -37,69 +36,11 @@ pub enum ArchiveError {
     UnsafePath(String),
 }
 
-/// Schema-v1 package manifest stored at the front of every archive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackageManifest {
-    pub schema_version: u32,
-    pub name: String,
-    #[serde(default = "default_slot")]
-    pub slot: String,
-    pub version: String,
-    pub release: u32,
-    #[serde(default)]
-    pub epoch: u32,
-    pub arch: String,
-    pub channel: String,
-    pub description: String,
-    pub license: String,
-    pub installed_size: u64,
-    pub build_time: u64,
-    #[serde(default)]
-    pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub provides: Vec<String>,
-    #[serde(default)]
-    pub conflicts: Vec<String>,
-    /// Build-time feature selection baked into this immutable artifact.
-    #[serde(default)]
-    pub features: Vec<String>,
-    /// Compiler and linker processes observed during this exact managed build.
-    /// Prebuilt and repackaged artifacts keep this list empty.
-    #[serde(default)]
-    pub managed_build_tools: Vec<ManagedBuildTool>,
-}
+/// Schema-v1 package manifest shared with recipes and solver records.
+pub type PackageManifest = sage_core::Package;
 
-/// One compiler or linker process directly observed during a managed build.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedBuildTool {
-    pub role: String,
-    pub executable: String,
-    pub family: String,
-    pub version: String,
-    pub version_argument: String,
-    /// Non-empty Sage-configured flag channels stored as `NAME=value`.
-    #[serde(default)]
-    pub parameters: Vec<String>,
-}
-
-impl PackageManifest {
-    /// Returns the package identity and version represented by this manifest.
-    pub fn coordinate(&self) -> sage_core::PackageCoordinate {
-        self.coordinate_for_channel(&self.channel)
-    }
-
-    /// Returns the package coordinate while replacing the manifest channel.
-    pub fn coordinate_for_channel(&self, channel: &str) -> sage_core::PackageCoordinate {
-        sage_core::PackageCoordinate::new(
-            sage_core::PackageKey::new(channel, &self.name, &self.slot),
-            sage_core::Version::new(self.epoch, &self.version, self.release),
-        )
-    }
-}
-
-fn default_slot() -> String {
-    "0".into()
-}
+/// Build-tool provenance shared with package manifests.
+pub use sage_core::ManagedBuildTool;
 
 /// One integrity record from `.METADATA/files.idx`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::paths::under_root;
+pub use sage_repo::{ReleaseLocation, ReleaseSource};
 
 pub(crate) async fn obtain_release_archive(
     engine: &sage_repo::DownloadEngine,
@@ -22,21 +23,6 @@ pub(crate) async fn obtain_release_archive(
             Ok(archive)
         }
     }
-}
-
-/// A resolved package release and its retrieval location.
-#[derive(Clone)]
-pub struct ReleaseSource {
-    pub release: sage_repo::IndexedRelease,
-    pub location: ReleaseLocation,
-    pub target_root: PathBuf,
-}
-
-/// Where a resolved package archive can be retrieved.
-#[derive(Clone)]
-pub enum ReleaseLocation {
-    Remote(String),
-    Local(PathBuf),
 }
 
 /// Package candidates and channel aliases visible to the application.
@@ -90,19 +76,14 @@ pub fn load_available_with_pool(
             let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
             for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
                 if architecture.is_some_and(|wanted| {
-                    release.manifest.arch != wanted
-                        && release.manifest.arch != "any"
-                        && release.manifest.arch != "noarch"
+                    release.package.arch != wanted
+                        && release.package.arch != "any"
+                        && release.package.arch != "noarch"
                 }) {
                     continue;
                 }
                 let coordinate = release.coordinate_for_channel(&canonical);
-                universe.insert(sage_solver::PackageRelease {
-                    key: coordinate.key.clone(),
-                    version: coordinate.version.clone(),
-                    dependencies: release.dependencies.clone(),
-                    provides: release.manifest.provides.clone(),
-                });
+                universe.insert(release.package.for_channel(&canonical));
                 releases.insert(
                     coordinate,
                     ReleaseSource {
@@ -151,25 +132,14 @@ pub fn load_available_with_pool(
             aliases
                 .entry(canonical.clone())
                 .or_insert_with(|| canonical.clone());
-            let coordinate = inspection.manifest.coordinate_for_channel(&canonical);
-            let dependencies = inspection
-                .manifest
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.parse())
-                .collect::<Result<Vec<_>, _>>()?;
-            universe.insert(sage_solver::PackageRelease {
-                key: coordinate.key.clone(),
-                version: coordinate.version.clone(),
-                dependencies: dependencies.clone(),
-                provides: inspection.manifest.provides.clone(),
-            });
+            let package = inspection.manifest.for_channel(&canonical);
+            let coordinate = package.coordinate();
+            universe.insert(package);
             releases.insert(
                 coordinate,
                 ReleaseSource {
                     release: sage_repo::IndexedRelease {
-                        manifest: inspection.manifest,
-                        dependencies,
+                        package: inspection.manifest,
                         archive: path.file_name().unwrap().to_string_lossy().into_owned(),
                         sha256: String::new(),
                     },

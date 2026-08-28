@@ -256,10 +256,13 @@ async fn build_recipe(
     };
     let mut recipe = sage_build::RecipeSpec::load(&recipe_path)?;
     let features = recipe.effective_features(requested_features, use_default_features)?;
-    recipe
-        .package
-        .dependencies
-        .extend(features.dependencies.clone());
+    recipe.package.dependencies.extend(
+        features
+            .dependencies
+            .iter()
+            .map(|value| value.parse::<sage_core::Dependency>())
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     recipe.package.dependencies.sort();
     recipe.package.dependencies.dedup();
     recipe.build.args.extend(features.args.clone());
@@ -668,10 +671,14 @@ fn package_staging(
         .subpackages
         .iter()
         .find(|subpackage| subpackage.name == area.name);
-    let mut dependencies = area.dependencies.clone();
-    dependencies.extend(elf.dependencies);
-    dependencies.sort();
-    dependencies.dedup();
+    let mut dependency_strings = area.dependencies.clone();
+    dependency_strings.extend(elf.dependencies);
+    dependency_strings.sort();
+    dependency_strings.dedup();
+    let dependencies = dependency_strings
+        .into_iter()
+        .map(|value| value.parse::<sage_core::Dependency>())
+        .collect::<Result<Vec<_>, _>>()?;
     let mut provides = area.provides.clone();
     provides.extend(elf.provides);
     provides.sort();

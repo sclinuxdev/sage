@@ -4,7 +4,7 @@ use pubgrub::{
     resolve, DefaultStringReporter, Dependencies, DependencyProvider, Map,
     PackageResolutionStatistics, PubGrubError, Ranges, Reporter,
 };
-use sage_core::{ConstraintOp, Dependency, PackageKey, Version, DEFAULT_SLOT};
+use sage_core::{ConstraintOp, Dependency, Package, PackageKey, Version, DEFAULT_SLOT};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
@@ -24,14 +24,8 @@ pub enum SolverError {
     Internal(String),
 }
 
-/// One repository release and the dependency edges published with it.
-#[derive(Debug, Clone)]
-pub struct PackageRelease {
-    pub key: PackageKey,
-    pub version: Version,
-    pub dependencies: Vec<Dependency>,
-    pub provides: Vec<String>,
-}
+/// Solver releases use the canonical package record without a conversion layer.
+pub type PackageRelease = Package;
 
 /// Compact package universe assembled from mmap-backed repository point queries.
 #[derive(Debug, Default)]
@@ -43,17 +37,18 @@ pub struct PackageUniverse {
 impl PackageUniverse {
     /// Inserts or replaces a release while maintaining the virtual-provider index.
     pub fn insert(&mut self, release: PackageRelease) {
+        let coordinate = release.coordinate();
         for symbol in &release.provides {
             let providers = self.providers.entry(symbol.clone()).or_default();
-            if !providers.contains(&release.key) {
-                providers.push(release.key.clone());
+            if !providers.contains(&coordinate.key) {
+                providers.push(coordinate.key.clone());
                 providers.sort();
             }
         }
         self.releases
-            .entry(release.key.clone())
+            .entry(coordinate.key)
             .or_default()
-            .insert(release.version.clone(), release);
+            .insert(coordinate.version, release);
     }
 
     pub fn versions(&self, key: &PackageKey) -> impl DoubleEndedIterator<Item = &Version> {
@@ -184,7 +179,7 @@ impl SageProvider {
                 releases
                     .entry(key.clone())
                     .or_insert_with(BTreeMap::new)
-                    .insert(release.version.clone(), dependencies);
+                    .insert(release.coordinate().version, dependencies);
             }
         }
         releases

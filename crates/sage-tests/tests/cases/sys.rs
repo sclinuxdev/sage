@@ -194,18 +194,18 @@ mod sys_tests {
     #[test]
     fn reconciliation_computes_dependency_closed_difference() {
         let mut universe = sage_solver::PackageUniverse::default();
-        universe.insert(sage_solver::PackageRelease {
-            key: sage_core::PackageKey::new("main/system", "app", "0"),
-            version: "1.0-1".parse().unwrap(),
-            dependencies: vec!["lib".parse().unwrap()],
-            provides: vec![],
-        });
-        universe.insert(sage_solver::PackageRelease {
-            key: sage_core::PackageKey::new("main/system", "lib", "0"),
-            version: "1.0-1".parse().unwrap(),
-            dependencies: vec![],
-            provides: vec![],
-        });
+        universe.insert(sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", "app", "0"),
+            "1.0-1".parse().unwrap(),
+            vec!["lib".parse().unwrap()],
+            vec![],
+        ));
+        universe.insert(sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", "lib", "0"),
+            "1.0-1".parse().unwrap(),
+            vec![],
+            vec![],
+        ));
         let old = sage_db::InstalledPackage {
             key: sage_core::PackageKey::new("main/system", "old", "0"),
             version: "1.0-1".parse().unwrap(),

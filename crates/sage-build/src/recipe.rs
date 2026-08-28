@@ -43,39 +43,8 @@ fn default_source_destination() -> PathBuf {
     PathBuf::from(".")
 }
 
-/// Shared and main-package metadata from a recipe.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RecipePackage {
-    pub name: String,
-    #[serde(default = "default_slot")]
-    pub slot: String,
-    pub version: String,
-    pub release: u32,
-    #[serde(default)]
-    pub epoch: u32,
-    pub description: String,
-    pub license: String,
-    pub channel: String,
-    pub arch: String,
-    #[serde(default)]
-    pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub provides: Vec<String>,
-}
-
-impl RecipePackage {
-    /// Returns the unified package coordinate used by build and repository code.
-    pub fn coordinate(&self) -> sage_core::PackageCoordinate {
-        sage_core::PackageCoordinate::new(
-            sage_core::PackageKey::new(&self.channel, &self.name, &self.slot),
-            sage_core::Version::new(self.epoch, &self.version, self.release),
-        )
-    }
-}
-
-fn default_slot() -> String {
-    sage_core::DEFAULT_SLOT.into()
-}
+/// Recipe package metadata is the canonical shared package record.
+pub type RecipePackage = sage_core::Package;
 
 /// Ordered glob claims used to partition one DESTDIR.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -222,7 +191,12 @@ impl BuildUnit {
         for package in &recipe.subpackages {
             produces.extend(package.provides.clone());
         }
-        let mut declarations = recipe.package.dependencies.clone();
+        let mut declarations: Vec<String> = recipe
+            .package
+            .dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         declarations.extend(recipe.build.dependencies.clone());
         declarations.extend(recipe.build.target_dependencies.clone());
         declarations.extend(features.dependencies);
