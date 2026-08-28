@@ -155,6 +155,61 @@ pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
         .collect()
 }
 
+/// Builds a sorted integrity index for a staged payload tree.
+pub fn build_file_index(root: &Path) -> Result<Vec<FileRecord>, ArchiveError> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        output: &mut Vec<FileRecord>,
+    ) -> Result<(), ArchiveError> {
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                visit(root, &path, output)?;
+            } else if metadata.is_file() {
+                let mut file = File::open(&path)?;
+                let mut hasher = Sha256::new();
+                io::copy(&mut file, &mut HashOnly(&mut hasher))?;
+                output.push(FileRecord {
+                    path: path
+                        .strip_prefix(root)
+                        .expect("recursive walk stays below root")
+                        .to_path_buf(),
+                    mode: metadata.mode() & 0o7777,
+                    size: metadata.len(),
+                    sha256: hex::encode(hasher.finalize()),
+                });
+            } else {
+                return Err(ArchiveError::UnsafePath(path.display().to_string()));
+            }
+        }
+        Ok(())
+    }
+    let mut records = Vec::new();
+    visit(root, root, &mut records)?;
+    Ok(records)
+}
+
+/// Encodes index records using the schema-v1 compact TSV representation.
+pub fn format_file_index(records: &[FileRecord]) -> String {
+    let mut output = String::from("# path\tmode\tsize\tsha256\n");
+    for record in records {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "{}\t{:04o}\t{}\t{}",
+            record.path.display(),
+            record.mode,
+            record.size,
+            record.sha256
+        );
+    }
+    output
+}
+
 /// Creates a deterministic archive with metadata entries before payload entries.
 pub fn create_package(
     source_dir: impl AsRef<Path>,
@@ -564,6 +619,17 @@ mod tests {
     #[test]
     fn index_rejects_parent_paths() {
         assert!(parse_file_index(b"../etc/passwd\t0644\t1\t0000000000000000000000000000000000000000000000000000000000000000\n").is_err());
+    }
+
+    #[test]
+    fn generated_index_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"data").unwrap();
+        let records = build_file_index(root.path()).unwrap();
+        assert_eq!(
+            parse_file_index(format_file_index(&records).as_bytes()).unwrap(),
+            records
+        );
     }
 
     #[test]
