@@ -990,6 +990,7 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
         toolchain: None,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
+    sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
         let report = sage_build::ElfScanner::rewrite_private_runpaths(
             &destdir,
@@ -1061,6 +1062,7 @@ fn build_variables(
         ("SRC_DIR".into(), "/source".into()),
         ("BUILD_DIR".into(), "/build".into()),
         ("DESTDIR".into(), "/dest".into()),
+        ("PACKAGE_SLOT".into(), recipe.package.slot.clone()),
     ]);
     variables.extend(
         recipe
@@ -1102,7 +1104,7 @@ fn package_staging(
     let manifest = sage_archive::PackageManifest {
         schema_version: sage_core::SCHEMA_VERSION,
         name: area.name.clone(),
-        slot: sage_core::DEFAULT_SLOT.into(),
+        slot: recipe.package.slot.clone(),
         version: recipe.package.version.clone(),
         release: recipe.package.release,
         epoch: recipe.package.epoch,

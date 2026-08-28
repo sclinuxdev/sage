@@ -56,6 +56,8 @@ pub struct SourceSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecipePackage {
     pub name: String,
+    #[serde(default = "default_slot")]
+    pub slot: String,
     pub version: String,
     pub release: u32,
     #[serde(default)]
@@ -68,6 +70,10 @@ pub struct RecipePackage {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub provides: Vec<String>,
+}
+
+fn default_slot() -> String {
+    sage_core::DEFAULT_SLOT.into()
 }
 
 /// Ordered glob claims used to partition one DESTDIR.
@@ -131,6 +137,16 @@ impl RecipeSpec {
         if recipe.package.name.is_empty() || recipe.package.arch.is_empty() {
             return Err(BuildError::InvalidSpec(
                 "package name and architecture are required".into(),
+            ));
+        }
+        if recipe.package.slot.is_empty()
+            || !recipe.package.slot.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
+            })
+        {
+            return Err(BuildError::InvalidSpec(
+                "package slot must contain only ASCII letters, digits, '.', '_', '+', or '-'"
+                    .into(),
             ));
         }
         if recipe.source.is_some() && !recipe.sources.is_empty() {
@@ -748,6 +764,29 @@ impl ElfScanner {
     }
 }
 
+/// Ensures every kernel module tree belongs to the package's declared Slot.
+///
+/// Kernel packages and out-of-tree modules can therefore coexist without a
+/// special package identity: `usr/lib/modules/<version>` and the manifest Slot
+/// must agree. Packages without a modules directory take the fast no-op path.
+pub fn validate_kernel_module_slot(root: &Path, slot: &str) -> Result<(), BuildError> {
+    let modules = root.join("usr/lib/modules");
+    if !modules.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(modules)? {
+        let entry = entry?;
+        let version = entry.file_name();
+        if version != std::ffi::OsStr::new(slot) {
+            return Err(BuildError::InvalidSpec(format!(
+                "kernel module directory '{}' does not match package slot '{slot}'",
+                version.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_relative_path(path: &Path) -> Result<(), BuildError> {
     if path.as_os_str().is_empty()
         || path
@@ -853,6 +892,7 @@ sha256="{}"
         )
         .unwrap();
         let recipe = RecipeSpec::load(path).unwrap();
+        assert_eq!(recipe.package.slot, sage_core::DEFAULT_SLOT);
         assert_eq!(recipe.source_inputs().count(), 2);
         assert_eq!(
             recipe.source_inputs().nth(1).unwrap().url,
@@ -880,6 +920,7 @@ sha256="{}"
             schema_version: 1,
             package: RecipePackage {
                 name: "x".into(),
+                slot: sage_core::DEFAULT_SLOT.into(),
                 version: "1.0".into(),
                 release: 1,
                 epoch: 0,
@@ -961,5 +1002,30 @@ sha256="{}"
         assert!(arguments.lines().any(|line| line == "$ORIGIN/../lib"));
         assert!(origin_path(Path::new("lib"), Path::new("lib")).unwrap() == "$ORIGIN");
         assert!(validate_relative_path(Path::new("../lib")).is_err());
+    }
+
+    #[test]
+    fn kernel_module_tree_must_match_the_package_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("usr/lib/modules/6.12.4/updates")).unwrap();
+        validate_kernel_module_slot(directory.path(), "6.12.4").unwrap();
+        assert!(validate_kernel_module_slot(directory.path(), "6.13.0").is_err());
+    }
+
+    #[test]
+    fn kmod_rclass_uses_the_package_slot_as_kernel_release() {
+        let class =
+            Rclass::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/kmod.toml"))
+                .unwrap();
+        let variables = BTreeMap::from([
+            ("PACKAGE_SLOT".into(), "6.12.4".into()),
+            ("SRC_DIR".into(), "/source".into()),
+            ("DESTDIR".into(), "/dest".into()),
+            ("JOBS".into(), "8".into()),
+            ("args.make_args".into(), String::new()),
+        ]);
+        let runner = compose_runner(&[class], &variables).unwrap();
+        assert!(runner.contains("/usr/lib/modules/6.12.4/build"));
+        assert!(runner.contains("INSTALL_MOD_PATH=\"/dest\""));
     }
 }

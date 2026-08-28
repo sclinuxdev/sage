@@ -1,0 +1,48 @@
+schema_version = 1
+name = "kmod"
+description = "Reproducible out-of-tree Linux kernel module build class"
+
+implicit_build_dependencies = ["linux-headers", "kmod"]
+allowed_compilers = ["clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[env]
+KERNELRELEASE = "${PACKAGE_SLOT}"
+
+[phases]
+src_unpack = """
+first=1
+for archive in "${SRC_DIR}"/.distfiles/*; do
+    if [ "$first" -eq 1 ]; then
+        tar -xf "$archive" --strip-components=1 -C "${SRC_DIR}"
+        first=0
+    else
+        tar -xf "$archive" -C "${SRC_DIR}"
+    fi
+done
+"""
+
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do
+        patch -d "${SRC_DIR}" -p1 < "$patch_file"
+    done
+fi
+"""
+
+src_compile = """
+make -C "/usr/lib/modules/${PACKAGE_SLOT}/build" \
+    M="${SRC_DIR}" \
+    -j "${JOBS}" \
+    ${args.make_args} \
+    modules
+"""
+
+src_install = """
+make -C "/usr/lib/modules/${PACKAGE_SLOT}/build" \
+    M="${SRC_DIR}" \
+    INSTALL_MOD_PATH="${DESTDIR}" \
+    INSTALL_MOD_DIR=updates \
+    ${args.make_args} \
+    modules_install
+"""

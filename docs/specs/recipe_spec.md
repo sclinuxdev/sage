@@ -119,6 +119,7 @@ files = [
 ### 3.1 `[package]` (主包)
 - `name`: 主包名称。
 - `version` / `release` / `epoch`: 全局版本元数据（所有子包默认继承）。
+- `slot`: 可共存的 ABI 槽，默认 `0`。外置内核模块必须设为目标内核版本。
 - `channel`: 默认通道作用域（子包可覆盖）。
 - `dependencies`: 主包专属运行时依赖。
 
@@ -166,3 +167,27 @@ private_library_dirs = ["lib", "lib64"]
 
 The builder rejects absolute paths and parent traversal. It passes only computed
 `$ORIGIN`-relative paths to the globally configured `patchelf` executable.
+
+### 3.5 Out-of-tree kernel modules
+
+Prebuilt Kmod packages use the target kernel version as their package Slot. The
+declarative `kmod` rclass builds against that kernel's read-only headers and asks
+the kernel build system to install into the versioned module tree:
+
+```toml
+[package]
+name = "vendor-driver"
+slot = "6.12.4"
+version = "1.8.0"
+
+[build]
+inherit = ["kmod"]
+
+[build.args]
+make_args = ""
+```
+
+The package step rejects any `usr/lib/modules/<version>` tree that differs from
+the declared Slot. This gives DKMS-style out-of-tree sources reproducible Kmod
+artifacts whose installed versions are tracked independently by the solver and
+database instead of being rebuilt as untracked host mutations.

@@ -90,7 +90,7 @@ impl TriggerEngine {
         Ok(triggers)
     }
 
-    /// Executes each matching trigger at most once in priority order.
+    /// Executes each distinct expanded command once in priority order.
     pub fn execute_triggers(
         triggers: &[TriggerSpec],
         modified_paths: &[PathBuf],
@@ -107,34 +107,90 @@ impl TriggerEngine {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            if !modified_paths
+            let matching_paths = modified_paths
                 .iter()
-                .any(|path| patterns.iter().any(|pattern| pattern.matches_path(path)))
-            {
+                .filter(|path| patterns.iter().any(|pattern| pattern.matches_path(path)));
+            let commands = matching_paths
+                .map(|path| {
+                    trigger
+                        .exec
+                        .iter()
+                        .map(|argument| expand_trigger_argument(argument, path))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if commands.is_empty() {
                 continue;
             }
-            let binary = target_path(sysroot, Path::new(&trigger.exec[0]))?;
-            if !binary.exists() && trigger.ignore_missing_binary {
-                continue;
+            let mut ran = false;
+            for command in commands {
+                let binary = target_path(sysroot, Path::new(&command[0]))?;
+                if !binary.exists() && trigger.ignore_missing_binary {
+                    continue;
+                }
+                ensure_existing_beneath(sysroot, &binary)?;
+                let status = Command::new(binary)
+                    .args(&command[1..])
+                    .current_dir(sysroot)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("SAGE_SYSROOT", sysroot)
+                    .status()?;
+                if !status.success() {
+                    return Err(SysError::Trigger {
+                        name: trigger.name.clone(),
+                        status,
+                    });
+                }
+                ran = true;
             }
-            ensure_existing_beneath(sysroot, &binary)?;
-            let status = Command::new(binary)
-                .args(&trigger.exec[1..])
-                .current_dir(sysroot)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("SAGE_SYSROOT", sysroot)
-                .status()?;
-            if !status.success() {
-                return Err(SysError::Trigger {
-                    name: trigger.name.clone(),
-                    status,
-                });
+            if ran {
+                executed.push(trigger.name.clone());
             }
-            executed.push(trigger.name.clone());
         }
         Ok(executed)
     }
+}
+
+/// Expands path data without invoking a shell. Only `${path}` and the indexed
+/// `${path[N]}` form are accepted, keeping trigger commands deterministic and
+/// preventing configuration typos from silently reaching privileged tools.
+fn expand_trigger_argument(template: &str, path: &Path) -> Result<String, SysError> {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let expression = &rest[start + 2..];
+        let end = expression.find('}').ok_or_else(|| {
+            SysError::Invalid(format!("unterminated trigger variable in '{template}'"))
+        })?;
+        let variable = &expression[..end];
+        let value = if variable == "path" {
+            path.to_str()
+        } else if let Some(index) = variable
+            .strip_prefix("path[")
+            .and_then(|value| value.strip_suffix(']'))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            path.components()
+                .nth(index)
+                .and_then(|part| part.as_os_str().to_str())
+        } else {
+            return Err(SysError::Invalid(format!(
+                "unknown trigger variable '{variable}'"
+            )));
+        }
+        .ok_or_else(|| {
+            SysError::Invalid(format!(
+                "trigger variable '{variable}' is unavailable for {}",
+                path.display()
+            ))
+        })?;
+        output.push_str(value);
+        rest = &expression[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 /// Init-independent daemon declaration carried by a package.
@@ -666,6 +722,38 @@ mod tests {
     #[test]
     fn target_paths_cannot_escape_sysroot() {
         assert!(target_path(Path::new("/root"), Path::new("../../etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn trigger_path_variables_execute_once_per_kernel_slot() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        let recorder = root.path().join("usr/bin/record-slot");
+        fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"$SAGE_SYSROOT/result\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut trigger: TriggerSpec =
+            toml::from_str(include_str!("../../../triggers/depmod.toml")).unwrap();
+        trigger.exec[0] = "/usr/bin/record-slot".into();
+        trigger.ignore_missing_binary = false;
+        let modified = [
+            PathBuf::from("usr/lib/modules/6.12/a.ko"),
+            PathBuf::from("usr/lib/modules/6.12/b.ko"),
+            PathBuf::from("usr/lib/modules/6.13/c.ko"),
+        ];
+
+        assert_eq!(
+            TriggerEngine::execute_triggers(&[trigger], &modified, root.path()).unwrap(),
+            ["depmod"]
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("result")).unwrap(),
+            "6.12\n6.13\n"
+        );
+        assert!(expand_trigger_argument("${unknown}", &modified[0]).is_err());
     }
 
     #[test]

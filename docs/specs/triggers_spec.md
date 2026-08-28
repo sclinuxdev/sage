@@ -56,6 +56,20 @@ priority = 60
 ignore_missing_binary = true
 ```
 
+### 示例 4: `depmod.toml`
+
+```toml
+schema_version = 1
+name = "depmod"
+description = "Regenerate dependency maps for changed kernel module slots"
+on_paths = ["usr/lib/modules/**"]
+exec = ["/sbin/depmod", "-a", "${path[3]}"]
+priority = 20
+ignore_missing_binary = true
+```
+
+`${path}` 展开为匹配的事务相对路径，`${path[N]}` 展开为从零开始的路径组件。引擎不调用 shell，并对展开后的完整命令去重；同一事务写入同一内核 Slot 的多个 `.ko` 文件只运行一次 `depmod`，不同 Slot 则各运行一次。
+
 ---
 
 ## 2. 触发器引擎执行流水线 (`TriggerEngine`)
@@ -74,7 +88,7 @@ ignore_missing_binary = true
 ```
 
 1. **完全动态注册**: 安装携带新特性的包（如 Python、GTK、Fonts）会自动在 `/usr/share/sage/triggers/` 中落地新的触发器，即刻对后续事务生效，`sage` 二进制代码无需任何改动。
-2. **去重与合并**: 事务涉及 100 个 `.so` 文件时，`ldconfig` 仅在事务末尾**被聚合调用执行 1 次**。
+2. **去重与合并**: 事务涉及 100 个 `.so` 文件时，`ldconfig` 仅在事务末尾**被聚合调用执行 1 次**；包含路径变量的命令按展开结果分别去重。
 
 ---
 
