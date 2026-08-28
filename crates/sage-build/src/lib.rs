@@ -1,7 +1,7 @@
 //! Declarative rclass execution, Bubblewrap isolation, payload carving, and ELF scans.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -33,6 +33,119 @@ pub enum BuildError {
     SandboxFailed(ExitStatus),
     #[error("invalid build specification: {0}")]
     InvalidSpec(String),
+    #[error("invalid glob pattern: {0}")]
+    Glob(#[from] glob::PatternError),
+    #[error("filesystem traversal failed: {0}")]
+    Walk(#[from] walkdir::Error),
+    #[error("ELF parse failed: {0}")]
+    Elf(#[from] goblin::error::Error),
+}
+
+/// Schema-v1 source input.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceSpec {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Shared and main-package metadata from a recipe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecipePackage {
+    pub name: String,
+    pub version: String,
+    pub release: u32,
+    #[serde(default)]
+    pub epoch: u32,
+    pub description: String,
+    pub license: String,
+    pub channel: String,
+    pub arch: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+}
+
+/// Ordered glob claims used to partition one DESTDIR.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PayloadSpec {
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub default: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RecipeBuild {
+    #[serde(default)]
+    pub inherit: Vec<String>,
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    #[serde(default)]
+    pub payload: PayloadSpec,
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubpackageSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub payload: PayloadSpec,
+}
+
+/// Complete single-build, multiple-output recipe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecipeSpec {
+    pub schema_version: u32,
+    pub package: RecipePackage,
+    pub source: SourceSpec,
+    #[serde(default)]
+    pub build: RecipeBuild,
+    #[serde(default)]
+    pub subpackages: Vec<SubpackageSpec>,
+}
+
+impl RecipeSpec {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, BuildError> {
+        let recipe: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        validate_schema(recipe.schema_version)?;
+        if recipe.package.name.is_empty() || recipe.package.arch.is_empty() {
+            return Err(BuildError::InvalidSpec(
+                "package name and architecture are required".into(),
+            ));
+        }
+        if recipe.source.sha256.len() != 64
+            || !recipe
+                .source
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(BuildError::InvalidSpec(
+                "source SHA-256 must contain 64 hex digits".into(),
+            ));
+        }
+        let mut names = BTreeSet::from([recipe.package.name.as_str()]);
+        if recipe
+            .subpackages
+            .iter()
+            .any(|subpackage| !names.insert(&subpackage.name))
+        {
+            return Err(BuildError::InvalidSpec(
+                "subpackage names must be unique".into(),
+            ));
+        }
+        Ok(recipe)
+    }
 }
 
 /// Global reproducible-build and sandbox policy.
@@ -301,6 +414,179 @@ impl<'a> SandboxRunner<'a> {
     }
 }
 
+/// One mutually exclusive package tree carved from a shared DESTDIR.
+pub struct PackageStagingArea {
+    pub name: String,
+    root: tempfile::TempDir,
+    pub dependencies: Vec<String>,
+    pub provides: Vec<String>,
+}
+
+impl PackageStagingArea {
+    pub fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+/// Declaratively partitions build output using first-match ownership.
+pub struct PayloadCarver;
+
+impl PayloadCarver {
+    pub fn carve_packages(
+        destdir: &Path,
+        recipe: &RecipeSpec,
+    ) -> Result<Vec<PackageStagingArea>, BuildError> {
+        let claims: Vec<_> = recipe
+            .subpackages
+            .iter()
+            .map(|subpackage| {
+                Ok((
+                    compile_patterns(&subpackage.payload.files)?,
+                    compile_patterns(&subpackage.payload.excludes)?,
+                ))
+            })
+            .collect::<Result<_, BuildError>>()?;
+        let main_patterns = compile_patterns(&recipe.build.payload.files)?;
+        let main_excludes = compile_patterns(&recipe.build.payload.excludes)?;
+        let mut areas = Vec::with_capacity(recipe.subpackages.len() + 1);
+        areas.push(staging(
+            &recipe.package.name,
+            &recipe.package.dependencies,
+            &recipe.package.provides,
+        )?);
+        for subpackage in &recipe.subpackages {
+            areas.push(staging(
+                &subpackage.name,
+                &subpackage.dependencies,
+                &subpackage.provides,
+            )?);
+        }
+        let mut paths: Vec<_> = walkdir::WalkDir::new(destdir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.path() != destdir && !entry.file_type().is_dir() => {
+                    Some(Ok(entry))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<_, _>>()?;
+        paths.sort_by_key(|entry| entry.path().to_path_buf());
+        for entry in paths {
+            let relative = entry
+                .path()
+                .strip_prefix(destdir)
+                .expect("walkdir keeps entries beneath its root");
+            let owner = claims
+                .iter()
+                .position(|(includes, excludes)| {
+                    matches_any(includes, relative) && !matches_any(excludes, relative)
+                })
+                .map(|index| index + 1)
+                .or_else(|| {
+                    let allowed = main_patterns.is_empty() || matches_any(&main_patterns, relative);
+                    (allowed && !matches_any(&main_excludes, relative)).then_some(0)
+                });
+            if let Some(owner) = owner {
+                link_entry(
+                    entry.path(),
+                    &areas[owner].path().join("data").join(relative),
+                )?;
+            }
+        }
+        Ok(areas)
+    }
+}
+
+fn staging(
+    name: &str,
+    dependencies: &[String],
+    provides: &[String],
+) -> Result<PackageStagingArea, BuildError> {
+    let root = tempfile::Builder::new().prefix("sage-package-").tempdir()?;
+    fs::create_dir(root.path().join("data"))?;
+    Ok(PackageStagingArea {
+        name: name.into(),
+        root,
+        dependencies: dependencies.to_vec(),
+        provides: provides.to_vec(),
+    })
+}
+
+fn compile_patterns(patterns: &[String]) -> Result<Vec<glob::Pattern>, BuildError> {
+    patterns
+        .iter()
+        .map(|pattern| Ok(glob::Pattern::new(pattern)?))
+        .collect()
+}
+
+fn matches_any(patterns: &[glob::Pattern], path: &Path) -> bool {
+    patterns.iter().any(|pattern| pattern.matches_path(path))
+}
+
+fn link_entry(source: &Path, target: &Path) -> Result<(), BuildError> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        let link = fs::read_link(source)?;
+        if link.is_absolute()
+            || link
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(BuildError::InvalidSpec(format!(
+                "unsafe payload symlink {} -> {}",
+                source.display(),
+                link.display()
+            )));
+        }
+        std::os::unix::fs::symlink(link, target)?;
+    } else if fs::hard_link(source, target).is_err() {
+        fs::copy(source, target)?;
+        fs::set_permissions(target, metadata.permissions())?;
+    }
+    Ok(())
+}
+
+/// Dynamic symbols discovered from one independently carved package.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ElfSymbols {
+    pub provides: BTreeSet<String>,
+    pub dependencies: BTreeSet<String>,
+}
+
+pub struct ElfScanner;
+
+impl ElfScanner {
+    /// Scans regular files once and ignores non-ELF payloads without error.
+    pub fn scan(root: &Path) -> Result<ElfSymbols, BuildError> {
+        let mut symbols = ElfSymbols::default();
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            if !bytes.starts_with(b"\x7fELF") {
+                continue;
+            }
+            let goblin::Object::Elf(elf) = goblin::Object::parse(&bytes)? else {
+                continue;
+            };
+            if let Some(soname) = elf.soname {
+                symbols.provides.insert(format!("so:{soname}"));
+            }
+            symbols
+                .dependencies
+                .extend(elf.libraries.into_iter().map(|name| format!("so:{name}")));
+        }
+        Ok(symbols)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +619,71 @@ mod tests {
     #[test]
     fn shell_quote_does_not_open_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn carving_assigns_each_file_to_first_matching_package() {
+        let dest = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dest.path().join("usr/lib")).unwrap();
+        fs::create_dir_all(dest.path().join("usr/include")).unwrap();
+        fs::create_dir_all(dest.path().join("usr/bin")).unwrap();
+        fs::write(dest.path().join("usr/lib/libx.so.1"), b"lib").unwrap();
+        fs::write(dest.path().join("usr/include/x.h"), b"header").unwrap();
+        fs::write(dest.path().join("usr/bin/x"), b"bin").unwrap();
+        let recipe = RecipeSpec {
+            schema_version: 1,
+            package: RecipePackage {
+                name: "x".into(),
+                version: "1.0".into(),
+                release: 1,
+                epoch: 0,
+                description: "x".into(),
+                license: "MIT".into(),
+                channel: "system".into(),
+                arch: "amd64".into(),
+                dependencies: vec![],
+                provides: vec![],
+            },
+            source: SourceSpec {
+                url: "https://example.invalid/x".into(),
+                sha256: "00".repeat(32),
+            },
+            build: RecipeBuild::default(),
+            subpackages: vec![
+                SubpackageSpec {
+                    name: "x-libs".into(),
+                    description: None,
+                    license: None,
+                    dependencies: vec![],
+                    provides: vec![],
+                    payload: PayloadSpec {
+                        files: vec!["usr/lib/*.so.*".into()],
+                        ..PayloadSpec::default()
+                    },
+                },
+                SubpackageSpec {
+                    name: "x-dev".into(),
+                    description: None,
+                    license: None,
+                    dependencies: vec![],
+                    provides: vec![],
+                    payload: PayloadSpec {
+                        files: vec!["usr/include/**".into()],
+                        ..PayloadSpec::default()
+                    },
+                },
+            ],
+        };
+        let areas = PayloadCarver::carve_packages(dest.path(), &recipe).unwrap();
+        assert!(areas[0].path().join("data/usr/bin/x").exists());
+        assert!(areas[1].path().join("data/usr/lib/libx.so.1").exists());
+        assert!(areas[2].path().join("data/usr/include/x.h").exists());
+        assert!(!areas[0].path().join("data/usr/lib/libx.so.1").exists());
+    }
+
+    #[test]
+    fn elf_scanner_reads_dynamic_dependencies() {
+        let symbols = ElfScanner::scan(Path::new("/bin/ls")).unwrap();
+        assert!(!symbols.dependencies.is_empty());
     }
 }
