@@ -2,7 +2,7 @@
 
 - **Crate 路径**: `crates/sage-build`
 - **选用生态**: `bwrap` (Bubblewrap), `fakeroot`, `goblin` (ELF 动态符号解析)
-- **代码预算**: ~1,500 行
+- **代码预算**: ~1,700 行
 - **职责**: 驱动 Bubblewrap 密闭构建沙箱、解析执行 `rclass` 阶段脚本、执行 Ptrace 工具链审计、**单配方多包产物切分 (Payload Carving)** 与自动化 ELF 依赖扫描。
 
 ---

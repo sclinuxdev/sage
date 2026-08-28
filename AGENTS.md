@@ -21,8 +21,8 @@
    - 软件源镜像 URL 完全由配置文件提供，代码中零预设 URL。
 3. **原生支持多版本共存 (Native Multi-Version Slots)**：
    - 领域标识基于 `(Channel, PackageName, Slot)`，不同 Slot 与不同 Channel 的包在求解器与数据库中天然共存。
-4. **极致性能与精简代码 (< 8,000 行)**：
-   - 全 Workspace 所有 Rust 代码总量严格控制在 **8,000 行以内**。
+4. **极致性能与精简代码 (< 9,000 行)**：
+   - 全 Workspace 所有 Rust 代码总量严格控制在 **9,000 行以内**。
    - 零多余抽象，关键路径无锁零拷贝 (`mmap`)，符号 Interning 整数化比对。
 
 ---

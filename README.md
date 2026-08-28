@@ -36,8 +36,8 @@
   基于 Bubblewrap 的密闭沙箱，支持 Ptrace 工具链审计、ELF 动态符号反查以及单次编译零重复的多包切分。
 
 - **Ultra Compact / 极致精简**:
-  Strict engineering budget controlling total workspace Rust code under **8,000 lines of code**.  
-  严格控制全 Workspace Rust 代码总量在 **8,000 行以内**。
+  Strict engineering budget controlling total workspace Rust code under **9,000 lines of code**.
+  严格控制全 Workspace Rust 代码总量在 **9,000 行以内**。
 
 ---
 
