@@ -873,6 +873,7 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
             inherited,
         )?)?);
     }
+    sage_build::validate_toolchain(&classes, &config)?;
     if dry_run {
         println!(
             "Would build {}-{}-{} for {} using {:?}",

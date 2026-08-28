@@ -39,6 +39,8 @@ pub enum BuildError {
     Walk(#[from] walkdir::Error),
     #[error("ELF parse failed: {0}")]
     Elf(#[from] goblin::error::Error),
+    #[error("tool '{tool}' is not allowed by inherited rclasses")]
+    UnauthorizedTool { tool: String },
 }
 
 /// Schema-v1 source input.
@@ -223,6 +225,52 @@ impl Rclass {
         let class: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(class.schema_version)?;
         Ok(class)
+    }
+}
+
+/// Verifies the selected compiler and linker families against rclass policy.
+pub fn validate_toolchain(classes: &[Rclass], config: &BuildConfig) -> Result<(), BuildError> {
+    let compilers: BTreeSet<_> = classes
+        .iter()
+        .flat_map(|class| class.allowed_compilers.iter().map(|name| name.as_str()))
+        .collect();
+    let linkers: BTreeSet<_> = classes
+        .iter()
+        .flat_map(|class| class.allowed_linkers.iter().map(|name| name.as_str()))
+        .collect();
+    if !compilers.is_empty() {
+        for tool in [&config.cc, &config.cxx] {
+            let family = tool_family(tool);
+            if !compilers.contains(family.as_str()) {
+                return Err(BuildError::UnauthorizedTool { tool: tool.clone() });
+            }
+        }
+    }
+    if !linkers.is_empty() && !linkers.contains(tool_family(&config.linker).as_str()) {
+        return Err(BuildError::UnauthorizedTool {
+            tool: config.linker.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn tool_family(tool: &str) -> String {
+    let name = Path::new(tool)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(tool);
+    if name.contains("clang") {
+        "clang".into()
+    } else if name.contains("gcc") || name == "g++" {
+        "gcc".into()
+    } else if name.contains("lld") {
+        "lld".into()
+    } else if name.contains("mold") {
+        "mold".into()
+    } else if name == "ld" || name.ends_with("-ld") {
+        "ld".into()
+    } else {
+        name.into()
     }
 }
 
@@ -615,6 +663,8 @@ mod tests {
     #[test]
     fn shell_quote_does_not_open_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(tool_family("/usr/bin/clang++"), "clang");
+        assert_eq!(tool_family("ld.lld"), "lld");
     }
 
     #[test]
