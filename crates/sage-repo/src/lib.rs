@@ -539,6 +539,69 @@ pub fn open_index(path: &Path) -> Result<Env, RepoError> {
     Ok(unsafe { options.open(path)? })
 }
 
+/// Read-only typed view over a verified repository index.
+pub struct RepositoryIndex {
+    env: Env,
+}
+
+impl RepositoryIndex {
+    pub fn open(path: &Path) -> Result<Self, RepoError> {
+        let env = open_index(path)?;
+        let txn = env.read_txn()?;
+        env.open_database::<Str, Bytes>(&txn, Some("packages"))?
+            .ok_or_else(|| RepoError::InvalidConfig("index has no packages table".into()))?;
+        env.open_database::<Str, Bytes>(&txn, Some("provides"))?
+            .ok_or_else(|| RepoError::InvalidConfig("index has no provides table".into()))?;
+        drop(txn);
+        Ok(Self { env })
+    }
+
+    /// Performs one point lookup for all versions of `name:slot`.
+    pub fn releases(&self, name: &str, slot: &str) -> Result<Vec<IndexedRelease>, RepoError> {
+        let txn = self.env.read_txn()?;
+        let packages: heed::Database<Str, Bytes> = self
+            .env
+            .open_database(&txn, Some("packages"))?
+            .ok_or_else(|| RepoError::InvalidConfig("index has no packages table".into()))?;
+        let key = format!("{name}:{slot}");
+        packages
+            .get(&txn, &key)?
+            .map(bincode::deserialize)
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .map_err(Into::into)
+    }
+
+    /// Iterates owned records while keeping mmap slices inside the read transaction.
+    pub fn all_releases(&self) -> Result<Vec<IndexedRelease>, RepoError> {
+        let txn = self.env.read_txn()?;
+        let packages: heed::Database<Str, Bytes> = self
+            .env
+            .open_database(&txn, Some("packages"))?
+            .ok_or_else(|| RepoError::InvalidConfig("index has no packages table".into()))?;
+        let mut releases = Vec::new();
+        for item in packages.iter(&txn)? {
+            let (_, bytes) = item?;
+            releases.extend(bincode::deserialize::<Vec<IndexedRelease>>(bytes)?);
+        }
+        Ok(releases)
+    }
+
+    pub fn providers(&self, symbol: &str) -> Result<Vec<String>, RepoError> {
+        let txn = self.env.read_txn()?;
+        let provides: heed::Database<Str, Bytes> = self
+            .env
+            .open_database(&txn, Some("provides"))?
+            .ok_or_else(|| RepoError::InvalidConfig("index has no provides table".into()))?;
+        provides
+            .get(&txn, symbol)?
+            .map(bincode::deserialize)
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .map_err(Into::into)
+    }
+}
+
 fn join_url(base: &str, relative: &str) -> String {
     format!(
         "{}/{}",
@@ -657,5 +720,10 @@ provides=["cmd:demo"]
             bincode::deserialize(packages.get(&txn, "demo:0").unwrap().unwrap()).unwrap();
         assert_eq!(releases[0].manifest.name, "demo");
         assert!(artifacts.compressed.exists() && artifacts.signature.exists());
+        drop(txn);
+        drop(env);
+        let reader = RepositoryIndex::open(&artifacts.index).unwrap();
+        assert_eq!(reader.releases("demo", "0").unwrap().len(), 1);
+        assert_eq!(reader.providers("cmd:demo").unwrap(), vec!["demo:0"]);
     }
 }
