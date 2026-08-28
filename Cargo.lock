@@ -1468,9 +1468,12 @@ dependencies = [
  "goblin",
  "sage-archive",
  "sage-core",
+ "serde",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
