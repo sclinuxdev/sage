@@ -9,6 +9,7 @@ description = "Core domain models, version algebra, and locking primitives for S
 
 [dependencies]
 serde = { workspace = true }
+spdx = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
 nix = { workspace = true }

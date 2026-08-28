@@ -107,6 +107,18 @@ pub struct IndexedRelease {
     pub sha256: String,
 }
 
+impl IndexedRelease {
+    /// Returns the coordinate encoded by the indexed package manifest.
+    pub fn coordinate(&self) -> sage_core::PackageCoordinate {
+        self.manifest.coordinate()
+    }
+
+    /// Returns the coordinate with the canonical channel assigned by its index.
+    pub fn coordinate_for_channel(&self, channel: &str) -> sage_core::PackageCoordinate {
+        self.manifest.coordinate_for_channel(channel)
+    }
+}
+
 /// Files emitted by one repository indexing pass.
 #[derive(Debug, Clone)]
 pub struct IndexArtifacts {

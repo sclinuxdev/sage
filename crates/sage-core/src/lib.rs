@@ -30,6 +30,8 @@ pub enum CoreError {
     InvalidPackageKey(String),
     #[error("invalid dependency string '{0}'")]
     InvalidDependency(String),
+    #[error("invalid metadata: {0}")]
+    InvalidMetadata(String),
     #[error("unsupported schema version {found}; expected {SCHEMA_VERSION}")]
     UnsupportedSchema { found: u32 },
     #[error("symbol table exhausted its 32-bit address space")]
@@ -41,6 +43,20 @@ pub fn validate_schema(found: u32) -> Result<(), CoreError> {
     (found == SCHEMA_VERSION)
         .then_some(())
         .ok_or(CoreError::UnsupportedSchema { found })
+}
+
+/// Validates a non-empty SPDX license expression against the embedded SPDX list.
+pub fn validate_spdx_expression(expression: &str) -> Result<(), CoreError> {
+    if expression.is_empty() {
+        return Err(CoreError::InvalidMetadata(
+            "SPDX license expression is required".into(),
+        ));
+    }
+    spdx::Expression::parse(expression)
+        .map(|_| ())
+        .map_err(|error| {
+            CoreError::InvalidMetadata(format!("invalid SPDX license expression: {error}"))
+        })
 }
 
 /// Unique package identity `(channel, name, slot)` independent of its version.
@@ -114,6 +130,26 @@ impl Version {
             upstream: upstream.into(),
             release,
         }
+    }
+}
+
+/// A package identity paired with its ordered release version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PackageCoordinate {
+    pub key: PackageKey,
+    pub version: Version,
+}
+
+impl PackageCoordinate {
+    /// Creates a coordinate from an identity and version.
+    pub fn new(key: PackageKey, version: Version) -> Self {
+        Self { key, version }
+    }
+}
+
+impl fmt::Display for PackageCoordinate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.key, self.version)
     }
 }
 

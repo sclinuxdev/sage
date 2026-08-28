@@ -12,6 +12,11 @@
 - **冷启动开销**: 严格控制在 **< 5ms**，避免加载任何庞大终端渲染框架。
 - **无 TUI 依赖**: 专注于纯粹、高效的 CLI 交互。
 
+The binary target only parses `clap` arguments and enters the library. Command
+orchestration is kept behind small deep interfaces: package state operations,
+source builds, mass rebuilds, and bootstrap each own their implementation
+boundary, so the parser does not know about databases, archives, or sandboxes.
+
 ---
 
 ## 2. CLI 命令设计 (`clap`)

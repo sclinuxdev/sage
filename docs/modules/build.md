@@ -61,7 +61,17 @@ impl PayloadCarver {
 2. **自动化 ELF 扫描 (`ElfScanner`)**:
    - 对每个独立切分后的子包 staging 目录，使用 `goblin` 扫描其内部的 ELF 动态可执行文件与动态库。
    - 提取 `DT_SONAME` 自动追加至该子包的 `provides = ["so:libfoo.so.1"]`。
-   - 提取 `DT_NEEDED` 自动追加至该子包的 `dependencies = ["so:libbar.so.2"]`。
+    - 提取 `DT_NEEDED` 自动追加至该子包的 `dependencies = ["so:libbar.so.2"]`。
+
+## 5. Per-build toolchain provenance
+
+The sandbox installs narrow wrappers for the configured C compiler, C++
+compiler, linker, and Rust compiler. Each wrapper logs its resolved executable
+only when it is invoked. The resulting `managed_build_tools` entries are
+written into every archive produced by that build with the role, resolved
+executable, family, first `--version` line, and non-empty configured flag
+channels. Unused configured tools are omitted. CRT objects and auxiliary
+tools such as `ar`, `as`, and `ranlib` are not observed or reported.
 
 ## 6. Ephemeral inputs, features, and cross targets
 

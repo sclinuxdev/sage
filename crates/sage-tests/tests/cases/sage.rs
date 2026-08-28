@@ -128,6 +128,7 @@ recipes=["app/recipe.toml"]
             provides: Vec::new(),
             conflicts: Vec::new(),
             features: Vec::new(),
+            managed_build_tools: Vec::new(),
         };
         std::fs::write(
             stage.join(".METADATA/manifest.toml"),
@@ -142,7 +143,7 @@ recipes=["app/recipe.toml"]
         let key = sage_core::PackageKey::new("main/system", "seed", "0");
         let version = sage_core::Version::new(0, "1", 1);
         assert!(matches!(
-            available.releases[&(key, version)].location,
+            available.releases[&sage_core::PackageCoordinate::new(key, version)].location,
             ReleaseLocation::Local(_)
         ));
     }

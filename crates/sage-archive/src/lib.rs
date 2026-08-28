@@ -63,6 +63,38 @@ pub struct PackageManifest {
     /// Build-time feature selection baked into this immutable artifact.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Compiler and linker processes observed during this exact managed build.
+    /// Prebuilt and repackaged artifacts keep this list empty.
+    #[serde(default)]
+    pub managed_build_tools: Vec<ManagedBuildTool>,
+}
+
+/// One compiler or linker process directly observed during a managed build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBuildTool {
+    pub role: String,
+    pub executable: String,
+    pub family: String,
+    pub version: String,
+    pub version_argument: String,
+    /// Non-empty Sage-configured flag channels stored as `NAME=value`.
+    #[serde(default)]
+    pub parameters: Vec<String>,
+}
+
+impl PackageManifest {
+    /// Returns the package identity and version represented by this manifest.
+    pub fn coordinate(&self) -> sage_core::PackageCoordinate {
+        self.coordinate_for_channel(&self.channel)
+    }
+
+    /// Returns the package coordinate while replacing the manifest channel.
+    pub fn coordinate_for_channel(&self, channel: &str) -> sage_core::PackageCoordinate {
+        sage_core::PackageCoordinate::new(
+            sage_core::PackageKey::new(channel, &self.name, &self.slot),
+            sage_core::Version::new(self.epoch, &self.version, self.release),
+        )
+    }
 }
 
 fn default_slot() -> String {
@@ -113,6 +145,8 @@ pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, Arch
             .map_err(|_| ArchiveError::InvalidMetadata("manifest is not UTF-8".into()))?,
     )?;
     sage_core::validate_schema(manifest.schema_version)
+        .map_err(|error| ArchiveError::InvalidMetadata(error.to_string()))?;
+    sage_core::validate_spdx_expression(&manifest.license)
         .map_err(|error| ArchiveError::InvalidMetadata(error.to_string()))?;
     let index = metadata
         .remove(".METADATA/files.idx")

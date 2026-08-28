@@ -30,6 +30,7 @@ sage-repo = { path = "crates/sage-repo", version = "0.4.0" }
 sage = { path = "crates/sage", version = "0.4.0" }
 
 serde = { version = "1.0", features = ["derive"] }
+spdx = "0.13.5"
 serde_json = "1.0"
 toml = "0.8"
 bincode = "1.3"

@@ -45,6 +45,28 @@ mod core_tests {
     }
 
     #[test]
+    fn spdx_expressions_are_strictly_validated() {
+        for expression in [
+            "Apache-2.0 OR MIT",
+            "GPL-2.0-or-later WITH Classpath-exception-2.0",
+            "LicenseRef-Public-Domain",
+        ] {
+            validate_spdx_expression(expression).unwrap();
+        }
+        assert!(validate_spdx_expression("").is_err());
+        assert!(validate_spdx_expression("public-domain").is_err());
+    }
+
+    #[test]
+    fn package_coordinate_unifies_identity_and_version() {
+        let coordinate = PackageCoordinate::new(
+            PackageKey::new("main/system", "sage", "0"),
+            Version::new(1, "0.4", 2),
+        );
+        assert_eq!(coordinate.to_string(), "main/system:sage:0@1:0.4-2");
+    }
+
+    #[test]
     fn interning_reuses_stable_ids() {
         let mut symbols = SymbolTable::default();
         let first = symbols.intern("system").unwrap();

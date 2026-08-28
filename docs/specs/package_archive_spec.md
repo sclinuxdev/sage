@@ -49,7 +49,22 @@ dependencies = [
 ]
 provides = ["rg"]
 conflicts = []
+
+# Present only for artifacts produced by a managed Sage source build.
+[[managed_build_tools]]
+role = "cc"
+executable = "/usr/bin/clang"
+family = "clang"
+version = "clang version 18.1.8"
+version_argument = "--version"
+parameters = ["CPPFLAGS=-D_FILE_OFFSET_BITS=64", "CFLAGS=-O2"]
 ```
+
+`managed_build_tools` is an observation of this archive's build, not a package
+or repository default. Sage records only compiler and linker wrappers that
+actually executed (`cc`, `cxx`, `linker`, or `rustc`); CRT objects and helper
+tools such as `ar`, `as`, and `ranlib` are intentionally excluded. `parameters`
+contains the non-empty Sage-configured flag channels used for that role.
 
 ---
 

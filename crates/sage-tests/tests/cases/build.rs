@@ -2,8 +2,74 @@ mod build_tests {
     use sage_build::*;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn observed_tools_contain_only_executed_compilers_and_linker() {
+        let directory = tempfile::tempdir().unwrap();
+        let toolchain = directory.path().join("toolchain");
+        let tool_dir = toolchain.join("usr/bin");
+        fs::create_dir_all(&tool_dir).unwrap();
+        for (name, version) in [("gcc", "gcc (Sage test) 1.0"), ("ld.lld", "LLD 18.1")] {
+            let path = tool_dir.join(name);
+            fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let build = directory.path().join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(
+            build.join(".sage-tool-usage"),
+            "cc\t/usr/bin/gcc\ncc\t/usr/bin/gcc\nlinker\t/usr/bin/ld.lld\n",
+        )
+        .unwrap();
+        let config = BuildConfig {
+            schema_version: 1,
+            fakeroot: "fakeroot".into(),
+            bwrap: "bwrap".into(),
+            git: "git".into(),
+            sysroot: directory.path().into(),
+            cc: "gcc".into(),
+            cxx: "g++".into(),
+            linker: "ld.lld".into(),
+            rustc: "rustc".into(),
+            patchelf: "patchelf".into(),
+            cflags: "-O2".into(),
+            cxxflags: "-O3".into(),
+            cppflags: "-DTEST=1".into(),
+            ldflags: "-Wl,--as-needed".into(),
+            rustflags: "-C debuginfo=0".into(),
+            source_date_epoch: 1,
+            jobs: 1,
+            memory_limit: String::new(),
+            pids_limit: 16,
+            compiler_cache: String::new(),
+            ccache_dir: PathBuf::new(),
+            build: String::new(),
+            targets: BTreeMap::new(),
+        };
+        let paths = SandboxPaths {
+            source: directory.path().join("source"),
+            build,
+            destdir: directory.path().join("dest"),
+            runner: directory.path().join("runner.sh"),
+            toolchain: Some(toolchain),
+            target_sysroot: None,
+        };
+        let observed = SandboxRunner::new(&config).observed_tools(&paths).unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].role, "cc");
+        assert_eq!(observed[0].family, "gcc");
+        assert_eq!(observed[0].version, "gcc (Sage test) 1.0");
+        assert_eq!(
+            observed[0].parameters,
+            ["CPPFLAGS=-DTEST=1", "CFLAGS=-O2"]
+        );
+        assert_eq!(observed[1].role, "linker");
+        assert_eq!(observed[1].family, "lld");
+        assert_eq!(observed[1].parameters, ["LDFLAGS=-Wl,--as-needed"]);
+    }
 
     #[test]
     fn runner_orders_phases_and_rejects_unknown_variables() {
@@ -146,13 +212,18 @@ sha256="{}"
             ),
         )
         .unwrap();
-        let recipe = RecipeSpec::load(path).unwrap();
+        let recipe = RecipeSpec::load(&path).unwrap();
         assert_eq!(recipe.package.slot, sage_core::DEFAULT_SLOT);
         assert_eq!(recipe.source_inputs().count(), 2);
         assert_eq!(
             recipe.source_inputs().nth(1).unwrap().url,
             "https://example.invalid/languages.tar"
         );
+        let invalid = fs::read_to_string(&path)
+            .unwrap()
+            .replace("license=\"MIT\"", "license=\"public-domain\"");
+        fs::write(&path, invalid).unwrap();
+        assert!(RecipeSpec::load(path).is_err());
     }
 
     #[test]
