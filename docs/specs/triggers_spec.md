@@ -123,3 +123,23 @@ priority = 50
 
 - **仲裁逻辑**: `sage-sys` 维护各 link 的所有已安装提供者及其优先级，始终将物理软链接指向优先级最高者。
 - **自动降级**: 当卸载当前处于激活态的提供者时，自动原子降级指向剩余候选者中优先级最高的一项。
+
+## 4. Declarative lifecycle boundaries
+
+Triggers may declare `events = ["post-change", "post-remove", "rebuild"]`.
+Omitting the field preserves schema-v1 compatibility and enables post-change and
+post-remove. Package declarations are retained in memory through removal and run
+only after filesystem and ownership publication. Standard input stays closed,
+arguments expand without a shell, and identical commands are deduplicated.
+
+| Legacy hook purpose | Sage declaration |
+| :--- | :--- |
+| create users or groups | `[[sysusers]]` and the sysusers post-change trigger |
+| rebuild caches or ABI maps | path trigger on post-change and post-remove |
+| register and enable a daemon | `service.toml` plus init rclass on rebuild |
+| select command providers | alternatives declaration |
+| interactive configuration | administrator-owned `/etc` state |
+
+Arbitrary pre-install execution remains forbidden. Preconditions belong in
+solver constraints and archive validation; package code before publication would
+break reproducibility and rollback safety.

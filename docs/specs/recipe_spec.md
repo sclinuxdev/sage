@@ -209,3 +209,33 @@ single-trigger schema as files under `/usr/share/sage/triggers`.
 Executable lifecycle hooks such as `preinst`, `postinst`, `prerm`, and `postrm`
 are rejected. Transactions never treat package metadata as executable content and
 never open standard input for configuration prompts.
+
+### 3.7 Features and build-only dependencies
+
+Features are deterministic recipe transformations selected with
+`sage build --feature <name>`. Defaults are enabled unless
+`--no-default-features` is supplied:
+
+```toml
+[build]
+inherit = ["meson"]
+dependencies = ["wayland-protocols >= 1.37-1"]
+target = "aarch64-linux-gnu"
+
+[features.tls]
+default = true
+dependencies = ["openssl-libs >= 3.4-1"]
+build_dependencies = ["pkgconf"]
+
+[features.tls.args]
+meson_args = "-Dtls=enabled"
+
+[features.tls.env]
+TLS_BACKEND = "openssl"
+```
+
+Rules fold once in bytewise name order. Runtime dependencies enter the normal
+PubGrub graph through the artifact manifest. Build dependencies from the recipe,
+features, and inherited rclasses are solved together, installed only under the
+ephemeral `/toolchain`, and never recorded as host state. Unknown feature names
+or unconfigured targets fail before source downloads begin.

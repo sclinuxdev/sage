@@ -152,3 +152,20 @@ depends_on = ${service.after_json}
 | `${service.pid_file}` | PID 文件路径 |
 | `${service.restart}` | 重启策略 (`always`, `on-failure`, `no`) |
 | `${SYSROOT}` | 目标系统的根文件系统挂载点 |
+
+## 5. Standard build-class library
+
+The standard library contains `autotools`, `meson`, `python` (PEP 517), `go`,
+`cmake`, `cargo`, and `kmod`. Tool defaults remain data-owned:
+
+```toml
+implicit_build_dependencies = ["meson", "ninja", "pkgconf"]
+
+[defaults]
+"args.test" = "0"
+"args.meson_args" = ""
+```
+
+Later rclasses and recipe arguments override defaults. Implicit dependencies
+participate in the constrained build-environment solve. The verified result is
+mounted read-only at `/toolchain` and exposed through standard tool search paths.

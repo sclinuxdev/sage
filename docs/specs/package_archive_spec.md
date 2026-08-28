@@ -67,3 +67,8 @@ usr/share/man/man1/rg.1	0644	4912	0123456789abcdef0123456789abcdef0123456789abcd
 ## 4. 恒定代价检视保证 ($O(1)$ Inspect)
 
 打包时将 `.METADATA/` 目录的内容严格写入 Tar 归档的最开始位置。`sage-archive` 在检视或读取元数据时，仅需流式读取前数十 KB 数据并在遇到第一个 `data/` 条目时立即中止解压，消耗接近 $O(1)$ 的时间和极小内存。
+
+`manifest.toml` may include `features = ["name", ...]`. This sorted audit list
+records the selection baked into the immutable artifact. Conditional runtime
+dependencies are already expanded into `dependencies`, keeping repository lookup
+and the PubGrub hot path identical to ordinary packages.

@@ -37,3 +37,8 @@
 ├── 包 app-x 需要 python-requests (channel=python3.12, ver >= 2.30.0)
 └── 仓库中最高可用版本为 python-requests 2.28.0
 ```
+
+Build environments use `resolve_dependencies(channel, constraints)` with a
+synthetic root. Repeated constraints intersect before PubGrub begins. Feature
+runtime dependencies are folded into package manifests, so installation retains
+the same candidate ordering, backtracking, and causality reporting.

@@ -77,3 +77,7 @@ impl TemplateServiceGenerator {
 4. 调度 `sage-solver` 执行依赖求解，调度 `sage-archive` 执行两阶段文件原子交接。
 5. 通过 `TemplateServiceGenerator` 渲染并激活全量服务。
 6. 调用 `TriggerEngine` 扫描所有外部触发器并完成批量触发。
+
+The trigger engine exposes three auditable lifecycle boundaries: post-change,
+post-remove, and rebuild. Removal snapshots declarations before owned files
+disappear; rebuild handlers run after package, provider, and service convergence.

@@ -63,3 +63,26 @@ ccache_dir = "/var/cache/sage/ccache"
 ### 2.3 私有通道 RUNPATH
 
 非 `system` 子通道在拆包前自动扫描整个 DESTDIR。包含 SONAME 的 ELF 所在目录会成为私有库目录，`patchelf` 将动态 ELF 的 RUNPATH 改写为相对该文件的 `$ORIGIN` 路径。绝对 RPATH 不会继承到包中，因此构建主机路径不能泄漏进产物。
+
+### 2.4 Cross-target table
+
+```toml
+build = "x86_64-linux-gnu"
+
+[targets.aarch64-linux-gnu]
+cc = "aarch64-linux-gnu-gcc"
+cxx = "aarch64-linux-gnu-g++"
+ar = "aarch64-linux-gnu-ar"
+strip = "aarch64-linux-gnu-strip"
+arch = "aarch64"
+goos = "linux"
+goarch = "arm64"
+cmake_system_name = "Linux"
+endian = "little"
+rustflags = "-C target-feature=+crt-static"
+```
+
+Recipe `[build].target` selects an exact entry. Sage injects the compiler,
+binutils, Go platform, Meson cross file, CMake platform, and Cargo target into
+all inherited classes. Adding an architecture changes TOML only; Rust contains
+no architecture mapping table.

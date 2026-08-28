@@ -62,3 +62,14 @@ impl PayloadCarver {
    - 对每个独立切分后的子包 staging 目录，使用 `goblin` 扫描其内部的 ELF 动态可执行文件与动态库。
    - 提取 `DT_SONAME` 自动追加至该子包的 `provides = ["so:libfoo.so.1"]`。
    - 提取 `DT_NEEDED` 自动追加至该子包的 `dependencies = ["so:libbar.so.2"]`。
+
+## 6. Ephemeral inputs, features, and cross targets
+
+Explicit recipe dependencies, selected feature build dependencies, and rclass
+implicit dependencies form one constrained PubGrub root. Verified archives are
+checked for file conflicts, extracted with the dirfd safety rules, and mounted
+read-only at `/toolchain`; host LMDB state is untouched.
+
+Feature folding and target selection happen before runner composition, leaving
+phase execution free of per-feature and per-architecture branches. Cross tools
+and platform facts come exclusively from the configured target table.

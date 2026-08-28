@@ -88,7 +88,11 @@ graph TD
 | `sage-archive` | ~800 | `openat` 防逃逸、Rayon 并发流式解压、`files.idx` 校验 |
 | `sage-solver` | ~900 | PubGrub 适配、LMDB 零拷贝按需点查、Slot 正交求解 |
 | `sage-sys` | ~1,600 | 声明式 Glob 触发器、`rclass` Init 模板渲染、多 Python Channel 管理、Rebuild 调和 |
-| `sage-build` | ~1,500 | `bwrap` 沙箱驱动、`rclass` 阶段解释器、Ptrace 工具链白名单拦截、ELF 扫描 |
+| `sage-build` | ~1,700 | `bwrap` 沙箱、features、临时构建依赖、交叉工具链、产物切分与 ELF 扫描 |
 | `sage-repo` | ~600 | LMDB 索引下载解压与 Ed25519 验签、HTTP Range 多分块并发下载 |
 | `sage` (CLI) | ~500 | `clap` 命令行解析、`indicatif` 进度渲染与输出 |
-| **总计** | **~7,800** | **全链路 LMDB、零硬编码、极致紧凑、极高性能** |
+| **总计** | **< 9,000** | **全链路 LMDB、零硬编码、极致紧凑、极高性能** |
+
+The workspace Rust budget is 9,000 lines. Feature and architecture variability
+stays in schema-v1 TOML; Rust performs only generic validation, folding, solving,
+and execution.
