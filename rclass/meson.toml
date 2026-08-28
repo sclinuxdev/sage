@@ -9,6 +9,7 @@ allowed_linkers = ["lld", "mold", "ld"]
 [defaults]
 "args.meson_args" = ""
 "args.test" = "0"
+"args.cross_arg" = ""
 
 [phases]
 src_unpack = """
@@ -23,7 +24,23 @@ if [ -d "${SRC_DIR}/.patches" ]; then
     for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
 fi
 """
-src_configure = "meson setup \"${BUILD_DIR}\" \"${SRC_DIR}\" --prefix=/usr --libdir=lib --buildtype=release ${args.meson_args}"
+src_configure = """
+if [ -n "${TARGET_TRIPLE}" ]; then
+    cat > "${BUILD_DIR}/sage-cross.ini" <<EOF
+[binaries]
+c = '$CC'
+cpp = '$CXX'
+ar = '$AR'
+strip = '$STRIP'
+[host_machine]
+system = '${GOOS}'
+cpu_family = '${TARGET_ARCH}'
+cpu = '${TARGET_ARCH}'
+endian = '${TARGET_ENDIAN}'
+EOF
+fi
+meson setup "${BUILD_DIR}" "${SRC_DIR}" --prefix=/usr --libdir=lib --buildtype=release ${args.cross_arg} ${args.meson_args}
+"""
 src_compile = "meson compile -C \"${BUILD_DIR}\" -j \"${JOBS}\""
 src_test = "if [ \"${args.test}\" = 1 ]; then meson test -C \"${BUILD_DIR}\" --no-rebuild; fi"
 src_install = "DESTDIR=\"${DESTDIR}\" meson install -C \"${BUILD_DIR}\" --no-rebuild"

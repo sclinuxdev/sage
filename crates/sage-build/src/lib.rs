@@ -113,6 +113,9 @@ pub struct RecipeBuild {
     /// Extra private-library directories, relative to the installed channel root.
     #[serde(default)]
     pub private_library_dirs: Vec<PathBuf>,
+    /// Optional target triple. An empty value means a native build.
+    #[serde(default)]
+    pub target: String,
 }
 
 /// One opt-in build feature. Rules are folded before dependency solving or
@@ -465,6 +468,33 @@ pub struct BuildConfig {
     pub compiler_cache: String,
     #[serde(default)]
     pub ccache_dir: PathBuf,
+    /// Native machine triple used as the GNU build/host default.
+    #[serde(default)]
+    pub build: String,
+    /// Entirely data-driven cross toolchains keyed by target triple.
+    #[serde(default)]
+    pub targets: BTreeMap<String, CrossTarget>,
+}
+
+/// Commands and platform facts for one configured cross-compilation target.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrossTarget {
+    pub cc: String,
+    pub cxx: String,
+    pub ar: String,
+    pub strip: String,
+    pub arch: String,
+    pub goos: String,
+    pub goarch: String,
+    pub cmake_system_name: String,
+    #[serde(default = "default_endian")]
+    pub endian: String,
+    #[serde(default)]
+    pub rustflags: String,
+}
+
+fn default_endian() -> String {
+    "little".into()
 }
 
 fn default_pids() -> u32 {
@@ -486,6 +516,25 @@ impl BuildConfig {
             config.cxxflags.clone_from(&config.cflags);
         }
         Ok(config)
+    }
+
+    /// Selects a configured target and rejects unsafe triple spelling.
+    pub fn cross_target(&self, triple: &str) -> Result<Option<&CrossTarget>, BuildError> {
+        if triple.is_empty() {
+            return Ok(None);
+        }
+        if self.build.is_empty()
+            || !triple.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b'.' | b'-')
+            })
+        {
+            return Err(BuildError::InvalidSpec(
+                "cross builds require a safe target triple and configured build triple".into(),
+            ));
+        }
+        self.targets.get(triple).map(Some).ok_or_else(|| {
+            BuildError::InvalidSpec(format!("cross target '{triple}' is not configured"))
+        })
     }
 }
 
@@ -1164,6 +1213,31 @@ mod tests {
         assert!(script.find("configure").unwrap() < script.find("make -j").unwrap());
         assert!(script.contains("export PARALLEL='8'"));
         assert!(expand("${missing}", &vars).is_err());
+    }
+
+    #[test]
+    fn mainstream_rclasses_expand_for_native_builds() {
+        let variables = BTreeMap::from([
+            ("JOBS".into(), "4".into()),
+            ("CFLAGS".into(), "-O2".into()),
+            ("CXXFLAGS".into(), "-O2".into()),
+            ("LDFLAGS".into(), "".into()),
+            ("RUSTFLAGS".into(), "".into()),
+            ("SRC_DIR".into(), "/source".into()),
+            ("BUILD_DIR".into(), "/build".into()),
+            ("DESTDIR".into(), "/dest".into()),
+            ("TARGET_TRIPLE".into(), "".into()),
+            ("TARGET_ARCH".into(), "".into()),
+            ("TARGET_ENDIAN".into(), "".into()),
+            ("GOOS".into(), "".into()),
+        ]);
+        for name in ["autotools", "meson", "python", "go", "cmake", "cargo"] {
+            let class = Rclass::load(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../rclass/{name}.toml")),
+            )
+            .unwrap();
+            compose_runner(&[class], &variables).unwrap();
+        }
     }
 
     #[test]

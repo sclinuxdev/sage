@@ -986,6 +986,30 @@ async fn build_recipe(
     let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
     let config = sage_build::BuildConfig::load(&build_config_path)
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
+    let cross = config.cross_target(&recipe.build.target)?.cloned();
+    if let Some(target) = &cross {
+        recipe.build.args.extend([
+            (
+                "configure_triples".into(),
+                format!("--build={} --host={}", config.build, recipe.build.target),
+            ),
+            (
+                "cross_args".into(),
+                format!(
+                    "-DCMAKE_SYSTEM_NAME={} -DCMAKE_SYSTEM_PROCESSOR={}",
+                    target.cmake_system_name, target.arch
+                ),
+            ),
+            (
+                "cross_arg".into(),
+                "--cross-file /build/sage-cross.ini".into(),
+            ),
+            (
+                "target_arg".into(),
+                format!("--target {}", recipe.build.target),
+            ),
+        ]);
+    }
     let mut classes = Vec::new();
     for inherited in &recipe.build.inherit {
         classes.push(sage_build::Rclass::load(find_rclass(
@@ -1007,7 +1031,36 @@ async fn build_recipe(
             phases: BTreeMap::new(),
         });
     }
-    sage_build::validate_toolchain(&classes, &config)?;
+    let mut selected_config = config.clone();
+    if let Some(target) = &cross {
+        selected_config.cc.clone_from(&target.cc);
+        selected_config.cxx.clone_from(&target.cxx);
+        classes.push(sage_build::Rclass {
+            schema_version: sage_core::SCHEMA_VERSION,
+            name: "cross-target".into(),
+            description: "Configured cross compilation environment".into(),
+            implicit_build_dependencies: Vec::new(),
+            allowed_compilers: Vec::new(),
+            allowed_linkers: Vec::new(),
+            defaults: BTreeMap::new(),
+            env: BTreeMap::from([
+                ("CC".into(), target.cc.clone()),
+                ("CXX".into(), target.cxx.clone()),
+                ("AR".into(), target.ar.clone()),
+                ("STRIP".into(), target.strip.clone()),
+                ("GOOS".into(), target.goos.clone()),
+                ("GOARCH".into(), target.goarch.clone()),
+                (
+                    "RUSTFLAGS".into(),
+                    format!("{} {}", config.rustflags, target.rustflags)
+                        .trim()
+                        .into(),
+                ),
+            ]),
+            phases: BTreeMap::new(),
+        });
+    }
+    sage_build::validate_toolchain(&classes, &selected_config)?;
     let build_dependencies = sage_build::build_dependencies(&recipe, &classes, &features)?;
     if dry_run {
         println!(
@@ -1193,6 +1246,32 @@ fn build_variables(
         ("BUILD_DIR".into(), "/build".into()),
         ("DESTDIR".into(), "/dest".into()),
         ("PACKAGE_SLOT".into(), recipe.package.slot.clone()),
+        ("BUILD_TRIPLE".into(), config.build.clone()),
+        ("TARGET_TRIPLE".into(), recipe.build.target.clone()),
+        (
+            "TARGET_ARCH".into(),
+            config
+                .targets
+                .get(&recipe.build.target)
+                .map(|target| target.arch.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "TARGET_ENDIAN".into(),
+            config
+                .targets
+                .get(&recipe.build.target)
+                .map(|target| target.endian.clone())
+                .unwrap_or_default(),
+        ),
+        (
+            "GOOS".into(),
+            config
+                .targets
+                .get(&recipe.build.target)
+                .map(|target| target.goos.clone())
+                .unwrap_or_default(),
+        ),
     ]);
     variables.extend(
         recipe

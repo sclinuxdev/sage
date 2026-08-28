@@ -8,6 +8,7 @@ allowed_linkers = ["lld", "mold", "ld"]
 
 [defaults]
 "args.cmake_args" = ""
+"args.cross_args" = ""
 
 [env]
 CMAKE_BUILD_PARALLEL_LEVEL = "${JOBS}"
@@ -38,7 +39,7 @@ cmake -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_C_FLAGS="${CFLAGS}" \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
     -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
-    -DCMAKE_SYSTEM_PROCESSOR="${TARGET_ARCH}" \
+    ${args.cross_args} \
     ${args.cmake_args} \
     "${SRC_DIR}"
 """

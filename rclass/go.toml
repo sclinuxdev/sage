@@ -11,13 +11,12 @@ allowed_linkers = ["lld", "mold", "ld"]
 "args.ldflags" = "-s -w"
 "args.output" = "app"
 "args.packages" = "."
+"args.test" = "0"
 
 [env]
 GOMODCACHE = "${BUILD_DIR}/gomodcache"
 GOCACHE = "${BUILD_DIR}/gocache"
 CGO_ENABLED = "${args.cgo}"
-GOOS = "${GOOS}"
-GOARCH = "${GOARCH}"
 
 [phases]
 src_unpack = """
