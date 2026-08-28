@@ -1,0 +1,40 @@
+schema_version = 1
+name = "gradle"
+description = "Reproducible Gradle JVM build class"
+
+implicit_build_dependencies = ["jdk", "gradle"]
+allowed_compilers = ["clang", "gcc", "java", "javac"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.command" = "gradle"
+"args.tasks" = "assemble"
+"args.gradle_args" = "--no-daemon"
+"args.test" = "0"
+"args.test_task" = "test"
+"args.artifact" = "/source/build/libs/*.jar"
+"args.output" = "app.jar"
+
+[env]
+GRADLE_USER_HOME = "${BUILD_DIR}/gradle-home"
+
+[phases]
+src_unpack = """
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"; mkdir -p "$target"; input="${SRC_DIR}/.distfiles/$archive"
+    if [ -d "$input" ]; then cp -a "$input"/. "$target"/; else tar -xf "$input" --strip-components="$strip" -C "$target"; fi
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+fi
+"""
+src_compile = "cd \"${SRC_DIR}\" && ${args.command} --max-workers \"${JOBS}\" ${args.gradle_args} ${args.tasks}"
+src_test = "if [ \"${args.test}\" = 1 ]; then cd \"${SRC_DIR}\" && ${args.command} --max-workers \"${JOBS}\" ${args.gradle_args} ${args.test_task}; fi"
+src_install = """
+set -- ${args.artifact}
+[ "$#" -eq 1 ]
+install -Dm644 "$1" "${DESTDIR}/usr/share/java/${args.output}"
+"""

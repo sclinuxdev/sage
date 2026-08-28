@@ -156,7 +156,8 @@ depends_on = ${service.after_json}
 ## 5. Standard build-class library
 
 The standard library contains `autotools`, `meson`, `python` (PEP 517), `go`,
-`cmake`, `cargo`, and `kmod`. Tool defaults remain data-owned:
+`cmake`, `cargo`, `npm`, `pnpm`, `gradle`, `maven`, and `kmod`. Tool defaults
+remain data-owned:
 
 ```toml
 implicit_build_dependencies = ["meson", "ninja", "pkgconf"]
@@ -169,3 +170,21 @@ implicit_build_dependencies = ["meson", "ninja", "pkgconf"]
 Later rclasses and recipe arguments override defaults. Implicit dependencies
 participate in the constrained build-environment solve. The verified result is
 mounted read-only at `/toolchain` and exposed through standard tool search paths.
+
+### 5.1 Node.js classes
+
+`npm` requires `npm ci`; `pnpm` requires a frozen lockfile. Both isolate their
+cache/store below `/build`, run a configurable build and test script, pack one
+deterministic tarball, and install it below DESTDIR without running installation
+lifecycle scripts. Native addons use the ordinary configured C/C++ toolchain.
+
+### 5.2 JVM classes
+
+`gradle` uses a private `GRADLE_USER_HOME`, disables the daemon, and caps workers
+to `${JOBS}`. `maven` uses a private local repository, batch mode, and the same
+parallelism cap. Commands, tasks/goals, artifact glob, and final JAR name are
+recipe arguments. Artifact globs must resolve to exactly one file.
+
+Ecosystem dependency access follows the global sandbox rule: builds have no
+network unless the recipe explicitly sets `allow_network = true`. Vendored or
+pre-populated inputs therefore remain the reproducible default.

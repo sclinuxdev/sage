@@ -84,3 +84,8 @@ file transport is disabled for the superproject and recursive submodules, and
 the resulting checkout is exported without VCS metadata into the immutable
 distfile area. Build rclasses materialize archive and Git inputs in one ordered
 plan.
+
+Node and JVM classes reuse the same phase runner and build-only dependency
+environment. npm/pnpm caches, Gradle home, and the Maven local repository live
+under disposable `/build`; installation writes only to DESTDIR and package
+install lifecycle scripts are not executed.

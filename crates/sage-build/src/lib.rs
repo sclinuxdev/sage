@@ -1450,7 +1450,18 @@ mod tests {
             ("TARGET_ENDIAN".into(), "".into()),
             ("GOOS".into(), "".into()),
         ]);
-        for name in ["autotools", "meson", "python", "go", "cmake", "cargo"] {
+        for name in [
+            "autotools",
+            "meson",
+            "python",
+            "go",
+            "cmake",
+            "cargo",
+            "npm",
+            "pnpm",
+            "gradle",
+            "maven",
+        ] {
             let class = Rclass::load(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../rclass/{name}.toml")),
             )

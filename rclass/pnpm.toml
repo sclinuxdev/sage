@@ -1,0 +1,42 @@
+schema_version = 1
+name = "pnpm"
+description = "Frozen-lockfile Node.js pnpm build class"
+
+implicit_build_dependencies = ["nodejs", "pnpm"]
+allowed_compilers = ["clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.install_args" = "--frozen-lockfile"
+"args.build_script" = "build"
+"args.test" = "0"
+"args.test_script" = "test"
+
+[env]
+PNPM_HOME = "${BUILD_DIR}/pnpm-home"
+PNPM_STORE_DIR = "${BUILD_DIR}/pnpm-store"
+CI = "true"
+
+[phases]
+src_unpack = """
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"; mkdir -p "$target"; input="${SRC_DIR}/.distfiles/$archive"
+    if [ -d "$input" ]; then cp -a "$input"/. "$target"/; else tar -xf "$input" --strip-components="$strip" -C "$target"; fi
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+fi
+"""
+src_configure = "cd \"${SRC_DIR}\" && pnpm install ${args.install_args}"
+src_compile = "if [ -n \"${args.build_script}\" ]; then cd \"${SRC_DIR}\" && pnpm run \"${args.build_script}\"; fi"
+src_test = "if [ \"${args.test}\" = 1 ]; then cd \"${SRC_DIR}\" && pnpm run \"${args.test_script}\"; fi"
+src_install = """
+cd "${SRC_DIR}"
+pnpm pack --pack-destination "${BUILD_DIR}"
+set -- "${BUILD_DIR}"/*.tgz
+[ "$#" -eq 1 ]
+pnpm add --global --offline --global-dir "${DESTDIR}/usr/lib/node_modules" --global-bin-dir "${DESTDIR}/usr/bin" "$1"
+"""
