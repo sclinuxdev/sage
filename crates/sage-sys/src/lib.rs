@@ -43,6 +43,7 @@ fn validate_schema(version: u32) -> Result<(), SysError> {
     }
 }
 
+include!("triggers.rs");
 include!("services.rs");
 include!("state.rs");
 

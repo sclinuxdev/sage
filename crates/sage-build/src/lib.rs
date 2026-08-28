@@ -52,6 +52,7 @@ pub enum BuildError {
 }
 
 include!("recipe.rs");
+include!("sources.rs");
 include!("execution.rs");
 include!("payload.rs");
 
