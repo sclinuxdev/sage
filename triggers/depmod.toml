@@ -4,4 +4,5 @@ description = "Regenerate dependency maps for changed kernel module slots"
 on_paths = ["usr/lib/modules/**"]
 exec = ["/sbin/depmod", "-a", "${path[3]}"]
 priority = 20
+events = ["post-change", "post-remove"]
 ignore_missing_binary = true

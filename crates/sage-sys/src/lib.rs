@@ -52,8 +52,24 @@ pub struct TriggerSpec {
     pub on_paths: Vec<String>,
     pub exec: Vec<String>,
     pub priority: u32,
+    /// Transaction boundaries at which this trigger is eligible to run.
+    #[serde(default = "default_trigger_events")]
+    pub events: Vec<TriggerEvent>,
     #[serde(default)]
     pub ignore_missing_binary: bool,
+}
+
+/// Safe transaction boundaries exposed to declarative lifecycle handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriggerEvent {
+    PostChange,
+    PostRemove,
+    Rebuild,
+}
+
+fn default_trigger_events() -> Vec<TriggerEvent> {
+    vec![TriggerEvent::PostChange, TriggerEvent::PostRemove]
 }
 
 pub struct TriggerEngine;
@@ -88,8 +104,21 @@ impl TriggerEngine {
         modified_paths: &[PathBuf],
         sysroot: &Path,
     ) -> Result<Vec<String>, SysError> {
+        Self::execute_triggers_for(triggers, modified_paths, sysroot, TriggerEvent::PostChange)
+    }
+
+    /// Executes triggers eligible for one explicit transaction boundary.
+    pub fn execute_triggers_for(
+        triggers: &[TriggerSpec],
+        modified_paths: &[PathBuf],
+        sysroot: &Path,
+        event: TriggerEvent,
+    ) -> Result<Vec<String>, SysError> {
         let mut executed = Vec::new();
         for trigger in triggers {
+            if !trigger.events.contains(&event) {
+                continue;
+            }
             let patterns: Vec<_> = trigger
                 .on_paths
                 .iter()
@@ -788,14 +817,28 @@ mod tests {
             toml::from_str(include_str!("../../../triggers/depmod.toml")).unwrap();
         trigger.exec[0] = "/usr/bin/record-slot".into();
         trigger.ignore_missing_binary = false;
+        trigger.events = vec![TriggerEvent::PostRemove];
         let modified = [
             PathBuf::from("usr/lib/modules/6.12/a.ko"),
             PathBuf::from("usr/lib/modules/6.12/b.ko"),
             PathBuf::from("usr/lib/modules/6.13/c.ko"),
         ];
 
+        assert!(TriggerEngine::execute_triggers(
+            std::slice::from_ref(&trigger),
+            &modified,
+            root.path()
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(
-            TriggerEngine::execute_triggers(&[trigger], &modified, root.path()).unwrap(),
+            TriggerEngine::execute_triggers_for(
+                &[trigger],
+                &modified,
+                root.path(),
+                TriggerEvent::PostRemove,
+            )
+            .unwrap(),
             ["depmod"]
         );
         assert_eq!(

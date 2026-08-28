@@ -576,7 +576,12 @@ async fn publish_packages(
         }
     }
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
-    sage_sys::TriggerEngine::execute_triggers(&triggers, &modified, root)?;
+    sage_sys::TriggerEngine::execute_triggers_for(
+        &triggers,
+        &modified,
+        root,
+        sage_sys::TriggerEvent::PostChange,
+    )?;
     database.finish_journal(&op_id)?;
     Ok(())
 }
@@ -660,6 +665,9 @@ fn remove_packages(
     if dry_run {
         return Ok(());
     }
+    // Keep declarations in memory before package-owned trigger files disappear;
+    // post-remove actions must observe the completed filesystem transaction.
+    let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
     let database = sage_db::SageDatabase::open(&db_path)?;
     let timestamp = unix_timestamp()?;
     let op_id = format!("remove-{}-{timestamp}", std::process::id());
@@ -686,8 +694,12 @@ fn remove_packages(
             modified.push(PathBuf::from(relative));
         }
     }
-    let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
-    sage_sys::TriggerEngine::execute_triggers(&triggers, &modified, root)?;
+    sage_sys::TriggerEngine::execute_triggers_for(
+        &triggers,
+        &modified,
+        root,
+        sage_sys::TriggerEvent::PostRemove,
+    )?;
     database.finish_journal(&op_id)?;
     Ok(())
 }
