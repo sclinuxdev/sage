@@ -271,14 +271,24 @@ impl FromStr for Dependency {
         if fields.is_empty() || fields.len() > 3 {
             return Err(CoreError::InvalidDependency(input.into()));
         }
-        let (channel, package) = fields[0]
-            .rsplit_once('/')
-            .map_or((None, fields[0]), |(channel, package)| {
-                (Some(channel.into()), package)
-            });
-        let (name, slot) = package
-            .split_once(':')
-            .map_or((package, None), |(name, slot)| (name, Some(slot.into())));
+        // Provider symbols are opaque. For concrete packages the final slash
+        // separates an optional channel, and the colon separates an optional slot.
+        let (channel, package) = if fields[0].starts_with("virtual/") {
+            (None, fields[0])
+        } else {
+            fields[0]
+                .rsplit_once('/')
+                .map_or((None, fields[0]), |(channel, package)| {
+                    (Some(channel.into()), package)
+                })
+        };
+        let (name, slot) = if package.starts_with("so:") {
+            (package, None)
+        } else {
+            package
+                .split_once(':')
+                .map_or((package, None), |(name, slot)| (name, Some(slot.into())))
+        };
         if name.is_empty() {
             return Err(CoreError::InvalidDependency(input.into()));
         }
@@ -442,6 +452,12 @@ mod tests {
         assert!(dep
             .op
             .matches(&"2.33-1".parse().unwrap(), dep.version.as_ref()));
+        let virtual_dep: Dependency = "virtual/libc".parse().unwrap();
+        assert_eq!(virtual_dep.name, "virtual/libc");
+        assert!(virtual_dep.channel.is_none());
+        let soname: Dependency = "so:libc.so.6".parse().unwrap();
+        assert_eq!(soname.name, "so:libc.so.6");
+        assert!(soname.slot.is_none());
     }
 
     #[test]
