@@ -1536,6 +1536,8 @@ dependencies = [
  "sage-db",
  "sage-solver",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "toml",
  "tracing",
