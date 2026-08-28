@@ -60,6 +60,9 @@ pub struct PackageManifest {
     pub provides: Vec<String>,
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Build-time feature selection baked into this immutable artifact.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 fn default_slot() -> String {

@@ -75,7 +75,15 @@ pub enum Commands {
         action: RepoAction,
     },
     /// Build binary package archive (*.pkg.tar.zst) from recipe.
-    Build { recipe_dir: PathBuf },
+    Build {
+        recipe_dir: PathBuf,
+        /// Enable a named recipe feature; may be repeated.
+        #[arg(long = "feature")]
+        features: Vec<String>,
+        /// Do not enable features marked as default by the recipe.
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Inspect configured software channels.
     Channel {
         #[command(subcommand)]
@@ -195,8 +203,19 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Build { recipe_dir } => {
-            build_recipe(&cli.root, &recipe_dir, cli.dry_run).await?;
+        Commands::Build {
+            recipe_dir,
+            features,
+            no_default_features,
+        } => {
+            build_recipe(
+                &cli.root,
+                &recipe_dir,
+                &features,
+                !no_default_features,
+                cli.dry_run,
+            )
+            .await?;
         }
         Commands::Channel { action } => match action {
             ChannelAction::List => list_channels(&cli.root)?,
@@ -931,13 +950,27 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
     Ok(())
 }
 
-async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<()> {
+async fn build_recipe(
+    root: &Path,
+    recipe_dir: &Path,
+    requested_features: &[String],
+    use_default_features: bool,
+    dry_run: bool,
+) -> Result<()> {
     let recipe_path = if recipe_dir.is_dir() {
         recipe_dir.join("recipe.toml")
     } else {
         recipe_dir.to_path_buf()
     };
-    let recipe = sage_build::RecipeSpec::load(&recipe_path)?;
+    let mut recipe = sage_build::RecipeSpec::load(&recipe_path)?;
+    let features = recipe.effective_features(requested_features, use_default_features)?;
+    recipe
+        .package
+        .dependencies
+        .extend(features.dependencies.clone());
+    recipe.package.dependencies.sort();
+    recipe.package.dependencies.dedup();
+    recipe.build.args.extend(features.args.clone());
     let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
     let config = sage_build::BuildConfig::load(&build_config_path)
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
@@ -948,6 +981,19 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
             root,
             inherited,
         )?)?);
+    }
+    if !features.env.is_empty() {
+        classes.push(sage_build::Rclass {
+            schema_version: sage_core::SCHEMA_VERSION,
+            name: "selected-features".into(),
+            description: "Environment selected by recipe features".into(),
+            implicit_build_dependencies: Vec::new(),
+            allowed_compilers: Vec::new(),
+            allowed_linkers: Vec::new(),
+            defaults: BTreeMap::new(),
+            env: features.env.clone(),
+            phases: BTreeMap::new(),
+        });
     }
     sage_build::validate_toolchain(&classes, &config)?;
     if dry_run {
@@ -1011,7 +1057,13 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
     let areas = sage_build::PayloadCarver::carve_packages(&destdir, &recipe)?;
     let output_dir = recipe_path.parent().unwrap_or(Path::new("."));
     for area in areas {
-        package_staging(&recipe, &area, output_dir, config.source_date_epoch)?;
+        package_staging(
+            &recipe,
+            &area,
+            output_dir,
+            config.source_date_epoch,
+            &features.enabled,
+        )?;
     }
     Ok(())
 }
@@ -1084,6 +1136,7 @@ fn package_staging(
     area: &sage_build::PackageStagingArea,
     output_dir: &Path,
     build_time: u64,
+    features: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let data = area.path().join("data");
     let records = sage_archive::build_file_index(&data)?;
@@ -1129,6 +1182,7 @@ fn package_staging(
         dependencies,
         provides,
         conflicts: Vec::new(),
+        features: features.iter().cloned().collect(),
     };
     std::fs::write(
         metadata.join("manifest.toml"),

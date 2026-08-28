@@ -112,6 +112,32 @@ pub struct RecipeBuild {
     pub private_library_dirs: Vec<PathBuf>,
 }
 
+/// One opt-in build feature. Rules are folded before dependency solving or
+/// runner generation, keeping feature checks out of all execution hot paths.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FeatureSpec {
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub build_dependencies: Vec<String>,
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Fully folded feature selection consumed by the solver and runner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveFeatures {
+    pub enabled: BTreeSet<String>,
+    pub dependencies: Vec<String>,
+    pub build_dependencies: Vec<String>,
+    pub args: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubpackageSpec {
     pub name: String,
@@ -163,6 +189,8 @@ pub struct RecipeSpec {
     pub subpackages: Vec<SubpackageSpec>,
     #[serde(default)]
     pub sysusers: Vec<SysuserSpec>,
+    #[serde(default)]
+    pub features: BTreeMap<String, FeatureSpec>,
 }
 
 impl RecipeSpec {
@@ -208,6 +236,11 @@ impl RecipeSpec {
         for user in &recipe.sysusers {
             user.validate()?;
         }
+        if recipe.features.keys().any(|name| !valid_feature_name(name)) {
+            return Err(BuildError::InvalidSpec(
+                "feature names must use lowercase ASCII letters, digits, '_' or '-'".into(),
+            ));
+        }
         reject_lifecycle_scripts(path.parent().unwrap_or_else(|| Path::new(".")))?;
         let mut names = BTreeSet::from([recipe.package.name.as_str()]);
         if recipe.subpackages.iter().any(|subpackage| {
@@ -245,6 +278,54 @@ impl RecipeSpec {
     pub fn uses_private_channel(&self) -> bool {
         self.package.channel != "system" && !self.package.channel.ends_with("/system")
     }
+
+    /// Validates and folds a feature selection in bytewise name order.
+    pub fn effective_features(
+        &self,
+        requested: &[String],
+        use_defaults: bool,
+    ) -> Result<EffectiveFeatures, BuildError> {
+        let mut enabled: BTreeSet<_> = requested.iter().cloned().collect();
+        if use_defaults {
+            enabled.extend(
+                self.features
+                    .iter()
+                    .filter(|(_, rule)| rule.default)
+                    .map(|(name, _)| name.clone()),
+            );
+        }
+        if let Some(name) = enabled
+            .iter()
+            .find(|name| !self.features.contains_key(*name))
+        {
+            return Err(BuildError::InvalidSpec(format!("unknown feature '{name}'")));
+        }
+        let mut result = EffectiveFeatures {
+            enabled,
+            ..EffectiveFeatures::default()
+        };
+        for name in &result.enabled {
+            let rule = &self.features[name];
+            result.dependencies.extend(rule.dependencies.clone());
+            result
+                .build_dependencies
+                .extend(rule.build_dependencies.clone());
+            result.args.extend(rule.args.clone());
+            result.env.extend(rule.env.clone());
+        }
+        result.dependencies.sort();
+        result.dependencies.dedup();
+        result.build_dependencies.sort();
+        result.build_dependencies.dedup();
+        Ok(result)
+    }
+}
+
+fn valid_feature_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// Stable sandbox filename for an independently verified source archive.
@@ -1039,6 +1120,53 @@ mod tests {
     }
 
     #[test]
+    fn features_fold_defaults_and_requested_rules_deterministically() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("source.tar"), b"unused").unwrap();
+        fs::write(
+            directory.path().join("recipe.toml"),
+            format!(
+                r#"schema_version=1
+[package]
+name="demo"
+version="1.0"
+release=1
+description="demo"
+license="MIT"
+channel="system"
+arch="amd64"
+[source]
+url="file://{}"
+sha256="{}"
+[features.tls]
+default=true
+dependencies=["openssl"]
+build_dependencies=["pkgconf"]
+[features.gui]
+dependencies=["gtk4"]
+[features.gui.args]
+frontend="gtk"
+"#,
+                directory.path().join("source.tar").display(),
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(directory.path().join("recipe.toml")).unwrap();
+        let selected = recipe.effective_features(&["gui".into()], true).unwrap();
+        assert_eq!(
+            selected.enabled.into_iter().collect::<Vec<_>>(),
+            ["gui", "tls"]
+        );
+        assert_eq!(selected.dependencies, ["gtk4", "openssl"]);
+        assert_eq!(selected.build_dependencies, ["pkgconf"]);
+        assert_eq!(selected.args["frontend"], "gtk");
+        assert!(recipe
+            .effective_features(&["missing".into()], false)
+            .is_err());
+    }
+
+    #[test]
     fn recipe_accepts_ordered_multiple_sources() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recipe.toml");
@@ -1247,6 +1375,7 @@ shell="/usr/bin/nologin"
             }),
             sources: vec![],
             build: RecipeBuild::default(),
+            features: BTreeMap::new(),
             subpackages: vec![
                 SubpackageSpec {
                     name: "x-libs".into(),
