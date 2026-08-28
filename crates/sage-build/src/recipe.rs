@@ -245,26 +245,47 @@ pub struct RecipeSpec {
 pub struct BuildUnit {
     pub recipe: PathBuf,
     pub name: String,
-    packages: BTreeSet<String>,
-    produces: BTreeSet<String>,
-    consumes: BTreeSet<String>,
+    channel: String,
+    packages: BTreeSet<sage_core::PackageKey>,
+    produces: BTreeSet<BuildSymbol>,
+    consumes: BTreeSet<BuildSymbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum BuildSymbol {
+    Package(sage_core::PackageKey),
+    Provided(String),
 }
 
 impl BuildUnit {
     /// Folds default features and converts all dependency classes into graph edges.
     pub fn from_recipe(path: PathBuf, recipe: &RecipeSpec) -> Result<Self, BuildError> {
         let features = recipe.effective_features(&[], true)?;
-        let mut packages = BTreeSet::from([recipe.package.name.clone()]);
+        let mut packages = BTreeSet::from([sage_core::PackageKey::new(
+            &recipe.package.channel,
+            &recipe.package.name,
+            &recipe.package.slot,
+        )]);
         packages.extend(
             recipe
                 .subpackages
                 .iter()
-                .map(|package| package.name.clone()),
+                .map(|package| {
+                    sage_core::PackageKey::new(
+                        &recipe.package.channel,
+                        &package.name,
+                        &recipe.package.slot,
+                    )
+                }),
         );
-        let mut produces = packages.clone();
-        produces.extend(recipe.package.provides.clone());
+        let mut produces: BTreeSet<_> = packages
+            .iter()
+            .cloned()
+            .map(BuildSymbol::Package)
+            .collect();
+        produces.extend(recipe.package.provides.iter().cloned().map(BuildSymbol::Provided));
         for package in &recipe.subpackages {
-            produces.extend(package.provides.clone());
+            produces.extend(package.provides.iter().cloned().map(BuildSymbol::Provided));
         }
         let mut declarations: Vec<String> = recipe
             .package
@@ -285,13 +306,14 @@ impl BuildUnit {
             .map(|value| {
                 value
                     .parse::<sage_core::Dependency>()
-                    .map(|dependency| dependency.name)
+                    .map(|dependency| dependency_symbol(&recipe.package.channel, dependency))
                     .map_err(|error| BuildError::InvalidSpec(error.to_string()))
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
             recipe: path,
             name: recipe.package.name.clone(),
+            channel: recipe.package.channel.clone(),
             packages,
             produces,
             consumes,
@@ -308,9 +330,22 @@ impl BuildUnit {
                 value.parse().map_err(|error: sage_core::CoreError| {
                     BuildError::InvalidSpec(error.to_string())
                 })?;
-            self.consumes.insert(dependency.name);
+            self.consumes
+                .insert(dependency_symbol(&self.channel, dependency));
         }
         Ok(())
+    }
+}
+
+fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildSymbol {
+    if dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:") {
+        BuildSymbol::Provided(dependency.name)
+    } else {
+        BuildSymbol::Package(sage_core::PackageKey::new(
+            dependency.channel.as_deref().unwrap_or(channel),
+            dependency.name,
+            dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT),
+        ))
     }
 }
 
@@ -334,7 +369,12 @@ impl BuildGraph {
         let mut latest = BTreeMap::new();
         for path in recipes {
             let recipe = RecipeSpec::load(&path)?;
-            let key = (recipe.package.name.clone(), recipe.package.arch.clone());
+            let key = (
+                recipe.package.channel.clone(),
+                recipe.package.name.clone(),
+                recipe.package.slot.clone(),
+                recipe.package.arch.clone(),
+            );
             let version = sage_core::Version::new(
                 recipe.package.epoch,
                 recipe.package.version.clone(),
@@ -366,7 +406,7 @@ impl BuildGraph {
                 }
             }
         }
-        let mut producers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut producers: BTreeMap<BuildSymbol, Vec<usize>> = BTreeMap::new();
         for (index, unit) in units.iter().enumerate() {
             for symbol in &unit.produces {
                 producers.entry(symbol.clone()).or_default().push(index);

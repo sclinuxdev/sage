@@ -3,7 +3,7 @@
 - **Crate 路径**: `crates/sage-build`
 - **选用生态**: `bwrap` (Bubblewrap), `fakeroot`, `goblin` (ELF 动态符号解析)
 - **代码预算**: ~1,700 行
-- **职责**: 驱动 Bubblewrap 密闭构建沙箱、解析执行 `rclass` 阶段脚本、执行 Ptrace 工具链审计、**单配方多包产物切分 (Payload Carving)** 与自动化 ELF 依赖扫描。
+- **职责**: 驱动 Bubblewrap 密闭构建沙箱、执行 `rclass` 阶段脚本、记录受管工具 wrapper 溯源、切分多包产物并扫描 ELF。
 
 ---
 
@@ -33,7 +33,7 @@
 
 ## 3. 单配方多包切分流水线 (`PayloadCarver`)
 
-构建完成后，`DESTDIR` 包含完整安装树。`sage-build` 按以下算法在内存与文件系统中执行单次构建、零拷贝多包切分：
+构建完成后，`DESTDIR` 包含完整安装树。`sage-build` 按以下算法执行单次构建和互斥多包切分；当前实现使用常规文件复制，不宣称 reflink：
 
 ```rust
 pub struct PayloadCarver;
@@ -53,11 +53,11 @@ impl PayloadCarver {
 
 ---
 
-## 4. Ptrace/Seccomp 工具链审计与 ELF 符号扫描
+## 4. 工具 wrapper 溯源与 ELF 符号扫描
 
-1. **工具链审计**:
-   - 追踪沙箱内派生子进程的 `execve` 系统调用。
-   - 对比 `allowed_compilers` 与 `allowed_linkers` 白名单，拦截未授权编译器的非法偷渡。
+1. **工具链溯源**:
+   - 为配置的编译器与链接器安装窄 wrapper，仅在实际执行时记录工具。
+   - 当前实现不使用 ptrace，也不宣称观察 wrapper 之外的所有 `execve`。
 2. **自动化 ELF 扫描 (`ElfScanner`)**:
    - 对每个独立切分后的子包 staging 目录，使用 `goblin` 扫描其内部的 ELF 动态可执行文件与动态库。
    - 提取 `DT_SONAME` 自动追加至该子包的 `provides = ["so:libfoo.so.1"]`。

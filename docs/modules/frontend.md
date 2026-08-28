@@ -91,7 +91,7 @@ pub enum Commands {
     Build {
         recipe_dir: PathBuf,
     },
-    /// LMDB 零拷贝极速查询 (installed, owner, info)
+    /// LMDB-backed state queries (installed, owner, info)
     Query {
         #[command(subcommand)]
         query: QueryAction,

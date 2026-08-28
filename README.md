@@ -16,8 +16,8 @@
 ## Key Features / 核心特性
 
 - **Unified LMDB Engine / 全链路统一 LMDB 极速存储**:
-  Local state (`/var/lib/sage/data.mdb`) and remote indexes (`index.mdb`) use LMDB (`heed`) for zero-copy, microsecond mmap queries and ACID transactions.  
-  本地已安装状态与软件源远端索引全量采用 LMDB 数据库，实现零反序列化微秒级 `mmap` 读取与 ACID 事务。
+  Local state and remote indexes use mmap-backed LMDB (`heed`) with ACID writes; schema-v1 values are compact Bincode records decoded after lookup.
+  本地状态与远端索引采用 mmap 支持的 LMDB 与 ACID 写事务；schema-v1 值在点查后由 Bincode 解码。
 
 - **Purely Data-Driven / 绝对零硬编码与数据驱动**:
   Triggers, init daemon generation, toolchains, and mirror URLs are purely configured via TOML specs and `rclass` templates. No hardcoded logic in Rust.  
@@ -32,12 +32,12 @@
   以 `/etc/sage/system.toml` 为系统唯一真相源，自动化执行差集求解、双阶段文件原子替换、服务配置渲染与触发器执行。
 
 - **Hermetic Sandbox & Carving / 密闭沙箱与单配方多包切分**:
-  `bwrap` sandboxed builds with Ptrace toolchain auditing, automatic ELF symbol resolution (`so:libfoo`), and single-build zero-duplicate payload carving (`libs`, `dev`, `doc`).  
-  基于 Bubblewrap 的密闭沙箱，支持 Ptrace 工具链审计、ELF 动态符号反查以及单次编译零重复的多包切分。
+  `bwrap` sandboxed builds with configured-tool wrapper provenance, automatic ELF symbol resolution (`so:libfoo`), and mutually exclusive payload carving (`libs`, `dev`, `doc`).
+  基于 Bubblewrap 的密闭沙箱，记录受管工具 wrapper 的构建溯源，支持 ELF 动态符号反查与互斥多包切分。
 
 - **Ultra Compact / 极致精简**:
-  Strict engineering budget controlling total workspace Rust code under **9,000 lines of code**.
-  严格控制全 Workspace Rust 代码总量在 **9,000 行以内**。
+  CI keeps production files under `crates/*/src/**/*.rs` within **9,000 physical lines**; tests are excluded from this implementation budget.
+  CI 将 `crates/*/src/**/*.rs` 生产代码控制在 **9,000 个物理行**内；测试不计入实现预算。
 
 ---
 

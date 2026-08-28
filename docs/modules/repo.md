@@ -22,7 +22,7 @@ pub async fn sync_channel_index(
 2. **原子更新**:
    - 若索引发生变化，流式下载 `index.mdb.zst`，解压至临时影子文件并由 `ed25519_dalek::Verifier` 进行公钥验签。
    - 验签通过后，通过原子重命名替换 `/var/cache/sage/channels/<channel>/index.mdb`。
-3. **只读挂载**: 以只读无锁模式（`MDB_RDONLY | MDB_NOLOCK`）打开 `heed::Env` 并移交 `sage-solver` 进行零拷贝点查。
+3. **只读挂载**: 以只读无锁模式（`MDB_RDONLY | MDB_NOLOCK`）打开 `heed::Env`；既支持 `name:slot` 点查，也支持当前 CLI 使用的有序 release 扫描。
 
 ---
 

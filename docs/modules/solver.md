@@ -3,7 +3,7 @@
 - **Crate 路径**: `crates/sage-solver`
 - **选用生态**: `pubgrub` crate, `heed` (LMDB 读取)
 - **代码预算**: ~900 行
-- **职责**: 适配 PubGrub 依赖求解器，直接对远端与本地 **LMDB 索引库** 执行零拷贝按需查询，原生支持版本化 Sub-channel 隔离、跨通道基础继承与因果诊断树。
+- **职责**: 适配 PubGrub 依赖求解器，消费经过架构过滤的内存候选集合，支持 Slot、跨通道基础继承、provider 回溯与因果诊断树。
 
 ---
 
@@ -19,9 +19,9 @@
 
 ---
 
-## 2. 极致性能：整数化与预筛 (High Performance Pruning)
+## 2. 候选预筛与排序 (Candidate Pruning)
 
-1. **Interned 符号匹配**: 将所有 `Channel`（如 `main/python3.12`）、`Name`、`Slot` 与依赖约束在进入求解主循环前完成符号整数化映射，热路径比较全部为整型比较。
+1. **当前表示**: repository 记录先按目标架构过滤，再解码为拥有所有权的 `Package`/`PackageKey` 集合；求解热路径使用 Rust 字符串键，尚未使用 symbol interning。
 2. **候选打分策略**:
    - 系统锁定目标优先 (+1000)。
    - 同名包优先 (+100)。

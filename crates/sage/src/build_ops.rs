@@ -427,8 +427,14 @@ async fn build_recipe(
         toolchain,
         target_sysroot,
     };
-    let managed_build_tools =
-        sage_build::SandboxRunner::new(&selected_config).run(&paths, recipe.build.allow_network)?;
+    // Pure data packages run no command, so entering bwrap adds no isolation.
+    let managed_build_tools = if recipe.source_inputs().next().is_none()
+        && classes.iter().all(|class| class.phases.is_empty())
+    {
+        Vec::new()
+    } else {
+        sage_build::SandboxRunner::new(&selected_config).run(&paths, recipe.build.allow_network)?
+    };
     sage_build::stage_declarative_install(&destdir, &source, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
@@ -694,7 +700,11 @@ fn package_staging(
         build_time,
         dependencies,
         provides,
-        conflicts: Vec::new(),
+        conflicts: if area.name == recipe.package.name {
+            recipe.package.conflicts.clone()
+        } else {
+            Vec::new()
+        },
         features: features.iter().cloned().collect(),
         managed_build_tools: managed_build_tools.to_vec(),
     };
@@ -703,8 +713,12 @@ fn package_staging(
         toml::to_string_pretty(&manifest)?,
     )?;
     let output = output_dir.join(format!(
-        "{}-{}-{}-{}.pkg.tar.zst",
-        area.name, recipe.package.version, recipe.package.release, recipe.package.arch
+        "{}-{}-{}-{}-{}.pkg.tar.zst",
+        area.name,
+        recipe.package.slot,
+        recipe.package.version,
+        recipe.package.release,
+        recipe.package.arch
     ));
     sage_archive::create_package(area.path(), &output, 15)?;
     println!("Created {}", output.display());

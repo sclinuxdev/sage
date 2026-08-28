@@ -11,6 +11,7 @@ mod db_tests {
             installed_size: 10,
             dependencies: vec![],
             provides: vec![format!("cmd:{name}")],
+            conflicts: vec![],
             files: vec![file.into()],
             config_hashes: BTreeMap::new(),
         }
@@ -65,13 +66,17 @@ mod db_tests {
     #[test]
     fn journals_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let record = JournalRecord {
-            op_id: "op-1".into(),
-            stage: "publish".into(),
-            affected_packages: vec![],
-            journal_sha256: "00".repeat(32),
-            timestamp: 1,
-        };
+        let record = JournalRecord::new(
+            "op-1".into(),
+            "packages",
+            JournalAction::Install {
+                architecture: "amd64".into(),
+                changes: vec![],
+                previous_packages: vec![],
+                modified_paths: vec![],
+                previous_alternative_documents: vec![],
+            },
+        );
         SageDatabase::open(dir.path())
             .unwrap()
             .write_journal(&record)
@@ -79,5 +84,22 @@ mod db_tests {
         let reopened = SageDatabase::open(dir.path()).unwrap();
         assert_eq!(reopened.pending_journals().unwrap(), vec![record]);
         assert!(reopened.finish_journal("op-1").unwrap());
+    }
+
+    #[test]
+    fn journal_integrity_covers_identity_and_recovery_stage() {
+        let action = JournalAction::Install {
+            architecture: "amd64".into(),
+            changes: vec![],
+            previous_packages: vec![],
+            modified_paths: vec![],
+            previous_alternative_documents: vec![],
+        };
+        let mut record = JournalRecord::new("op-1".into(), "packages", action.clone());
+        record.stage = "triggers".into();
+        assert!(matches!(record.validate(), Err(DbError::InvalidJournal(_))));
+        let mut record = JournalRecord::new("op-1".into(), "packages", action);
+        record.op_id = "op-2".into();
+        assert!(matches!(record.validate(), Err(DbError::InvalidJournal(_))));
     }
 }

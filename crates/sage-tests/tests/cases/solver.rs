@@ -46,6 +46,28 @@ mod solver_tests {
     }
 
     #[test]
+    fn virtual_dependencies_filter_concrete_provider_versions() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release(
+            "main/system",
+            "app",
+            "1-1",
+            &["virtual/libc >= 2-1"],
+        ));
+        let mut old = release("main/system", "glibc", "1-1", &[]);
+        old.provides.push("virtual/libc".into());
+        universe.insert(old);
+        let mut current = release("main/system", "musl", "2-1", &[]);
+        current.provides.push("virtual/libc".into());
+        universe.insert(current);
+        let solution = SageSolver::new(&universe)
+            .resolve(&[PackageKey::new("main/system", "app", "0")])
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/system", "musl", "0")));
+        assert!(!solution.contains_key(&PackageKey::new("main/system", "glibc", "0")));
+    }
+
+    #[test]
     fn locked_satisfying_version_wins_over_newest() {
         let mut universe = PackageUniverse::default();
         universe.insert(release("main/system", "lib", "1.0-1", &[]));
@@ -71,5 +93,62 @@ mod solver_tests {
             solution[&PackageKey::new("main/system", "cmake", "0")],
             "3.20-1".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn configured_virtual_provider_is_preferred_but_can_backtrack() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release("main/system", "app", "1-1", &["virtual/libc"]));
+        let mut glibc = release("main/system", "glibc", "1-1", &[]);
+        glibc.provides.push("virtual/libc".into());
+        universe.insert(glibc);
+        let mut musl = release("main/system", "musl", "1-1", &[]);
+        musl.provides.push("virtual/libc".into());
+        universe.insert(musl);
+        let app = PackageKey::new("main/system", "app", "0");
+        let preferred = PackageKey::new("main/system", "musl", "0");
+        let solution = SageSolver::new(&universe)
+            .prefer_providers([("virtual/libc".into(), preferred.clone())])
+            .resolve(std::slice::from_ref(&app))
+            .unwrap();
+        assert!(solution.contains_key(&preferred));
+
+        let mut guard = release("main/system", "guard", "1-1", &[]);
+        guard.conflicts.push("musl".into());
+        universe.insert(guard);
+        let solution = SageSolver::new(&universe)
+            .prefer_providers([("virtual/libc".into(), preferred)])
+            .resolve(&[app, PackageKey::new("main/system", "guard", "0")])
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/system", "glibc", "0")));
+        assert!(!solution.contains_key(&PackageKey::new("main/system", "musl", "0")));
+    }
+
+    #[test]
+    fn package_conflict_participates_in_version_backtracking() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release("main/system", "app", "1-1", &[]));
+        let mut newest = release("main/system", "app", "2-1", &[]);
+        newest.conflicts.push("lib".into());
+        universe.insert(newest);
+        universe.insert(release("main/system", "lib", "1-1", &[]));
+        let app = PackageKey::new("main/system", "app", "0");
+        let solution = SageSolver::new(&universe)
+            .resolve(&[app.clone(), PackageKey::new("main/system", "lib", "0")])
+            .unwrap();
+        assert_eq!(solution[&app], "1-1".parse().unwrap());
+    }
+
+    #[test]
+    fn malformed_conflicts_are_rejected_instead_of_ignored() {
+        let mut universe = PackageUniverse::default();
+        let mut app = release("main/system", "app", "1-1", &[]);
+        app.conflicts.push("lib >= invalid".into());
+        universe.insert(app);
+        let error = SageSolver::new(&universe)
+            .resolve(&[PackageKey::new("main/system", "app", "0")])
+            .unwrap_err();
+        assert!(matches!(error, SolverError::InvalidMetadata(_)));
+        assert!(error.to_string().contains("lib >= invalid"));
     }
 }
