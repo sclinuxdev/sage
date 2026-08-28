@@ -556,7 +556,7 @@ impl RecipeSpec {
             result
                 .target_dependencies
                 .extend(rule.target_dependencies.clone());
-            result.args.extend(rule.args.clone());
+            merge_build_arguments(&mut result.args, &rule.args);
             result.env.extend(rule.env.clone());
         }
         result.dependencies.sort();
@@ -566,6 +566,31 @@ impl RecipeSpec {
         result.target_dependencies.sort();
         result.target_dependencies.dedup();
         Ok(result)
+    }
+}
+
+/// Folds rclass-style free-form argument channels without allowing one feature
+/// to erase arguments selected by the recipe or an earlier feature. Keys ending
+/// in `_args` are ordered command fragments and therefore concatenate; scalar
+/// keys retain ordinary last-writer-wins semantics.
+pub fn merge_build_arguments(
+    target: &mut BTreeMap<String, String>,
+    additions: &BTreeMap<String, String>,
+) {
+    for (key, value) in additions {
+        if key.ends_with("_args") && !value.is_empty() {
+            target
+                .entry(key.clone())
+                .and_modify(|current| {
+                    if !current.is_empty() {
+                        current.push(' ');
+                    }
+                    current.push_str(value);
+                })
+                .or_insert_with(|| value.clone());
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -1751,6 +1776,23 @@ frontend="gtk"
         assert!(recipe
             .effective_features(&["missing".into()], false)
             .is_err());
+    }
+
+    #[test]
+    fn ordered_argument_channels_append_instead_of_erasing_prior_flags() {
+        let mut arguments = BTreeMap::from([
+            ("meson_args".into(), "-Dbase=enabled".into()),
+            ("mode".into(), "release".into()),
+        ]);
+        merge_build_arguments(
+            &mut arguments,
+            &BTreeMap::from([
+                ("meson_args".into(), "-Dtls=enabled".into()),
+                ("mode".into(), "debug".into()),
+            ]),
+        );
+        assert_eq!(arguments["meson_args"], "-Dbase=enabled -Dtls=enabled");
+        assert_eq!(arguments["mode"], "debug");
     }
 
     #[test]

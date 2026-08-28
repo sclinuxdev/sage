@@ -1306,7 +1306,7 @@ async fn build_recipe(
         .extend(features.dependencies.clone());
     recipe.package.dependencies.sort();
     recipe.package.dependencies.dedup();
-    recipe.build.args.extend(features.args.clone());
+    sage_build::merge_build_arguments(&mut recipe.build.args, &features.args);
     let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
     let mut config = sage_build::BuildConfig::load(&build_config_path)
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
