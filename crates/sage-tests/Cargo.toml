@@ -1,20 +1,14 @@
 [package]
-name = "sage"
+name = "sage-tests"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Ultra-fast declarative package manager CLI for Linux"
-
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "sage"
-path = "src/main.rs"
+description = "Unified integration test target for Sage"
 
 [dependencies]
+sage = { workspace = true }
 sage-core = { workspace = true }
 sage-db = { workspace = true }
 sage-archive = { workspace = true }
@@ -22,13 +16,12 @@ sage-solver = { workspace = true }
 sage-sys = { workspace = true }
 sage-build = { workspace = true }
 sage-repo = { workspace = true }
-clap = { workspace = true }
-indicatif = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
+bincode = { workspace = true }
+heed = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-tempfile = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
+zstd = { workspace = true }

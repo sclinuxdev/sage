@@ -1466,7 +1466,6 @@ dependencies = [
  "serde",
  "sha2",
  "tar",
- "tempfile",
  "thiserror",
  "toml",
  "tracing",
@@ -1507,7 +1506,6 @@ dependencies = [
  "heed",
  "sage-core",
  "serde",
- "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -1527,7 +1525,6 @@ dependencies = [
  "sage-db",
  "serde",
  "sha2",
- "tempfile",
  "thiserror",
  "tokio",
  "toml",
@@ -1557,11 +1554,33 @@ dependencies = [
  "sage-solver",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "toml",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "sage-tests"
+version = "0.4.0"
+dependencies = [
+ "bincode",
+ "heed",
+ "hex",
+ "sage",
+ "sage-archive",
+ "sage-build",
+ "sage-core",
+ "sage-db",
+ "sage-repo",
+ "sage-solver",
+ "sage-sys",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+ "zstd",
 ]
 
 [[package]]

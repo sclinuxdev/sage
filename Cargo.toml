@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sage",
+    "crates/sage-tests",
     "crates/sage-core",
     "crates/sage-db",
     "crates/sage-archive",
@@ -26,6 +27,7 @@ sage-solver = { path = "crates/sage-solver", version = "0.4.0" }
 sage-sys = { path = "crates/sage-sys", version = "0.4.0" }
 sage-build = { path = "crates/sage-build", version = "0.4.0" }
 sage-repo = { path = "crates/sage-repo", version = "0.4.0" }
+sage = { path = "crates/sage", version = "0.4.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
