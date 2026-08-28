@@ -24,9 +24,9 @@ on_paths = [
     "lib/*.so*",
     "etc/ld.so.conf.d/*"
 ]
-exec = ["/sbin/ldconfig", "-X"]
+exec = ["/usr/sbin/ldconfig", "-X"]
 priority = 10                         # 执行优先级 (数值小者先执行)
-ignore_missing_binary = true          # 若系统中尚未安装 /sbin/ldconfig 则安全忽略
+ignore_missing_binary = true          # 若系统中尚未安装 /usr/sbin/ldconfig 则安全忽略
 ```
 
 ### 示例 2: `ca-certificates.toml`
@@ -63,7 +63,7 @@ schema_version = 1
 name = "depmod"
 description = "Regenerate dependency maps for changed kernel module slots"
 on_paths = ["usr/lib/modules/**"]
-exec = ["/sbin/depmod", "-a", "${path[3]}"]
+exec = ["/usr/bin/depmod", "-a", "${path[3]}"]
 priority = 20
 ignore_missing_binary = true
 ```
@@ -94,10 +94,12 @@ ignore_missing_binary = true
 
 ## 3. 声明式系统用户 (`sysusers`)
 
-包在配方中声明 `[[sysusers]]`，打包时生成 `usr/lib/sysusers.d/<pkgname>.conf`：
+包在配方中声明 `[[sysusers]]`，打包时生成仅由 Sage 解释的
+`.METADATA/sysusers.toml`：
 
 ```toml
 [[sysusers]]
+package = "redis-server" # optional subpackage owner
 type = "user"
 name = "redis"
 id = 75
@@ -106,7 +108,10 @@ home = "/var/lib/redis"
 shell = "/usr/bin/nologin"
 ```
 
-事务后，声明式 `sysusers` 触发器调用独立的 `systemd-sysusers --root=${sysroot}` 应用全部记录。工具缺失会使事务失败，不会静默跳过账户创建或回退到包内脚本。
+发布事务把声明绑定到完整包身份并存入 `/usr/share/sage/sysusers/`。
+Sage 自身随后以确定顺序合并 `/etc/passwd`、`/etc/group` 和
+`/etc/shadow`；无需 init provider 或外部 sysusers 实现。显式数字 ID
+冲突会使事务失败，省略 ID 时则从 Sage 的动态系统账户区间稳定分配。
 
 ---
 
