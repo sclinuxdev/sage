@@ -635,7 +635,14 @@ pub fn fetch_git_source(
             git,
             checkout,
             "submodule checkout",
-            ["submodule", "update", "--init", "--recursive", "--depth=1"],
+            [
+                "submodule",
+                "update",
+                "--quiet",
+                "--init",
+                "--recursive",
+                "--depth=1",
+            ],
         )?;
     }
     export_git_tree(checkout, destination)
@@ -1814,6 +1821,122 @@ destination="vendor/project"
             fs::read(output.join("submodule/source.c")).unwrap(),
             b"source"
         );
+    }
+
+    fn test_git(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .env("GIT_AUTHOR_NAME", "Sage Test")
+            .env("GIT_AUTHOR_EMAIL", "sage@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Sage Test")
+            .env("GIT_COMMITTER_EMAIL", "sage@example.invalid")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git command failed: {arguments:?}");
+    }
+
+    #[test]
+    fn git_fetch_materializes_recursive_network_submodules() {
+        let directory = tempfile::tempdir().unwrap();
+        let repositories = directory.path().join("repositories");
+        fs::create_dir(&repositories).unwrap();
+        for name in ["child", "project"] {
+            let work = directory.path().join(name);
+            fs::create_dir(&work).unwrap();
+            test_git(&work, &["init", "--quiet"]);
+            fs::write(work.join(format!("{name}.txt")), name).unwrap();
+            test_git(&work, &["add", "."]);
+            test_git(&work, &["commit", "--quiet", "-m", name]);
+            let bare = repositories.join(format!("{name}.git"));
+            fs::create_dir(&bare).unwrap();
+            test_git(&bare, &["init", "--quiet", "--bare"]);
+            test_git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+            test_git(&work, &["push", "--quiet", "origin", "HEAD:master"]);
+            test_git(&bare, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+        }
+        let project = directory.path().join("project");
+        test_git(
+            &project,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                repositories.join("child.git").to_str().unwrap(),
+                "child",
+            ],
+        );
+        test_git(
+            &project,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.child.url",
+                "../child.git",
+            ],
+        );
+        test_git(&project, &["add", ".gitmodules", "child"]);
+        test_git(&project, &["commit", "--quiet", "-m", "add child"]);
+        test_git(&project, &["push", "--quiet", "origin", "HEAD:master"]);
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["-C", project.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut daemon = Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                &format!("--base-path={}", repositories.display()),
+                repositories.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source = SourceSpec {
+            kind: SourceKind::Git,
+            url: format!("git://127.0.0.1:{port}/project.git"),
+            sha256: String::new(),
+            commit: commit.trim().into(),
+            submodules: true,
+            strip_components: None,
+            destination: PathBuf::from("."),
+        };
+        let result = fetch_git_source(
+            Path::new("git"),
+            &source,
+            &directory.path().join("checkout"),
+            &directory.path().join("export"),
+        );
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        result.unwrap();
+        assert!(directory.path().join("export/project.txt").exists());
+        assert!(directory.path().join("export/child/child.txt").exists());
+        assert!(!directory.path().join("export/.git").exists());
+        assert!(!directory.path().join("export/child/.git").exists());
     }
 
     fn unit(name: &str, produces: &[&str], consumes: &[&str]) -> BuildUnit {
