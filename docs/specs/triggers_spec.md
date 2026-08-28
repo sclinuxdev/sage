@@ -24,9 +24,9 @@ on_paths = [
     "lib/*.so*",
     "etc/ld.so.conf.d/*"
 ]
-exec = ["/sbin/ldconfig", "-X"]
+exec = ["/usr/sbin/ldconfig", "-X"]
 priority = 10                         # 执行优先级 (数值小者先执行)
-ignore_missing_binary = true          # 若系统中尚未安装 /sbin/ldconfig 则安全忽略
+ignore_missing_binary = true          # 若系统中尚未安装 /usr/sbin/ldconfig 则安全忽略
 ```
 
 ### 示例 2: `ca-certificates.toml`
@@ -63,7 +63,7 @@ schema_version = 1
 name = "depmod"
 description = "Regenerate dependency maps for changed kernel module slots"
 on_paths = ["usr/lib/modules/**"]
-exec = ["/sbin/depmod", "-a", "${path[3]}"]
+exec = ["/usr/bin/depmod", "-a", "${path[3]}"]
 priority = 20
 ignore_missing_binary = true
 ```

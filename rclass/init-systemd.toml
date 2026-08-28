@@ -6,9 +6,10 @@ description = "Systemd Service Generator and Controller Class"
 target_path = "/usr/lib/systemd/system/${service.name}.service"
 mode = 420
 
-enable_cmd = "/usr/bin/systemctl enable ${service.name}.service"
-disable_cmd = "/usr/bin/systemctl disable ${service.name}.service"
+enable_cmd = "/usr/bin/systemctl --root ${SYSROOT} enable ${service.name}.service"
+disable_cmd = "/usr/bin/systemctl --root ${SYSROOT} disable ${service.name}.service"
 service_dependency_suffix = ".service"
+supported_types = ["simple", "forking", "notify", "oneshot"]
 
 template = """
 [Unit]

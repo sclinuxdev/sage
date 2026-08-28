@@ -767,23 +767,73 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
         root,
         &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
     );
-    if dry_run {
-        for service in &config.services {
-            println!("Would render service {service} with {}", rclass.display());
-        }
-        return Ok(());
-    }
     let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
     let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
+    let mut desired = Vec::with_capacity(config.services.len());
     for service in &config.services {
         let path = service_dir.join(format!("{service}.toml"));
         if !path.exists() {
             bail!("enabled service '{service}' has no installed declaration");
         }
-        let service = sage_sys::ServiceSpec::load(path)?;
-        generator.render_service(&service, root)?;
-        generator.enable_service(&service, root)?;
+        desired.push(sage_sys::ServiceSpec::load(path)?);
     }
+    let state_relative = Path::new("var/lib/sage/rendered-services.toml");
+    let state_path = under_root(root, state_relative);
+    let previous = if state_path.exists() {
+        Some(sage_sys::RenderedServicesState::load(&state_path)?)
+    } else {
+        None
+    };
+    if dry_run {
+        if let Some(previous) = &previous {
+            for service in &previous.services {
+                if previous.provider != *provider
+                    || !desired.iter().any(|candidate| candidate.name == service.name)
+                {
+                    println!(
+                        "Would disable stale service {} from init provider {}",
+                        service.name, previous.provider
+                    );
+                }
+            }
+        }
+        for service in &desired {
+            println!("Would render service {} with {}", service.name, rclass.display());
+        }
+        return Ok(());
+    }
+    if let Some(previous) = &previous {
+        let previous_rclass = under_root(
+            root,
+            &Path::new("/usr/share/sage/rclass")
+                .join(format!("init-{}.toml", previous.provider)),
+        );
+        let previous_generator =
+            sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
+        for service in &previous.services {
+            if previous.provider != *provider
+                || !desired.iter().any(|candidate| candidate.name == service.name)
+            {
+                previous_generator.disable_service(service, root)?;
+                previous_generator.remove_service(service, root)?;
+            }
+        }
+    }
+    for service in &desired {
+        generator.render_service_unvalidated(service, root)?;
+    }
+    if let Some(service) = desired.first() {
+        generator.validate_rendered_services(service, root)?;
+    }
+    for service in &desired {
+        generator.enable_service(service, root)?;
+    }
+    let state = sage_sys::RenderedServicesState {
+        schema_version: sage_core::SCHEMA_VERSION,
+        provider: provider.clone(),
+        services: desired,
+    };
+    write_atomic_under_root(root, state_relative, toml::to_string_pretty(&state)?.as_bytes())?;
     Ok(())
 }
 

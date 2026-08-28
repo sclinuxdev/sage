@@ -275,8 +275,8 @@ async fn build_recipe(
         selected_config.cc.clone_from(&target.cc);
         selected_config.cxx.clone_from(&target.cxx);
         let mut cross_env = BTreeMap::from([
-            ("CC".into(), target.cc.clone()),
-            ("CXX".into(), target.cxx.clone()),
+            ("CC".into(), "/build/.sage-tools/cc".into()),
+            ("CXX".into(), "/build/.sage-tools/cxx".into()),
             ("AR".into(), target.ar.clone()),
             ("STRIP".into(), target.strip.clone()),
             ("GOOS".into(), target.goos.clone()),
@@ -417,7 +417,7 @@ async fn build_recipe(
     let runner = workspace.path().join("sage-build-runner.sh");
     std::fs::write(&runner, runner_contents)?;
     let paths = sage_build::SandboxPaths {
-        source,
+        source: source.clone(),
         build,
         destdir: destdir.clone(),
         runner,
@@ -426,7 +426,7 @@ async fn build_recipe(
     };
     let managed_build_tools =
         sage_build::SandboxRunner::new(&selected_config).run(&paths, recipe.build.allow_network)?;
-    sage_build::stage_declarative_install(&destdir, &recipe)?;
+    sage_build::stage_declarative_install(&destdir, &source, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
         let report = sage_build::ElfScanner::rewrite_private_runpaths(

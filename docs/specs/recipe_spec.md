@@ -252,13 +252,19 @@ mode = 420 # 0644
 [[install.symlinks]]
 path = "etc/os-release"
 target = "../usr/lib/os-release"
+
+[[install.copies]]
+source = "policy"
+path = "usr/share/example/policy"
+recursive = true
 ```
 
 Recipes with no upstream source are valid when their payload is fully
 declarative, including pure meta-packages whose only state is dependencies.
 
-Recipes may declare system accounts with `[[sysusers]]`; the builder emits a
-deterministic `usr/lib/sysusers.d/<package>.conf`. Optional `service.toml` and
+Recipes may declare system accounts with `[[sysusers]]`; Sage stores the
+declaration as package metadata and reconciles `/etc/passwd`, `/etc/group`, and
+`/etc/shadow` directly without calling an init-system utility. Optional `service.toml` and
 `triggers.toml` files beside `recipe.toml` are schema-validated and copied into
 the main package's `.METADATA` section. Package-specific triggers use the same
 single-trigger schema as files under `/usr/share/sage/triggers`.
