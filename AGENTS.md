@@ -51,6 +51,7 @@
 | **声明式系统配置** | `/etc/sage/system.toml` | [system_spec.md](file:///home/ir/sage/docs/specs/system_spec.md) |
 | **通道源配置** | `/etc/sage/channels.toml` | [channels_spec.md](file:///home/ir/sage/docs/specs/channels_spec.md) |
 | **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](file:///home/ir/sage/docs/specs/build_config_spec.md) |
+| **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](file:///home/ir/sage/docs/specs/bootstrap_spec.md) |
 | **包配方格式与单配方多包** | `recipes/.../recipe.toml` | [recipe_spec.md](file:///home/ir/sage/docs/specs/recipe_spec.md) |
 | **配方目录树与分类体系** | `recipes/<category>/<pkg>/...` | [recipe_tree_spec.md](file:///home/ir/sage/docs/specs/recipe_tree_spec.md) |
 | **构建类继承规范** | `rclass/*.toml` (如 `cmake.toml`, `cargo.toml`) | [rclass_spec.md](file:///home/ir/sage/docs/specs/rclass_spec.md) |

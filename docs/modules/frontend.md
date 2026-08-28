@@ -111,3 +111,9 @@ sage upgrade --channel python3.12
 # 4. 切换全局活动 GCC 为 gcc15
 sage toolchain use gcc15
 ```
+
+## 5. Source fleet commands
+
+`mass-rebuild` performs automatic recipe discovery and parallel dependency
+layers. `bootstrap` executes explicitly staged self-hosting plans. Both support
+dry-run topology output, bounded package concurrency, and a custom artifact pool.

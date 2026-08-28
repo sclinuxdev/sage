@@ -84,6 +84,23 @@ pub enum Commands {
         #[arg(long)]
         no_default_features: bool,
     },
+    /// Rebuild every discovered recipe in dependency-topological layers.
+    MassRebuild {
+        recipe_root: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Concurrent packages; zero divides available CPUs automatically.
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Execute an explicitly staged self-hosting bootstrap plan.
+    Bootstrap {
+        plan: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
     /// Inspect configured software channels.
     Channel {
         #[command(subcommand)]
@@ -214,8 +231,26 @@ async fn main() -> Result<()> {
                 &features,
                 !no_default_features,
                 cli.dry_run,
+                BuildInvocation::default(),
             )
             .await?;
+        }
+        Commands::MassRebuild {
+            recipe_root,
+            output,
+            jobs,
+        } => {
+            mass_rebuild(
+                &cli.root,
+                &recipe_root,
+                output.as_deref(),
+                jobs,
+                cli.dry_run,
+            )
+            .await?;
+        }
+        Commands::Bootstrap { plan, output, jobs } => {
+            bootstrap_sources(&cli.root, &plan, output.as_deref(), jobs, cli.dry_run).await?;
         }
         Commands::Channel { action } => match action {
             ChannelAction::List => list_channels(&cli.root)?,
@@ -307,8 +342,14 @@ fn settle_journals(root: &Path) -> Result<()> {
 #[derive(Clone)]
 struct ReleaseSource {
     release: sage_repo::IndexedRelease,
-    url: String,
+    location: ReleaseLocation,
     target_root: PathBuf,
+}
+
+#[derive(Clone)]
+enum ReleaseLocation {
+    Remote(String),
+    Local(PathBuf),
 }
 
 struct AvailablePackages {
@@ -322,12 +363,21 @@ fn load_available(root: &Path) -> Result<AvailablePackages> {
 }
 
 fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<AvailablePackages> {
+    load_available_with_pool(root, architecture, None)
+}
+
+fn load_available_with_pool(
+    root: &Path,
+    architecture: Option<&str>,
+    local_pool: Option<&Path>,
+) -> Result<AvailablePackages> {
     let config =
         sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
     let cache = under_root(root, Path::new("/var/cache/sage/channels"));
     let mut universe = sage_solver::PackageUniverse::default();
     let mut releases = BTreeMap::new();
     let mut aliases = BTreeMap::new();
+    let mut target_roots = BTreeMap::new();
     for (channel_name, channel) in config.channels {
         if !channel.enabled {
             continue;
@@ -344,6 +394,7 @@ fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<Av
             }
             aliases.insert(alias.into(), canonical.clone());
             aliases.insert(canonical.clone(), canonical.clone());
+            target_roots.insert(canonical.clone(), subchannel.target_root.clone());
             let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
             for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
                 if architecture.is_some_and(|wanted| {
@@ -373,11 +424,88 @@ fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<Av
                     (key, version),
                     ReleaseSource {
                         release,
-                        url: url.clone(),
+                        location: ReleaseLocation::Remote(url.clone()),
                         target_root: subchannel.target_root.clone(),
                     },
                 );
             }
+        }
+    }
+    if let Some(pool) = local_pool.filter(|pool| pool.exists()) {
+        let mut packages: Vec<_> = std::fs::read_dir(pool)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+            })
+            .collect();
+        packages.sort();
+        for path in packages {
+            let inspection = sage_archive::inspect_package(&path)?;
+            if architecture.is_some_and(|wanted| {
+                inspection.manifest.arch != wanted
+                    && inspection.manifest.arch != "any"
+                    && inspection.manifest.arch != "noarch"
+            }) {
+                continue;
+            }
+            let canonical = aliases
+                .get(&inspection.manifest.channel)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if inspection.manifest.channel.contains('/') {
+                        inspection.manifest.channel.clone()
+                    } else {
+                        format!("main/{}", inspection.manifest.channel)
+                    }
+                });
+            aliases
+                .entry(inspection.manifest.channel.clone())
+                .or_insert_with(|| canonical.clone());
+            aliases
+                .entry(canonical.clone())
+                .or_insert_with(|| canonical.clone());
+            let key = sage_core::PackageKey::new(
+                &canonical,
+                &inspection.manifest.name,
+                &inspection.manifest.slot,
+            );
+            let version = sage_core::Version::new(
+                inspection.manifest.epoch,
+                &inspection.manifest.version,
+                inspection.manifest.release,
+            );
+            let dependencies = inspection
+                .manifest
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.parse())
+                .collect::<Result<Vec<_>, _>>()?;
+            universe.insert(sage_solver::PackageRelease {
+                key: key.clone(),
+                version: version.clone(),
+                dependencies: dependencies.clone(),
+                provides: inspection.manifest.provides.clone(),
+            });
+            releases.insert(
+                (key, version),
+                ReleaseSource {
+                    release: sage_repo::IndexedRelease {
+                        manifest: inspection.manifest,
+                        dependencies,
+                        archive: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        sha256: String::new(),
+                    },
+                    location: ReleaseLocation::Local(path),
+                    target_root: target_roots
+                        .get(&canonical)
+                        .cloned()
+                        .unwrap_or_else(|| PathBuf::from("/")),
+                },
+            );
         }
     }
     Ok(AvailablePackages {
@@ -474,15 +602,7 @@ async fn publish_packages(
             .releases
             .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for {key} {version}"))?;
-        let archive = package_cache.join(&source.release.sha256);
-        let url = format!(
-            "{}/{}",
-            source.url.trim_end_matches('/'),
-            source.release.archive
-        );
-        engine
-            .download_url(&url, &archive, &source.release.sha256)
-            .await?;
+        let archive = obtain_release_archive(&engine, &package_cache, source).await?;
         let inspection = sage_archive::inspect_package(&archive)?;
         let target = under_root(root, &source.target_root);
         std::fs::create_dir_all(&target)?;
@@ -980,12 +1100,198 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
     Ok(())
 }
 
+async fn mass_rebuild(
+    root: &Path,
+    recipe_root: &Path,
+    output: Option<&Path>,
+    jobs: usize,
+    dry_run: bool,
+) -> Result<()> {
+    let units = source_build_units(root, sage_build::BuildGraph::discover(recipe_root)?)?;
+    let layers = sage_build::BuildGraph::layers(units)?;
+    let pool = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| recipe_root.join(".sage-packages"));
+    prepare_source_pool(&pool, dry_run)?;
+    execute_source_layers(root, &layers, &pool, jobs, dry_run).await
+}
+
+async fn bootstrap_sources(
+    root: &Path,
+    plan_path: &Path,
+    output: Option<&Path>,
+    jobs: usize,
+    dry_run: bool,
+) -> Result<()> {
+    let plan = sage_build::BootstrapPlan::load(plan_path)?;
+    let base = plan_path.parent().unwrap_or(Path::new("."));
+    let pool = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| base.join(".sage-bootstrap"));
+    prepare_source_pool(&pool, dry_run)?;
+    for stage in plan.stages {
+        println!("Bootstrap stage {}", stage.name);
+        let mut units = Vec::new();
+        for declared in stage.recipes {
+            let path = base.join(declared);
+            let recipe_path = if path.is_dir() {
+                path.join("recipe.toml")
+            } else {
+                path
+            };
+            let recipe = sage_build::RecipeSpec::load(&recipe_path)?;
+            units.push(sage_build::BuildUnit::from_recipe(recipe_path, &recipe)?);
+        }
+        let units = source_build_units(root, units)?;
+        let layers = sage_build::BuildGraph::layers(units)?;
+        execute_source_layers(root, &layers, &pool, jobs, dry_run).await?;
+    }
+    Ok(())
+}
+
+fn source_build_units(
+    root: &Path,
+    mut units: Vec<sage_build::BuildUnit>,
+) -> Result<Vec<sage_build::BuildUnit>> {
+    for unit in &mut units {
+        let recipe = sage_build::RecipeSpec::load(&unit.recipe)?;
+        let mut dependencies = Vec::new();
+        for inherited in &recipe.build.inherit {
+            let class = sage_build::Rclass::load(find_rclass(
+                unit.recipe.parent().unwrap_or(Path::new(".")),
+                root,
+                inherited,
+            )?)?;
+            dependencies.extend(class.implicit_build_dependencies);
+        }
+        unit.include_dependencies(dependencies)?;
+    }
+    Ok(units)
+}
+
+fn prepare_source_pool(pool: &Path, dry_run: bool) -> Result<()> {
+    if pool.exists()
+        && std::fs::read_dir(pool)?.any(|entry| {
+            entry.ok().is_some_and(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+            })
+        })
+    {
+        bail!(
+            "source build output must not contain existing packages: {}",
+            pool.display()
+        );
+    }
+    if !dry_run {
+        std::fs::create_dir_all(pool)?;
+    }
+    Ok(())
+}
+
+async fn execute_source_layers(
+    root: &Path,
+    layers: &[Vec<sage_build::BuildUnit>],
+    pool: &Path,
+    requested_jobs: usize,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        for (index, layer) in layers.iter().enumerate() {
+            println!(
+                "Layer {}: {}",
+                index + 1,
+                layer
+                    .iter()
+                    .map(|unit| unit.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(());
+    }
+    let config =
+        sage_build::BuildConfig::load(under_root(root, Path::new("/etc/sage/build.toml")))?;
+    for (layer_index, layer) in layers.iter().enumerate() {
+        let concurrency = if requested_jobs == 0 {
+            config.jobs.min(layer.len()).max(1)
+        } else {
+            requested_jobs.min(layer.len()).max(1)
+        };
+        let inner_jobs = (config.jobs / concurrency).max(1);
+        println!("Build layer {} ({} packages)", layer_index + 1, layer.len());
+        for chunk in layer.chunks(concurrency) {
+            let outputs = tempfile::Builder::new()
+                .prefix(".sage-layer-")
+                .tempdir_in(pool)?;
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, unit) in chunk.iter().enumerate() {
+                let root = root.to_path_buf();
+                let recipe = unit.recipe.clone();
+                let output = outputs.path().join(format!("{index:04}"));
+                let pool = pool.to_path_buf();
+                std::fs::create_dir(&output)?;
+                tasks.spawn(async move {
+                    build_recipe(
+                        &root,
+                        &recipe,
+                        &[],
+                        true,
+                        false,
+                        BuildInvocation {
+                            output_dir: Some(output.clone()),
+                            local_pool: Some(pool),
+                            jobs_override: Some(inner_jobs),
+                        },
+                    )
+                    .await
+                    .map(|_| output)
+                });
+            }
+            let mut completed = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                completed.push(result??);
+            }
+            completed.sort();
+            for directory in completed {
+                let mut artifacts: Vec<_> = std::fs::read_dir(directory)?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+                    })
+                    .collect();
+                artifacts.sort();
+                for artifact in artifacts {
+                    let target = pool.join(artifact.file_name().unwrap());
+                    std::fs::rename(&artifact, &target)?;
+                    println!("Published {}", target.display());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct BuildInvocation {
+    output_dir: Option<PathBuf>,
+    local_pool: Option<PathBuf>,
+    jobs_override: Option<usize>,
+}
+
 async fn build_recipe(
     root: &Path,
     recipe_dir: &Path,
     requested_features: &[String],
     use_default_features: bool,
     dry_run: bool,
+    invocation: BuildInvocation,
 ) -> Result<()> {
     let recipe_path = if recipe_dir.is_dir() {
         recipe_dir.join("recipe.toml")
@@ -1002,8 +1308,11 @@ async fn build_recipe(
     recipe.package.dependencies.dedup();
     recipe.build.args.extend(features.args.clone());
     let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
-    let config = sage_build::BuildConfig::load(&build_config_path)
+    let mut config = sage_build::BuildConfig::load(&build_config_path)
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
+    if let Some(jobs) = invocation.jobs_override {
+        config.jobs = jobs.max(1);
+    }
     let cross = config.cross_target(&recipe.build.target)?.cloned();
     if let Some(target) = &cross {
         recipe.build.args.extend([
@@ -1131,6 +1440,7 @@ async fn build_recipe(
         workspace.path(),
         &recipe.package.channel,
         &build_dependencies,
+        invocation.local_pool.as_deref(),
     )
     .await?;
     let target_sysroot = if let Some(target) = &cross {
@@ -1141,6 +1451,7 @@ async fn build_recipe(
             &recipe.package.channel,
             &target_dependencies,
             Some(&target.arch),
+            invocation.local_pool.as_deref(),
         )
         .await?
     } else {
@@ -1198,11 +1509,15 @@ async fn build_recipe(
         );
     }
     let areas = sage_build::PayloadCarver::carve_packages(&destdir, &recipe)?;
-    let output_dir = recipe_path.parent().unwrap_or(Path::new("."));
+    let output_dir = invocation
+        .output_dir
+        .as_deref()
+        .unwrap_or_else(|| recipe_path.parent().unwrap_or(Path::new(".")));
     for area in areas {
         package_staging(
             &recipe,
             &area,
+            recipe_path.parent().unwrap_or(Path::new(".")),
             output_dir,
             config.source_date_epoch,
             &features.enabled,
@@ -1219,8 +1534,18 @@ async fn prepare_build_toolchain(
     workspace: &Path,
     channel: &str,
     dependencies: &[sage_core::Dependency],
+    local_pool: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
-    prepare_package_tree(root, workspace, "toolchain", channel, dependencies, None).await
+    prepare_package_tree(
+        root,
+        workspace,
+        "toolchain",
+        channel,
+        dependencies,
+        None,
+        local_pool,
+    )
+    .await
 }
 
 async fn prepare_package_tree(
@@ -1230,13 +1555,19 @@ async fn prepare_package_tree(
     channel: &str,
     dependencies: &[sage_core::Dependency],
     architecture: Option<&str>,
+    local_pool: Option<&Path>,
 ) -> Result<Option<PathBuf>> {
     if dependencies.is_empty() {
         return Ok(None);
     }
-    let available = load_available_for_arch(root, architecture)?;
+    let available = load_available_with_pool(root, architecture, local_pool)?;
     let channel = canonical_channel(&available, Some(channel))?;
-    let solution = sage_solver::SageSolver::new(&available.universe)
+    let local_locks = available
+        .releases
+        .iter()
+        .filter(|(_, source)| matches!(source.location, ReleaseLocation::Local(_)))
+        .map(|((key, version), _)| (key.clone(), version.clone()));
+    let solution = sage_solver::SageSolver::with_locked(&available.universe, local_locks)
         .resolve_dependencies(&channel, dependencies)?;
     let tree = workspace.join(tree_name);
     std::fs::create_dir(&tree)?;
@@ -1248,15 +1579,7 @@ async fn prepare_package_tree(
             .releases
             .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for build dependency {key}"))?;
-        let archive = package_cache.join(&source.release.sha256);
-        let url = format!(
-            "{}/{}",
-            source.url.trim_end_matches('/'),
-            source.release.archive
-        );
-        engine
-            .download_url(&url, &archive, &source.release.sha256)
-            .await?;
+        let archive = obtain_release_archive(&engine, &package_cache, source).await?;
         let inspection = sage_archive::inspect_package(&archive)?;
         if let Some(path) = inspection
             .files
@@ -1270,6 +1593,24 @@ async fn prepare_package_tree(
         println!("{} dependency {} {}", tree_name, key, version);
     }
     Ok(Some(tree))
+}
+
+async fn obtain_release_archive(
+    engine: &sage_repo::DownloadEngine,
+    cache: &Path,
+    source: &ReleaseSource,
+) -> Result<PathBuf> {
+    match &source.location {
+        ReleaseLocation::Local(path) => Ok(path.clone()),
+        ReleaseLocation::Remote(base) => {
+            let archive = cache.join(&source.release.sha256);
+            let url = format!("{}/{}", base.trim_end_matches('/'), source.release.archive);
+            engine
+                .download_url(&url, &archive, &source.release.sha256)
+                .await?;
+            Ok(archive)
+        }
+    }
 }
 
 fn stage_patches(recipe_dir: &Path, source: &Path) -> Result<()> {
@@ -1364,6 +1705,7 @@ fn build_variables(
 fn package_staging(
     recipe: &sage_build::RecipeSpec,
     area: &sage_build::PackageStagingArea,
+    recipe_dir: &Path,
     output_dir: &Path,
     build_time: u64,
     features: &std::collections::BTreeSet<String>,
@@ -1374,7 +1716,7 @@ fn package_staging(
     let metadata = area.path().join(".METADATA");
     std::fs::create_dir(&metadata)?;
     if area.name == recipe.package.name {
-        stage_declarative_metadata(output_dir, &metadata)?;
+        stage_declarative_metadata(recipe_dir, &metadata)?;
     }
     std::fs::write(
         metadata.join("files.idx"),
@@ -1481,5 +1823,113 @@ ignore_missing_binary=false
         stage_declarative_metadata(directory.path(), &metadata).unwrap();
         sage_sys::ServiceSpec::load(metadata.join("service.toml")).unwrap();
         sage_sys::TriggerSpec::load(metadata.join("triggers.toml")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mass_rebuild_dry_run_discovers_dependency_tree_without_output() {
+        let root = tempfile::tempdir().unwrap();
+        let recipes = tempfile::tempdir().unwrap();
+        for (name, dependencies) in [("lib", ""), ("app", "dependencies=[\"lib\"]")] {
+            let directory = recipes.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(
+                directory.join("recipe.toml"),
+                format!(
+                    r#"schema_version=1
+[package]
+name="{name}"
+version="1"
+release=1
+description="{name}"
+license="MIT"
+channel="system"
+arch="any"
+{dependencies}
+[source]
+url="https://example.invalid/{name}.tar"
+sha256="{}"
+"#,
+                    "00".repeat(32)
+                ),
+            )
+            .unwrap();
+        }
+        mass_rebuild(root.path(), recipes.path(), None, 0, true)
+            .await
+            .unwrap();
+        assert!(!recipes.path().join(".sage-packages").exists());
+        let plan = recipes.path().join("bootstrap.toml");
+        std::fs::write(
+            &plan,
+            r#"schema_version=1
+[[stages]]
+name="seed"
+recipes=["lib/recipe.toml"]
+[[stages]]
+name="world"
+recipes=["app/recipe.toml"]
+"#,
+        )
+        .unwrap();
+        bootstrap_sources(root.path(), &plan, None, 0, true)
+            .await
+            .unwrap();
+        assert!(!recipes.path().join(".sage-bootstrap").exists());
+    }
+
+    #[test]
+    fn source_pool_overlays_local_artifacts_into_solver_universe() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
+        std::fs::write(
+            root.path().join("etc/sage/channels.toml"),
+            "schema_version=1\n[channels]\n",
+        )
+        .unwrap();
+        let pool = root.path().join("pool");
+        let stage = root.path().join("stage");
+        std::fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        std::fs::create_dir_all(stage.join("data/usr/lib")).unwrap();
+        std::fs::write(stage.join("data/usr/lib/libseed.so"), b"seed").unwrap();
+        let records = sage_archive::build_file_index(&stage.join("data")).unwrap();
+        std::fs::write(
+            stage.join(".METADATA/files.idx"),
+            sage_archive::format_file_index(&records),
+        )
+        .unwrap();
+        let manifest = sage_archive::PackageManifest {
+            schema_version: 1,
+            name: "seed".into(),
+            slot: "0".into(),
+            version: "1".into(),
+            release: 1,
+            epoch: 0,
+            arch: "any".into(),
+            channel: "system".into(),
+            description: "seed".into(),
+            license: "MIT".into(),
+            installed_size: 4,
+            build_time: 1,
+            dependencies: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            features: Vec::new(),
+        };
+        std::fs::write(
+            stage.join(".METADATA/manifest.toml"),
+            toml::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir(&pool).unwrap();
+        let package = pool.join("seed-1-1-any.pkg.tar.zst");
+        sage_archive::create_package(&stage, &package, 1).unwrap();
+
+        let available = load_available_with_pool(root.path(), None, Some(&pool)).unwrap();
+        let key = sage_core::PackageKey::new("main/system", "seed", "0");
+        let version = sage_core::Version::new(0, "1", 1);
+        assert!(matches!(
+            available.releases[&(key, version)].location,
+            ReleaseLocation::Local(_)
+        ));
     }
 }

@@ -89,3 +89,10 @@ Node and JVM classes reuse the same phase runner and build-only dependency
 environment. npm/pnpm caches, Gradle home, and the Maven local repository live
 under disposable `/build`; installation writes only to DESTDIR and package
 install lifecycle scripts are not executed.
+
+Mass rebuild constructs producer/consumer edges across main packages,
+subpackages, provides, default features, and rclass dependencies. Deterministic
+Kahn layers run with bounded package parallelism. Completed artifacts enter a
+transient local repository view and are locked into later PubGrub solves.
+Bootstrap plans compose several such graphs, allowing explicit seed stages to
+break unavoidable self-hosting cycles.

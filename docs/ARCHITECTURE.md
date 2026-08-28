@@ -96,3 +96,7 @@ graph TD
 The workspace Rust budget is 9,000 lines. Feature and architecture variability
 stays in schema-v1 TOML; Rust performs only generic validation, folding, solving,
 and execution.
+
+Source builds add a short-lived package-pool overlay above synchronized indexes.
+Mass-rebuild publishes one dependency layer at a time; bootstrap keeps the same
+overlay across explicit stages. Installed LMDB state is never mutated.

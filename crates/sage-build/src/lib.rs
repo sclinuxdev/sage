@@ -228,6 +228,208 @@ pub struct RecipeSpec {
     pub features: BTreeMap<String, FeatureSpec>,
 }
 
+/// One source-build vertex and the package symbols it consumes and produces.
+#[derive(Debug, Clone)]
+pub struct BuildUnit {
+    pub recipe: PathBuf,
+    pub name: String,
+    packages: BTreeSet<String>,
+    produces: BTreeSet<String>,
+    consumes: BTreeSet<String>,
+}
+
+impl BuildUnit {
+    /// Folds default features and converts all dependency classes into graph edges.
+    pub fn from_recipe(path: PathBuf, recipe: &RecipeSpec) -> Result<Self, BuildError> {
+        let features = recipe.effective_features(&[], true)?;
+        let mut packages = BTreeSet::from([recipe.package.name.clone()]);
+        packages.extend(
+            recipe
+                .subpackages
+                .iter()
+                .map(|package| package.name.clone()),
+        );
+        let mut produces = packages.clone();
+        produces.extend(recipe.package.provides.clone());
+        for package in &recipe.subpackages {
+            produces.extend(package.provides.clone());
+        }
+        let mut declarations = recipe.package.dependencies.clone();
+        declarations.extend(recipe.build.dependencies.clone());
+        declarations.extend(recipe.build.target_dependencies.clone());
+        declarations.extend(features.dependencies);
+        declarations.extend(features.build_dependencies);
+        declarations.extend(features.target_dependencies);
+        for package in &recipe.subpackages {
+            declarations.extend(package.dependencies.clone());
+        }
+        let consumes = declarations
+            .into_iter()
+            .map(|value| {
+                value
+                    .parse::<sage_core::Dependency>()
+                    .map(|dependency| dependency.name)
+                    .map_err(|error| BuildError::InvalidSpec(error.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            recipe: path,
+            name: recipe.package.name.clone(),
+            packages,
+            produces,
+            consumes,
+        })
+    }
+
+    /// Adds rclass-provided dependency declarations to the topology graph.
+    pub fn include_dependencies(
+        &mut self,
+        declarations: impl IntoIterator<Item = String>,
+    ) -> Result<(), BuildError> {
+        for value in declarations {
+            let dependency: sage_core::Dependency =
+                value.parse().map_err(|error: sage_core::CoreError| {
+                    BuildError::InvalidSpec(error.to_string())
+                })?;
+            self.consumes.insert(dependency.name);
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic dependency layers for parallel source builds.
+pub struct BuildGraph;
+
+impl BuildGraph {
+    pub fn discover(root: &Path) -> Result<Vec<BuildUnit>, BuildError> {
+        let mut recipes: Vec<_> = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_type().is_file() && entry.file_name() == "recipe.toml" => {
+                    Some(Ok(entry.into_path()))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(BuildError::Walk(error))),
+            })
+            .collect::<Result<_, _>>()?;
+        recipes.sort();
+        recipes
+            .into_iter()
+            .map(|path| {
+                let recipe = RecipeSpec::load(&path)?;
+                BuildUnit::from_recipe(path, &recipe)
+            })
+            .collect()
+    }
+
+    /// Applies Kahn's algorithm and returns maximal deterministic parallel layers.
+    pub fn layers(units: Vec<BuildUnit>) -> Result<Vec<Vec<BuildUnit>>, BuildError> {
+        let mut package_owners = BTreeMap::new();
+        for unit in &units {
+            for package in &unit.packages {
+                if let Some(owner) = package_owners.insert(package, unit.name.as_str()) {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "package '{package}' is produced by both {owner} and {}",
+                        unit.name
+                    )));
+                }
+            }
+        }
+        let mut producers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, unit) in units.iter().enumerate() {
+            for symbol in &unit.produces {
+                producers.entry(symbol.clone()).or_default().push(index);
+            }
+        }
+        let mut outgoing = vec![BTreeSet::new(); units.len()];
+        let mut indegree = vec![0usize; units.len()];
+        for (consumer, unit) in units.iter().enumerate() {
+            for symbol in &unit.consumes {
+                for &producer in producers.get(symbol).into_iter().flatten() {
+                    if producer != consumer && outgoing[producer].insert(consumer) {
+                        indegree[consumer] += 1;
+                    }
+                }
+            }
+        }
+        let mut ready: BTreeSet<_> = indegree
+            .iter()
+            .enumerate()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(index, _)| index)
+            .collect();
+        let mut layers = Vec::new();
+        let mut completed = 0;
+        while !ready.is_empty() {
+            let current: Vec<_> = std::mem::take(&mut ready).into_iter().collect();
+            let mut next = BTreeSet::new();
+            for &producer in &current {
+                completed += 1;
+                for &consumer in &outgoing[producer] {
+                    indegree[consumer] -= 1;
+                    if indegree[consumer] == 0 {
+                        next.insert(consumer);
+                    }
+                }
+            }
+            layers.push(
+                current
+                    .into_iter()
+                    .map(|index| units[index].clone())
+                    .collect(),
+            );
+            ready = next;
+        }
+        if completed != units.len() {
+            let cycle = units
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| indegree[*index] != 0)
+                .map(|(_, unit)| unit.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(BuildError::InvalidSpec(format!(
+                "source build graph contains a cycle: {cycle}"
+            )));
+        }
+        Ok(layers)
+    }
+}
+
+/// Explicit stage boundary used to break compiler/bootstrap dependency cycles.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapPlan {
+    pub schema_version: u32,
+    pub stages: Vec<BootstrapStage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootstrapStage {
+    pub name: String,
+    pub recipes: Vec<PathBuf>,
+}
+
+impl BootstrapPlan {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, BuildError> {
+        let plan: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        validate_schema(plan.schema_version)?;
+        let mut names = BTreeSet::new();
+        if plan.stages.is_empty()
+            || plan.stages.iter().any(|stage| {
+                stage.name.is_empty()
+                    || stage.recipes.is_empty()
+                    || !names.insert(stage.name.as_str())
+            })
+        {
+            return Err(BuildError::InvalidSpec(
+                "bootstrap stages require unique names and non-empty recipe lists".into(),
+            ));
+        }
+        Ok(plan)
+    }
+}
+
 impl RecipeSpec {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, BuildError> {
         let path = path.as_ref();
@@ -1612,6 +1814,65 @@ destination="vendor/project"
             fs::read(output.join("submodule/source.c")).unwrap(),
             b"source"
         );
+    }
+
+    fn unit(name: &str, produces: &[&str], consumes: &[&str]) -> BuildUnit {
+        BuildUnit {
+            recipe: PathBuf::from(format!("{name}/recipe.toml")),
+            name: name.into(),
+            packages: produces.iter().map(|value| (*value).into()).collect(),
+            produces: produces.iter().map(|value| (*value).into()).collect(),
+            consumes: consumes.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn source_graph_returns_parallel_dependency_layers() {
+        let layers = BuildGraph::layers(vec![
+            unit("compiler", &["compiler"], &[]),
+            unit("runtime", &["runtime"], &["compiler"]),
+            unit("docs", &["docs"], &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            layers[0]
+                .iter()
+                .map(|unit| unit.name.as_str())
+                .collect::<Vec<_>>(),
+            ["compiler", "docs"]
+        );
+        assert_eq!(layers[1][0].name, "runtime");
+    }
+
+    #[test]
+    fn source_graph_reports_bootstrap_cycles() {
+        let error = BuildGraph::layers(vec![
+            unit("compiler", &["compiler"], &["libc"]),
+            unit("libc", &["libc"], &["compiler"]),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("compiler, libc"));
+    }
+
+    #[test]
+    fn bootstrap_plan_preserves_explicit_stage_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bootstrap.toml");
+        fs::write(
+            &path,
+            r#"schema_version=1
+[[stages]]
+name="seed"
+recipes=["compiler/recipe.toml"]
+[[stages]]
+name="self-host"
+recipes=["libc/recipe.toml", "compiler/recipe.toml"]
+"#,
+        )
+        .unwrap();
+        let plan = BootstrapPlan::load(path).unwrap();
+        assert_eq!(plan.stages[0].name, "seed");
+        assert_eq!(plan.stages[1].recipes.len(), 2);
     }
 
     #[test]
