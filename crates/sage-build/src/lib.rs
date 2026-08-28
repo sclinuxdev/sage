@@ -50,6 +50,16 @@ pub enum BuildError {
 pub struct SourceSpec {
     pub url: String,
     pub sha256: String,
+    /// Leading archive components removed during extraction.
+    #[serde(default)]
+    pub strip_components: Option<u32>,
+    /// Extraction directory relative to the shared source root.
+    #[serde(default = "default_source_destination")]
+    pub destination: PathBuf,
+}
+
+fn default_source_destination() -> PathBuf {
+    PathBuf::from(".")
 }
 
 /// Shared and main-package metadata from a recipe.
@@ -192,6 +202,9 @@ impl RecipeSpec {
                 "every source SHA-256 must contain 64 hex digits".into(),
             ));
         }
+        for source in recipe.source_inputs() {
+            validate_source_destination(&source.destination)?;
+        }
         for user in &recipe.sysusers {
             user.validate()?;
         }
@@ -212,9 +225,55 @@ impl RecipeSpec {
         self.source.iter().chain(self.sources.iter())
     }
 
+    /// Produces the ordered extraction plan consumed by every archive rclass.
+    pub fn source_manifest(&self) -> String {
+        let mut manifest = String::new();
+        for (index, source) in self.source_inputs().enumerate() {
+            let strip = source
+                .strip_components
+                .unwrap_or(if index == 0 { 1 } else { 0 });
+            manifest.push_str(&format!(
+                "{}\t{strip}\t{}\n",
+                source_archive_name(index),
+                source.destination.display()
+            ));
+        }
+        manifest
+    }
+
     /// Returns whether the package is installed outside the system channel root.
     pub fn uses_private_channel(&self) -> bool {
         self.package.channel != "system" && !self.package.channel.ends_with("/system")
+    }
+}
+
+/// Stable sandbox filename for an independently verified source archive.
+pub fn source_archive_name(index: usize) -> String {
+    format!("{index:03}-source")
+}
+
+fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
+    let valid = !path.as_os_str().is_empty()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::Normal(_)
+            )
+        })
+        && !path.starts_with(".distfiles")
+        && !path.starts_with(".patches")
+        && !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\t' | b'\n' | b'\r' | b'\0'));
+    if valid {
+        Ok(())
+    } else {
+        Err(BuildError::InvalidSpec(format!(
+            "source destination must stay below the source root: {}",
+            path.display()
+        )))
     }
 }
 
@@ -541,6 +600,19 @@ impl<'a> SandboxRunner<'a> {
             .arg(&self.config.sysroot)
             .arg("/");
         command.args(["--bind"]).arg(&paths.source).arg("/source");
+        // Overlay immutable inputs after the writable source bind. An archive may
+        // populate the source tree, but it cannot replace later distfiles, the
+        // extraction manifest, or patches before their declared turn.
+        command
+            .args(["--ro-bind"])
+            .arg(paths.source.join(".distfiles"))
+            .arg("/source/.distfiles");
+        if paths.source.join(".patches").exists() {
+            command
+                .args(["--ro-bind"])
+                .arg(paths.source.join(".patches"))
+                .arg("/source/.patches");
+        }
         command.args(["--bind"]).arg(&paths.build).arg("/build");
         command.args(["--bind"]).arg(&paths.destdir).arg("/dest");
         command
@@ -999,6 +1071,88 @@ sha256="{}"
     }
 
     #[test]
+    fn five_tarballs_follow_the_declarative_extraction_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe_path = directory.path().join("recipe.toml");
+        let mut document = r#"schema_version=1
+[package]
+name="aggregate"
+version="1"
+release=1
+description="aggregate"
+license="MIT"
+channel="system"
+arch="any"
+"#
+        .to_owned();
+        for index in 0..5 {
+            let destination = if index == 4 { "vendor/component" } else { "." };
+            document.push_str(&format!(
+                r#"
+[[sources]]
+url="https://example.invalid/source-{index}.tar"
+sha256="{}"
+strip_components=1
+destination="{destination}"
+"#,
+                format!("{index:x}").repeat(64)
+            ));
+        }
+        fs::write(&recipe_path, document).unwrap();
+        let recipe = RecipeSpec::load(recipe_path).unwrap();
+        assert_eq!(recipe.source_inputs().count(), 5);
+
+        let source = directory.path().join("source");
+        let distfiles = source.join(".distfiles");
+        fs::create_dir_all(&distfiles).unwrap();
+        for index in 0..5 {
+            let input = directory.path().join(format!("input-{index}/top"));
+            fs::create_dir_all(&input).unwrap();
+            fs::write(input.join(format!("file-{index}")), index.to_string()).unwrap();
+            let status = Command::new("tar")
+                .arg("-cf")
+                .arg(distfiles.join(source_archive_name(index)))
+                .arg("-C")
+                .arg(input.parent().unwrap())
+                .arg("top")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        fs::write(distfiles.join("manifest"), recipe.source_manifest()).unwrap();
+
+        let mut class =
+            Rclass::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/cmake.toml"))
+                .unwrap();
+        class.phases.retain(|phase, _| phase == "src_unpack");
+        let runner = compose_runner(
+            &[class],
+            &BTreeMap::from([
+                ("SRC_DIR".into(), source.display().to_string()),
+                ("JOBS".into(), "1".into()),
+            ]),
+        )
+        .unwrap();
+        let runner_path = directory.path().join("runner.sh");
+        fs::write(&runner_path, runner).unwrap();
+        assert!(Command::new("/bin/sh")
+            .arg(runner_path)
+            .status()
+            .unwrap()
+            .success());
+        for index in 0..4 {
+            assert_eq!(
+                fs::read_to_string(source.join(format!("file-{index}"))).unwrap(),
+                index.to_string()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(source.join("vendor/component/file-4")).unwrap(),
+            "4"
+        );
+    }
+
+    #[test]
     fn sysusers_are_staged_and_lifecycle_scripts_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recipe.toml");
@@ -1081,6 +1235,8 @@ shell="/usr/bin/nologin"
             source: Some(SourceSpec {
                 url: "https://example.invalid/x".into(),
                 sha256: "00".repeat(32),
+                strip_components: None,
+                destination: default_source_destination(),
             }),
             sources: vec![],
             build: RecipeBuild::default(),

@@ -972,26 +972,15 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
     std::fs::create_dir(&distfiles)?;
     let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
     for (index, input) in recipe.source_inputs().enumerate() {
-        let source_name = input
-            .url
-            .rsplit('/')
-            .next()
-            .and_then(|name| name.split('?').next())
-            .filter(|name| !name.is_empty())
-            .filter(|name| {
-                Path::new(name)
-                    .components()
-                    .all(|part| matches!(part, std::path::Component::Normal(_)))
-            })
-            .unwrap_or("source.archive");
         engine
             .download_url(
                 &input.url,
-                &distfiles.join(format!("{index:03}-{source_name}")),
+                &distfiles.join(sage_build::source_archive_name(index)),
                 &input.sha256,
             )
             .await?;
     }
+    std::fs::write(distfiles.join("manifest"), recipe.source_manifest())?;
     stage_patches(recipe_path.parent().unwrap_or(Path::new(".")), &source)?;
     let variables = build_variables(&config, &recipe);
     let runner_contents = sage_build::compose_runner(&classes, &variables)?;

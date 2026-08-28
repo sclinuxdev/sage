@@ -12,15 +12,12 @@ RUSTFLAGS = "${RUSTFLAGS}"
 
 [phases]
 src_unpack = """
-first=1
-for archive in "${SRC_DIR}"/.distfiles/*; do
-    if [ "$first" -eq 1 ]; then
-        tar -xf "$archive" --strip-components=1 -C "${SRC_DIR}"
-        first=0
-    else
-        tar -xf "$archive" -C "${SRC_DIR}"
-    fi
-done
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"
+    mkdir -p "$target"
+    tar -xf "${SRC_DIR}/.distfiles/$archive" --strip-components="$strip" -C "$target"
+done < "${SRC_DIR}/.distfiles/manifest"
 """
 
 src_prepare = """

@@ -146,10 +146,16 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 [[sources]]
 url = "https://example.org/project-languages-1.0.tar.xz"
 sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+strip_components = 1
+destination = "translations"
 ```
 
 The first archive supplies the primary source tree and is unpacked with its leading
 directory removed. Later archives overlay their native layout in declaration order.
+Both defaults can be overridden per source: `strip_components` controls leading
+archive removal and `destination` selects a safe directory below the shared source
+root. Arrays have no fixed length; a five-tarball recipe produces one ordered
+manifest and independently verifies all five archives before any extraction begins.
 Files in the recipe's `patches/` directory are copied into the sandbox and applied
 with `patch -p1` in bytewise filename order during `src_prepare`.
 
