@@ -171,7 +171,13 @@ struct ServiceDocument {
 
 impl ServiceSpec {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
-        let document: ServiceDocument = toml::from_str(&fs::read_to_string(path)?)?;
+        Self::parse(&fs::read(path)?)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SysError::Invalid("service document is not UTF-8".into()))?;
+        let document: ServiceDocument = toml::from_str(text)?;
         validate_schema(document.schema_version)?;
         document.service.validate()?;
         Ok(document.service)

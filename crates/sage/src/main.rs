@@ -369,11 +369,19 @@ async fn publish_packages(
             .target_root
             .strip_prefix("/")
             .unwrap_or(&source.target_root);
-        let ownership: Vec<_> = inspection
+        let mut ownership: Vec<_> = inspection
             .files
             .iter()
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
+        let service = if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
+            Some((sage_sys::ServiceSpec::parse(bytes)?, bytes.clone()))
+        } else {
+            None
+        };
+        if let Some((service, _)) = &service {
+            ownership.push(format!("usr/share/sage/services/{}.toml", service.name));
+        }
         for path in &ownership {
             let owners = database.owners(path)?;
             if owners.iter().any(|owner| owner != key) {
@@ -391,6 +399,13 @@ async fn publish_packages(
             &inspection.files,
             &previous,
         )?;
+        if let Some((service, bytes)) = service {
+            write_atomic_under_root(
+                root,
+                &Path::new("usr/share/sage/services").join(format!("{}.toml", service.name)),
+                &bytes,
+            )?;
+        }
         modified.extend(ownership.iter().map(PathBuf::from));
         let config_hashes = inspection
             .files
@@ -576,6 +591,35 @@ fn remove_file_beneath(root: &Path, path: &Path) -> Result<()> {
     }
 }
 
+fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        bail!("unsafe state path {}", relative.display());
+    }
+    let target = root.join(relative);
+    let parent = target.parent().context("state path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(canonical_root) {
+        bail!("state path escapes sysroot: {}", target.display());
+    }
+    let temporary = parent.join(format!(".sage-state-{}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    use std::io::Write as _;
+    options
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?
+        .write_all(bytes)?;
+    std::fs::rename(temporary, target)?;
+    Ok(())
+}
+
 async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
@@ -601,6 +645,34 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         } else {
             database.set_system_provider(&interface, &key)?;
         }
+    }
+    render_services(root, &config, dry_run)?;
+    Ok(())
+}
+
+fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) -> Result<()> {
+    let provider = config
+        .providers
+        .get("init")
+        .context("system providers must select an init implementation")?;
+    let rclass = under_root(
+        root,
+        &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
+    );
+    if dry_run {
+        for service in &config.services {
+            println!("Would render service {service} with {}", rclass.display());
+        }
+        return Ok(());
+    }
+    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
+    let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
+    for service in &config.services {
+        let path = service_dir.join(format!("{service}.toml"));
+        if !path.exists() {
+            bail!("enabled service '{service}' has no installed declaration");
+        }
+        generator.render_service(&sage_sys::ServiceSpec::load(path)?, root)?;
     }
     Ok(())
 }
