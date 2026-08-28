@@ -248,6 +248,24 @@ pub fn extract_package(
     sysroot: impl AsRef<Path>,
     index: &[FileRecord],
 ) -> Result<Vec<PathBuf>, ArchiveError> {
+    Ok(extract_package_with_config(package, sysroot, index, &BTreeMap::new())?.written)
+}
+
+/// Result of extraction including preserved and review-required configuration files.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExtractionReport {
+    pub written: Vec<PathBuf>,
+    pub preserved: Vec<PathBuf>,
+    pub sage_new: Vec<PathBuf>,
+}
+
+/// Extracts a package and applies three-way hashes to files below `etc/`.
+pub fn extract_package_with_config(
+    package: impl AsRef<Path>,
+    sysroot: impl AsRef<Path>,
+    index: &[FileRecord],
+    previous_hashes: &BTreeMap<String, String>,
+) -> Result<ExtractionReport, ArchiveError> {
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
@@ -261,7 +279,8 @@ pub fn extract_package(
     let root = unsafe { OwnedFd::from_raw_fd(root_raw) };
     let decoder = zstd::Decoder::new(File::open(package)?)?;
     let mut archive = tar::Archive::new(decoder);
-    let mut written = Vec::new();
+    let mut report = ExtractionReport::default();
+    let mut seen = 0;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = clean_archive_path(&entry.path()?)?;
@@ -290,28 +309,64 @@ pub fn extract_package(
                 relative.display()
             )));
         }
-        write_verified(&root, relative, record, &mut entry)?;
-        written.push(relative.to_path_buf());
+        let previous = previous_hashes
+            .get(&relative.to_string_lossy().into_owned())
+            .map(String::as_str);
+        match write_verified(&root, relative, record, previous, &mut entry)? {
+            WriteOutcome::Written => report.written.push(relative.to_path_buf()),
+            WriteOutcome::Preserved => report.preserved.push(relative.to_path_buf()),
+            WriteOutcome::SageNew => report.sage_new.push(relative.with_file_name(format!(
+                "{}.sage-new",
+                relative.file_name().unwrap().to_string_lossy()
+            ))),
+        }
+        seen += 1;
     }
-    if written.len() != expected.len() {
+    if seen != expected.len() {
         return Err(ArchiveError::InvalidMetadata(
             "archive payload does not match files.idx".into(),
         ));
     }
-    Ok(written)
+    Ok(report)
+}
+
+enum WriteOutcome {
+    Written,
+    Preserved,
+    SageNew,
 }
 
 fn write_verified(
     root: &OwnedFd,
     path: &Path,
     record: &FileRecord,
+    previous_hash: Option<&str>,
     reader: &mut impl Read,
-) -> Result<(), ArchiveError> {
+) -> Result<WriteOutcome, ArchiveError> {
     let parent = path.parent().unwrap_or(Path::new(""));
     let directory = ensure_directory(root, parent)?;
     let name = path
         .file_name()
         .ok_or_else(|| ArchiveError::UnsafePath(path.display().to_string()))?;
+    let live_hash = if path.starts_with("etc") && previous_hash.is_some() {
+        hash_at(&directory, name)?
+    } else {
+        None
+    };
+    if let (Some(previous), Some(live)) = (previous_hash, live_hash.as_deref()) {
+        if live != previous && record.sha256 == previous {
+            verify_reader(path, record, reader)?;
+            return Ok(WriteOutcome::Preserved);
+        }
+    }
+    let conflict = previous_hash
+        .zip(live_hash.as_deref())
+        .is_some_and(|(previous, live)| live != previous && record.sha256 != previous);
+    let destination = if conflict {
+        format!("{}.sage-new", name.to_string_lossy())
+    } else {
+        name.to_string_lossy().into_owned()
+    };
     let temp = format!(
         ".sage-tmp-{}-{}",
         std::process::id(),
@@ -359,10 +414,66 @@ fn write_verified(
         Some(directory.as_raw_fd()),
         temp.as_str(),
         Some(directory.as_raw_fd()),
-        name,
+        destination.as_str(),
     )?;
     temporary.active = false;
-    Ok(())
+    Ok(if conflict {
+        WriteOutcome::SageNew
+    } else {
+        WriteOutcome::Written
+    })
+}
+
+fn hash_at(directory: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<String>, ArchiveError> {
+    let raw = match openat(
+        Some(directory.as_raw_fd()),
+        name,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(raw) => raw,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    // SAFETY: `openat` returned one fresh descriptor transferred to `File`.
+    let mut file = unsafe { File::from_raw_fd(raw) };
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut HashOnly(&mut hasher))?;
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+fn verify_reader(
+    path: &Path,
+    record: &FileRecord,
+    reader: &mut impl Read,
+) -> Result<(), ArchiveError> {
+    let mut hasher = Sha256::new();
+    let copied = io::copy(
+        &mut reader.take(record.size + 1),
+        &mut HashOnly(&mut hasher),
+    )?;
+    let actual = hex::encode(hasher.finalize());
+    if copied == record.size && actual == record.sha256 {
+        Ok(())
+    } else {
+        Err(ArchiveError::ChecksumMismatch {
+            path: path.into(),
+            expected: record.sha256.clone(),
+            actual,
+        })
+    }
+}
+
+struct HashOnly<'a>(&'a mut Sha256);
+
+impl Write for HashOnly<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct TempGuard {
@@ -491,5 +602,56 @@ build_time=1
         fs::create_dir(&root).unwrap();
         extract_package(&package, &root, &inspection.files).unwrap();
         assert_eq!(fs::read(root.join("usr/bin/hello")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn modified_configuration_is_written_as_sage_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        fs::create_dir_all(stage.join("data/etc")).unwrap();
+        fs::write(stage.join("data/etc/demo.conf"), b"new upstream").unwrap();
+        let new_hash = hex::encode(Sha256::digest(b"new upstream"));
+        fs::write(
+            stage.join(".METADATA/files.idx"),
+            format!("etc/demo.conf\t0644\t12\t{new_hash}\n"),
+        )
+        .unwrap();
+        fs::write(
+            stage.join(".METADATA/manifest.toml"),
+            r#"schema_version=1
+name="demo"
+version="2.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+installed_size=12
+build_time=1
+"#,
+        )
+        .unwrap();
+        let package = temp.path().join("demo.pkg.tar.zst");
+        create_package(&stage, &package, 1).unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/demo.conf"), b"user edit").unwrap();
+        let previous = BTreeMap::from([(
+            "etc/demo.conf".into(),
+            hex::encode(Sha256::digest(b"old upstream")),
+        )]);
+        let inspection = inspect_package(&package).unwrap();
+        let report =
+            extract_package_with_config(&package, &root, &inspection.files, &previous).unwrap();
+        assert_eq!(fs::read(root.join("etc/demo.conf")).unwrap(), b"user edit");
+        assert_eq!(
+            fs::read(root.join("etc/demo.conf.sage-new")).unwrap(),
+            b"new upstream"
+        );
+        assert_eq!(
+            report.sage_new,
+            vec![PathBuf::from("etc/demo.conf.sage-new")]
+        );
     }
 }
