@@ -764,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn standard_trigger_library_is_valid_and_unique() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../triggers");
+        let mut names = BTreeSet::new();
+        let mut files: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        files.sort_by_key(|entry| entry.file_name());
+        for file in files {
+            let trigger = TriggerSpec::load(file.path()).unwrap();
+            assert!(names.insert(trigger.name));
+        }
+        assert!(names.len() >= 9);
+    }
+
+    #[test]
     fn service_template_renders_atomically() {
         let root = tempfile::tempdir().unwrap();
         let generator = TemplateServiceGenerator {

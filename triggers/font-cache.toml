@@ -1,0 +1,8 @@
+schema_version = 1
+name = "font-cache"
+description = "Refresh the system fontconfig cache"
+on_paths = ["usr/share/fonts/**"]
+exec = ["/usr/bin/fc-cache", "-f", "${sysroot}/usr/share/fonts"]
+priority = 45
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

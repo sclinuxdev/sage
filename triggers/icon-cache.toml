@@ -1,0 +1,8 @@
+schema_version = 1
+name = "icon-cache"
+description = "Refresh modified freedesktop icon theme caches"
+on_paths = ["usr/share/icons/*/**"]
+exec = ["/usr/bin/gtk-update-icon-cache", "-q", "-f", "${sysroot}/usr/share/icons/${path[3]}"]
+priority = 40
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

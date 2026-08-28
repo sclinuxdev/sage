@@ -143,3 +143,14 @@ arguments expand without a shell, and identical commands are deduplicated.
 Arbitrary pre-install execution remains forbidden. Preconditions belong in
 solver constraints and archive validation; package code before publication would
 break reproducibility and rollback safety.
+
+## 5. Standard trigger library
+
+The base data library covers dynamic linker maps, kernel modules, system users,
+GLib schemas, the shared MIME database, icon themes, fontconfig caches, desktop
+application handlers, and GIO modules. Each declaration is an independent TOML
+file, so distributions can override or replace commands without rebuilding Sage.
+
+All cache refreshes run after change and removal, use `${sysroot}` rather than
+assuming `/`, and collapse identical expanded commands. Theme- and ABI-specific
+triggers derive their cache directory from validated path components.

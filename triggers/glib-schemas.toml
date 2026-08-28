@@ -1,0 +1,8 @@
+schema_version = 1
+name = "glib-schemas"
+description = "Compile installed GLib settings schemas"
+on_paths = ["usr/share/glib-2.0/schemas/*.xml"]
+exec = ["/usr/bin/glib-compile-schemas", "${sysroot}/usr/share/glib-2.0/schemas"]
+priority = 30
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

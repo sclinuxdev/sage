@@ -1,0 +1,8 @@
+schema_version = 1
+name = "gio-modules"
+description = "Refresh GIO extension module caches"
+on_paths = ["usr/lib*/gio/modules/*.so"]
+exec = ["/usr/bin/gio-querymodules", "${sysroot}/usr/${path[1]}/gio/modules"]
+priority = 32
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

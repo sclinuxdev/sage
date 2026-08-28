@@ -1,0 +1,8 @@
+schema_version = 1
+name = "desktop-database"
+description = "Refresh desktop application MIME handlers"
+on_paths = ["usr/share/applications/*.desktop"]
+exec = ["/usr/bin/update-desktop-database", "${sysroot}/usr/share/applications"]
+priority = 50
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

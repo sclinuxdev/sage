@@ -1,0 +1,8 @@
+schema_version = 1
+name = "ldconfig"
+description = "Refresh the dynamic linker cache after library changes"
+on_paths = ["usr/lib*/**/*.so", "usr/lib*/**/*.so.*"]
+exec = ["/sbin/ldconfig", "-r", "${sysroot}"]
+priority = 10
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

@@ -1,0 +1,8 @@
+schema_version = 1
+name = "mime-database"
+description = "Refresh the shared MIME type database"
+on_paths = ["usr/share/mime/packages/**"]
+exec = ["/usr/bin/update-mime-database", "${sysroot}/usr/share/mime"]
+priority = 35
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true

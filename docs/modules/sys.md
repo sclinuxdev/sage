@@ -81,3 +81,8 @@ impl TemplateServiceGenerator {
 The trigger engine exposes three auditable lifecycle boundaries: post-change,
 post-remove, and rebuild. Removal snapshots declarations before owned files
 disappear; rebuild handlers run after package, provider, and service convergence.
+
+The shipped trigger directory supplies generic declarations for `ldconfig`,
+`depmod`, sysusers, GLib schemas, MIME data, icon themes, fonts, desktop entries,
+and GIO modules. A unit test parses the complete directory and rejects invalid or
+duplicate declaration names.
