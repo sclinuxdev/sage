@@ -313,12 +313,20 @@ struct ProcessExecAudit {
                     ::ptrace(PTRACE_CONT, descendant, nullptr, nullptr);
                 }
             }
+            int pass_sig = 0;
+            if (event == 0) {
+                const int sig = WSTOPSIG(status);
+                if (sig != SIGSTOP && sig != SIGTRAP) {
+                    pass_sig = sig;
+                }
+            }
             // Options are inherited by traced descendants on Linux, but
             // setting them again is harmless and covers kernels that only
             // copy the tracing relationship at clone time.
             ::ptrace(PTRACE_SETOPTIONS, pid, nullptr,
                      reinterpret_cast<void*>(trace_options));
-            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+            ::ptrace(PTRACE_CONT, pid, nullptr,
+                     reinterpret_cast<void*>(static_cast<intptr_t>(pass_sig)));
         }
         if (!root_done) return std::unexpected(std::string{"build audit supervisor lost its root child"});
         if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);

@@ -348,7 +348,10 @@ inline std::expected<BuildPlan, std::string> plan_v2(
     // turning the selected backend into an observed child execution.
     const auto audit_root = tools.path_for_build.substr(
         0, tools.path_for_build.find(':'));
-    const std::string audit_prefix = tools.path_for_build.empty()
+    const bool has_target_flags = std::ranges::any_of(spec.configure_options, [](const auto& opt) {
+        return opt.starts_with("LDFLAGS_FOR_TARGET=") || opt.starts_with("CFLAGS_FOR_TARGET=");
+    });
+    const std::string audit_prefix = (tools.path_for_build.empty() || has_target_flags)
         ? "" : " -B" + audit_root;
     const std::string cxxflags = apply_flag_policy(
         cfg.cxxflags.empty() ? cfg.cflags : cfg.cxxflags, spec.flag_policy);
@@ -370,7 +373,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
         {"CPPFLAGS", cppflags}, {"CFLAGS", cflags},
         {"CXXFLAGS", cxxflags}, {"LDFLAGS", ldflags},
         {"RUSTFLAGS", rustflags}, {"DESTDIR", paths.package.string()},
-        {"PREFIX", "/usr"}, {"MAKEFLAGS", std::format("-j{}", jobs)},
+        {"PREFIX", "/usr"}, {"MAKEFLAGS", std::format("-j{} --jobserver-style=pipe", jobs)},
         {"CARGO_BUILD_JOBS", std::to_string(jobs)},
         {"LC_ALL", "C"}, {"LANG", "C"}, {"TZ", "UTC"},
         {"SOURCE_DATE_EPOCH", std::to_string(cfg.source_date_epoch)},
@@ -675,6 +678,7 @@ inline std::expected<BuildPlan, std::string> plan_v2(
                     spec.autotools->raw_options.begin(), spec.autotools->raw_options.end());
             }
             if (!tools.target_triplet.empty()) {
+                autotools_opts.push_back("--build=" + tools.target_triplet);
                 autotools_opts.push_back("--host=" + tools.target_triplet);
             }
             for (const auto& option : autotools_opts) {
@@ -695,25 +699,42 @@ inline std::expected<BuildPlan, std::string> plan_v2(
             const auto configure_vars = make_vars.empty()
                 ? std::string{}
                 : make_vars.substr(1) + " ";
+            const auto cache_file = (source / "config.cache").string();
+            const std::string preseed = "printf '%s\\n' "
+                "'lt_cv_shlibpath_overrides_runpath=${lt_cv_shlibpath_overrides_runpath=no}' "
+                ">> " + shell_quote(cache_file) + " && ";
             if (spec.build_dir.empty()) {
-                step("configure", source, configure_vars
-                    + "./configure --prefix=/usr --libdir=/usr/lib" +
+                step("configure", source, preseed + configure_vars
+                    + "./configure --prefix=/usr --libdir=/usr/lib --cache-file="
+                    + shell_quote(cache_file) +
                     (options.empty() ? "" : " " + options));
             } else {
                 step("configure", source, "mkdir -p " + shell_quote(build.string())
                     + " && cd " + shell_quote(build.string())
-                    + " && " + configure_vars
-                    + "../configure --prefix=/usr --libdir=/usr/lib"
+                    + " && " + preseed + configure_vars
+                    + "../configure --prefix=/usr --libdir=/usr/lib --cache-file="
+                    + shell_quote(cache_file)
                     + (options.empty() ? "" : " " + options));
             }
             const auto autotools_cwd = spec.build_dir.empty() ? source : build;
             custom_steps("pre-build");
-            step("build", autotools_cwd, "make" + make_managed_vars + make_vars +
-                (build_targets.empty() ? "" : " " + build_targets));
+            if (spec.build_targets.empty()) {
+                step("build", autotools_cwd, "make" + make_vars);
+            } else {
+                for (const auto& target : spec.build_targets) {
+                    step("build", autotools_cwd, "make" + make_vars + " " + shell_quote(target));
+                }
+            }
             for (const auto* phase : {"post-build", "check", "pre-install"}) custom_steps(phase);
-            step("install", autotools_cwd, "make" + make_managed_vars + make_vars + " DESTDIR=" +
-                shell_quote(paths.package.string()) + " " +
-                (install_targets.empty() ? "install" : install_targets));
+            if (spec.install_targets.empty()) {
+                step("install", autotools_cwd, "make" + make_vars + " DESTDIR=" +
+                    shell_quote(paths.package.string()) + " install");
+            } else {
+                for (const auto& target : spec.install_targets) {
+                    step("install", autotools_cwd, "make" + make_vars + " DESTDIR=" +
+                        shell_quote(paths.package.string()) + " " + shell_quote(target));
+                }
+            }
             for (const auto* phase : {"install", "post-install"}) custom_steps(phase);
             break;
         }

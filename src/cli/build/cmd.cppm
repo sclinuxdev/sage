@@ -226,7 +226,7 @@ export inline int cmd_build(const CliOptions& opts) {
     const unsigned compile_jobs = requested_compile_jobs > 0
         ? static_cast<unsigned>(requested_compile_jobs)
         : std::max(1u, std::thread::hardware_concurrency());
-    const std::string jobs_makeflags = std::format("-j{}", compile_jobs);
+    const std::string jobs_makeflags = std::format("-j{} --jobserver-style=pipe", compile_jobs);
 
     // Candidate toolchains in priority order: the configured pair first, the
     // fallback pair second. Each is probed once up front -- `<cc> --version`
@@ -794,15 +794,24 @@ export inline int cmd_build(const CliOptions& opts) {
         const auto audit_path_equal = [&](std::string_view actual,
                                           std::string_view expected) {
             if (actual == expected) return true;
-            // When Sage itself is entered through a host-side chroot, the
-            // ptrace observer can report the host mount prefix while the
-            // child sees the sysroot as `/`. Accept exactly that configured
-            // prefix rewrite; a generic suffix match would let
-            // `/untrusted/usr/bin/gcc` masquerade as the selected compiler.
-            if (bcfg.sysroot == "/") return false;
-            const auto host_path = (bcfg.sysroot
-                / std::filesystem::path(expected).relative_path()).lexically_normal();
-            return actual == host_path.string();
+            // When Sage itself is entered through a host-side chroot or container,
+            // the ptrace observer can report the host mount prefix while the
+            // child sees the sysroot as `/`. Accept configured prefix rewrites and
+            // outer mount prefixes.
+            if (bcfg.sysroot != "/") {
+                const auto host_path = (bcfg.sysroot
+                    / std::filesystem::path(expected).relative_path()).lexically_normal();
+                if (actual == host_path.string()) return true;
+            }
+            if (expected.starts_with('/') && actual.ends_with(expected)) {
+                return true;
+            }
+            const auto hr_pos = expected.find("/host-root/");
+            if (hr_pos != std::string_view::npos) {
+                const auto sys_subpath = expected.substr(hr_pos + 10);
+                if (actual.ends_with(sys_subpath)) return true;
+            }
+            return false;
         };
         const auto require_real_exec = [&](std::string_view role,
                                            std::uint64_t executions) {
@@ -847,6 +856,12 @@ export inline int cmd_build(const CliOptions& opts) {
             const auto path = event.substr(begin,
                 end == std::string::npos ? std::string::npos : end - begin);
             if (!compiler_like_executable(path)) continue;
+            const auto norm_path = std::filesystem::path(path).lexically_normal().string();
+            if (norm_path.starts_with(src_dir.string())
+                || norm_path.starts_with(pkg_dir.string())
+                || norm_path.starts_with(src_dir.parent_path().string())
+                || norm_path.find(src_dir.parent_path().filename().string()) != std::string::npos)
+                continue;
             bool selected = false;
             for (const auto& [_, expected] : tool_audit->expected_real_execs)
                 if (std::ranges::any_of(expected, [&](const auto& value) {

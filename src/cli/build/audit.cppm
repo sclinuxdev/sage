@@ -307,6 +307,41 @@ struct ToolAudit {
         const auto execution_paths = [&](std::string_view role,
                                          const std::filesystem::path& real) {
             std::vector<std::string> paths{execution_path(role, real)};
+            std::error_code dir_ec;
+            const auto prefix = real.parent_path().parent_path();
+            if (std::filesystem::is_directory(prefix, dir_ec)) {
+                for (const auto& entry : std::filesystem::directory_iterator(prefix, dir_ec)) {
+                    if (entry.is_directory(dir_ec)) {
+                        const auto triplet_bin_dir = entry.path() / "bin";
+                        if (std::filesystem::is_directory(triplet_bin_dir, dir_ec)) {
+                            for (const auto& bin_entry : std::filesystem::directory_iterator(triplet_bin_dir, dir_ec)) {
+                                if (bin_entry.is_regular_file(dir_ec)) {
+                                    const auto p = execution_path(role, bin_entry.path());
+                                    if (std::ranges::find(paths, p) == paths.end())
+                                        paths.push_back(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            const auto usr_dir = sysroot_root / "usr";
+            if (std::filesystem::is_directory(usr_dir, dir_ec)) {
+                for (const auto& entry : std::filesystem::directory_iterator(usr_dir, dir_ec)) {
+                    if (entry.is_directory(dir_ec)) {
+                        const auto triplet_bin_dir = entry.path() / "bin";
+                        if (std::filesystem::is_directory(triplet_bin_dir, dir_ec)) {
+                            for (const auto& bin_entry : std::filesystem::directory_iterator(triplet_bin_dir, dir_ec)) {
+                                if (bin_entry.is_regular_file(dir_ec)) {
+                                    const auto p = execution_path(role, bin_entry.path());
+                                    if (std::ranges::find(paths, p) == paths.end())
+                                        paths.push_back(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             std::ifstream in(real);
             std::string first;
             if (!in || !std::getline(in, first) || !first.starts_with("#!"))
@@ -451,15 +486,39 @@ struct ToolAudit {
             }
             return false;
         };
-        for (const auto& directory : {std::filesystem::path{"/usr/bin"},
-                                      std::filesystem::path{"/bin"},
-                                      std::filesystem::path{"/usr/local/bin"}}) {
+        std::vector<std::filesystem::path> scan_dirs;
+        for (const auto& dir : {std::filesystem::path{"usr/bin"},
+                                std::filesystem::path{"bin"},
+                                std::filesystem::path{"usr/local/bin"}}) {
+            std::error_code dir_ec;
+            const auto target_dir = build_sysroot / dir;
+            if (std::filesystem::is_directory(target_dir, dir_ec))
+                scan_dirs.push_back(target_dir);
+        }
+        if (std::filesystem::exists(build_sysroot / "opt/channels")) {
+            std::error_code opt_ec;
+            for (const auto& ch_entry : std::filesystem::recursive_directory_iterator(
+                     build_sysroot / "opt/channels",
+                     std::filesystem::directory_options::skip_permission_denied, opt_ec)) {
+                if (ch_entry.is_directory(opt_ec) && ch_entry.path().filename() == "bin") {
+                    scan_dirs.push_back(ch_entry.path());
+                }
+            }
+        }
+        std::vector<std::pair<std::string, std::filesystem::path>> all_tool_paths;
+        for (const auto& directory : scan_dirs) {
             std::error_code scan_ec;
             for (const auto& entry : std::filesystem::directory_iterator(directory, scan_ec)) {
                 const auto name = entry.path().filename().string();
-                if (looks_like_tool(name)
-                    && std::ranges::find(fenced, name) == fenced.end())
-                    fenced.push_back(name);
+                if (looks_like_tool(name)) {
+                    if (std::ranges::find(fenced, name) == fenced.end())
+                        fenced.push_back(name);
+                    std::error_code can_ec;
+                    auto canonical_path = std::filesystem::weakly_canonical(entry.path(), can_ec);
+                    if (!can_ec && std::filesystem::is_regular_file(canonical_path, can_ec)) {
+                        all_tool_paths.emplace_back(name, canonical_path);
+                    }
+                }
             }
         }
         const auto deny = [&](std::string_view name) {
@@ -560,24 +619,24 @@ struct ToolAudit {
                     + " --bind " + sage::build::shell_quote(ccache_dir.string())
                     + " " + sage::build::shell_quote(ccache_dir.string());
             }
-            for (const auto& name : fenced) {
-                if (auto resolved = resolve(name)) {
-                    const auto target = namespace_path(*resolved);
-                    if (!bound_targets.insert(target.string()).second) continue;
-                    // Bind selected and non-selected aliases alike. Selected
-                    // wrappers execute the mirrored sysroot path above, so
-                    // an absolute compiler/linker path cannot bypass observation.
-                    const bool is_linker_name = name == "ld"
-                        || name.starts_with("ld.") || name.starts_with("ld-")
-                        || name == "lld" || name.starts_with("lld-")
-                        || name == "mold" || name.starts_with("mold-");
-                    const bool is_rustc_name = name.starts_with("rustc");
-                    const auto source = is_linker_name
-                        ? audit.root / std::string(name)
-                        : is_rustc_name
-                            ? (rustc ? audit.root / "sage-rustc"
-                                     : audit.root / std::string(name))
-                            : audit.root / "sage-compiler-dispatch";
+            for (const auto& [name, tool_path] : all_tool_paths) {
+                const auto target = namespace_path(tool_path);
+                if (!bound_targets.insert(target.string()).second) continue;
+                // Bind selected and non-selected aliases alike. Selected
+                // wrappers execute the mirrored sysroot path above, so
+                // an absolute compiler/linker path cannot bypass observation.
+                const bool is_linker_name = name == "ld"
+                    || name.starts_with("ld.") || name.starts_with("ld-")
+                    || name == "lld" || name.starts_with("lld-")
+                    || name == "mold" || name.starts_with("mold-");
+                const bool is_rustc_name = name.starts_with("rustc");
+                const auto source = is_linker_name
+                    ? audit.root / std::string(name)
+                    : is_rustc_name
+                        ? (rustc ? audit.root / "sage-rustc"
+                                 : audit.root / std::string(name))
+                        : audit.root / "sage-compiler-dispatch";
+                if (std::filesystem::exists(source)) {
                     audit.sandbox += " --bind "
                         + sage::build::shell_quote(source.string())
                         + " " + sage::build::shell_quote(target.string());

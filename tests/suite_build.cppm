@@ -270,7 +270,7 @@ install = [
         auto jobcanary = build_with_root(job_dir, job_root, temp_dir / "bcfg-jobs-x",
                                          "jobcanary-1.0.0-1-x86_64.pkg.tar.zst");
         if (!jobcanary
-            || read_text(temp_dir / "bcfg-jobs-x/usr/share/makeflags.txt") != std::format("-j{}", expect_jobs)
+            || read_text(temp_dir / "bcfg-jobs-x/usr/share/makeflags.txt") != std::format("-j{} --jobserver-style=pipe", expect_jobs)
             || read_text(temp_dir / "bcfg-jobs-x/usr/share/cargojobs.txt") != std::to_string(expect_jobs)
             || read_text(temp_dir / "bcfg-jobs-x/usr/share/fakeroot.txt") != "1") {
             sage::util::log_error(
@@ -895,7 +895,7 @@ install_files = ["usr/bin/tool"]
                 sage::util::log_error("A managed recipe v2 backend failed to plan");
                 return 1;
             }
-            if (variant_plan->environment["MAKEFLAGS"] != "-j8"
+            if (variant_plan->environment["MAKEFLAGS"] != "-j8 --jobserver-style=pipe"
                 || variant_plan->environment["CARGO_BUILD_JOBS"] != "8") {
                 sage::util::log_error(
                     "Managed recipe v2 environment lost single-package parallelism");

@@ -227,6 +227,10 @@ inline std::expected<UniqueFd, std::string> open_anchored_dir_strict(
 #endif
         int next = ::openat(current.get(), name.c_str(), flags);
         if (next < 0) {
+            if (errno == ENOENT) {
+                return std::unexpected(std::format(
+                    "Cannot anchor directory '{}': No such file or directory", name));
+            }
             return std::unexpected(std::format(
                 "Cannot anchor directory '{}': {}", name, std::strerror(errno)));
         }

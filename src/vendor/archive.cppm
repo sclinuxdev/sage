@@ -3,6 +3,7 @@ module;
 #include <archive.h>
 #include <archive_entry.h>
 #include <sys/stat.h>
+#include <clocale>
 
 export module sage.vendor.libarchive;
 
@@ -72,6 +73,7 @@ public:
     [[nodiscard]] bool valid() const noexcept { return handle_ != nullptr; }
 
     static std::expected<ArchiveReader, std::string> open_fd(int fd, size_t block_size = 64 * 1024) {
+        std::setlocale(LC_ALL, "");
         ArchiveReader reader;
         reader.handle_ = ::archive_read_new();
         if (!reader.handle_) return std::unexpected(std::string{"Cannot allocate libarchive reader"});

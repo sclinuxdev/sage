@@ -106,6 +106,8 @@ inline bool compiler_like_executable(std::string_view path) {
         || base == "as" || base == "ar" || base == "ranlib"
         || base == "gcc-ar" || base == "gcc-nm" || base == "gcc-ranlib"
         || base == "llvm-ar" || base == "llvm-nm" || base == "llvm-ranlib"
+        || base.ends_with("-tblgen")
+        || (base.starts_with("clang-") && base.size() > 6 && !std::isdigit(static_cast<unsigned char>(base[6])))
         // clang-scan-deps is an analysis helper launched by the selected
         // clang driver, not an alternative compiler/linker.  It must be
         // visible to module dependency generation without being mistaken for
@@ -121,8 +123,13 @@ inline bool compiler_like_executable(std::string_view path) {
                               std::string_view{"ld"}, std::string_view{"lld"},
                               std::string_view{"mold"}, std::string_view{"rustc"}}) {
         if (base.starts_with(prefix)
-            && (base.size() == prefix.size() || base[prefix.size()] == '-'
+            && (base.size() == prefix.size()
                 || base[prefix.size()] == '.'
+                || (base[prefix.size()] == '-' && base.size() > prefix.size() + 1
+                    && (std::isdigit(static_cast<unsigned char>(base[prefix.size() + 1]))
+                        || base.ends_with("-ld") || base.ends_with("-gcc")
+                        || base.ends_with("-g++") || base.ends_with("-clang")
+                        || base.ends_with("-clang++")))
                 || std::isdigit(static_cast<unsigned char>(base[prefix.size()]))))
             return true;
     }
