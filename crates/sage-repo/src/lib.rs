@@ -64,6 +64,36 @@ pub struct SubchannelConfig {
     pub enabled: bool,
 }
 
+/// Complete `/etc/sage/channels.toml` document.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelsConfig {
+    pub schema_version: u32,
+    pub channels: std::collections::BTreeMap<String, ChannelConfig>,
+}
+
+impl ChannelsConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, RepoError> {
+        let config: Self = toml::from_str(&std::fs::read_to_string(path)?)
+            .map_err(|error| RepoError::InvalidConfig(error.to_string()))?;
+        if config.schema_version != sage_core::SCHEMA_VERSION {
+            return Err(RepoError::InvalidConfig(format!(
+                "unsupported schema version {}",
+                config.schema_version
+            )));
+        }
+        Ok(config)
+    }
+}
+
+/// Derives a subchannel URL solely from configuration values.
+pub fn subchannel_url(
+    channel: &ChannelConfig,
+    name: &str,
+    subchannel: &SubchannelConfig,
+) -> String {
+    join_url(&channel.url, subchannel.alias.as_deref().unwrap_or(name))
+}
+
 fn enabled() -> bool {
     true
 }
