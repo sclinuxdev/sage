@@ -11,10 +11,16 @@ CARGO_BUILD_JOBS = "${JOBS}"
 RUSTFLAGS = "${RUSTFLAGS}"
 
 [phases]
+src_unpack = """
+archive="$(find "${SRC_DIR}" -maxdepth 1 -type f -print -quit)"
+tar -xf "$archive" --strip-components=1 -C "${SRC_DIR}"
+rm -f "$archive"
+"""
+
 src_compile = """
-cargo build --release --locked
+cargo build --release --locked --manifest-path "${SRC_DIR}/Cargo.toml" --target-dir "${BUILD_DIR}/target"
 """
 
 src_install = """
-cargo install --locked --root "${DESTDIR}/usr" --path .
+cargo install --locked --root "${DESTDIR}/usr" --path "${SRC_DIR}"
 """
