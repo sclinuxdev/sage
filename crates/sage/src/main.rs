@@ -672,7 +672,9 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
         if !path.exists() {
             bail!("enabled service '{service}' has no installed declaration");
         }
-        generator.render_service(&sage_sys::ServiceSpec::load(path)?, root)?;
+        let service = sage_sys::ServiceSpec::load(path)?;
+        generator.render_service(&service, root)?;
+        generator.enable_service(&service, root)?;
     }
     Ok(())
 }

@@ -228,6 +228,10 @@ pub struct TemplateServiceGenerator {
     pub mode: u32,
     pub template: String,
     pub validate_command: Option<String>,
+    #[serde(alias = "enable_cmd")]
+    pub enable_command: Option<String>,
+    #[serde(alias = "disable_cmd")]
+    pub disable_command: Option<String>,
 }
 
 impl TemplateServiceGenerator {
@@ -267,6 +271,17 @@ impl TemplateServiceGenerator {
             run_validation(&expand_template(command, &variables)?, sysroot)?;
         }
         Ok(target)
+    }
+
+    /// Executes the init class's generic enable action, when it declares one.
+    pub fn enable_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
+        if let Some(command) = &self.enable_command {
+            run_validation(
+                &expand_template(command, &service_variables(service, sysroot)?)?,
+                sysroot,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -622,6 +637,8 @@ mod tests {
             mode: 0o755,
             template: "exec ${service.command_json}\n".into(),
             validate_command: None,
+            enable_command: None,
+            disable_command: None,
         };
         let service = ServiceSpec {
             name: "demo".into(),
