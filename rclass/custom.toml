@@ -1,0 +1,13 @@
+schema_version = 1
+name = "custom"
+description = "Direct custom script execution class for meta and system data packages"
+
+implicit_build_dependencies = []
+allowed_compilers = []
+allowed_linkers = []
+
+[defaults]
+"args.install_cmd" = ":"
+
+[phases]
+src_install = "${args.install_cmd}"

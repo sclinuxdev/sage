@@ -1,8 +1,0 @@
-schema_version = 1
-name = "sysusers"
-description = "Apply declarative system user and group records"
-on_paths = ["usr/lib/sysusers.d/**"]
-exec = ["/usr/bin/systemd-sysusers", "--root=${sysroot}"]
-priority = 5
-events = ["post-change"]
-ignore_missing_binary = false

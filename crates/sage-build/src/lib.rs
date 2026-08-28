@@ -53,6 +53,7 @@ pub enum BuildError {
 
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     #[serde(default)]
     pub kind: SourceKind,
@@ -89,6 +90,7 @@ fn default_source_destination() -> PathBuf {
 
 /// Shared and main-package metadata from a recipe.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipePackage {
     pub name: String,
     #[serde(default = "default_slot")]
@@ -113,6 +115,7 @@ fn default_slot() -> String {
 
 /// Ordered glob claims used to partition one DESTDIR.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadSpec {
     #[serde(default)]
     pub files: Vec<String>,
@@ -123,6 +126,7 @@ pub struct PayloadSpec {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeBuild {
     #[serde(default)]
     pub inherit: Vec<String>,
@@ -149,6 +153,7 @@ pub struct RecipeBuild {
 /// One opt-in build feature. Rules are folded before dependency solving or
 /// runner generation, keeping feature checks out of all execution hot paths.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureSpec {
     #[serde(default)]
     pub default: bool,
@@ -176,6 +181,7 @@ pub struct EffectiveFeatures {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubpackageSpec {
     pub name: String,
     pub description: Option<String>,
@@ -188,9 +194,13 @@ pub struct SubpackageSpec {
     pub payload: PayloadSpec,
 }
 
-/// One declarative account emitted in systemd-sysusers compatible syntax.
+/// One declarative account staged as Sage-owned package metadata.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SysuserSpec {
+    /// Output package that owns this declaration; empty selects the main one.
+    #[serde(default)]
+    pub package: String,
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
@@ -269,6 +279,7 @@ fn default_shell() -> String {
 
 /// Complete single-build, multiple-output recipe.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeSpec {
     pub schema_version: u32,
     pub package: RecipePackage,
@@ -565,6 +576,28 @@ impl RecipeSpec {
                 "subpackage names must be unique".into(),
             ));
         }
+        if recipe
+            .sysusers
+            .iter()
+            .any(|account| !account.package.is_empty() && !names.contains(account.package.as_str()))
+        {
+            return Err(BuildError::InvalidSpec(
+                "sysuser owner must name an output package".into(),
+            ));
+        }
+        if recipe.alternatives.iter().any(|alternative| {
+            !alternative.package.is_empty() && !names.contains(alternative.package.as_str())
+        }) {
+            return Err(BuildError::InvalidSpec(
+                "alternative owner must name an output package".into(),
+            ));
+        }
+        for subpackage in &recipe.subpackages {
+            if let Some(license) = &subpackage.license {
+                sage_core::validate_spdx_expression(license)
+                    .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;
+            }
+        }
         Ok(recipe)
     }
 
@@ -763,7 +796,10 @@ impl SourceSpec {
         match self.kind {
             SourceKind::Archive => {
                 if self.sha256.len() != 64
-                    || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !self
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
                     || !self.commit.is_empty()
                     || self.submodules
                 {
@@ -965,19 +1001,20 @@ fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
 
 impl SysuserSpec {
     fn validate(&self) -> Result<(), BuildError> {
-        if !matches!(self.kind.as_str(), "user" | "group")
+        if (!self.package.is_empty() && !valid_package_name(&self.package))
+            || !matches!(self.kind.as_str(), "user" | "group")
             || self.name.is_empty()
             || !self
                 .name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            || self.description.contains(['\n', '\r', '\0', '"'])
+            || self.description.contains(['\n', '\r', '\0', '"', ':'])
             || !Path::new(&self.home).is_absolute()
             || !Path::new(&self.shell).is_absolute()
             || [&self.home, &self.shell].iter().any(|value| {
                 value
                     .bytes()
-                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\'))
+                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b':'))
             })
         {
             return Err(BuildError::InvalidSpec(format!(
@@ -1003,33 +1040,6 @@ fn reject_lifecycle_scripts(recipe_dir: &Path) -> Result<(), BuildError> {
             "interactive lifecycle script '{name}' is not supported; use declarative metadata"
         )));
     }
-    Ok(())
-}
-
-/// Writes all recipe accounts into one deterministic sysusers payload file.
-pub fn stage_sysusers(root: &Path, recipe: &RecipeSpec) -> Result<(), BuildError> {
-    if recipe.sysusers.is_empty() {
-        return Ok(());
-    }
-    let directory = root.join("usr/lib/sysusers.d");
-    fs::create_dir_all(&directory)?;
-    let mut output = String::new();
-    for account in &recipe.sysusers {
-        let id = account.id.map_or_else(|| "-".into(), |id| id.to_string());
-        if account.kind == "group" {
-            output.push_str(&format!("g {} {id}\n", account.name));
-        } else {
-            let description = account.description.replace('\\', "\\\\");
-            output.push_str(&format!(
-                "u {} {id} \"{}\" {} {}\n",
-                account.name, description, account.home, account.shell
-            ));
-        }
-    }
-    fs::write(
-        directory.join(format!("{}.conf", recipe.package.name)),
-        output,
-    )?;
     Ok(())
 }
 
@@ -1069,6 +1079,10 @@ pub struct BuildConfig {
     pub compiler_cache: String,
     #[serde(default)]
     pub ccache_dir: PathBuf,
+    /// Data-owned tools needed to enter every build sandbox. They are solved
+    /// into the ephemeral toolchain and never registered as host state.
+    #[serde(default)]
+    pub sandbox_dependencies: Vec<String>,
     /// Native machine triple used as the GNU build/host default.
     #[serde(default)]
     pub build: String,
@@ -1413,6 +1427,10 @@ impl<'a> SandboxRunner<'a> {
         ]);
         if let Some(toolchain) = &paths.toolchain {
             command.args(["--ro-bind"]).arg(toolchain).arg("/toolchain");
+            command
+                .args(["--ro-bind"])
+                .arg(toolchain.join("usr"))
+                .arg("/usr");
         }
         if let Some(target_sysroot) = &paths.target_sysroot {
             command
@@ -1432,22 +1450,179 @@ impl<'a> SandboxRunner<'a> {
         command
     }
 
-    pub fn run(&self, paths: &SandboxPaths, allow_network: bool) -> Result<(), BuildError> {
+    pub fn run(
+        &self,
+        paths: &SandboxPaths,
+        allow_network: bool,
+    ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
+        self.prepare_tool_wrappers(paths)?;
         let status = self.command(paths, allow_network).status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(BuildError::SandboxFailed(status))
+        if !status.success() {
+            return Err(BuildError::SandboxFailed(status));
         }
+        self.read_build_tools(paths)
+    }
+
+    /// Creates narrow observation wrappers for configured compilers and the
+    /// selected linker. A role is attested only when its wrapper is executed;
+    /// merely configuring a tool never adds it to the package manifest.
+    fn prepare_tool_wrappers(&self, paths: &SandboxPaths) -> Result<(), BuildError> {
+        let directory = paths.build.join(".sage-tools");
+        fs::create_dir(&directory)?;
+        fs::write(paths.build.join(".sage-tool-usage"), [])?;
+        self.write_tool_wrapper(&directory.join("cc"), "cc", &self.config.cc, true, false)?;
+        self.write_tool_wrapper(&directory.join("cxx"), "cxx", &self.config.cxx, true, false)?;
+        self.write_tool_wrapper(
+            &directory.join("ld"),
+            "linker",
+            &self.config.linker,
+            false,
+            false,
+        )?;
+        self.write_tool_wrapper(
+            &directory.join("rustc"),
+            "rustc",
+            &self.config.rustc,
+            false,
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn write_tool_wrapper(
+        &self,
+        path: &Path,
+        role: &str,
+        tool: &str,
+        compiler_driver: bool,
+        rustc: bool,
+    ) -> Result<(), BuildError> {
+        if tool.contains(['\n', '\r', '\0']) || role.contains(['\n', '\r', '\0']) {
+            return Err(BuildError::InvalidSpec(
+                "tool names may not contain control characters".into(),
+            ));
+        }
+        let search_path = "/usr/bin:/bin";
+        let mut script = format!(
+            "#!/bin/bash\nset -euo pipefail\nresolved=$(PATH={} command -v -- {})\nprintf '%s\\t%s\\n' {} \"$resolved\" >> /build/.sage-tool-usage\n",
+            shell_quote(search_path),
+            shell_quote(tool),
+            shell_quote(role),
+        );
+        if compiler_driver {
+            script.push_str("exec \"$resolved\" -B/build/.sage-tools \"$@\"\n");
+        } else if rustc {
+            script.push_str("exec \"$resolved\" -C linker=/build/.sage-tools/ld \"$@\"\n");
+        } else {
+            script.push_str("exec \"$resolved\" \"$@\"\n");
+        }
+        fs::write(path, script)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    fn read_build_tools(
+        &self,
+        paths: &SandboxPaths,
+    ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
+        let log = fs::read_to_string(paths.build.join(".sage-tool-usage"))?;
+        let mut observed = BTreeMap::new();
+        for line in log.lines() {
+            let Some((role, executable)) = line.split_once('\t') else {
+                return Err(BuildError::InvalidSpec(
+                    "malformed managed build-tool observation".into(),
+                ));
+            };
+            if !matches!(role, "cc" | "cxx" | "linker" | "rustc") || executable.is_empty() {
+                return Err(BuildError::InvalidSpec(
+                    "unknown managed build-tool observation".into(),
+                ));
+            }
+            observed
+                .entry(role.to_string())
+                .or_insert_with(|| executable.to_string());
+        }
+        observed
+            .into_iter()
+            .map(|(role, executable)| {
+                let host_path = self.host_tool_path(paths, &executable)?;
+                let output = Command::new(&host_path).arg("--version").output()?;
+                if !output.status.success() {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "failed to probe observed build tool {executable}"
+                    )));
+                }
+                let version_output = String::from_utf8_lossy(&output.stdout);
+                let version = version_output
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if version.is_empty() {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "observed build tool {executable} returned no version"
+                    )));
+                }
+                let parameters = match role.as_str() {
+                    "cc" => flag_parameters([
+                        ("CPPFLAGS", self.config.cppflags.as_str()),
+                        ("CFLAGS", self.config.cflags.as_str()),
+                    ]),
+                    "cxx" => flag_parameters([
+                        ("CPPFLAGS", self.config.cppflags.as_str()),
+                        ("CXXFLAGS", self.config.cxxflags.as_str()),
+                    ]),
+                    "linker" => flag_parameters([("LDFLAGS", self.config.ldflags.as_str())]),
+                    "rustc" => flag_parameters([("RUSTFLAGS", self.config.rustflags.as_str())]),
+                    _ => unreachable!(),
+                };
+                Ok(sage_archive::ManagedBuildTool {
+                    role,
+                    executable,
+                    family: tool_family(&host_path.to_string_lossy()),
+                    version,
+                    version_argument: "--version".into(),
+                    parameters,
+                })
+            })
+            .collect()
+    }
+
+    fn host_tool_path(
+        &self,
+        paths: &SandboxPaths,
+        executable: &str,
+    ) -> Result<PathBuf, BuildError> {
+        let sandbox_path = Path::new(executable);
+        if let Ok(relative) = sandbox_path.strip_prefix("/toolchain") {
+            return paths
+                .toolchain
+                .as_ref()
+                .map(|root| root.join(relative))
+                .ok_or_else(|| {
+                    BuildError::InvalidSpec(
+                        "toolchain observation exists without a toolchain mount".into(),
+                    )
+                });
+        }
+        if let (Some(toolchain), Ok(relative)) =
+            (&paths.toolchain, sandbox_path.strip_prefix("/usr"))
+        {
+            return Ok(toolchain.join("usr").join(relative));
+        }
+        if sandbox_path.is_absolute() {
+            return Ok(self
+                .config
+                .sysroot
+                .join(sandbox_path.strip_prefix("/").unwrap()));
+        }
+        Ok(sandbox_path.to_path_buf())
     }
 
     fn environment(&self, paths: &SandboxPaths) -> BTreeMap<String, String> {
         let toolchain = paths.toolchain.is_some();
-        let path = if toolchain {
-            "/toolchain/usr/bin:/toolchain/bin:/usr/bin:/bin"
-        } else {
-            "/usr/bin:/bin"
-        };
+        let path = "/usr/bin:/bin";
         let mut environment = BTreeMap::from([
             ("LC_ALL".into(), "C".into()),
             ("TZ".into(), "UTC".into()),
@@ -1461,10 +1636,10 @@ impl<'a> SandboxRunner<'a> {
                 "SOURCE_DATE_EPOCH".into(),
                 self.config.source_date_epoch.to_string(),
             ),
-            ("CC".into(), self.config.cc.clone()),
-            ("CXX".into(), self.config.cxx.clone()),
-            ("LD".into(), self.config.linker.clone()),
-            ("RUSTC".into(), self.config.rustc.clone()),
+            ("CC".into(), "/build/.sage-tools/cc".into()),
+            ("CXX".into(), "/build/.sage-tools/cxx".into()),
+            ("LD".into(), "/build/.sage-tools/ld".into()),
+            ("RUSTC".into(), "/build/.sage-tools/rustc".into()),
             ("CFLAGS".into(), self.config.cflags.clone()),
             ("CXXFLAGS".into(), self.config.cxxflags.clone()),
             ("CPPFLAGS".into(), self.config.cppflags.clone()),
@@ -1475,18 +1650,12 @@ impl<'a> SandboxRunner<'a> {
             environment.extend([
                 (
                     "PKG_CONFIG_PATH".into(),
-                    "/toolchain/usr/lib/pkgconfig:/toolchain/usr/share/pkgconfig".into(),
+                    "/usr/lib/pkgconfig:/usr/share/pkgconfig".into(),
                 ),
-                ("CMAKE_PREFIX_PATH".into(), "/toolchain/usr".into()),
-                ("ACLOCAL_PATH".into(), "/toolchain/usr/share/aclocal".into()),
-                (
-                    "PYTHONPATH".into(),
-                    "/toolchain/usr/lib/python/site-packages".into(),
-                ),
-                (
-                    "LD_LIBRARY_PATH".into(),
-                    "/toolchain/usr/lib:/toolchain/usr/lib64".into(),
-                ),
+                ("CMAKE_PREFIX_PATH".into(), "/usr".into()),
+                ("ACLOCAL_PATH".into(), "/usr/share/aclocal".into()),
+                ("PYTHONPATH".into(), "/usr/lib/python/site-packages".into()),
+                ("LD_LIBRARY_PATH".into(), "/usr/lib:/usr/lib64".into()),
             ]);
         }
         if paths.target_sysroot.is_some() {
@@ -1501,6 +1670,14 @@ impl<'a> SandboxRunner<'a> {
         }
         environment
     }
+}
+
+fn flag_parameters<const N: usize>(values: [(&str, &str); N]) -> Vec<String> {
+    values
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect()
 }
 
 /// One mutually exclusive package tree carved from a shared DESTDIR.
@@ -1831,6 +2008,35 @@ fn origin_path(from: &Path, to: &Path) -> Result<String, BuildError> {
 mod tests {
     use super::*;
 
+    fn test_build_config() -> BuildConfig {
+        BuildConfig {
+            schema_version: 1,
+            fakeroot: "/usr/bin/fakeroot".into(),
+            bwrap: "/usr/bin/bwrap".into(),
+            git: "/usr/bin/git".into(),
+            sysroot: "/".into(),
+            cc: "gcc".into(),
+            cxx: "g++".into(),
+            linker: "ld.lld".into(),
+            rustc: "rustc".into(),
+            patchelf: "/usr/bin/patchelf".into(),
+            cflags: "-O2 -pipe".into(),
+            cxxflags: "-O2 -pipe".into(),
+            cppflags: "-DNDEBUG".into(),
+            ldflags: "-Wl,--as-needed".into(),
+            rustflags: "-C debuginfo=0".into(),
+            source_date_epoch: 0,
+            jobs: 1,
+            memory_limit: String::new(),
+            pids_limit: 128,
+            compiler_cache: String::new(),
+            ccache_dir: PathBuf::new(),
+            sandbox_dependencies: Vec::new(),
+            build: "x86_64-pc-linux-gnu".into(),
+            targets: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn runner_orders_phases_and_rejects_unknown_variables() {
         let class = Rclass {
@@ -2031,7 +2237,10 @@ destination=".source-patches/001"
         )
         .unwrap();
         let recipe = RecipeSpec::load(path).unwrap();
-        assert_eq!(recipe.source_inputs().nth(1).unwrap().kind, SourceKind::File);
+        assert_eq!(
+            recipe.source_inputs().nth(1).unwrap().kind,
+            SourceKind::File
+        );
         assert_eq!(
             recipe.source_manifest(),
             concat!(
@@ -2412,7 +2621,7 @@ destination="{destination}"
     }
 
     #[test]
-    fn sysusers_are_staged_and_lifecycle_scripts_are_rejected() {
+    fn sysusers_are_validated_and_lifecycle_scripts_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recipe.toml");
         fs::write(
@@ -2444,14 +2653,7 @@ shell="/usr/bin/nologin"
             ),
         )
         .unwrap();
-        let recipe = RecipeSpec::load(&path).unwrap();
-        let root = directory.path().join("dest");
-        fs::create_dir(&root).unwrap();
-        stage_sysusers(&root, &recipe).unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("usr/lib/sysusers.d/daemon.conf")).unwrap(),
-            "u daemon 75 \"Daemon User\" /var/lib/daemon /usr/bin/nologin\n"
-        );
+        RecipeSpec::load(&path).unwrap();
 
         fs::write(directory.path().join("preinst"), "#!/bin/sh\nread answer\n").unwrap();
         assert!(RecipeSpec::load(path)
@@ -2465,6 +2667,52 @@ shell="/usr/bin/nologin"
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(tool_family("/usr/bin/clang++"), "clang");
         assert_eq!(tool_family("ld.lld"), "lld");
+    }
+
+    #[test]
+    fn build_tool_metadata_contains_only_observed_roles_and_their_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let build = directory.path().join("build");
+        let toolchain = directory.path().join("toolchain");
+        fs::create_dir(&build).unwrap();
+        fs::create_dir_all(toolchain.join("usr/bin")).unwrap();
+        for name in ["gcc", "ld.lld"] {
+            let path = toolchain.join("usr/bin").join(name);
+            fs::write(&path, format!("#!/bin/sh\necho '{name} version 1'\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            build.join(".sage-tool-usage"),
+            "cc\t/usr/bin/gcc\nlinker\t/usr/bin/ld.lld\ncc\t/usr/bin/gcc\n",
+        )
+        .unwrap();
+        let paths = SandboxPaths {
+            source: directory.path().join("source"),
+            build,
+            destdir: directory.path().join("dest"),
+            runner: directory.path().join("runner"),
+            toolchain: Some(toolchain),
+            target_sysroot: None,
+        };
+        let config = test_build_config();
+
+        let tools = SandboxRunner::new(&config)
+            .read_build_tools(&paths)
+            .unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].role, "cc");
+        assert_eq!(tools[0].family, "gcc");
+        assert_eq!(
+            tools[0].parameters,
+            ["CPPFLAGS=-DNDEBUG", "CFLAGS=-O2 -pipe"]
+        );
+        assert_eq!(tools[1].role, "linker");
+        assert_eq!(tools[1].family, "lld");
+        assert_eq!(tools[1].parameters, ["LDFLAGS=-Wl,--as-needed"]);
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.role == "cxx" || tool.role == "rustc"));
     }
 
     #[test]

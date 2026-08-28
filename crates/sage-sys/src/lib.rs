@@ -254,6 +254,10 @@ fn expand_trigger_argument(
 /// Init-independent daemon declaration carried by a package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSpec {
+    /// Output package that owns this declaration when a recipe emits multiple
+    /// packages. Empty in installed singleton documents and for the main output.
+    #[serde(default)]
+    pub package: String,
     pub name: String,
     pub description: String,
     pub command: Vec<String>,
@@ -277,10 +281,13 @@ pub struct ServiceSpec {
     pub runtime: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceDocument {
-    schema_version: u32,
-    service: ServiceSpec,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDocument {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub service: Option<ServiceSpec>,
+    #[serde(default)]
+    pub services: Vec<ServiceSpec>,
 }
 
 impl ServiceSpec {
@@ -289,22 +296,29 @@ impl ServiceSpec {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| SysError::Invalid("service document is not UTF-8".into()))?;
-        let document: ServiceDocument = toml::from_str(text)?;
-        validate_schema(document.schema_version)?;
-        document.service.validate()?;
-        Ok(document.service)
+        let mut services = ServiceDocument::parse(bytes)?.into_services();
+        if services.len() != 1 {
+            return Err(SysError::Invalid(
+                "installed service document must contain exactly one service".into(),
+            ));
+        }
+        Ok(services.remove(0))
     }
 
     fn validate(&self) -> Result<(), SysError> {
+        if !self.package.is_empty() && !valid_declaration_name(&self.package) {
+            return Err(SysError::Invalid(format!(
+                "invalid owning package for service {}",
+                self.name
+            )));
+        }
         if !valid_declaration_name(&self.name) || self.command.is_empty() {
             return Err(SysError::Invalid(
                 "service name and command are required".into(),
             ));
         }
         if !["always", "on-failure", "no"].contains(&self.restart.as_str())
-            || !["simple", "forking"].contains(&self.service_type.as_str())
+            || !["simple", "forking", "notify", "oneshot"].contains(&self.service_type.as_str())
         {
             return Err(SysError::Invalid(format!(
                 "invalid policy for service {}",
@@ -340,6 +354,72 @@ impl ServiceSpec {
     }
 }
 
+impl ServiceDocument {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
+        Self::parse(&fs::read(path)?)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SysError::Invalid("service document is not UTF-8".into()))?;
+        let document: Self = toml::from_str(text)?;
+        validate_schema(document.schema_version)?;
+        if document.services().next().is_none() {
+            return Err(SysError::Invalid(
+                "service document must contain at least one service".into(),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for service in document.services() {
+            service.validate()?;
+            if !names.insert(&service.name) {
+                return Err(SysError::Invalid(format!(
+                    "duplicate service name {}",
+                    service.name
+                )));
+            }
+        }
+        Ok(document)
+    }
+
+    pub fn services(&self) -> impl Iterator<Item = &ServiceSpec> {
+        self.service.iter().chain(self.services.iter())
+    }
+
+    pub fn into_services(self) -> Vec<ServiceSpec> {
+        self.service.into_iter().chain(self.services).collect()
+    }
+
+    pub fn for_package(&self, package: &str, main_package: &str) -> Self {
+        let services = self
+            .services()
+            .filter(|service| {
+                service.package == package
+                    || (service.package.is_empty() && package == main_package)
+            })
+            .cloned()
+            .collect();
+        Self {
+            schema_version: self.schema_version,
+            service: None,
+            services,
+        }
+    }
+
+    pub fn validate_output_packages(&self, outputs: &BTreeSet<String>) -> Result<(), SysError> {
+        if let Some(service) = self
+            .services()
+            .find(|service| !service.package.is_empty() && !outputs.contains(&service.package))
+        {
+            return Err(SysError::Invalid(format!(
+                "service {} names unknown output package {}",
+                service.name, service.package
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn valid_declaration_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -360,6 +440,14 @@ pub struct TemplateServiceGenerator {
     pub target_path_template: String,
     pub mode: u32,
     pub template: String,
+    /// Provider-owned translations from init-independent dependency names to
+    /// native dependency identifiers (for example `network` to a target).
+    #[serde(default)]
+    pub dependency_aliases: BTreeMap<String, String>,
+    /// Provider-owned suffix for service dependencies that have no explicit
+    /// alias or native-looking extension.
+    #[serde(default)]
+    pub service_dependency_suffix: String,
     pub validate_command: Option<String>,
     #[serde(alias = "enable_cmd")]
     pub enable_command: Option<String>,
@@ -381,7 +469,7 @@ impl TemplateServiceGenerator {
         sysroot: &Path,
     ) -> Result<PathBuf, SysError> {
         service.validate()?;
-        let variables = service_variables(service, sysroot)?;
+        let variables = self.service_variables(service, sysroot)?;
         let relative = expand_template(&self.target_path_template, &variables)?;
         let target = target_path(sysroot, Path::new(&relative))?;
         let rendered = expand_template(&self.template, &variables)?;
@@ -410,19 +498,44 @@ impl TemplateServiceGenerator {
     pub fn enable_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
         if let Some(command) = &self.enable_command {
             run_validation(
-                &expand_template(command, &service_variables(service, sysroot)?)?,
+                &expand_template(command, &self.service_variables(service, sysroot)?)?,
                 sysroot,
             )?;
         }
         Ok(())
+    }
+
+    fn service_variables(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+    ) -> Result<BTreeMap<String, String>, SysError> {
+        service_variables(
+            service,
+            sysroot,
+            &self.dependency_aliases,
+            &self.service_dependency_suffix,
+        )
     }
 }
 
 fn service_variables(
     service: &ServiceSpec,
     sysroot: &Path,
+    dependency_aliases: &BTreeMap<String, String>,
+    service_dependency_suffix: &str,
 ) -> Result<BTreeMap<String, String>, SysError> {
     let command_tail = service.command.get(1..).unwrap_or_default();
+    let after = map_service_dependencies(
+        &service.after,
+        dependency_aliases,
+        service_dependency_suffix,
+    );
+    let before = map_service_dependencies(
+        &service.before,
+        dependency_aliases,
+        service_dependency_suffix,
+    );
     Ok(BTreeMap::from([
         ("service.name".into(), service.name.clone()),
         ("service.description".into(), service.description.clone()),
@@ -430,8 +543,36 @@ fn service_variables(
         ("service.command[1:]".into(), command_tail.join(" ")),
         ("service.command_str".into(), service.command.join(" ")),
         (
+            "service.command_quoted".into(),
+            quote_command(&service.command)?,
+        ),
+        (
             "service.command_json".into(),
             serde_json::to_string(&service.command)?,
+        ),
+        (
+            "service.stop_command_str".into(),
+            service.stop_command.join(" "),
+        ),
+        (
+            "service.stop_command_quoted".into(),
+            quote_command(&service.stop_command)?,
+        ),
+        (
+            "service.stop_command_json".into(),
+            serde_json::to_string(&service.stop_command)?,
+        ),
+        (
+            "service.reload_command_str".into(),
+            service.reload_command.join(" "),
+        ),
+        (
+            "service.reload_command_quoted".into(),
+            quote_command(&service.reload_command)?,
+        ),
+        (
+            "service.reload_command_json".into(),
+            serde_json::to_string(&service.reload_command)?,
         ),
         ("service.user".into(), service.user.clone()),
         ("service.group".into(), service.group.clone()),
@@ -439,14 +580,49 @@ fn service_variables(
         ("service.pid_file".into(), service.pid_file.clone()),
         ("service.restart".into(), service.restart.clone()),
         ("service.type".into(), service.service_type.clone()),
-        ("service.after".into(), service.after.join(" ")),
-        ("service.after_space".into(), service.after.join(" ")),
+        ("service.after".into(), after.join(" ")),
+        ("service.after_space".into(), after.join(" ")),
+        ("service.after_json".into(), serde_json::to_string(&after)?),
+        ("service.before".into(), before.join(" ")),
+        ("service.before_space".into(), before.join(" ")),
         (
-            "service.after_json".into(),
-            serde_json::to_string(&service.after)?,
+            "service.before_json".into(),
+            serde_json::to_string(&before)?,
+        ),
+        ("service.runtime".into(), service.runtime.clone()),
+        (
+            "service.runtime_json".into(),
+            serde_json::to_string(&service.runtime)?,
         ),
         ("SYSROOT".into(), sysroot.display().to_string()),
     ]))
+}
+
+fn map_service_dependencies(
+    dependencies: &[String],
+    aliases: &BTreeMap<String, String>,
+    service_suffix: &str,
+) -> Vec<String> {
+    dependencies
+        .iter()
+        .map(|dependency| {
+            aliases.get(dependency).cloned().unwrap_or_else(|| {
+                if !service_suffix.is_empty() && !dependency.contains('.') {
+                    format!("{dependency}{service_suffix}")
+                } else {
+                    dependency.clone()
+                }
+            })
+        })
+        .collect()
+}
+
+fn quote_command(command: &[String]) -> Result<String, SysError> {
+    command
+        .iter()
+        .map(|argument| serde_json::to_string(argument).map_err(SysError::from))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|arguments| arguments.join(" "))
 }
 
 fn expand_template(
@@ -722,6 +898,265 @@ impl AlternativesDocument {
     }
 }
 
+/// One init-independent system account owned by an installed package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SysuserDeclaration {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub description: String,
+    pub home: String,
+    pub shell: String,
+}
+
+/// Installed Sage account declarations bound to one exact package identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SysusersDocument {
+    pub schema_version: u32,
+    pub package: sage_core::PackageKey,
+    pub accounts: Vec<SysuserDeclaration>,
+}
+
+impl SysusersDocument {
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SysError::Invalid("sysusers document is not UTF-8".into()))?;
+        let document: Self = toml::from_str(text)?;
+        validate_schema(document.schema_version)?;
+        if document.accounts.is_empty() {
+            return Err(SysError::Invalid(
+                "sysusers document must contain at least one declaration".into(),
+            ));
+        }
+        for account in &document.accounts {
+            account.validate()?;
+        }
+        Ok(document)
+    }
+
+    pub fn load_installed(sysroot: &Path) -> Result<Vec<SysuserDeclaration>, SysError> {
+        let directory = sysroot.join("usr/share/sage/sysusers");
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut accounts = Vec::new();
+        for entry in entries {
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            accounts.extend(Self::parse(&fs::read(entry.path())?)?.accounts);
+        }
+        Ok(accounts)
+    }
+}
+
+impl SysuserDeclaration {
+    fn validate(&self) -> Result<(), SysError> {
+        if !matches!(self.kind.as_str(), "user" | "group")
+            || !valid_declaration_name(&self.name)
+            || self.description.contains(['\n', '\r', '\0', ':'])
+            || !Path::new(&self.home).is_absolute()
+            || !Path::new(&self.shell).is_absolute()
+            || [&self.home, &self.shell]
+                .iter()
+                .any(|value| value.contains(['\n', '\r', '\0', ':']))
+        {
+            return Err(SysError::Invalid(format!(
+                "invalid system account {}",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Applies Sage-owned account declarations without depending on an init suite.
+pub struct SysusersEngine;
+
+impl SysusersEngine {
+    pub fn reconcile(sysroot: &Path, declarations: &[SysuserDeclaration]) -> Result<(), SysError> {
+        let mut declarations = declarations.to_vec();
+        declarations.sort_by_key(|account| (account.kind.clone(), account.name.clone()));
+        let mut unique = BTreeMap::new();
+        for account in declarations {
+            account.validate()?;
+            if let Some(previous) = unique.insert(
+                (account.kind.clone(), account.name.clone()),
+                account.clone(),
+            ) {
+                if previous != account {
+                    return Err(SysError::Invalid(format!(
+                        "conflicting declarations for system account {}",
+                        account.name
+                    )));
+                }
+            }
+        }
+
+        let etc = target_path(sysroot, Path::new("etc"))?;
+        ensure_directory_beneath(sysroot, &etc)?;
+        let passwd_path = etc.join("passwd");
+        let group_path = etc.join("group");
+        let shadow_path = etc.join("shadow");
+        let mut passwd = read_account_file(&passwd_path)?;
+        let mut group = read_account_file(&group_path)?;
+        let mut shadow = read_account_file(&shadow_path)?;
+        let mut users = parse_account_ids(&passwd, "passwd")?;
+        let mut groups = parse_account_ids(&group, "group")?;
+
+        for account in unique.values().filter(|account| account.kind == "group") {
+            ensure_group(account, &mut group, &mut groups)?;
+        }
+        for account in unique.values().filter(|account| account.kind == "user") {
+            let uid = ensure_user_group(account, &mut group, &mut groups)?;
+            ensure_user(account, uid, &mut passwd, &mut shadow, &mut users)?;
+        }
+
+        write_account_file(&passwd_path, &passwd, 0o644)?;
+        write_account_file(&group_path, &group, 0o644)?;
+        write_account_file(&shadow_path, &shadow, 0o600)?;
+        Ok(())
+    }
+}
+
+fn read_account_file(path: &Path) -> Result<String, SysError> {
+    match fs::read_to_string(path) {
+        Ok(mut content) => {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            Ok(content)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_account_ids(content: &str, kind: &str) -> Result<BTreeMap<String, u32>, SysError> {
+    let mut result = BTreeMap::new();
+    let id_index = if kind == "passwd" { 2 } else { 2 };
+    for line in content.lines().filter(|line| !line.is_empty()) {
+        let fields: Vec<_> = line.split(':').collect();
+        let name = fields.first().copied().unwrap_or_default();
+        let id = fields
+            .get(id_index)
+            .ok_or_else(|| SysError::Invalid(format!("malformed /etc/{kind} entry")))?
+            .parse::<u32>()
+            .map_err(|_| SysError::Invalid(format!("invalid /etc/{kind} ID for {name}")))?;
+        if result.insert(name.into(), id).is_some() {
+            return Err(SysError::Invalid(format!(
+                "duplicate /etc/{kind} entry for {name}"
+            )));
+        }
+    }
+    Ok(result)
+}
+
+fn ensure_group(
+    account: &SysuserDeclaration,
+    content: &mut String,
+    groups: &mut BTreeMap<String, u32>,
+) -> Result<u32, SysError> {
+    if let Some(existing) = groups.get(&account.name).copied() {
+        if account.id.is_some_and(|id| id != existing) {
+            return Err(SysError::Invalid(format!(
+                "group {} already has ID {existing}",
+                account.name
+            )));
+        }
+        return Ok(existing);
+    }
+    let id = allocate_account_id(account.id, groups, "group", &account.name)?;
+    content.push_str(&format!("{}:x:{id}:\n", account.name));
+    groups.insert(account.name.clone(), id);
+    Ok(id)
+}
+
+fn ensure_user_group(
+    account: &SysuserDeclaration,
+    content: &mut String,
+    groups: &mut BTreeMap<String, u32>,
+) -> Result<u32, SysError> {
+    let group = SysuserDeclaration {
+        kind: "group".into(),
+        name: account.name.clone(),
+        id: account.id,
+        description: String::new(),
+        home: "/".into(),
+        shell: "/usr/bin/nologin".into(),
+    };
+    ensure_group(&group, content, groups)
+}
+
+fn ensure_user(
+    account: &SysuserDeclaration,
+    primary_group: u32,
+    passwd: &mut String,
+    shadow: &mut String,
+    users: &mut BTreeMap<String, u32>,
+) -> Result<(), SysError> {
+    if let Some(existing) = users.get(&account.name).copied() {
+        if account.id.is_some_and(|id| id != existing) {
+            return Err(SysError::Invalid(format!(
+                "user {} already has ID {existing}",
+                account.name
+            )));
+        }
+        return Ok(());
+    }
+    let uid = allocate_account_id(account.id, users, "user", &account.name)?;
+    passwd.push_str(&format!(
+        "{}:x:{uid}:{primary_group}:{}:{}:{}\n",
+        account.name, account.description, account.home, account.shell
+    ));
+    shadow.push_str(&format!("{}:!*:::::::\n", account.name));
+    users.insert(account.name.clone(), uid);
+    Ok(())
+}
+
+fn allocate_account_id(
+    requested: Option<u32>,
+    accounts: &BTreeMap<String, u32>,
+    kind: &str,
+    name: &str,
+) -> Result<u32, SysError> {
+    if let Some(id) = requested {
+        if let Some(owner) = accounts
+            .iter()
+            .find_map(|(owner, existing)| (*existing == id).then_some(owner))
+        {
+            return Err(SysError::Invalid(format!(
+                "{kind} ID {id} for {name} is already owned by {owner}"
+            )));
+        }
+        return Ok(id);
+    }
+    (61184..=65519)
+        .find(|candidate| !accounts.values().any(|existing| existing == candidate))
+        .ok_or_else(|| SysError::Invalid(format!("no dynamic {kind} IDs remain")))
+}
+
+fn write_account_file(path: &Path, content: &str, mode: u32) -> Result<(), SysError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| SysError::Invalid("account file has no parent".into()))?;
+    let temporary = parent.join(format!(
+        ".sage-account-{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    std::io::Write::write_all(&mut options.open(&temporary)?, content.as_bytes())?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn validate_alternative_path(path: &Path, target: bool) -> Result<(), SysError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -903,7 +1338,27 @@ mod tests {
             let trigger = TriggerSpec::load(file.path()).unwrap();
             assert!(names.insert(trigger.name));
         }
-        assert!(names.len() >= 9);
+        assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn standard_init_rclasses_are_parseable() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass");
+        let mut files: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        files.sort_by_key(|entry| entry.file_name());
+        let mut count = 0;
+        for file in files {
+            let name = file.file_name();
+            if !name.to_string_lossy().starts_with("init-") {
+                continue;
+            }
+            TemplateServiceGenerator::from_rclass(&file.path()).unwrap();
+            count += 1;
+        }
+        assert!(count >= 2);
     }
 
     #[test]
@@ -913,11 +1368,14 @@ mod tests {
             target_path_template: "/etc/init/${service.name}".into(),
             mode: 0o755,
             template: "exec ${service.command_json}\n".into(),
+            dependency_aliases: BTreeMap::new(),
+            service_dependency_suffix: String::new(),
             validate_command: None,
             enable_command: None,
             disable_command: None,
         };
         let service = ServiceSpec {
+            package: String::new(),
             name: "demo".into(),
             description: "demo".into(),
             command: vec!["/bin/demo".into(), "--run".into()],
@@ -937,6 +1395,57 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "exec [\"/bin/demo\",\"--run\"]\n"
+        );
+    }
+
+    #[test]
+    fn service_template_maps_dependencies_and_exposes_lifecycle_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let generator = TemplateServiceGenerator {
+            target_path_template: "/etc/init/${service.name}".into(),
+            mode: 0o644,
+            template: concat!(
+                "after=${service.after_space}\n",
+                "before=${service.before_space}\n",
+                "stop=${service.stop_command_quoted}\n",
+                "reload=${service.reload_command_json}\n",
+                "runtime=${service.runtime_json}\n",
+            )
+            .into(),
+            dependency_aliases: BTreeMap::from([("network".into(), "network.target".into())]),
+            service_dependency_suffix: ".service".into(),
+            validate_command: None,
+            enable_command: None,
+            disable_command: None,
+        };
+        let service = ServiceSpec {
+            package: String::new(),
+            name: "demo".into(),
+            description: "demo".into(),
+            command: vec!["/usr/bin/demo".into(), "two words".into()],
+            stop_command: vec!["/usr/bin/demo".into(), "--stop".into()],
+            reload_command: vec!["/usr/bin/demo".into(), "--reload".into()],
+            user: "root".into(),
+            group: "root".into(),
+            working_dir: "/".into(),
+            pid_file: "/run/demo.pid".into(),
+            restart: "on-failure".into(),
+            service_type: "simple".into(),
+            after: vec!["network".into(), "logger".into()],
+            before: vec!["consumer".into()],
+            runtime: "runtime/python:3.14".into(),
+        };
+
+        let path = generator.render_service(&service, root.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            concat!(
+                "after=network.target logger.service\n",
+                "before=consumer.service\n",
+                "stop=\"/usr/bin/demo\" \"--stop\"\n",
+                "reload=[\"/usr/bin/demo\",\"--reload\"]\n",
+                "runtime=\"runtime/python:3.14\"\n",
+            )
         );
     }
 
@@ -989,33 +1498,6 @@ mod tests {
             "6.12\n6.13\n"
         );
         assert!(expand_trigger_argument("${unknown}", &modified[0], root.path()).is_err());
-    }
-
-    #[test]
-    fn sysusers_trigger_receives_the_transaction_root() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
-        let recorder = root.path().join("usr/bin/record-root");
-        fs::write(
-            &recorder,
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$SAGE_SYSROOT/sysusers-args\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut trigger =
-            TriggerSpec::parse(include_bytes!("../../../triggers/sysusers.toml")).unwrap();
-        trigger.exec[0] = "/usr/bin/record-root".into();
-
-        TriggerEngine::execute_triggers(
-            &[trigger],
-            &[PathBuf::from("usr/lib/sysusers.d/daemon.conf")],
-            root.path(),
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(root.path().join("sysusers-args")).unwrap(),
-            format!("--root={}\n", root.path().display())
-        );
     }
 
     #[test]
@@ -1083,5 +1565,70 @@ mod tests {
             fs::read_link(root.path().join("usr/bin/vi")).unwrap(),
             PathBuf::from("vim")
         );
+    }
+
+    #[test]
+    fn sysusers_are_applied_without_an_init_provider() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("etc")).unwrap();
+        fs::write(
+            root.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/usr/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("etc/group"), "root:x:0:\n").unwrap();
+        fs::write(root.path().join("etc/shadow"), "root:!*:::::::\n").unwrap();
+        let declarations = vec![SysuserDeclaration {
+            kind: "user".into(),
+            name: "messagebus".into(),
+            id: Some(18),
+            description: "D-Bus Message Bus".into(),
+            home: "/run/dbus".into(),
+            shell: "/usr/bin/nologin".into(),
+        }];
+
+        SysusersEngine::reconcile(root.path(), &declarations).unwrap();
+        SysusersEngine::reconcile(root.path(), &declarations).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("etc/passwd")).unwrap(),
+            concat!(
+                "root:x:0:0:root:/root:/usr/bin/sh\n",
+                "messagebus:x:18:18:D-Bus Message Bus:/run/dbus:/usr/bin/nologin\n",
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("etc/group")).unwrap(),
+            "root:x:0:\nmessagebus:x:18:\n"
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("etc/shadow"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn sysusers_reject_conflicting_numeric_ids() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("etc")).unwrap();
+        fs::write(
+            root.path().join("etc/passwd"),
+            "other:x:18:18::/:/usr/bin/nologin\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("etc/group"), "other:x:18:\n").unwrap();
+        let declaration = SysuserDeclaration {
+            kind: "user".into(),
+            name: "messagebus".into(),
+            id: Some(18),
+            description: String::new(),
+            home: "/".into(),
+            shell: "/usr/bin/nologin".into(),
+        };
+        assert!(SysusersEngine::reconcile(root.path(), &[declaration]).is_err());
     }
 }

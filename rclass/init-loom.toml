@@ -4,21 +4,21 @@ description = "Loom Service Generator and Controller Class"
 
 [service_generator]
 target_path = "/usr/lib/loom/services/${service.name}.toml"
-mode = 0644
+mode = 420
 
 validate_command = "/usr/lib/loom/loom validate --root ${SYSROOT}"
 enable_cmd = "/usr/lib/loom/loom enable ${service.name}"
 disable_cmd = "/usr/lib/loom/loom disable ${service.name}"
-start_cmd = "/usr/lib/loom/loom start ${service.name}"
-stop_cmd = "/usr/lib/loom/loom stop ${service.name}"
-restart_cmd = "/usr/lib/loom/loom restart ${service.name}"
-reload_cmd = "/usr/lib/loom/loom reload ${service.name}"
 
 template = """
 name = "${service.name}"
 description = "${service.description}"
 exec = ${service.command_json}
+stop_exec = ${service.stop_command_json}
+reload_exec = ${service.reload_command_json}
 user = "${service.user}"
 group = "${service.group}"
 depends_on = ${service.after_json}
+before = ${service.before_json}
+runtime = ${service.runtime_json}
 """
