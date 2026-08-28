@@ -6,6 +6,8 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -105,31 +107,28 @@ async fn main() -> Result<()> {
         Commands::Install {
             packages,
             channel,
-            no_save,
+            no_save: _,
         } => {
-            println!(
-                "Install request for {:?} (channel: {:?}, no_save: {})",
-                packages, channel, no_save
-            );
+            apply_packages(&cli.root, &packages, channel.as_deref(), false, cli.dry_run).await?;
         }
         Commands::Remove { packages, channel } => {
-            println!("Remove request for {:?} (channel: {:?})", packages, channel);
+            remove_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run)?;
         }
         Commands::Upgrade {
             packages,
             channel,
             sync,
         } => {
-            println!(
-                "Upgrade request (packages: {:?}, channel: {:?}, sync: {})",
-                packages, channel, sync
-            );
+            if sync {
+                sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
+            }
+            upgrade_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run).await?;
         }
         Commands::Sync { channel } => {
             sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
         }
         Commands::Rebuild { no_prune } => {
-            println!("Rebuild system state (no_prune: {})", no_prune);
+            rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
         }
         Commands::Repo { action } => match action {
             RepoAction::Index { dir, sign_key } => {
@@ -197,6 +196,419 @@ async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Re
 
 fn under_root(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+#[derive(Clone)]
+struct ReleaseSource {
+    release: sage_repo::IndexedRelease,
+    url: String,
+    target_root: PathBuf,
+}
+
+struct AvailablePackages {
+    universe: sage_solver::PackageUniverse,
+    releases: BTreeMap<(sage_core::PackageKey, sage_core::Version), ReleaseSource>,
+    aliases: BTreeMap<String, String>,
+}
+
+fn load_available(root: &Path) -> Result<AvailablePackages> {
+    let config =
+        sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
+    let cache = under_root(root, Path::new("/var/cache/sage/channels"));
+    let mut universe = sage_solver::PackageUniverse::default();
+    let mut releases = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for (channel_name, channel) in config.channels {
+        if !channel.enabled {
+            continue;
+        }
+        for (sub_name, subchannel) in &channel.subchannels {
+            if !subchannel.enabled {
+                continue;
+            }
+            let alias = subchannel.alias.as_deref().unwrap_or(sub_name);
+            let canonical = format!("{channel_name}/{alias}");
+            let index_path = cache.join(&channel_name).join(alias).join("index.mdb");
+            if !index_path.exists() {
+                continue;
+            }
+            aliases.insert(alias.into(), canonical.clone());
+            aliases.insert(canonical.clone(), canonical.clone());
+            let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
+            for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
+                let key = sage_core::PackageKey::new(
+                    &canonical,
+                    &release.manifest.name,
+                    &release.manifest.slot,
+                );
+                let version = sage_core::Version::new(
+                    release.manifest.epoch,
+                    &release.manifest.version,
+                    release.manifest.release,
+                );
+                universe.insert(sage_solver::PackageRelease {
+                    key: key.clone(),
+                    version: version.clone(),
+                    dependencies: release.dependencies.clone(),
+                    provides: release.manifest.provides.clone(),
+                });
+                releases.insert(
+                    (key, version),
+                    ReleaseSource {
+                        release,
+                        url: url.clone(),
+                        target_root: subchannel.target_root.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(AvailablePackages {
+        universe,
+        releases,
+        aliases,
+    })
+}
+
+fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
+    let selected = selected.unwrap_or("system");
+    available
+        .aliases
+        .get(selected)
+        .cloned()
+        .with_context(|| format!("channel '{selected}' has no synchronized index"))
+}
+
+async fn apply_packages(
+    root: &Path,
+    names: &[String],
+    channel: Option<&str>,
+    prefer_latest: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let available = load_available(root)?;
+    let channel = canonical_channel(&available, channel)?;
+    let requested: Vec<_> = names
+        .iter()
+        .map(|name| sage_core::PackageKey::new(&channel, name, sage_core::DEFAULT_SLOT))
+        .collect();
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let database = sage_db::SageDatabase::open(&db_path)?;
+    let installed = database.packages()?;
+    let solution = if prefer_latest {
+        sage_solver::SageSolver::new(&available.universe).resolve(&requested)?
+    } else {
+        let locks = installed
+            .iter()
+            .map(|package| (package.key.clone(), package.version.clone()));
+        sage_solver::SageSolver::with_locked(&available.universe, locks).resolve(&requested)?
+    };
+    let current: BTreeMap<_, _> = installed
+        .iter()
+        .map(|package| (package.key.clone(), package.version.clone()))
+        .collect();
+    let changes: Vec<_> = solution
+        .into_iter()
+        .filter(|(key, version)| current.get(key) != Some(version))
+        .collect();
+    for (key, version) in &changes {
+        println!(
+            "{} {} {}",
+            if current.contains_key(key) {
+                "Upgrade"
+            } else {
+                "Install"
+            },
+            key,
+            version
+        );
+    }
+    if dry_run || changes.is_empty() {
+        return Ok(());
+    }
+    publish_packages(root, &database, &available, &changes).await
+}
+
+async fn publish_packages(
+    root: &Path,
+    database: &sage_db::SageDatabase,
+    available: &AvailablePackages,
+    changes: &[(sage_core::PackageKey, sage_core::Version)],
+) -> Result<()> {
+    let timestamp = unix_timestamp()?;
+    let op_id = format!("install-{}-{timestamp}", std::process::id());
+    let digest = hex::encode(Sha256::digest(format!("{changes:?}").as_bytes()));
+    database.write_journal(&sage_db::JournalRecord {
+        op_id: op_id.clone(),
+        stage: "publish".into(),
+        affected_packages: changes.iter().map(|(key, _)| key.clone()).collect(),
+        journal_sha256: digest,
+        timestamp,
+    })?;
+    let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
+    let engine = sage_repo::DownloadEngine::new(&package_cache)?;
+    let mut modified = Vec::new();
+    for (key, version) in changes {
+        let source = available
+            .releases
+            .get(&(key.clone(), version.clone()))
+            .with_context(|| format!("index record disappeared for {key} {version}"))?;
+        let archive = package_cache.join(&source.release.sha256);
+        let url = format!(
+            "{}/{}",
+            source.url.trim_end_matches('/'),
+            source.release.archive
+        );
+        engine
+            .download_url(&url, &archive, &source.release.sha256)
+            .await?;
+        let inspection = sage_archive::inspect_package(&archive)?;
+        let target = under_root(root, &source.target_root);
+        std::fs::create_dir_all(&target)?;
+        let prefix = source
+            .target_root
+            .strip_prefix("/")
+            .unwrap_or(&source.target_root);
+        let ownership: Vec<_> = inspection
+            .files
+            .iter()
+            .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
+            .collect();
+        for path in &ownership {
+            let owners = database.owners(path)?;
+            if owners.iter().any(|owner| owner != key) {
+                bail!("file conflict for {path}: {owners:?}");
+            }
+        }
+        let previous_package = database.package(key)?;
+        let previous = previous_package
+            .as_ref()
+            .map(|package| package.config_hashes.clone())
+            .unwrap_or_default();
+        let report = sage_archive::extract_package_with_config(
+            &archive,
+            &target,
+            &inspection.files,
+            &previous,
+        )?;
+        modified.extend(ownership.iter().map(PathBuf::from));
+        let config_hashes = inspection
+            .files
+            .iter()
+            .filter(|record| record.path.starts_with("etc"))
+            .map(|record| {
+                (
+                    record.path.to_string_lossy().into_owned(),
+                    record.sha256.clone(),
+                )
+            })
+            .collect();
+        database.install(
+            &sage_db::InstalledPackage {
+                key: key.clone(),
+                version: version.clone(),
+                arch: source.release.manifest.arch.clone(),
+                installed_size: source.release.manifest.installed_size,
+                dependencies: source.release.dependencies.clone(),
+                provides: source.release.manifest.provides.clone(),
+                files: ownership.clone(),
+                config_hashes,
+            },
+            false,
+        )?;
+        if let Some(previous_package) = previous_package {
+            for obsolete in previous_package
+                .files
+                .iter()
+                .filter(|path| !ownership.contains(path))
+            {
+                if database.owners(obsolete)?.is_empty() {
+                    let path = under_root(root, Path::new(obsolete));
+                    if !should_preserve_config(&path, obsolete, &previous_package.config_hashes)? {
+                        remove_file_beneath(root, &path)?;
+                        modified.push(PathBuf::from(obsolete));
+                    }
+                }
+            }
+        }
+        for path in report.sage_new {
+            eprintln!("Configuration update requires review: {}", path.display());
+        }
+    }
+    let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+    sage_sys::TriggerEngine::execute_triggers(&triggers, &modified, root)?;
+    database.finish_journal(&op_id)?;
+    Ok(())
+}
+
+async fn upgrade_packages(
+    root: &Path,
+    names: &[String],
+    channel: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let available = load_available(root)?;
+    let canonical = canonical_channel(&available, channel)?;
+    let names = if names.is_empty() {
+        sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?
+            .packages()?
+            .into_iter()
+            .filter(|package| package.key.channel == canonical)
+            .map(|package| package.key.name)
+            .collect()
+    } else {
+        names.to_vec()
+    };
+    apply_packages(root, &names, Some(&canonical), true, dry_run).await
+}
+
+fn remove_packages(
+    root: &Path,
+    names: &[String],
+    channel: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
+    let installed = database.packages()?;
+    let canonical = channel.map_or_else(
+        || "main/system".into(),
+        |value| {
+            if value.contains('/') {
+                value.into()
+            } else {
+                format!("main/{value}")
+            }
+        },
+    );
+    let selected: Vec<_> = installed
+        .into_iter()
+        .filter(|package| {
+            package.key.channel == canonical && names.iter().any(|name| name == &package.key.name)
+        })
+        .collect();
+    if selected.len() != names.len() {
+        bail!("one or more requested packages are not installed in {canonical}");
+    }
+    for dependent in database.packages()? {
+        if selected.iter().any(|removed| {
+            dependent.key != removed.key
+                && dependent.dependencies.iter().any(|dependency| {
+                    (dependency.name == removed.key.name
+                        || removed.provides.contains(&dependency.name))
+                        && dependency
+                            .channel
+                            .as_deref()
+                            .is_none_or(|channel| channel == removed.key.channel)
+                })
+        }) {
+            bail!("cannot remove packages required by {}", dependent.key);
+        }
+    }
+    for package in &selected {
+        println!("Remove {} {}", package.key, package.version);
+    }
+    if dry_run {
+        return Ok(());
+    }
+    let timestamp = unix_timestamp()?;
+    let op_id = format!("remove-{}-{timestamp}", std::process::id());
+    database.write_journal(&sage_db::JournalRecord {
+        op_id: op_id.clone(),
+        stage: "remove".into(),
+        affected_packages: selected.iter().map(|package| package.key.clone()).collect(),
+        journal_sha256: hex::encode(Sha256::digest(format!("{names:?}").as_bytes())),
+        timestamp,
+    })?;
+    let mut modified = Vec::new();
+    for package in selected {
+        database.remove(&package.key)?;
+        for relative in &package.files {
+            if !database.owners(relative)?.is_empty() {
+                continue;
+            }
+            let path = under_root(root, Path::new(relative));
+            if should_preserve_config(&path, relative, &package.config_hashes)? {
+                eprintln!("Preserving modified configuration {}", path.display());
+                continue;
+            }
+            remove_file_beneath(root, &path)?;
+            modified.push(PathBuf::from(relative));
+        }
+    }
+    let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+    sage_sys::TriggerEngine::execute_triggers(&triggers, &modified, root)?;
+    database.finish_journal(&op_id)?;
+    Ok(())
+}
+
+fn should_preserve_config(
+    path: &Path,
+    physical: &str,
+    hashes: &BTreeMap<String, String>,
+) -> Result<bool> {
+    let Some((_, expected)) = hashes
+        .iter()
+        .find(|(relative, _)| Path::new(physical).ends_with(relative))
+    else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = std::fs::read(path)?;
+    Ok(hex::encode(Sha256::digest(bytes)) != *expected)
+}
+
+fn remove_file_beneath(root: &Path, path: &Path) -> Result<()> {
+    let parent = path.parent().context("installed path has no parent")?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(canonical_root) {
+        bail!(
+            "refusing to remove path outside sysroot: {}",
+            path.display()
+        );
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
+    let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
+    let config = sage_sys::SystemConfig::load(&config_path)?;
+    let mut desired: Vec<_> = config.packages.iter().cloned().collect();
+    desired.extend(config.providers.values().cloned());
+    desired.sort();
+    desired.dedup();
+    apply_packages(root, &desired, Some("system"), false, dry_run).await?;
+    if no_prune {
+        return Ok(());
+    }
+    let available = load_available(root)?;
+    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
+    let installed = database.packages()?;
+    let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, false)?;
+    let names: Vec<_> = plan.remove.into_iter().map(|key| key.name).collect();
+    if !names.is_empty() {
+        remove_packages(root, &names, Some("main/system"), dry_run)?;
+    }
+    for (interface, key) in plan.provider_bindings {
+        if dry_run {
+            println!("Would bind virtual/{interface} to {key}");
+        } else {
+            database.set_system_provider(&interface, &key)?;
+        }
+    }
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
 }
 
 async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<()> {
