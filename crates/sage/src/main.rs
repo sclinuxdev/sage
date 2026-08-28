@@ -318,6 +318,10 @@ struct AvailablePackages {
 }
 
 fn load_available(root: &Path) -> Result<AvailablePackages> {
+    load_available_for_arch(root, None)
+}
+
+fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<AvailablePackages> {
     let config =
         sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
     let cache = under_root(root, Path::new("/var/cache/sage/channels"));
@@ -342,6 +346,13 @@ fn load_available(root: &Path) -> Result<AvailablePackages> {
             aliases.insert(canonical.clone(), canonical.clone());
             let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
             for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
+                if architecture.is_some_and(|wanted| {
+                    release.manifest.arch != wanted
+                        && release.manifest.arch != "any"
+                        && release.manifest.arch != "noarch"
+                }) {
+                    continue;
+                }
                 let key = sage_core::PackageKey::new(
                     &canonical,
                     &release.manifest.name,
@@ -1042,6 +1053,37 @@ async fn build_recipe(
     if let Some(target) = &cross {
         selected_config.cc.clone_from(&target.cc);
         selected_config.cxx.clone_from(&target.cxx);
+        let mut cross_env = BTreeMap::from([
+            ("CC".into(), target.cc.clone()),
+            ("CXX".into(), target.cxx.clone()),
+            ("AR".into(), target.ar.clone()),
+            ("STRIP".into(), target.strip.clone()),
+            ("GOOS".into(), target.goos.clone()),
+            ("GOARCH".into(), target.goarch.clone()),
+            (
+                "RUSTFLAGS".into(),
+                format!("{} {}", config.rustflags, target.rustflags)
+                    .trim()
+                    .into(),
+            ),
+        ]);
+        if !recipe.build.target_dependencies.is_empty() || !features.target_dependencies.is_empty()
+        {
+            cross_env.extend([
+                (
+                    "CFLAGS".into(),
+                    format!("{} --sysroot=/sysroot", config.cflags),
+                ),
+                (
+                    "CXXFLAGS".into(),
+                    format!("{} --sysroot=/sysroot", config.cxxflags),
+                ),
+                (
+                    "LDFLAGS".into(),
+                    format!("{} --sysroot=/sysroot", config.ldflags),
+                ),
+            ]);
+        }
         classes.push(sage_build::Rclass {
             schema_version: sage_core::SCHEMA_VERSION,
             name: "cross-target".into(),
@@ -1050,25 +1092,16 @@ async fn build_recipe(
             allowed_compilers: Vec::new(),
             allowed_linkers: Vec::new(),
             defaults: BTreeMap::new(),
-            env: BTreeMap::from([
-                ("CC".into(), target.cc.clone()),
-                ("CXX".into(), target.cxx.clone()),
-                ("AR".into(), target.ar.clone()),
-                ("STRIP".into(), target.strip.clone()),
-                ("GOOS".into(), target.goos.clone()),
-                ("GOARCH".into(), target.goarch.clone()),
-                (
-                    "RUSTFLAGS".into(),
-                    format!("{} {}", config.rustflags, target.rustflags)
-                        .trim()
-                        .into(),
-                ),
-            ]),
+            env: cross_env,
             phases: BTreeMap::new(),
         });
     }
     sage_build::validate_toolchain(&classes, &selected_config)?;
     let build_dependencies = sage_build::build_dependencies(&recipe, &classes, &features)?;
+    let target_dependencies = sage_build::target_dependencies(&recipe, &features)?;
+    if cross.is_none() && !target_dependencies.is_empty() {
+        bail!("target_dependencies require [build].target");
+    }
     if dry_run {
         println!(
             "Would build {}-{}-{} for {} using {:?}",
@@ -1080,6 +1113,9 @@ async fn build_recipe(
         );
         for dependency in &build_dependencies {
             println!("Build-depends: {}", dependency.name);
+        }
+        for dependency in &target_dependencies {
+            println!("Target-depends: {}", dependency.name);
         }
         return Ok(());
     }
@@ -1097,6 +1133,19 @@ async fn build_recipe(
         &build_dependencies,
     )
     .await?;
+    let target_sysroot = if let Some(target) = &cross {
+        prepare_package_tree(
+            root,
+            workspace.path(),
+            "sysroot",
+            &recipe.package.channel,
+            &target_dependencies,
+            Some(&target.arch),
+        )
+        .await?
+    } else {
+        None
+    };
     let distfiles = source.join(".distfiles");
     std::fs::create_dir(&distfiles)?;
     let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
@@ -1121,6 +1170,7 @@ async fn build_recipe(
         destdir: destdir.clone(),
         runner,
         toolchain,
+        target_sysroot,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
     sage_build::stage_sysusers(&destdir, &recipe)?;
@@ -1160,15 +1210,26 @@ async fn prepare_build_toolchain(
     channel: &str,
     dependencies: &[sage_core::Dependency],
 ) -> Result<Option<PathBuf>> {
+    prepare_package_tree(root, workspace, "toolchain", channel, dependencies, None).await
+}
+
+async fn prepare_package_tree(
+    root: &Path,
+    workspace: &Path,
+    tree_name: &str,
+    channel: &str,
+    dependencies: &[sage_core::Dependency],
+    architecture: Option<&str>,
+) -> Result<Option<PathBuf>> {
     if dependencies.is_empty() {
         return Ok(None);
     }
-    let available = load_available(root)?;
+    let available = load_available_for_arch(root, architecture)?;
     let channel = canonical_channel(&available, Some(channel))?;
     let solution = sage_solver::SageSolver::new(&available.universe)
         .resolve_dependencies(&channel, dependencies)?;
-    let toolchain = workspace.join("toolchain");
-    std::fs::create_dir(&toolchain)?;
+    let tree = workspace.join(tree_name);
+    std::fs::create_dir(&tree)?;
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let mut owned = std::collections::BTreeSet::new();
@@ -1195,10 +1256,10 @@ async fn prepare_build_toolchain(
         {
             bail!("build dependency file conflict at {}", path.display());
         }
-        sage_archive::extract_package(&archive, &toolchain, &inspection.files)?;
-        println!("Build dependency {} {}", key, version);
+        sage_archive::extract_package(&archive, &tree, &inspection.files)?;
+        println!("{} dependency {} {}", tree_name, key, version);
     }
-    Ok(Some(toolchain))
+    Ok(Some(tree))
 }
 
 fn stage_patches(recipe_dir: &Path, source: &Path) -> Result<()> {

@@ -106,6 +106,9 @@ pub struct RecipeBuild {
     /// Explicit packages needed only while building this recipe.
     #[serde(default)]
     pub dependencies: Vec<String>,
+    /// Target-architecture headers and libraries mounted below `/sysroot`.
+    #[serde(default)]
+    pub target_dependencies: Vec<String>,
     #[serde(default)]
     pub payload: PayloadSpec,
     #[serde(default)]
@@ -129,6 +132,8 @@ pub struct FeatureSpec {
     #[serde(default)]
     pub build_dependencies: Vec<String>,
     #[serde(default)]
+    pub target_dependencies: Vec<String>,
+    #[serde(default)]
     pub args: BTreeMap<String, String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -140,6 +145,7 @@ pub struct EffectiveFeatures {
     pub enabled: BTreeSet<String>,
     pub dependencies: Vec<String>,
     pub build_dependencies: Vec<String>,
+    pub target_dependencies: Vec<String>,
     pub args: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
 }
@@ -316,6 +322,9 @@ impl RecipeSpec {
             result
                 .build_dependencies
                 .extend(rule.build_dependencies.clone());
+            result
+                .target_dependencies
+                .extend(rule.target_dependencies.clone());
             result.args.extend(rule.args.clone());
             result.env.extend(rule.env.clone());
         }
@@ -323,6 +332,8 @@ impl RecipeSpec {
         result.dependencies.dedup();
         result.build_dependencies.sort();
         result.build_dependencies.dedup();
+        result.target_dependencies.sort();
+        result.target_dependencies.dedup();
         Ok(result)
     }
 }
@@ -692,6 +703,25 @@ pub fn build_dependencies(
         .collect()
 }
 
+/// Returns target-architecture package constraints for the cross sysroot.
+pub fn target_dependencies(
+    recipe: &RecipeSpec,
+    features: &EffectiveFeatures,
+) -> Result<Vec<sage_core::Dependency>, BuildError> {
+    let mut values = recipe.build.target_dependencies.clone();
+    values.extend(features.target_dependencies.clone());
+    values.sort();
+    values.dedup();
+    values
+        .into_iter()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error: sage_core::CoreError| BuildError::InvalidSpec(error.to_string()))
+        })
+        .collect()
+}
+
 fn validate_shell_name(value: &str) -> Result<(), BuildError> {
     if !value.is_empty()
         && value
@@ -740,6 +770,7 @@ pub struct SandboxPaths {
     pub destdir: PathBuf,
     pub runner: PathBuf,
     pub toolchain: Option<PathBuf>,
+    pub target_sysroot: Option<PathBuf>,
 }
 
 /// Assembles and executes one hermetic Bubblewrap process.
@@ -789,8 +820,14 @@ impl<'a> SandboxRunner<'a> {
         if let Some(toolchain) = &paths.toolchain {
             command.args(["--ro-bind"]).arg(toolchain).arg("/toolchain");
         }
+        if let Some(target_sysroot) = &paths.target_sysroot {
+            command
+                .args(["--ro-bind"])
+                .arg(target_sysroot)
+                .arg("/sysroot");
+        }
         command.arg("--clearenv");
-        for (name, value) in self.environment(paths.toolchain.is_some()) {
+        for (name, value) in self.environment(paths) {
             command.args(["--setenv", &name, &value]);
         }
         command.arg("--").arg(&self.config.fakeroot).args([
@@ -810,7 +847,8 @@ impl<'a> SandboxRunner<'a> {
         }
     }
 
-    fn environment(&self, toolchain: bool) -> BTreeMap<String, String> {
+    fn environment(&self, paths: &SandboxPaths) -> BTreeMap<String, String> {
+        let toolchain = paths.toolchain.is_some();
         let path = if toolchain {
             "/toolchain/usr/bin:/toolchain/bin:/usr/bin:/bin"
         } else {
@@ -855,6 +893,16 @@ impl<'a> SandboxRunner<'a> {
                     "LD_LIBRARY_PATH".into(),
                     "/toolchain/usr/lib:/toolchain/usr/lib64".into(),
                 ),
+            ]);
+        }
+        if paths.target_sysroot.is_some() {
+            environment.extend([
+                ("PKG_CONFIG_SYSROOT_DIR".into(), "/sysroot".into()),
+                (
+                    "PKG_CONFIG_LIBDIR".into(),
+                    "/sysroot/usr/lib/pkgconfig:/sysroot/usr/share/pkgconfig".into(),
+                ),
+                ("CMAKE_FIND_ROOT_PATH".into(), "/sysroot".into()),
             ]);
         }
         environment
@@ -1265,6 +1313,7 @@ dependencies=["openssl"]
 build_dependencies=["pkgconf"]
 [features.gui]
 dependencies=["gtk4"]
+target_dependencies=["gtk4-dev"]
 [features.gui.args]
 frontend="gtk"
 "#,
@@ -1281,6 +1330,7 @@ frontend="gtk"
         );
         assert_eq!(selected.dependencies, ["gtk4", "openssl"]);
         assert_eq!(selected.build_dependencies, ["pkgconf"]);
+        assert_eq!(selected.target_dependencies, ["gtk4-dev"]);
         assert_eq!(selected.args["frontend"], "gtk");
         assert!(recipe
             .effective_features(&["missing".into()], false)

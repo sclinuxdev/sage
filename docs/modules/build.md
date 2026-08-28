@@ -70,6 +70,10 @@ implicit dependencies form one constrained PubGrub root. Verified archives are
 checked for file conflicts, extracted with the dirfd safety rules, and mounted
 read-only at `/toolchain`; host LMDB state is untouched.
 
+Cross-architecture headers and libraries are solved with the configured package
+architecture and mounted separately at `/sysroot`. Compiler, pkg-config, and
+CMake sysroot variables point there, while executable build tools remain native.
+
 Feature folding and target selection happen before runner composition, leaving
 phase execution free of per-feature and per-architecture branches. Cross tools
 and platform facts come exclusively from the configured target table.

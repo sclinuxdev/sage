@@ -221,6 +221,7 @@ Features are deterministic recipe transformations selected with
 inherit = ["meson"]
 dependencies = ["wayland-protocols >= 1.37-1"]
 target = "aarch64-linux-gnu"
+target_dependencies = ["zlib-dev >= 1.3-1"]
 
 [features.tls]
 default = true
@@ -239,3 +240,8 @@ PubGrub graph through the artifact manifest. Build dependencies from the recipe,
 features, and inherited rclasses are solved together, installed only under the
 ephemeral `/toolchain`, and never recorded as host state. Unknown feature names
 or unconfigured targets fail before source downloads begin.
+
+For cross builds, `target_dependencies` are architecture-filtered and extracted
+to a separate read-only `/sysroot`. Native build tools remain in `/toolchain`, so
+host executables can never be replaced by target binaries. Features may add the
+same field with `target_dependencies = [...]`.
