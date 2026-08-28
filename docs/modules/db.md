@@ -3,7 +3,7 @@
 - **Crate 路径**: `crates/sage-db`
 - **选用生态**: `heed` (LMDB Rust 绑定)
 - **代码预算**: ~1,100 行
-- **职责**: 零拷贝 mmap 持久化存储、版本化 Sub-channel 隔离实例追踪、文件所有权追踪与事务崩溃恢复日志。
+- **职责**: mmap 支持的 LMDB 持久化、版本化 Sub-channel 实例追踪、文件所有权与可重放事务日志。
 
 ---
 
@@ -13,7 +13,7 @@
 
 | 表名 (DBI) | Key | Value | 极致性能特性 |
 | :--- | :--- | :--- | :--- |
-| `packages` | `pkg_key` (`"channel:name:slot"`) | `PackageManifest` (TOML/bincode) | 零拷贝内存映射直接反序列化 |
+| `packages` | `pkg_key` (`"channel:name:slot"`) | `InstalledPackage` (Bincode) | mmap 点查后解码为所有权对象 |
 | `files` | `rel_path: &str` | `String` (换行符分隔的 `channel:name:slot`) | 极速所有权匹配与冲突检测 |
 | `provides` | `symbol: &str` | `Vec<String>` (实例标识列表) | 虚拟提供者与 SONAME 符号索引 |
 | `system` | `interface: &str` | `String` (激活的包名与 Slot) | 声明式系统核心提供者锁定 |
@@ -39,4 +39,4 @@
 
 ## 3. 崩溃恢复状态机 (`operations` 表)
 
-`sage` 启动时只读扫描 `operations` 表（开销 < 100μs）。若存在未决事务，根据 `journal_sha256` 幂等重放完成文件发布与触发器。
+`sage` 启动时扫描 `operations` 表并验证 `journal_sha256`。journal 保存安装版本、删除快照和声明式元数据，可从 packages、alternatives、triggers 阶段继续；重复的文件与 LMDB 操作均为幂等操作。

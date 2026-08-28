@@ -5,6 +5,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
 use sage_core::{CoreError, Dependency, PackageKey, Version};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub enum DbError {
         path: String,
         owners: Vec<PackageKey>,
     },
+    #[error("operation journal '{0}' failed its integrity check")]
+    InvalidJournal(String),
 }
 
 /// Complete installed state required for removal and reconciliation.
@@ -44,14 +47,66 @@ pub struct InstalledPackage {
     pub config_hashes: BTreeMap<String, String>,
 }
 
+/// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalAction {
+    Install {
+        architecture: String,
+        changes: Vec<(PackageKey, Version)>,
+        modified_paths: Vec<String>,
+        previous_alternative_documents: Vec<Vec<u8>>,
+    },
+    Remove {
+        packages: Vec<InstalledPackage>,
+        modified_paths: Vec<String>,
+        trigger_documents: Vec<Vec<u8>>,
+        alternative_documents: Vec<Vec<u8>>,
+    },
+}
+
 /// Durable operation marker used for idempotent forward recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
     pub op_id: String,
     pub stage: String,
-    pub affected_packages: Vec<PackageKey>,
     pub journal_sha256: String,
-    pub timestamp: u64,
+    pub action: JournalAction,
+}
+
+impl JournalRecord {
+    /// Creates a sealed journal that startup can integrity-check.
+    pub fn new(op_id: String, stage: &str, action: JournalAction) -> Self {
+        let mut record = Self {
+            op_id,
+            stage: stage.into(),
+            journal_sha256: String::new(),
+            action,
+        };
+        record.seal();
+        record
+    }
+
+    pub fn advance(&mut self, stage: &str) {
+        self.stage = stage.into();
+        self.seal();
+    }
+
+    pub fn validate(&self) -> Result<(), DbError> {
+        if self.journal_sha256 == action_digest(&self.action)? {
+            Ok(())
+        } else {
+            Err(DbError::InvalidJournal(self.op_id.clone()))
+        }
+    }
+
+    fn seal(&mut self) {
+        self.journal_sha256 = action_digest(&self.action)
+            .expect("serializing an in-memory journal action cannot fail");
+    }
+}
+
+fn action_digest(action: &JournalAction) -> Result<String, DbError> {
+    Ok(hex::encode(Sha256::digest(bincode::serialize(action)?)))
 }
 
 /// Named LMDB tables sharing one ACID environment.
@@ -213,6 +268,7 @@ impl SageDatabase {
 
     /// Starts or advances an operation by replacing its durable journal record.
     pub fn write_journal(&self, record: &JournalRecord) -> Result<(), DbError> {
+        record.validate()?;
         let mut txn = self.env.write_txn()?;
         put_encoded(&self.operations, &mut txn, &record.op_id, record)?;
         txn.commit()?;

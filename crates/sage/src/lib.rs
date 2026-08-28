@@ -155,8 +155,11 @@ pub enum QueryAction {
 }
 
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    execute(Cli::parse()).await
+}
 
+/// Executes one parsed command through the binary's production interface.
+pub async fn execute(cli: Cli) -> Result<()> {
     if cli.verbose {
         tracing_subscriber::fmt::init();
     }
@@ -174,19 +177,27 @@ pub async fn run() -> Result<()> {
         sage_core::HostLock::acquire_exclusive(lock_path)?
     };
     if !cli.dry_run && !read_only {
-        settle_journals(&cli.root)?;
+        settle_journals(&cli.root).await?;
     }
 
     match cli.command {
         Commands::Install {
             packages,
             channel,
-            no_save: _,
+            no_save,
         } => {
-            apply_packages(&cli.root, &packages, channel.as_deref(), false, cli.dry_run).await?;
+            apply_packages(
+                &cli.root,
+                &packages,
+                channel.as_deref(),
+                false,
+                !no_save,
+                cli.dry_run,
+            )
+            .await?;
         }
         Commands::Remove { packages, channel } => {
-            remove_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run)?;
+            remove_packages(&cli.root, &packages, channel.as_deref(), true, cli.dry_run)?;
         }
         Commands::Upgrade {
             packages,

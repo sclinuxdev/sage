@@ -54,32 +54,71 @@ fn sysusers_declaration_path(key: &sage_core::PackageKey) -> PathBuf {
     PathBuf::from("usr/share/sage/sysusers").join(format!("{digest}.toml"))
 }
 
-fn settle_journals(root: &Path) -> Result<()> {
+fn read_documents(root: &Path, relative: &Path) -> Result<Vec<Vec<u8>>> {
+    let directory = under_root(root, relative);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries
+        .into_iter()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("toml"))
+        .map(|entry| std::fs::read(entry.path()).map_err(Into::into))
+        .collect()
+}
+
+fn alternatives_from_documents(documents: &[Vec<u8>]) -> Result<Vec<sage_sys::Alternative>> {
+    let mut alternatives = Vec::new();
+    for document in documents {
+        alternatives.extend(sage_sys::AlternativesDocument::parse(document)?.alternatives());
+    }
+    Ok(alternatives)
+}
+
+fn trigger_documents(root: &Path) -> Result<Vec<Vec<u8>>> {
+    sage_sys::TriggerEngine::load_triggers(root)?
+        .into_iter()
+        .map(|trigger| Ok(toml::to_string(&trigger)?.into_bytes()))
+        .collect()
+}
+
+/// One-shot sysroot-local crash injection; the next startup exercises recovery.
+fn crash_point(root: &Path, stage: &str) -> Result<()> {
+    let marker = under_root(root, Path::new("/run/sage/crash-point"));
+    if std::fs::read_to_string(&marker)
+        .ok()
+        .is_some_and(|value| value.trim() == stage)
+    {
+        std::fs::remove_file(marker)?;
+        bail!("injected crash after {stage}");
+    }
+    Ok(())
+}
+
+async fn settle_journals(root: &Path) -> Result<()> {
     let path = under_root(root, Path::new("/var/lib/sage"));
     if !path.exists() {
         return Ok(());
     }
     let database = sage_db::SageDatabase::open(path)?;
-    for journal in database.pending_journals()? {
-        let present = journal
-            .affected_packages
-            .iter()
-            .map(|key| database.package(key))
-            .collect::<Result<Vec<_>, _>>()?;
-        let complete = match journal.stage.as_str() {
-            "publish" => present.iter().all(Option::is_some),
-            "remove" => present.iter().all(Option::is_none),
-            _ => false,
-        };
-        if complete {
-            database.finish_journal(&journal.op_id)?;
-            eprintln!("Recovered completed operation {}", journal.op_id);
-        } else {
-            eprintln!(
-                "Resuming convergence with unfinished operation {} ({})",
-                journal.op_id, journal.stage
-            );
+    for mut journal in database.pending_journals()? {
+        journal.validate()?;
+        eprintln!(
+            "Recovering unfinished operation {} ({})",
+            journal.op_id, journal.stage
+        );
+        match &journal.action {
+            sage_db::JournalAction::Install { architecture, .. } => {
+                let architecture = architecture.clone();
+                let available = load_available_with_pool(root, Some(&architecture), None)?;
+                resume_install(root, &database, &available, &mut journal).await?;
+            }
+            sage_db::JournalAction::Remove { .. } => {
+                resume_remove(root, &database, &mut journal)?;
+            }
         }
+        eprintln!("Recovered operation {}", journal.op_id);
     }
     Ok(())
 }
@@ -88,14 +127,6 @@ pub struct AvailablePackages {
     pub universe: sage_solver::PackageUniverse,
     pub releases: BTreeMap<(sage_core::PackageKey, sage_core::Version), ReleaseSource>,
     pub aliases: BTreeMap<String, String>,
-}
-
-fn load_available(root: &Path) -> Result<AvailablePackages> {
-    load_available_for_arch(root, None)
-}
-
-fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<AvailablePackages> {
-    load_available_with_pool(root, architecture, None)
 }
 
 pub fn load_available_with_pool(
@@ -227,14 +258,17 @@ async fn apply_packages(
     names: &[String],
     channel: Option<&str>,
     prefer_latest: bool,
+    save: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let available = load_available(root)?;
+    let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
+    let mut config = sage_sys::SystemConfig::load(&config_path)?;
+    let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let channel = canonical_channel(&available, channel)?;
     let requested: Vec<_> = names
         .iter()
-        .map(|name| sage_core::PackageKey::new(&channel, name, sage_core::DEFAULT_SLOT))
-        .collect();
+        .map(|name| sage_core::PackageKey::in_channel(&channel, name))
+        .collect::<Result<_, _>>()?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = if dry_run {
         sage_db::read_packages(&db_path)?
@@ -242,21 +276,26 @@ async fn apply_packages(
         sage_db::SageDatabase::open(&db_path)?.packages()?
     };
     let solution = if prefer_latest {
-        sage_solver::SageSolver::new(&available.universe).resolve(&requested)?
+        sage_solver::SageSolver::new(&available.universe)
+            .prefer_providers(config.provider_preferences("main/system")?)
+            .resolve(&requested)?
     } else {
         let locks = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
-        sage_solver::SageSolver::with_locked(&available.universe, locks).resolve(&requested)?
+        sage_solver::SageSolver::with_locked(&available.universe, locks)
+            .prefer_providers(config.provider_preferences("main/system")?)
+            .resolve(&requested)?
     };
     let current: BTreeMap<_, _> = installed
         .iter()
         .map(|package| (package.key.clone(), package.version.clone()))
         .collect();
-    let changes: Vec<_> = solution
+    let changes = solution
         .into_iter()
         .filter(|(key, version)| current.get(key) != Some(version))
         .collect();
+    let changes = installation_order(&available, changes)?;
     for (key, version) in &changes {
         println!(
             "{} {} {}",
@@ -269,40 +308,140 @@ async fn apply_packages(
             version
         );
     }
-    if dry_run || changes.is_empty() {
+    if dry_run {
         return Ok(());
     }
-    let database = sage_db::SageDatabase::open(&db_path)?;
-    publish_packages(root, &database, &available, &changes).await
+    if !changes.is_empty() {
+        let database = sage_db::SageDatabase::open(&db_path)?;
+        publish_packages(
+            root,
+            &database,
+            &available,
+            &config.system.architecture,
+            &changes,
+        )
+        .await?;
+    }
+    if save && channel == "main/system" {
+        config.packages.extend(names.iter().cloned());
+        write_atomic_under_root(
+            root,
+            Path::new("etc/sage/system.toml"),
+            toml::to_string_pretty(&config)?.as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+fn installation_order(
+    available: &AvailablePackages,
+    changes: BTreeMap<sage_core::PackageKey, sage_core::Version>,
+) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
+    let mut pending = changes;
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let ready = pending.iter().find_map(|(key, version)| {
+            let package = &available.releases[&(key.clone(), version.clone())]
+                .release
+                .package;
+            let blocked = package.dependencies.iter().any(|dependency| {
+                pending.keys().any(|candidate| {
+                    if candidate == key {
+                        return false;
+                    }
+                    if dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:")
+                    {
+                        return pending
+                            .get(candidate)
+                            .and_then(|candidate_version| {
+                                available
+                                    .releases
+                                    .get(&(candidate.clone(), candidate_version.clone()))
+                            })
+                            .is_some_and(|source| {
+                                source.release.package.provides.contains(&dependency.name)
+                            });
+                    }
+                    candidate.name == dependency.name
+                        && candidate.slot
+                            == dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT)
+                        && candidate.channel
+                            == dependency.channel.as_deref().unwrap_or(&key.channel)
+                })
+            });
+            (!blocked).then(|| key.clone())
+        });
+        let Some(key) = ready else {
+            bail!("selected package graph contains an installation cycle");
+        };
+        ordered.push((key.clone(), pending.remove(&key).unwrap()));
+    }
+    Ok(ordered)
 }
 
 async fn publish_packages(
     root: &Path,
     database: &sage_db::SageDatabase,
     available: &AvailablePackages,
+    architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
 ) -> Result<()> {
     let timestamp = unix_timestamp()?;
     let op_id = format!("install-{}-{timestamp}", std::process::id());
-    let digest = hex::encode(Sha256::digest(format!("{changes:?}").as_bytes()));
-    database.write_journal(&sage_db::JournalRecord {
-        op_id: op_id.clone(),
-        stage: "publish".into(),
-        affected_packages: changes.iter().map(|(key, _)| key.clone()).collect(),
-        journal_sha256: digest,
-        timestamp,
-    })?;
+    let mut journal = sage_db::JournalRecord::new(
+        op_id,
+        "packages",
+        sage_db::JournalAction::Install {
+            architecture: architecture.into(),
+            changes: changes.to_vec(),
+            modified_paths: Vec::new(),
+            previous_alternative_documents: read_documents(
+                root,
+                Path::new("usr/share/sage/alternatives"),
+            )?,
+        },
+    );
+    database.write_journal(&journal)?;
+    resume_install(root, database, available, &mut journal).await
+}
+
+async fn resume_install(
+    root: &Path,
+    database: &sage_db::SageDatabase,
+    available: &AvailablePackages,
+    journal: &mut sage_db::JournalRecord,
+) -> Result<()> {
+    journal.validate()?;
+    let (architecture, changes) = match &journal.action {
+        sage_db::JournalAction::Install {
+            architecture,
+            changes,
+            ..
+        } => (architecture.clone(), changes.clone()),
+        _ => bail!("install recovery received a removal journal"),
+    };
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
-    let previous_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
     let mut modified = Vec::new();
-    for (key, version) in changes {
+    if journal.stage == "packages" {
+    for (key, version) in &changes {
         let source = available
             .releases
             .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for {key} {version}"))?;
         let archive = obtain_release_archive(&engine, &package_cache, source).await?;
         let inspection = sage_archive::inspect_package(&archive)?;
+        if inspection.manifest.arch != architecture
+            && inspection.manifest.arch != "any"
+            && inspection.manifest.arch != "noarch"
+        {
+            bail!(
+                "package {} has architecture {}, expected {}",
+                key,
+                inspection.manifest.arch,
+                architecture
+            );
+        }
         let target = under_root(root, &source.target_root);
         std::fs::create_dir_all(&target)?;
         let prefix = source
@@ -390,6 +529,7 @@ async fn publish_packages(
             &inspection.files,
             &previous,
         )?;
+        crash_point(root, "extraction")?;
         for (service, bytes) in services {
             write_atomic_under_root(
                 root,
@@ -435,6 +575,7 @@ async fn publish_packages(
             },
             false,
         )?;
+        crash_point(root, "lmdb-publication")?;
         if let Some(previous_package) = previous_package {
             for obsolete in previous_package
                 .files
@@ -454,6 +595,29 @@ async fn publish_packages(
             eprintln!("Configuration update requires review: {}", path.display());
         }
     }
+    if let sage_db::JournalAction::Install { modified_paths, .. } = &mut journal.action {
+        *modified_paths = modified
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    journal.advance("alternatives");
+    database.write_journal(journal)?;
+    }
+    let modified: Vec<PathBuf> = match &journal.action {
+        sage_db::JournalAction::Install { modified_paths, .. } => {
+            modified_paths.iter().map(PathBuf::from).collect()
+        }
+        _ => unreachable!(),
+    };
+    if journal.stage == "alternatives" {
+    let previous_alternatives = alternatives_from_documents(match &journal.action {
+        sage_db::JournalAction::Install {
+            previous_alternative_documents,
+            ..
+        } => previous_alternative_documents,
+        _ => unreachable!(),
+    })?;
     let current_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
     sage_sys::ProfileEngine::reconcile_alternatives(
         root,
@@ -462,14 +626,21 @@ async fn publish_packages(
     )?;
     let accounts = sage_sys::SysusersDocument::load_installed(root)?;
     sage_sys::SysusersEngine::reconcile(root, &accounts)?;
+    journal.advance("triggers");
+    database.write_journal(journal)?;
+    crash_point(root, "alternatives")?;
+    }
+    if journal.stage == "triggers" {
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+    crash_point(root, "triggers")?;
     sage_sys::TriggerEngine::execute_triggers_for(
         &triggers,
         &modified,
         root,
         sage_sys::TriggerEvent::PostChange,
     )?;
-    database.finish_journal(&op_id)?;
+    }
+    database.finish_journal(&journal.op_id)?;
     Ok(())
 }
 
@@ -479,7 +650,11 @@ async fn upgrade_packages(
     channel: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    let available = load_available(root)?;
+    let config = sage_sys::SystemConfig::load(under_root(
+        root,
+        Path::new("/etc/sage/system.toml"),
+    ))?;
+    let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let canonical = canonical_channel(&available, channel)?;
     let names = if names.is_empty() {
         let db_path = under_root(root, Path::new("/var/lib/sage"));
@@ -491,18 +666,19 @@ async fn upgrade_packages(
         packages
             .into_iter()
             .filter(|package| package.key.channel == canonical)
-            .map(|package| package.key.name)
+            .map(|package| format!("{}:{}", package.key.name, package.key.slot))
             .collect()
     } else {
         names.to_vec()
     };
-    apply_packages(root, &names, Some(&canonical), true, dry_run).await
+    apply_packages(root, &names, Some(&canonical), true, false, dry_run).await
 }
 
 fn remove_packages(
     root: &Path,
     names: &[String],
     channel: Option<&str>,
+    update_saved: bool,
     dry_run: bool,
 ) -> Result<()> {
     let db_path = under_root(root, Path::new("/var/lib/sage"));
@@ -521,11 +697,13 @@ fn remove_packages(
             }
         },
     );
+    let requested = names
+        .iter()
+        .map(|selector| sage_core::PackageKey::in_channel(&canonical, selector))
+        .collect::<Result<Vec<_>, _>>()?;
     let selected: Vec<_> = installed
         .iter()
-        .filter(|package| {
-            package.key.channel == canonical && names.iter().any(|name| name == &package.key.name)
-        })
+        .filter(|package| requested.contains(&package.key))
         .cloned()
         .collect();
     if selected.len() != names.len() {
@@ -537,6 +715,10 @@ fn remove_packages(
                 && dependent.dependencies.iter().any(|dependency| {
                     (dependency.name == removed.key.name
                         || removed.provides.contains(&dependency.name))
+                        && dependency
+                            .slot
+                            .as_deref()
+                            .is_none_or(|slot| slot == removed.key.slot)
                         && dependency
                             .channel
                             .as_deref()
@@ -552,23 +734,53 @@ fn remove_packages(
     if dry_run {
         return Ok(());
     }
-    // Keep declarations in memory before package-owned trigger files disappear;
-    // post-remove actions must observe the completed filesystem transaction.
-    let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
-    let previous_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
+    if update_saved && canonical == "main/system" {
+        let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
+        let mut config = sage_sys::SystemConfig::load(&config_path)?;
+        for name in names {
+            config.packages.remove(name);
+        }
+        write_atomic_under_root(
+            root,
+            Path::new("etc/sage/system.toml"),
+            toml::to_string_pretty(&config)?.as_bytes(),
+        )?;
+    }
     let database = sage_db::SageDatabase::open(&db_path)?;
     let timestamp = unix_timestamp()?;
     let op_id = format!("remove-{}-{timestamp}", std::process::id());
-    database.write_journal(&sage_db::JournalRecord {
-        op_id: op_id.clone(),
-        stage: "remove".into(),
-        affected_packages: selected.iter().map(|package| package.key.clone()).collect(),
-        journal_sha256: hex::encode(Sha256::digest(format!("{names:?}").as_bytes())),
-        timestamp,
-    })?;
+    let mut journal = sage_db::JournalRecord::new(
+        op_id,
+        "packages",
+        sage_db::JournalAction::Remove {
+            packages: selected,
+            modified_paths: Vec::new(),
+            trigger_documents: trigger_documents(root)?,
+            alternative_documents: read_documents(
+                root,
+                Path::new("usr/share/sage/alternatives"),
+            )?,
+        },
+    );
+    database.write_journal(&journal)?;
+    resume_remove(root, &database, &mut journal)
+}
+
+fn resume_remove(
+    root: &Path,
+    database: &sage_db::SageDatabase,
+    journal: &mut sage_db::JournalRecord,
+) -> Result<()> {
+    journal.validate()?;
+    if journal.stage == "packages" {
+    let packages = match &journal.action {
+        sage_db::JournalAction::Remove { packages, .. } => packages.clone(),
+        _ => bail!("remove recovery received an install journal"),
+    };
     let mut modified = Vec::new();
-    for package in selected {
+    for package in packages {
         database.remove(&package.key)?;
+        crash_point(root, "removal")?;
         for relative in &package.files {
             if !database.owners(relative)?.is_empty() {
                 continue;
@@ -582,6 +794,29 @@ fn remove_packages(
             modified.push(PathBuf::from(relative));
         }
     }
+    if let sage_db::JournalAction::Remove { modified_paths, .. } = &mut journal.action {
+        *modified_paths = modified
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    }
+    journal.advance("alternatives");
+    database.write_journal(journal)?;
+    }
+    let modified: Vec<PathBuf> = match &journal.action {
+        sage_db::JournalAction::Remove { modified_paths, .. } => {
+            modified_paths.iter().map(PathBuf::from).collect()
+        }
+        _ => unreachable!(),
+    };
+    if journal.stage == "alternatives" {
+    let previous_alternatives = alternatives_from_documents(match &journal.action {
+        sage_db::JournalAction::Remove {
+            alternative_documents,
+            ..
+        } => alternative_documents,
+        _ => unreachable!(),
+    })?;
     let current_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
     sage_sys::ProfileEngine::reconcile_alternatives(
         root,
@@ -590,13 +825,29 @@ fn remove_packages(
     )?;
     let accounts = sage_sys::SysusersDocument::load_installed(root)?;
     sage_sys::SysusersEngine::reconcile(root, &accounts)?;
+    journal.advance("triggers");
+    database.write_journal(journal)?;
+    crash_point(root, "alternatives")?;
+    }
+    if journal.stage == "triggers" {
+    let triggers = match &journal.action {
+        sage_db::JournalAction::Remove {
+            trigger_documents, ..
+        } => trigger_documents
+            .iter()
+            .map(|bytes| sage_sys::TriggerSpec::parse(bytes))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => unreachable!(),
+    };
+    crash_point(root, "triggers")?;
     sage_sys::TriggerEngine::execute_triggers_for(
         &triggers,
         &modified,
         root,
         sage_sys::TriggerEvent::PostRemove,
     )?;
-    database.finish_journal(&op_id)?;
+    }
+    database.finish_journal(&journal.op_id)?;
     Ok(())
 }
 
@@ -671,8 +922,8 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     desired.extend(config.providers.values().cloned());
     desired.sort();
     desired.dedup();
-    apply_packages(root, &desired, Some("system"), false, dry_run).await?;
-    let available = load_available(root)?;
+    apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
+    let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = if dry_run {
         sage_db::read_packages(&db_path)?
@@ -681,9 +932,13 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     };
     let plan =
         sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
-    let names: Vec<_> = plan.remove.into_iter().map(|key| key.name).collect();
+    let names: Vec<_> = plan
+        .remove
+        .into_iter()
+        .map(|key| format!("{}:{}", key.name, key.slot))
+        .collect();
     if !names.is_empty() {
-        remove_packages(root, &names, Some("main/system"), dry_run)?;
+        remove_packages(root, &names, Some("main/system"), false, dry_run)?;
     }
     let database = if dry_run {
         None
@@ -924,7 +1179,7 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
             } else {
                 format!("main/{channel}")
             };
-            let key = sage_core::PackageKey::new(channel, package, sage_core::DEFAULT_SLOT);
+            let key = sage_core::PackageKey::in_channel(channel, &package)?;
             let record = sage_db::read_packages(&db_path)?
                 .into_iter()
                 .find(|record| record.key == key)

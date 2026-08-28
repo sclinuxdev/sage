@@ -247,6 +247,51 @@ mod sys_tests {
     }
 
     #[test]
+    fn reconciliation_switches_and_prunes_virtual_provider() {
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", "app", "0"),
+            "1-1".parse().unwrap(),
+            vec!["virtual/libc".parse().unwrap()],
+            vec![],
+        ));
+        for name in ["glibc", "musl"] {
+            universe.insert(sage_core::Package::from_release(
+                sage_core::PackageKey::new("main/system", name, "0"),
+                "1-1".parse().unwrap(),
+                vec![],
+                vec!["virtual/libc".into()],
+            ));
+        }
+        let glibc = sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "glibc", "0"),
+            version: "1-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 0,
+            dependencies: vec![],
+            provides: vec!["virtual/libc".into()],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        };
+        let config = SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::from([("libc".into(), "musl".into())]),
+            packages: BTreeSet::from(["app".into()]),
+            services: BTreeSet::new(),
+        };
+        let plan = ReconcilePlan::compute(&config, &[glibc], &universe, false).unwrap();
+        assert!(plan
+            .install
+            .iter()
+            .any(|(key, _)| key.name == "musl"));
+        assert_eq!(plan.remove[0].name, "glibc");
+    }
+
+    #[test]
     fn alternatives_choose_priority_and_publish_atomically() {
         let root = tempfile::tempdir().unwrap();
         let candidates = [

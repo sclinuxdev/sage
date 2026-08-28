@@ -469,6 +469,22 @@ destination="vendor/project"
     }
 
     #[test]
+    fn discovery_keeps_channel_and_slot_instances_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        for (path, channel, slot) in [("a", "system", "1"), ("b", "testing", "2")] {
+            fs::create_dir(directory.path().join(path)).unwrap();
+            fs::write(
+                directory.path().join(path).join("recipe.toml"),
+                format!(
+                    "schema_version=1\n[package]\nname=\"lib\"\nslot=\"{slot}\"\nversion=\"1\"\nrelease=1\narch=\"amd64\"\nchannel=\"{channel}\"\ndescription=\"lib\"\nlicense=\"MIT\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(BuildGraph::discover(directory.path()).unwrap().len(), 2);
+    }
+
+    #[test]
     fn bootstrap_plan_preserves_explicit_stage_order() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("bootstrap.toml");

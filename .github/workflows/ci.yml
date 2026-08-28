@@ -1,0 +1,29 @@
+name: Rust baseline
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run all targets
+        run: cargo test --all-targets
+      - name: Deny Clippy warnings
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Enforce production Rust line budget
+        shell: bash
+        run: |
+          lines=$(find crates -path '*/src/*.rs' -type f -print0 | xargs -0 cat | wc -l)
+          test "$lines" -le 9000 || { echo "production Rust lines: $lines (limit: 9000)"; exit 1; }

@@ -23,6 +23,37 @@ impl SystemConfig {
         validate_schema(config.schema_version)?;
         Ok(config)
     }
+
+    /// Expands declarative `name[:slot]` roots into exact solver identities.
+    pub fn package_keys(&self, channel: &str) -> Result<Vec<sage_core::PackageKey>, SysError> {
+        self.packages
+            .iter()
+            .map(|selector| {
+                sage_core::PackageKey::in_channel(channel, selector)
+                    .map_err(|error| SysError::Invalid(error.to_string()))
+            })
+            .collect()
+    }
+
+    /// Returns virtual symbols and their configured concrete package choices.
+    pub fn provider_preferences(
+        &self,
+        channel: &str,
+    ) -> Result<BTreeMap<String, sage_core::PackageKey>, SysError> {
+        self.providers
+            .iter()
+            .map(|(interface, selector)| {
+                let symbol = if interface.starts_with("virtual/") || interface.starts_with("so:") {
+                    interface.clone()
+                } else {
+                    format!("virtual/{interface}")
+                };
+                sage_core::PackageKey::in_channel(channel, selector)
+                    .map(|key| (symbol, key))
+                    .map_err(|error| SysError::Invalid(error.to_string()))
+            })
+            .collect()
+    }
 }
 
 /// Minimal transaction needed to converge installed state on the declaration.
@@ -42,16 +73,17 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
-        let mut desired_names = config.packages.clone();
-        desired_names.extend(config.providers.values().cloned());
-        let roots: Vec<_> = desired_names
-            .iter()
-            .map(|name| sage_core::PackageKey::new("main/system", name, sage_core::DEFAULT_SLOT))
-            .collect();
+        let mut roots = config.package_keys("main/system")?;
+        let preferences = config.provider_preferences("main/system")?;
+        roots.extend(preferences.values().cloned());
+        roots.sort();
+        roots.dedup();
         let locks = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
-        let solution = sage_solver::SageSolver::with_locked(universe, locks).resolve(&roots)?;
+        let solution = sage_solver::SageSolver::with_locked(universe, locks)
+            .prefer_providers(preferences.clone())
+            .resolve(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
@@ -70,15 +102,9 @@ impl ReconcilePlan {
                 .cloned()
                 .collect()
         };
-        let provider_bindings = config
-            .providers
-            .iter()
-            .map(|(interface, package)| {
-                (
-                    interface.clone(),
-                    sage_core::PackageKey::new("main/system", package, sage_core::DEFAULT_SLOT),
-                )
-            })
+        let provider_bindings = preferences
+            .into_iter()
+            .map(|(symbol, key)| (symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(), key))
             .collect();
         Ok(Self {
             install,

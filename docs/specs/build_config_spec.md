@@ -2,7 +2,7 @@
 
 - **文件路径**: `/etc/sage/build.toml`
 - **Schema 版本**: `1`
-- **设计目标**: 定义主机全局构建优化标志、沙箱资源配额及 Ptrace/Seccomp 审计工具链白名单。
+- **设计目标**: 定义主机全局构建优化标志、沙箱配置及受管工具链选择；资源字段保留供后续 cgroup adapter 实现。
 
 ---
 
@@ -41,8 +41,8 @@ source_date_epoch = 1700000000
 
 # 并发与资源限制
 jobs = 0                            # 0 = 自动匹配在线 CPU 线程数
-memory_limit = ""                   # Cgroups v2 内存限制 (例如 "8G", 为空表示不限制)
-pids_limit = 2048                   # Cgroups v2 最大进程数
+memory_limit = ""                   # Reserved; currently parsed but not enforced
+pids_limit = 2048                   # Reserved; currently parsed but not enforced
 
 # 编译器缓存策略 (none | auto | ccache | sccache)
 compiler_cache = "auto"
@@ -53,10 +53,8 @@ ccache_dir = "/var/cache/sage/ccache"
 
 ## 2. 字段详细解析
 
-### 2.1 编译器审计白名单与 Ptrace 监督
-在沙箱运行期间，`sage-build` 会拦截所有的 `execve` / `execveat` 调用：
-- 仅允许执行配方及其 `rclass` 声明的 `allowed_compilers`（如 `clang`, `gcc`, `rustc`）与系统核心命令（`sed`, `awk`, `sh` 等）。
-- 阻止外部未经授权的二进制偷渡执行，确保构建产物 100% 来源透明与防篡改。
+### 2.1 编译器配置与 wrapper 溯源
+`allowed_compilers` 与 `allowed_linkers` 用于验证所选配置。构建时只为受管编译器和链接器安装 wrapper，并记录实际调用及版本；当前 schema v1 不使用 ptrace，也不会拦截所有 `execve` / `execveat`。
 
 ### 2.2 确定性时间戳 (`source_date_epoch`)
 沙箱内的环境变量 `SOURCE_DATE_EPOCH` 将被强行重设为该值，并且构建时间、归档时间戳均统一规范化，保证二进制可重现（Bit-for-Bit Reproducible Builds）。

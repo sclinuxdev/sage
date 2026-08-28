@@ -89,6 +89,17 @@ impl PackageKey {
         }
     }
 
+    /// Parses the shared user-facing `name[:slot]` selector inside one channel.
+    pub fn in_channel(channel: impl Into<String>, selector: &str) -> Result<Self, CoreError> {
+        let (name, slot) = selector
+            .split_once(':')
+            .map_or((selector, DEFAULT_SLOT), |(name, slot)| (name, slot));
+        if name.is_empty() || slot.is_empty() || slot.contains(':') {
+            return Err(CoreError::InvalidPackageKey(selector.into()));
+        }
+        Ok(Self::new(channel, name, slot))
+    }
+
     /// Returns the stable key used in LMDB and diagnostics.
     pub fn canonical_id(&self) -> String {
         self.to_string()

@@ -65,13 +65,16 @@ mod db_tests {
     #[test]
     fn journals_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let record = JournalRecord {
-            op_id: "op-1".into(),
-            stage: "publish".into(),
-            affected_packages: vec![],
-            journal_sha256: "00".repeat(32),
-            timestamp: 1,
-        };
+        let record = JournalRecord::new(
+            "op-1".into(),
+            "packages",
+            JournalAction::Install {
+                architecture: "amd64".into(),
+                changes: vec![],
+                modified_paths: vec![],
+                previous_alternative_documents: vec![],
+            },
+        );
         SageDatabase::open(dir.path())
             .unwrap()
             .write_journal(&record)
