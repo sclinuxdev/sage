@@ -125,6 +125,20 @@ impl SageDatabase {
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
         let id = package.key.canonical_id();
+        // Replacing an installed version is one transaction: remove reverse
+        // indexes that disappeared before validating and adding the new set.
+        if let Some(previous) = get_owned::<InstalledPackage>(&self.packages, &txn, &id)? {
+            for path in previous.files {
+                if !package.files.contains(&path) {
+                    remove_member(&self.files, &mut txn, &path, &package.key)?;
+                }
+            }
+            for symbol in previous.provides {
+                if !package.provides.contains(&symbol) {
+                    remove_member(&self.provides, &mut txn, &symbol, &package.key)?;
+                }
+            }
+        }
         for path in &package.files {
             let mut owners: Vec<PackageKey> =
                 get_owned(&self.files, &txn, path)?.unwrap_or_default();
@@ -312,6 +326,21 @@ mod tests {
         ));
         assert!(db.package(&second.key).unwrap().is_none());
         assert!(db.providers("cmd:two").unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrade_prunes_obsolete_reverse_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SageDatabase::open(dir.path()).unwrap();
+        let first = package("demo", "usr/bin/old");
+        let mut second = package("demo", "usr/bin/new");
+        second.version = Version::new(0, "2.0", 1);
+        second.provides = vec!["cmd:new-demo".into()];
+        db.install(&first, false).unwrap();
+        db.install(&second, false).unwrap();
+        assert!(db.owners("usr/bin/old").unwrap().is_empty());
+        assert!(db.providers("cmd:demo").unwrap().is_empty());
+        assert_eq!(db.owners("usr/bin/new").unwrap(), vec![second.key]);
     }
 
     #[test]
