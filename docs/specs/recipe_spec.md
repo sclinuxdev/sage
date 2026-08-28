@@ -235,6 +235,28 @@ database instead of being rebuilt as untracked host mutations.
 
 ### 3.6 Declarative installation lifecycle
 
+Source-free data and policy packages use `[install]` entries instead of a
+`custom` build class. All paths are relative to DESTDIR, duplicate or escaping
+paths are rejected, and numeric modes use TOML decimal notation:
+
+```toml
+[[install.directories]]
+path = "tmp"
+mode = 1023 # 01777
+
+[[install.files]]
+path = "usr/lib/os-release"
+content = "NAME=Example\n"
+mode = 420 # 0644
+
+[[install.symlinks]]
+path = "etc/os-release"
+target = "../usr/lib/os-release"
+```
+
+Recipes with no upstream source are valid when their payload is fully
+declarative, including pure meta-packages whose only state is dependencies.
+
 Recipes may declare system accounts with `[[sysusers]]`; the builder emits a
 deterministic `usr/lib/sysusers.d/<package>.conf`. Optional `service.toml` and
 `triggers.toml` files beside `recipe.toml` are schema-validated and copied into

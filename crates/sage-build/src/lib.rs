@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use thiserror::Error;
@@ -202,6 +203,50 @@ pub struct SysuserSpec {
     pub shell: String,
 }
 
+/// Declarative filesystem payload for source-free data and policy packages.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallSpec {
+    #[serde(default)]
+    pub directories: Vec<InstallDirectory>,
+    #[serde(default)]
+    pub files: Vec<InstallFile>,
+    #[serde(default)]
+    pub symlinks: Vec<InstallSymlink>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallDirectory {
+    pub path: PathBuf,
+    #[serde(default = "default_directory_mode")]
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallFile {
+    pub path: PathBuf,
+    pub content: String,
+    #[serde(default = "default_file_mode")]
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallSymlink {
+    pub path: PathBuf,
+    pub target: PathBuf,
+}
+
+fn default_directory_mode() -> u32 {
+    0o755
+}
+
+fn default_file_mode() -> u32 {
+    0o644
+}
+
 fn default_home() -> String {
     "/".into()
 }
@@ -225,6 +270,8 @@ pub struct RecipeSpec {
     pub subpackages: Vec<SubpackageSpec>,
     #[serde(default)]
     pub sysusers: Vec<SysuserSpec>,
+    #[serde(default)]
+    pub install: InstallSpec,
     #[serde(default)]
     pub features: BTreeMap<String, FeatureSpec>,
 }
@@ -458,11 +505,6 @@ impl RecipeSpec {
                 "use either [source] or [[sources]], not both".into(),
             ));
         }
-        if recipe.source.is_none() && recipe.sources.is_empty() {
-            return Err(BuildError::InvalidSpec(
-                "at least one source is required".into(),
-            ));
-        }
         for source in recipe.source_inputs() {
             validate_source_destination(&source.destination)?;
             source.validate()?;
@@ -470,6 +512,7 @@ impl RecipeSpec {
         for user in &recipe.sysusers {
             user.validate()?;
         }
+        recipe.install.validate()?;
         if recipe.features.keys().any(|name| !valid_feature_name(name)) {
             return Err(BuildError::InvalidSpec(
                 "feature names must use lowercase ASCII letters, digits, '_' or '-'".into(),
@@ -567,6 +610,89 @@ impl RecipeSpec {
         result.target_dependencies.dedup();
         Ok(result)
     }
+}
+
+impl InstallSpec {
+    fn validate(&self) -> Result<(), BuildError> {
+        let mut paths = BTreeSet::new();
+        for (path, mode) in self
+            .directories
+            .iter()
+            .map(|entry| (&entry.path, entry.mode))
+            .chain(self.files.iter().map(|entry| (&entry.path, entry.mode)))
+        {
+            validate_install_path(path)?;
+            if mode > 0o7777 || !paths.insert(path) {
+                return Err(BuildError::InvalidSpec(format!(
+                    "duplicate path or invalid mode in declarative install: {}",
+                    path.display()
+                )));
+            }
+        }
+        for entry in &self.symlinks {
+            validate_install_path(&entry.path)?;
+            if entry.target.as_os_str().is_empty()
+                || entry.target.to_string_lossy().contains(['\n', '\r', '\0'])
+                || !paths.insert(&entry.path)
+            {
+                return Err(BuildError::InvalidSpec(format!(
+                    "invalid declarative symlink {}",
+                    entry.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_install_path(path: &Path) -> Result<(), BuildError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        })
+    {
+        return Err(BuildError::InvalidSpec(format!(
+            "declarative install path must be safe and relative: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Materializes a validated declarative payload into DESTDIR without invoking
+/// a shell or allowing a recipe path to escape the staging root.
+pub fn stage_declarative_install(root: &Path, recipe: &RecipeSpec) -> Result<(), BuildError> {
+    recipe.install.validate()?;
+    for entry in &recipe.install.directories {
+        let path = root.join(&entry.path);
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
+    }
+    for entry in &recipe.install.files {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, entry.content.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
+    }
+    for entry in &recipe.install.symlinks {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::os::unix::fs::symlink(&entry.target, path)?;
+    }
+    Ok(())
 }
 
 /// Folds rclass-style free-form argument channels without allowing one feature
@@ -1878,6 +2004,60 @@ destination=".source-patches/001"
     }
 
     #[test]
+    fn source_free_declarative_install_materializes_modes_and_usr_merge_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe_path = directory.path().join("recipe.toml");
+        fs::write(
+            &recipe_path,
+            r#"schema_version=1
+[package]
+name="base-files"
+version="1"
+release=1
+description="base"
+license="MIT"
+channel="system"
+arch="any"
+
+[[install.directories]]
+path="tmp"
+mode=1023
+
+[[install.files]]
+path="etc/issue"
+content="Sage\n"
+
+[[install.symlinks]]
+path="bin"
+target="usr/bin"
+"#,
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(recipe_path).unwrap();
+        let destdir = directory.path().join("dest");
+        fs::create_dir(&destdir).unwrap();
+
+        stage_declarative_install(&destdir, &recipe).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destdir.join("etc/issue")).unwrap(),
+            "Sage\n"
+        );
+        assert_eq!(
+            fs::read_link(destdir.join("bin")).unwrap(),
+            Path::new("usr/bin")
+        );
+        assert_eq!(
+            fs::metadata(destdir.join("tmp"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o1777
+        );
+    }
+
+    #[test]
     fn git_sources_require_pins_and_join_the_ordered_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recipe.toml");
@@ -2310,6 +2490,7 @@ shell="/usr/bin/nologin"
                 },
             ],
             sysusers: vec![],
+            install: InstallSpec::default(),
         };
         let areas = PayloadCarver::carve_packages(dest.path(), &recipe).unwrap();
         assert!(areas[0].path().join("data/usr/bin/x").exists());

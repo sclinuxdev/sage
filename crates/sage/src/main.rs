@@ -1499,6 +1499,7 @@ async fn build_recipe(
         target_sysroot,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
+    sage_build::stage_declarative_install(&destdir, &recipe)?;
     sage_build::stage_sysusers(&destdir, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
