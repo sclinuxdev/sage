@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[test]
 fn declarative_metadata_is_validated_and_staged() {
@@ -145,4 +146,64 @@ fn source_pool_overlays_local_artifacts_into_solver_universe() {
         available.releases[&(key, version)].location,
         ReleaseLocation::Local(_)
     ));
+}
+
+#[test]
+fn rebuild_renders_every_installed_service_and_enables_only_declared_ones() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("usr/share/sage/rclass")).unwrap();
+    std::fs::create_dir_all(root.path().join("usr/share/sage/services")).unwrap();
+    std::fs::write(
+        root.path().join("usr/share/sage/rclass/init-demo.toml"),
+        r#"schema_version=1
+name="init-demo"
+description="demo"
+[service_generator]
+target_path="/usr/lib/demo/${service.name}.unit"
+mode=420
+template="name=${service.name}\n"
+supported_types=["simple"]
+"#,
+    )
+    .unwrap();
+    for name in ["enabled", "available"] {
+        std::fs::write(
+            root.path()
+                .join("usr/share/sage/services")
+                .join(format!("{name}.toml")),
+            format!(
+                r#"schema_version=1
+[service]
+name="{name}"
+description="{name}"
+command=["/usr/bin/{name}"]
+user="root"
+group="root"
+working_dir="/"
+restart="no"
+type="simple"
+"#
+            ),
+        )
+        .unwrap();
+    }
+    let config = sage_sys::SystemConfig {
+        schema_version: 1,
+        system: sage_sys::SystemMetadata {
+            architecture: "amd64".into(),
+            profile: "default".into(),
+        },
+        providers: BTreeMap::from([("init".into(), "demo".into())]),
+        packages: BTreeSet::new(),
+        services: BTreeSet::from(["enabled".into()]),
+    };
+    render_services(root.path(), &config, false).unwrap();
+    assert!(root.path().join("usr/lib/demo/enabled.unit").exists());
+    assert!(root.path().join("usr/lib/demo/available.unit").exists());
+    let state = sage_sys::RenderedServicesState::load(
+        root.path().join("var/lib/sage/rendered-services.toml"),
+    )
+    .unwrap();
+    assert_eq!(state.services.len(), 2);
+    assert_eq!(state.enabled, BTreeSet::from(["enabled".into()]));
 }

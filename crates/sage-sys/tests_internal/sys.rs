@@ -66,6 +66,8 @@ fn service_template_renders_atomically() {
     let root = tempfile::tempdir().unwrap();
     let generator = TemplateServiceGenerator {
         supported_types: vec!["simple".into()],
+        compile_command: Vec::new(),
+        managed_directory: None,
         target_path_template: "/etc/init/${service.name}".into(),
         mode: 0o755,
         template: "exec ${service.command_json}\n".into(),
@@ -104,6 +106,8 @@ fn service_template_maps_dependencies_and_exposes_lifecycle_commands() {
     let root = tempfile::tempdir().unwrap();
     let generator = TemplateServiceGenerator {
         supported_types: vec!["simple".into()],
+        compile_command: Vec::new(),
+        managed_directory: None,
         target_path_template: "/etc/init/${service.name}".into(),
         mode: 0o644,
         template: concat!(
@@ -149,6 +153,110 @@ fn service_template_maps_dependencies_and_exposes_lifecycle_commands() {
             "runtime=\"runtime/python:3.14\"\n",
         )
     );
+}
+
+#[test]
+fn service_adapter_compiles_generic_input_without_a_shell() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+    let compiler = root.path().join("usr/bin/service-compiler");
+    fs::write(&compiler, "#!/usr/bin/sh\ncp -- \"$1\" \"$2\"\n").unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+    let generator = TemplateServiceGenerator {
+        target_path_template: "/usr/lib/example/${service.name}.toml".into(),
+        mode: 0o644,
+        template: "name=${service.name}\ncommand=${service.command_json}\n".into(),
+        dependency_aliases: BTreeMap::new(),
+        service_dependency_suffix: String::new(),
+        supported_types: vec!["simple".into()],
+        compile_command: vec![
+            "/usr/bin/service-compiler".into(),
+            "${INPUT}".into(),
+            "${OUTPUT}".into(),
+        ],
+        managed_directory: None,
+        validate_command: None,
+        enable_command: None,
+        disable_command: None,
+    };
+    let service = ServiceSpec {
+        package: String::new(),
+        name: "demo".into(),
+        description: "demo".into(),
+        command: vec!["/usr/bin/demo".into()],
+        stop_command: vec![],
+        reload_command: vec![],
+        user: "root".into(),
+        group: "root".into(),
+        working_dir: "/".into(),
+        pid_file: String::new(),
+        restart: "no".into(),
+        service_type: "simple".into(),
+        after: vec![],
+        before: vec![],
+        runtime: String::new(),
+    };
+    let output = generator.render_service(&service, root.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(output).unwrap(),
+        "name=demo\ncommand=[\"/usr/bin/demo\"]\n"
+    );
+}
+
+#[test]
+fn managed_service_generation_rolls_back_failed_validation() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+    fs::create_dir_all(root.path().join("usr/lib/example/services")).unwrap();
+    fs::write(
+        root.path().join("usr/lib/example/services/old.toml"),
+        "old=true\n",
+    )
+    .unwrap();
+    let validator = root.path().join("usr/bin/reject-services");
+    fs::write(&validator, "#!/usr/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&validator, fs::Permissions::from_mode(0o755)).unwrap();
+    let generator = TemplateServiceGenerator {
+        target_path_template: "/usr/lib/example/services/${service.name}.toml".into(),
+        mode: 0o644,
+        template: "name=${service.name}\n".into(),
+        dependency_aliases: BTreeMap::new(),
+        service_dependency_suffix: String::new(),
+        supported_types: vec!["simple".into()],
+        compile_command: Vec::new(),
+        managed_directory: Some("/usr/lib/example/services".into()),
+        validate_command: Some("/usr/bin/reject-services".into()),
+        enable_command: None,
+        disable_command: None,
+    };
+    let service = ServiceSpec {
+        package: String::new(),
+        name: "new".into(),
+        description: "new".into(),
+        command: vec!["/usr/bin/new".into()],
+        stop_command: vec![],
+        reload_command: vec![],
+        user: "root".into(),
+        group: "root".into(),
+        working_dir: "/".into(),
+        pid_file: String::new(),
+        restart: "no".into(),
+        service_type: "simple".into(),
+        after: vec![],
+        before: vec![],
+        runtime: String::new(),
+    };
+    assert!(generator
+        .render_service_set(&[service], root.path())
+        .is_err());
+    assert_eq!(
+        fs::read_to_string(root.path().join("usr/lib/example/services/old.toml")).unwrap(),
+        "old=true\n"
+    );
+    assert!(!root
+        .path()
+        .join("usr/lib/example/services/new.toml")
+        .exists());
 }
 
 #[test]

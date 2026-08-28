@@ -769,13 +769,26 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
     );
     let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
     let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
-    let mut desired = Vec::with_capacity(config.services.len());
-    for service in &config.services {
-        let path = service_dir.join(format!("{service}.toml"));
-        if !path.exists() {
-            bail!("enabled service '{service}' has no installed declaration");
+    let mut installed = Vec::new();
+    if service_dir.exists() {
+        let mut declarations = std::fs::read_dir(&service_dir)?.collect::<Result<Vec<_>, _>>()?;
+        declarations.sort_by_key(std::fs::DirEntry::file_name);
+        for declaration in declarations {
+            if declaration.path().extension().and_then(|value| value.to_str()) == Some("toml") {
+                installed.push(sage_sys::ServiceSpec::load(declaration.path())?);
+            }
         }
-        desired.push(sage_sys::ServiceSpec::load(path)?);
+    }
+    let installed_names = installed
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(service) = config
+        .services
+        .iter()
+        .find(|service| !installed_names.contains(service.as_str()))
+    {
+        bail!("enabled service '{service}' has no installed declaration");
     }
     let state_relative = Path::new("var/lib/sage/rendered-services.toml");
     let state_path = under_root(root, state_relative);
@@ -787,17 +800,27 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
     if dry_run {
         if let Some(previous) = &previous {
             for service in &previous.services {
-                if previous.provider != *provider
-                    || !desired.iter().any(|candidate| candidate.name == service.name)
-                {
+                let provider_changed = previous.provider != *provider;
+                let removed = !installed
+                    .iter()
+                    .any(|candidate| candidate.name == service.name);
+                let disabled = previous.enabled.contains(&service.name)
+                    && !config.services.contains(&service.name);
+                if provider_changed || removed || disabled {
                     println!(
-                        "Would disable stale service {} from init provider {}",
+                        "Would disable service {} from init provider {}",
                         service.name, previous.provider
+                    );
+                }
+                if provider_changed || removed {
+                    println!(
+                        "Would remove stale native definition for service {}",
+                        service.name
                     );
                 }
             }
         }
-        for service in &desired {
+        for service in &installed {
             println!("Would render service {} with {}", service.name, rclass.display());
         }
         return Ok(());
@@ -811,27 +834,31 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
         let previous_generator =
             sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
         for service in &previous.services {
-            if previous.provider != *provider
-                || !desired.iter().any(|candidate| candidate.name == service.name)
-            {
+            let provider_changed = previous.provider != *provider;
+            let removed = !installed
+                .iter()
+                .any(|candidate| candidate.name == service.name);
+            let disabled = previous.enabled.contains(&service.name)
+                && !config.services.contains(&service.name);
+            if provider_changed || removed || disabled {
                 previous_generator.disable_service(service, root)?;
+            }
+            if provider_changed || removed {
                 previous_generator.remove_service(service, root)?;
             }
         }
     }
-    for service in &desired {
-        generator.render_service_unvalidated(service, root)?;
-    }
-    if let Some(service) = desired.first() {
-        generator.validate_rendered_services(service, root)?;
-    }
-    for service in &desired {
-        generator.enable_service(service, root)?;
+    generator.render_service_set(&installed, root)?;
+    for service in &installed {
+        if config.services.contains(&service.name) {
+            generator.enable_service(service, root)?;
+        }
     }
     let state = sage_sys::RenderedServicesState {
         schema_version: sage_core::SCHEMA_VERSION,
         provider: provider.clone(),
-        services: desired,
+        services: installed,
+        enabled: config.services.clone(),
     };
     write_atomic_under_root(root, state_relative, toml::to_string_pretty(&state)?.as_bytes())?;
     Ok(())

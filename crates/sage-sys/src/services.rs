@@ -255,6 +255,8 @@ pub struct RenderedServicesState {
     pub schema_version: u32,
     pub provider: String,
     pub services: Vec<ServiceSpec>,
+    #[serde(default)]
+    pub enabled: BTreeSet<String>,
 }
 
 impl RenderedServicesState {
@@ -273,6 +275,11 @@ impl RenderedServicesState {
                     service.name
                 )));
             }
+        }
+        if let Some(name) = state.enabled.iter().find(|name| !names.contains(*name)) {
+            return Err(SysError::Invalid(format!(
+                "enabled service {name} has no rendered definition"
+            )));
         }
         Ok(state)
     }
@@ -487,6 +494,14 @@ pub struct TemplateServiceGenerator {
     /// compatibility with older provider classes that accepted every type.
     #[serde(default)]
     pub supported_types: Vec<String>,
+    /// Optional argv adapter that compiles the generic template into the
+    /// provider-native output. `${INPUT}` and `${OUTPUT}` are temporary files.
+    #[serde(default)]
+    pub compile_command: Vec<String>,
+    /// Provider-owned directory replaced as one validated generation. This is
+    /// used by managers such as Loom whose complete service graph is generated.
+    #[serde(default)]
+    pub managed_directory: Option<String>,
     pub validate_command: Option<String>,
     #[serde(alias = "enable_cmd")]
     pub enable_command: Option<String>,
@@ -521,8 +536,18 @@ impl TemplateServiceGenerator {
     ) -> Result<PathBuf, SysError> {
         service.validate()?;
         self.validate_service_type(service)?;
-        let variables = self.service_variables(service, sysroot)?;
         let target = self.rendered_path(service, sysroot)?;
+        self.render_service_to(service, sysroot, &target)?;
+        Ok(target)
+    }
+
+    fn render_service_to(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+        target: &Path,
+    ) -> Result<(), SysError> {
+        let variables = self.service_variables(service, sysroot)?;
         let rendered = expand_template(&self.template, &variables)?;
         let parent = target
             .parent()
@@ -534,12 +559,120 @@ impl TemplateServiceGenerator {
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        std::io::Write::write_all(&mut options.open(&temporary)?, rendered.as_bytes())?;
+        if self.compile_command.is_empty() {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            std::io::Write::write_all(&mut options.open(&temporary)?, rendered.as_bytes())?;
+        } else {
+            let input = temporary.with_extension("input.toml");
+            fs::write(&input, rendered)?;
+            let mut compile_variables = variables.clone();
+            compile_variables.insert("INPUT".into(), input.display().to_string());
+            compile_variables.insert("OUTPUT".into(), temporary.display().to_string());
+            let result = run_argv_template(&self.compile_command, &compile_variables, sysroot);
+            let _ = fs::remove_file(input);
+            result?;
+            if !temporary.is_file() {
+                return Err(SysError::Invalid(format!(
+                    "service compiler did not create {}",
+                    temporary.display()
+                )));
+            }
+        }
         fs::set_permissions(&temporary, fs::Permissions::from_mode(self.mode))?;
-        fs::rename(&temporary, &target)?;
-        Ok(target)
+        fs::rename(&temporary, target)?;
+        Ok(())
+    }
+
+    /// Renders a complete provider generation and validates it before keeping
+    /// the new tree. Managed directories are swapped and rolled back as a unit.
+    pub fn render_service_set(
+        &self,
+        services: &[ServiceSpec],
+        sysroot: &Path,
+    ) -> Result<(), SysError> {
+        let Some(directory) = &self.managed_directory else {
+            for service in services {
+                self.render_service_unvalidated(service, sysroot)?;
+            }
+            if let Some(service) = services.first() {
+                self.validate_rendered_services(service, sysroot)?;
+            }
+            return Ok(());
+        };
+        let target_directory = target_path(sysroot, Path::new(directory))?;
+        let parent = target_directory
+            .parent()
+            .ok_or_else(|| SysError::Invalid("managed service directory has no parent".into()))?;
+        ensure_directory_beneath(sysroot, parent)?;
+        let generation = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let leaf = target_directory
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| SysError::Invalid("invalid managed service directory".into()))?;
+        let staging = parent.join(format!(
+            ".{leaf}.sage-stage-{}-{generation}",
+            std::process::id()
+        ));
+        let backup = parent.join(format!(
+            ".{leaf}.sage-backup-{}-{generation}",
+            std::process::id()
+        ));
+        fs::create_dir(&staging)?;
+        let staged = (|| {
+            for service in services {
+                service.validate()?;
+                self.validate_service_type(service)?;
+                let target = self.rendered_path(service, sysroot)?;
+                if target.parent() != Some(target_directory.as_path()) {
+                    return Err(SysError::Invalid(format!(
+                        "service {} renders outside managed directory {}",
+                        service.name,
+                        target_directory.display()
+                    )));
+                }
+                self.render_service_to(
+                    service,
+                    sysroot,
+                    &staging.join(target.file_name().ok_or_else(|| {
+                        SysError::Invalid("rendered service target has no filename".into())
+                    })?),
+                )?;
+            }
+            Ok::<_, SysError>(())
+        })();
+        if let Err(error) = staged {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        let had_previous = target_directory.exists();
+        if had_previous {
+            fs::rename(&target_directory, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &target_directory) {
+            if had_previous {
+                let _ = fs::rename(&backup, &target_directory);
+            }
+            return Err(error.into());
+        }
+        if let Some(service) = services.first() {
+            if let Err(error) = self.validate_rendered_services(service, sysroot) {
+                let rejected = parent.join(format!(
+                    ".{leaf}.sage-rejected-{}-{generation}",
+                    std::process::id()
+                ));
+                let _ = fs::rename(&target_directory, &rejected);
+                if had_previous {
+                    let _ = fs::rename(&backup, &target_directory);
+                }
+                let _ = fs::remove_dir_all(rejected);
+                return Err(error);
+            }
+        }
+        if had_previous {
+            fs::remove_dir_all(backup)?;
+        }
+        Ok(())
     }
 
     /// Runs the provider's whole-tree validator after all definitions exist.
@@ -695,6 +828,17 @@ fn service_variables(
             },
         ),
         (
+            "service.stop_input_toml".into(),
+            if service.stop_command.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "stop_command = {}",
+                    serde_json::to_string(&service.stop_command)?
+                )
+            },
+        ),
+        (
             "service.reload_command_str".into(),
             service.reload_command.join(" "),
         ),
@@ -713,6 +857,17 @@ fn service_variables(
             } else {
                 format!(
                     "reload = {}",
+                    serde_json::to_string(&service.reload_command)?
+                )
+            },
+        ),
+        (
+            "service.reload_input_toml".into(),
+            if service.reload_command.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "reload_command = {}",
                     serde_json::to_string(&service.reload_command)?
                 )
             },
@@ -850,7 +1005,7 @@ fn run_validation(command: &str, sysroot: &Path) -> Result<(), SysError> {
     let status = Command::new(program)
         .args(words)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", "/usr/bin")
         .stdin(Stdio::null())
         .status()?;
     if status.success() {
@@ -858,6 +1013,37 @@ fn run_validation(command: &str, sysroot: &Path) -> Result<(), SysError> {
     } else {
         Err(SysError::Trigger {
             name: format!("validation in {}", sysroot.display()),
+            status,
+        })
+    }
+}
+
+fn run_argv_template(
+    command: &[String],
+    variables: &BTreeMap<String, String>,
+    sysroot: &Path,
+) -> Result<(), SysError> {
+    let (program, arguments) = command
+        .split_first()
+        .ok_or_else(|| SysError::Invalid("empty service compiler command".into()))?;
+    let program = expand_template(program, variables)?;
+    let program = target_path(sysroot, Path::new(&program))?;
+    ensure_existing_beneath(sysroot, &program)?;
+    let arguments = arguments
+        .iter()
+        .map(|argument| expand_template(argument, variables))
+        .collect::<Result<Vec<_>, _>>()?;
+    let status = Command::new(program)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin")
+        .stdin(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(SysError::Trigger {
+            name: format!("service compiler in {}", sysroot.display()),
             status,
         })
     }

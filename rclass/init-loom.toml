@@ -6,30 +6,35 @@ description = "Loom Service Generator and Controller Class"
 target_path = "/usr/lib/loom/services/${service.name}.toml"
 mode = 420
 supported_types = ["simple", "notify", "oneshot"]
+compile_command = [
+    "/usr/lib/loom/loom",
+    "compile-service",
+    "--from-sage",
+    "${INPUT}",
+    "--output",
+    "${OUTPUT}",
+]
+managed_directory = "/usr/lib/loom/services"
 
 validate_command = "/usr/lib/loom/loom validate --root ${SYSROOT}"
 enable_cmd = "/usr/bin/loomctl --root ${SYSROOT} enable ${service.name}"
 disable_cmd = "/usr/bin/loomctl --root ${SYSROOT} disable ${service.name}"
 
 template = """
-schema_version = 1
-description = ${service.description_json}
+schema_version = 2
 
-[process]
+[service]
+name = "${service.name}"
+description = ${service.description_json}
 command = ${service.command_json}
-type = "${service.process_type}"
-readiness = "${service.readiness}"
+${service.stop_input_toml}
+${service.reload_input_toml}
 user = ${service.user_json}
 group = ${service.group_json}
+type = "${service.process_type}"
+readiness = "${service.readiness}"
 working_directory = ${service.working_dir_json}
-
-[dependencies]
-after = ${service.after_json}
-
-[supervision]
 restart = "${service.restart}"
-
-[actions]
-${service.stop_action_toml}
-${service.reload_action_toml}
+after = ${service.after_json}
+before = ${service.before_json}
 """
