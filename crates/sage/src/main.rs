@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Build { recipe_dir } => {
-            println!("Build recipe from {:?}", recipe_dir);
+            build_recipe(&cli.root, &recipe_dir, cli.dry_run).await?;
         }
     }
 
@@ -197,4 +197,182 @@ async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Re
 
 fn under_root(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<()> {
+    let recipe_path = if recipe_dir.is_dir() {
+        recipe_dir.join("recipe.toml")
+    } else {
+        recipe_dir.to_path_buf()
+    };
+    let recipe = sage_build::RecipeSpec::load(&recipe_path)?;
+    let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
+    let config = sage_build::BuildConfig::load(&build_config_path)
+        .with_context(|| format!("failed to load {}", build_config_path.display()))?;
+    let mut classes = Vec::new();
+    for inherited in &recipe.build.inherit {
+        classes.push(sage_build::Rclass::load(find_rclass(
+            recipe_path.parent().unwrap_or(Path::new(".")),
+            root,
+            inherited,
+        )?)?);
+    }
+    if dry_run {
+        println!(
+            "Would build {}-{}-{} for {} using {:?}",
+            recipe.package.name,
+            recipe.package.version,
+            recipe.package.release,
+            recipe.package.arch,
+            recipe.build.inherit
+        );
+        return Ok(());
+    }
+    let workspace = tempfile::Builder::new().prefix("sage-build-").tempdir()?;
+    let source = workspace.path().join("source");
+    let build = workspace.path().join("build");
+    let destdir = workspace.path().join("dest");
+    std::fs::create_dir_all(&source)?;
+    std::fs::create_dir(&build)?;
+    std::fs::create_dir(&destdir)?;
+    let source_name = recipe
+        .source
+        .url
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .filter(|name| {
+            Path::new(name)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        })
+        .unwrap_or("source.archive");
+    let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
+    engine
+        .download_url(
+            &recipe.source.url,
+            &source.join(source_name),
+            &recipe.source.sha256,
+        )
+        .await?;
+    let variables = build_variables(&config, &recipe);
+    let runner_contents = sage_build::compose_runner(&classes, &variables)?;
+    let runner = workspace.path().join("sage-build-runner.sh");
+    std::fs::write(&runner, runner_contents)?;
+    let paths = sage_build::SandboxPaths {
+        source,
+        build,
+        destdir: destdir.clone(),
+        runner,
+        toolchain: None,
+    };
+    sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
+    let areas = sage_build::PayloadCarver::carve_packages(&destdir, &recipe)?;
+    let output_dir = recipe_path.parent().unwrap_or(Path::new("."));
+    for area in areas {
+        package_staging(&recipe, &area, output_dir, config.source_date_epoch)?;
+    }
+    Ok(())
+}
+
+fn find_rclass(recipe_dir: &Path, root: &Path, name: &str) -> Result<PathBuf> {
+    let filename = format!("{name}.toml");
+    for ancestor in recipe_dir.ancestors() {
+        let candidate = ancestor.join("rclass").join(&filename);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    let installed = under_root(root, &Path::new("/usr/share/sage/rclass").join(filename));
+    if installed.exists() {
+        Ok(installed)
+    } else {
+        bail!("rclass '{name}' was not found")
+    }
+}
+
+fn build_variables(
+    config: &sage_build::BuildConfig,
+    recipe: &sage_build::RecipeSpec,
+) -> std::collections::BTreeMap<String, String> {
+    let mut variables = std::collections::BTreeMap::from([
+        ("JOBS".into(), config.jobs.to_string()),
+        ("CFLAGS".into(), config.cflags.clone()),
+        ("CXXFLAGS".into(), config.cxxflags.clone()),
+        ("CPPFLAGS".into(), config.cppflags.clone()),
+        ("LDFLAGS".into(), config.ldflags.clone()),
+        ("RUSTFLAGS".into(), config.rustflags.clone()),
+        ("SRC_DIR".into(), "/source".into()),
+        ("BUILD_DIR".into(), "/build".into()),
+        ("DESTDIR".into(), "/dest".into()),
+    ]);
+    variables.extend(
+        recipe
+            .build
+            .args
+            .iter()
+            .map(|(key, value)| (format!("args.{key}"), value.clone())),
+    );
+    variables
+}
+
+fn package_staging(
+    recipe: &sage_build::RecipeSpec,
+    area: &sage_build::PackageStagingArea,
+    output_dir: &Path,
+    build_time: u64,
+) -> Result<()> {
+    let data = area.path().join("data");
+    let records = sage_archive::build_file_index(&data)?;
+    let elf = sage_build::ElfScanner::scan(&data)?;
+    let metadata = area.path().join(".METADATA");
+    std::fs::create_dir(&metadata)?;
+    std::fs::write(
+        metadata.join("files.idx"),
+        sage_archive::format_file_index(&records),
+    )?;
+    let subpackage = recipe
+        .subpackages
+        .iter()
+        .find(|subpackage| subpackage.name == area.name);
+    let mut dependencies = area.dependencies.clone();
+    dependencies.extend(elf.dependencies);
+    dependencies.sort();
+    dependencies.dedup();
+    let mut provides = area.provides.clone();
+    provides.extend(elf.provides);
+    provides.sort();
+    provides.dedup();
+    let manifest = sage_archive::PackageManifest {
+        schema_version: sage_core::SCHEMA_VERSION,
+        name: area.name.clone(),
+        slot: sage_core::DEFAULT_SLOT.into(),
+        version: recipe.package.version.clone(),
+        release: recipe.package.release,
+        epoch: recipe.package.epoch,
+        arch: recipe.package.arch.clone(),
+        channel: recipe.package.channel.clone(),
+        description: subpackage
+            .and_then(|package| package.description.clone())
+            .unwrap_or_else(|| recipe.package.description.clone()),
+        license: subpackage
+            .and_then(|package| package.license.clone())
+            .unwrap_or_else(|| recipe.package.license.clone()),
+        installed_size: records.iter().map(|record| record.size).sum(),
+        build_time,
+        dependencies,
+        provides,
+        conflicts: Vec::new(),
+    };
+    std::fs::write(
+        metadata.join("manifest.toml"),
+        toml::to_string_pretty(&manifest)?,
+    )?;
+    let output = output_dir.join(format!(
+        "{}-{}-{}-{}.pkg.tar.zst",
+        area.name, recipe.package.version, recipe.package.release, recipe.package.arch
+    ));
+    sage_archive::create_package(area.path(), &output, 15)?;
+    println!("Created {}", output.display());
+    Ok(())
 }

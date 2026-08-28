@@ -295,6 +295,16 @@ impl DownloadEngine {
         Err(RepoError::Mirrors(failures.join("; ")))
     }
 
+    /// Downloads one fully-qualified URL with the same atomic hash gate.
+    pub async fn download_url(
+        &self,
+        url: &str,
+        destination: &Path,
+        sha256: &str,
+    ) -> Result<(), RepoError> {
+        self.download_one(url, destination, sha256).await
+    }
+
     async fn download_one(
         &self,
         url: &str,
