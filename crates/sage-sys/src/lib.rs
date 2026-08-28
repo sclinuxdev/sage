@@ -657,6 +657,90 @@ pub struct Alternative {
     pub priority: i32,
 }
 
+/// Recipe/archive representation without an installed package identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlternativeDeclaration {
+    pub link: PathBuf,
+    pub target: PathBuf,
+    pub priority: i32,
+}
+
+/// Installed alternatives declaration. The package key is bound at publish
+/// time so candidates from different channels and slots remain independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlternativesDocument {
+    pub schema_version: u32,
+    pub package: sage_core::PackageKey,
+    pub alternatives: Vec<AlternativeDeclaration>,
+}
+
+impl AlternativesDocument {
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SysError::Invalid("alternatives document is not UTF-8".into()))?;
+        let document: Self = toml::from_str(text)?;
+        validate_schema(document.schema_version)?;
+        if document.alternatives.is_empty() {
+            return Err(SysError::Invalid(
+                "alternatives document must contain at least one declaration".into(),
+            ));
+        }
+        for alternative in &document.alternatives {
+            validate_alternative_path(&alternative.link, false)?;
+            validate_alternative_path(&alternative.target, true)?;
+        }
+        Ok(document)
+    }
+
+    pub fn alternatives(&self) -> Vec<Alternative> {
+        self.alternatives
+            .iter()
+            .map(|declaration| Alternative {
+                package: self.package.clone(),
+                link: declaration.link.clone(),
+                target: declaration.target.clone(),
+                priority: declaration.priority,
+            })
+            .collect()
+    }
+
+    pub fn load_installed(sysroot: &Path) -> Result<Vec<Alternative>, SysError> {
+        let directory = sysroot.join("usr/share/sage/alternatives");
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut alternatives = Vec::new();
+        for entry in entries {
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            alternatives.extend(Self::parse(&fs::read(entry.path())?)?.alternatives());
+        }
+        Ok(alternatives)
+    }
+}
+
+fn validate_alternative_path(path: &Path, target: bool) -> Result<(), SysError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(SysError::Invalid(format!(
+            "unsafe alternative {} {}",
+            if target { "target" } else { "link" },
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub struct ProfileEngine;
 
 impl ProfileEngine {
@@ -686,6 +770,31 @@ impl ProfileEngine {
         Ok(active)
     }
 
+    /// Reconciles a complete before/after candidate set, including removal of
+    /// links whose final provider disappeared. A stale link is removed only
+    /// when it still points to Sage's previously selected target.
+    pub fn reconcile_alternatives(
+        sysroot: &Path,
+        previous: &[Alternative],
+        current: &[Alternative],
+    ) -> Result<BTreeMap<PathBuf, PathBuf>, SysError> {
+        let previous = selected_alternatives(previous);
+        let active = Self::apply_alternatives(sysroot, current)?;
+        for (link, old_target) in previous {
+            if active.contains_key(&link) {
+                continue;
+            }
+            let path = target_path(sysroot, &link)?;
+            match fs::read_link(&path) {
+                Ok(target) if target == old_target => fs::remove_file(path)?,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(active)
+    }
+
     /// Atomically refreshes an active profile from a complete link map.
     pub fn apply_profile(
         sysroot: &Path,
@@ -707,6 +816,24 @@ impl ProfileEngine {
         }
         Ok(())
     }
+}
+
+fn selected_alternatives(alternatives: &[Alternative]) -> BTreeMap<PathBuf, PathBuf> {
+    let mut selected: BTreeMap<PathBuf, &Alternative> = BTreeMap::new();
+    for candidate in alternatives {
+        selected
+            .entry(candidate.link.clone())
+            .and_modify(|current| {
+                if (candidate.priority, &candidate.package) > (current.priority, &current.package) {
+                    *current = candidate;
+                }
+            })
+            .or_insert(candidate);
+    }
+    selected
+        .into_iter()
+        .map(|(link, candidate)| (link, candidate.target.clone()))
+        .collect()
 }
 
 fn atomic_symlink(sysroot: &Path, declared: &Path, target: &Path) -> Result<(), SysError> {

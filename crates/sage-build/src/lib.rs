@@ -203,6 +203,18 @@ pub struct SysuserSpec {
     pub shell: String,
 }
 
+/// One command-name provider managed transactionally by Sage.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlternativeSpec {
+    /// Output package that carries this declaration; empty selects the main one.
+    #[serde(default)]
+    pub package: String,
+    pub link: PathBuf,
+    pub target: PathBuf,
+    pub priority: i32,
+}
+
 /// Declarative filesystem payload for source-free data and policy packages.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +282,8 @@ pub struct RecipeSpec {
     pub subpackages: Vec<SubpackageSpec>,
     #[serde(default)]
     pub sysusers: Vec<SysuserSpec>,
+    #[serde(default)]
+    pub alternatives: Vec<AlternativeSpec>,
     #[serde(default)]
     pub install: InstallSpec,
     #[serde(default)]
@@ -511,6 +525,30 @@ impl RecipeSpec {
         }
         for user in &recipe.sysusers {
             user.validate()?;
+        }
+        for alternative in &recipe.alternatives {
+            if (!alternative.package.is_empty() && !valid_package_name(&alternative.package))
+                || alternative.link.as_os_str().is_empty()
+                || alternative.link.is_absolute()
+                || alternative.target.as_os_str().is_empty()
+                || alternative.target.is_absolute()
+                || alternative.link.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+                || alternative.target.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+            {
+                return Err(BuildError::InvalidSpec(
+                    "alternatives require safe relative package, link, and target values".into(),
+                ));
+            }
         }
         recipe.install.validate()?;
         if recipe.features.keys().any(|name| !valid_feature_name(name)) {
@@ -2490,6 +2528,7 @@ shell="/usr/bin/nologin"
                 },
             ],
             sysusers: vec![],
+            alternatives: vec![],
             install: InstallSpec::default(),
         };
         let areas = PayloadCarver::carve_packages(dest.path(), &recipe).unwrap();
