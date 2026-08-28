@@ -31,6 +31,8 @@ pub enum SysError {
     },
     #[error("template contains unknown variable '{0}'")]
     UnknownVariable(String),
+    #[error("dependency solver failed: {0}")]
+    Solver(#[from] sage_solver::SolverError),
 }
 
 fn validate_schema(version: u32) -> Result<(), SysError> {
@@ -427,6 +429,156 @@ impl SystemConfig {
     }
 }
 
+/// Minimal transaction needed to converge installed state on the declaration.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReconcilePlan {
+    pub install: Vec<(sage_core::PackageKey, sage_core::Version)>,
+    pub remove: Vec<sage_core::PackageKey>,
+    pub provider_bindings: BTreeMap<String, sage_core::PackageKey>,
+    pub services: BTreeSet<String>,
+}
+
+impl ReconcilePlan {
+    /// Solves desired roots, then computes deterministic install/remove differences.
+    pub fn compute(
+        config: &SystemConfig,
+        installed: &[sage_db::InstalledPackage],
+        universe: &sage_solver::PackageUniverse,
+        no_prune: bool,
+    ) -> Result<Self, SysError> {
+        let mut desired_names = config.packages.clone();
+        desired_names.extend(config.providers.values().cloned());
+        let roots: Vec<_> = desired_names
+            .iter()
+            .map(|name| sage_core::PackageKey::new("main/system", name, sage_core::DEFAULT_SLOT))
+            .collect();
+        let locks = installed
+            .iter()
+            .map(|package| (package.key.clone(), package.version.clone()));
+        let solution = sage_solver::SageSolver::with_locked(universe, locks).resolve(&roots)?;
+        let current: BTreeMap<_, _> = installed
+            .iter()
+            .map(|package| (package.key.clone(), package.version.clone()))
+            .collect();
+        let install = solution
+            .iter()
+            .filter(|(key, version)| current.get(*key) != Some(*version))
+            .map(|(key, version)| (key.clone(), version.clone()))
+            .collect();
+        let remove = if no_prune {
+            Vec::new()
+        } else {
+            current
+                .keys()
+                .filter(|key| key.channel == "main/system" && !solution.contains_key(*key))
+                .cloned()
+                .collect()
+        };
+        let provider_bindings = config
+            .providers
+            .iter()
+            .map(|(interface, package)| {
+                (
+                    interface.clone(),
+                    sage_core::PackageKey::new("main/system", package, sage_core::DEFAULT_SLOT),
+                )
+            })
+            .collect();
+        Ok(Self {
+            install,
+            remove,
+            provider_bindings,
+            services: config.services.clone(),
+        })
+    }
+}
+
+/// One candidate for a declarative alternatives link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alternative {
+    pub package: sage_core::PackageKey,
+    pub link: PathBuf,
+    pub target: PathBuf,
+    pub priority: i32,
+}
+
+pub struct ProfileEngine;
+
+impl ProfileEngine {
+    /// Selects the highest priority candidate for each link and publishes symlinks atomically.
+    pub fn apply_alternatives(
+        sysroot: &Path,
+        alternatives: &[Alternative],
+    ) -> Result<BTreeMap<PathBuf, PathBuf>, SysError> {
+        let mut selected: BTreeMap<PathBuf, &Alternative> = BTreeMap::new();
+        for candidate in alternatives {
+            selected
+                .entry(candidate.link.clone())
+                .and_modify(|current| {
+                    if (candidate.priority, &candidate.package)
+                        > (current.priority, &current.package)
+                    {
+                        *current = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        let mut active = BTreeMap::new();
+        for (link, candidate) in selected {
+            atomic_symlink(sysroot, &link, &candidate.target)?;
+            active.insert(link, candidate.target.clone());
+        }
+        Ok(active)
+    }
+
+    /// Atomically refreshes an active profile from a complete link map.
+    pub fn apply_profile(
+        sysroot: &Path,
+        profile: &str,
+        links: &BTreeMap<PathBuf, PathBuf>,
+    ) -> Result<(), SysError> {
+        if profile.is_empty()
+            || !profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SysError::Invalid(format!(
+                "invalid profile name '{profile}'"
+            )));
+        }
+        let base = PathBuf::from("etc/sage/profiles").join(profile);
+        for (link, target) in links {
+            atomic_symlink(sysroot, &base.join(link), target)?;
+        }
+        Ok(())
+    }
+}
+
+fn atomic_symlink(sysroot: &Path, declared: &Path, target: &Path) -> Result<(), SysError> {
+    if target
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(SysError::Invalid(format!(
+            "unsafe symlink target {}",
+            target.display()
+        )));
+    }
+    let link = target_path(sysroot, declared)?;
+    let parent = link
+        .parent()
+        .ok_or_else(|| SysError::Invalid("symlink has no parent".into()))?;
+    ensure_directory_beneath(sysroot, parent)?;
+    let temporary = parent.join(format!(
+        ".sage-link-{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::os::unix::fs::symlink(target, &temporary)?;
+    fs::rename(temporary, link)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +643,72 @@ mod tests {
     #[test]
     fn target_paths_cannot_escape_sysroot() {
         assert!(target_path(Path::new("/root"), Path::new("../../etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn reconciliation_computes_dependency_closed_difference() {
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(sage_solver::PackageRelease {
+            key: sage_core::PackageKey::new("main/system", "app", "0"),
+            version: "1.0-1".parse().unwrap(),
+            dependencies: vec!["lib".parse().unwrap()],
+            provides: vec![],
+        });
+        universe.insert(sage_solver::PackageRelease {
+            key: sage_core::PackageKey::new("main/system", "lib", "0"),
+            version: "1.0-1".parse().unwrap(),
+            dependencies: vec![],
+            provides: vec![],
+        });
+        let old = sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "old", "0"),
+            version: "1.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 0,
+            dependencies: vec![],
+            provides: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        };
+        let config = SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::new(),
+            packages: BTreeSet::from(["app".into()]),
+            services: BTreeSet::new(),
+        };
+        let plan = ReconcilePlan::compute(&config, &[old], &universe, false).unwrap();
+        assert_eq!(plan.install.len(), 2);
+        assert_eq!(
+            plan.remove,
+            vec![sage_core::PackageKey::new("main/system", "old", "0")]
+        );
+    }
+
+    #[test]
+    fn alternatives_choose_priority_and_publish_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let candidates = [
+            Alternative {
+                package: sage_core::PackageKey::new("main/system", "small", "0"),
+                link: "usr/bin/vi".into(),
+                target: "small-vi".into(),
+                priority: 10,
+            },
+            Alternative {
+                package: sage_core::PackageKey::new("main/system", "vim", "0"),
+                link: "usr/bin/vi".into(),
+                target: "vim".into(),
+                priority: 50,
+            },
+        ];
+        ProfileEngine::apply_alternatives(root.path(), &candidates).unwrap();
+        assert_eq!(
+            fs::read_link(root.path().join("usr/bin/vi")).unwrap(),
+            PathBuf::from("vim")
+        );
     }
 }
