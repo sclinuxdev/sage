@@ -76,6 +76,21 @@ pub enum Commands {
     },
     /// Build binary package archive (*.pkg.tar.zst) from recipe.
     Build { recipe_dir: PathBuf },
+    /// Inspect configured software channels.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
+    /// Switch the active toolchain profile.
+    Toolchain {
+        #[command(subcommand)]
+        action: ToolchainAction,
+    },
+    /// Query installed package and ownership state.
+    Query {
+        #[command(subcommand)]
+        action: QueryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -88,6 +103,32 @@ pub enum RepoAction {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ChannelAction {
+    /// List configured root channels and subchannels.
+    List,
+}
+
+#[derive(Subcommand)]
+pub enum ToolchainAction {
+    /// Populate the active profile from a versioned toolchain.
+    Use { channel: String },
+}
+
+#[derive(Subcommand)]
+pub enum QueryAction {
+    /// List all installed package instances.
+    Installed,
+    /// Find every owner of a physical path.
+    Owner { path: PathBuf },
+    /// Show one installed package instance.
+    Info {
+        package: String,
+        #[arg(long, default_value = "system")]
+        channel: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -96,8 +137,14 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt::init();
     }
 
+    let read_only = matches!(
+        &cli.command,
+        Commands::Channel {
+            action: ChannelAction::List
+        } | Commands::Query { .. }
+    );
     let lock_path = under_root(&cli.root, Path::new("/run/sage/operation.lock"));
-    let _lock = if cli.dry_run {
+    let _lock = if cli.dry_run || read_only {
         sage_core::HostLock::acquire_shared(lock_path)?
     } else {
         sage_core::HostLock::acquire_exclusive(lock_path)?
@@ -148,6 +195,13 @@ async fn main() -> Result<()> {
         Commands::Build { recipe_dir } => {
             build_recipe(&cli.root, &recipe_dir, cli.dry_run).await?;
         }
+        Commands::Channel { action } => match action {
+            ChannelAction::List => list_channels(&cli.root)?,
+        },
+        Commands::Toolchain { action } => match action {
+            ToolchainAction::Use { channel } => use_toolchain(&cli.root, &channel, cli.dry_run)?,
+        },
+        Commands::Query { action } => query_state(&cli.root, action)?,
     }
 
     Ok(())
@@ -683,6 +737,122 @@ fn unix_timestamp() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs())
+}
+
+fn list_channels(root: &Path) -> Result<()> {
+    let config =
+        sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
+    for (name, channel) in config.channels {
+        println!(
+            "{}\t{}\t{}",
+            name,
+            if channel.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            channel.url
+        );
+        for (sub_name, subchannel) in channel.subchannels {
+            println!(
+                "  {}/{}\t{}\t{}",
+                name,
+                subchannel.alias.as_deref().unwrap_or(&sub_name),
+                if subchannel.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                subchannel.target_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
+    if channel.is_empty()
+        || !channel
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        bail!("invalid toolchain channel '{channel}'");
+    }
+    let source = under_root(root, &Path::new("/opt/channels").join(channel).join("bin"));
+    let mut entries: Vec<_> = std::fs::read_dir(&source)
+        .with_context(|| format!("toolchain has no bin directory: {}", source.display()))?
+        .collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let links: BTreeMap<_, _> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_file() || kind.is_symlink())
+                .map(|_| {
+                    (
+                        PathBuf::from("bin").join(entry.file_name()),
+                        Path::new("/opt/channels")
+                            .join(channel)
+                            .join("bin")
+                            .join(entry.file_name()),
+                    )
+                })
+        })
+        .collect();
+    let system =
+        sage_sys::SystemConfig::load(under_root(root, Path::new("/etc/sage/system.toml")))?;
+    if dry_run {
+        println!(
+            "Would activate {} tools from {} in profile {}",
+            links.len(),
+            channel,
+            system.system.profile
+        );
+    } else {
+        sage_sys::ProfileEngine::apply_profile(root, &system.system.profile, &links)?;
+        println!("Activated toolchain {channel}");
+    }
+    Ok(())
+}
+
+fn query_state(root: &Path, action: QueryAction) -> Result<()> {
+    let database = sage_db::SageDatabase::open(under_root(root, Path::new("/var/lib/sage")))?;
+    match action {
+        QueryAction::Installed => {
+            for package in database.packages()? {
+                println!("{}\t{}\t{}", package.key, package.version, package.arch);
+            }
+        }
+        QueryAction::Owner { path } => {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let relative = relative.strip_prefix("/").unwrap_or(relative);
+            for owner in database.owners(&relative.to_string_lossy())? {
+                println!("{owner}");
+            }
+        }
+        QueryAction::Info { package, channel } => {
+            let channel = if channel.contains('/') {
+                channel
+            } else {
+                format!("main/{channel}")
+            };
+            let key = sage_core::PackageKey::new(channel, package, sage_core::DEFAULT_SLOT);
+            let record = database
+                .package(&key)?
+                .with_context(|| format!("package {key} is not installed"))?;
+            println!("Package: {}", record.key);
+            println!("Version: {}", record.version);
+            println!("Architecture: {}", record.arch);
+            println!("Installed size: {}", record.installed_size);
+            println!("Files: {}", record.files.len());
+            for dependency in record.dependencies {
+                println!("Depends: {}", dependency.name);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<()> {
