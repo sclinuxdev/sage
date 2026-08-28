@@ -532,11 +532,7 @@ fn link_entry(source: &Path, target: &Path) -> Result<(), BuildError> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
         let link = fs::read_link(source)?;
-        if link.is_absolute()
-            || link
-                .components()
-                .any(|component| component == std::path::Component::ParentDir)
-        {
+        if link.is_absolute() {
             return Err(BuildError::InvalidSpec(format!(
                 "unsafe payload symlink {} -> {}",
                 source.display(),

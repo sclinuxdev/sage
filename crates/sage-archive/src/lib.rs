@@ -182,6 +182,18 @@ pub fn build_file_index(root: &Path) -> Result<Vec<FileRecord>, ArchiveError> {
                     size: metadata.len(),
                     sha256: hex::encode(hasher.finalize()),
                 });
+            } else if metadata.file_type().is_symlink() {
+                let target = fs::read_link(&path)?;
+                let bytes = target.as_os_str().as_encoded_bytes();
+                output.push(FileRecord {
+                    path: path
+                        .strip_prefix(root)
+                        .expect("recursive walk stays below root")
+                        .to_path_buf(),
+                    mode: 0o777,
+                    size: bytes.len() as u64,
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                });
             } else {
                 return Err(ArchiveError::UnsafePath(path.display().to_string()));
             }
@@ -349,6 +361,18 @@ pub fn extract_package_with_config(
             ensure_directory(&root, relative)?;
             continue;
         }
+        if entry.header().entry_type().is_symlink() {
+            let record = expected.get(relative).ok_or_else(|| {
+                ArchiveError::InvalidMetadata(format!("unindexed link {}", relative.display()))
+            })?;
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| ArchiveError::InvalidMetadata("symlink has no target".into()))?;
+            write_verified_symlink(&root, relative, record, &target)?;
+            report.written.push(relative.to_path_buf());
+            seen += 1;
+            continue;
+        }
         if !entry.header().entry_type().is_file() {
             return Err(ArchiveError::UnsafePath(format!(
                 "unsupported entry {}",
@@ -383,6 +407,65 @@ pub fn extract_package_with_config(
         ));
     }
     Ok(report)
+}
+
+fn write_verified_symlink(
+    root: &OwnedFd,
+    path: &Path,
+    record: &FileRecord,
+    target: &Path,
+) -> Result<(), ArchiveError> {
+    validate_link_target(path, target)?;
+    let bytes = target.as_os_str().as_encoded_bytes();
+    let actual = hex::encode(Sha256::digest(bytes));
+    if bytes.len() as u64 != record.size || actual != record.sha256 {
+        return Err(ArchiveError::ChecksumMismatch {
+            path: path.into(),
+            expected: record.sha256.clone(),
+            actual,
+        });
+    }
+    let directory = ensure_directory(root, path.parent().unwrap_or(Path::new("")))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ArchiveError::UnsafePath(path.display().to_string()))?;
+    let temporary = format!(
+        ".sage-tmp-{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    nix::unistd::symlinkat(target, Some(directory.as_raw_fd()), temporary.as_str())?;
+    let mut guard = TempGuard {
+        dirfd: directory.as_raw_fd(),
+        name: temporary.clone(),
+        active: true,
+    };
+    renameat(
+        Some(directory.as_raw_fd()),
+        temporary.as_str(),
+        Some(directory.as_raw_fd()),
+        name,
+    )?;
+    guard.active = false;
+    Ok(())
+}
+
+fn validate_link_target(link: &Path, target: &Path) -> Result<(), ArchiveError> {
+    if target.is_absolute() {
+        return Err(ArchiveError::UnsafePath(target.display().to_string()));
+    }
+    let mut depth = link
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return Err(ArchiveError::UnsafePath(target.display().to_string())),
+        }
+    }
+    Ok(())
 }
 
 enum WriteOutcome {
@@ -639,10 +722,12 @@ mod tests {
         fs::create_dir_all(stage.join(".METADATA")).unwrap();
         fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
         fs::write(stage.join("data/usr/bin/hello"), b"hello").unwrap();
+        std::os::unix::fs::symlink("bin/hello", stage.join("data/usr/hello")).unwrap();
         let hash = hex::encode(Sha256::digest(b"hello"));
+        let link_hash = hex::encode(Sha256::digest(b"bin/hello"));
         fs::write(
             stage.join(".METADATA/files.idx"),
-            format!("usr/bin/hello\t0755\t5\t{hash}\n"),
+            format!("usr/bin/hello\t0755\t5\t{hash}\nusr/hello\t0777\t9\t{link_hash}\n"),
         )
         .unwrap();
         fs::write(
@@ -668,6 +753,10 @@ build_time=1
         fs::create_dir(&root).unwrap();
         extract_package(&package, &root, &inspection.files).unwrap();
         assert_eq!(fs::read(root.join("usr/bin/hello")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read_link(root.join("usr/hello")).unwrap(),
+            PathBuf::from("bin/hello")
+        );
     }
 
     #[test]
