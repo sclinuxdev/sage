@@ -41,6 +41,8 @@ pub enum BuildError {
     Elf(#[from] goblin::error::Error),
     #[error("tool '{tool}' is not allowed by inherited rclasses")]
     UnauthorizedTool { tool: String },
+    #[error("patchelf failed for {path}: {message}")]
+    Patchelf { path: PathBuf, message: String },
 }
 
 /// Schema-v1 source input.
@@ -89,6 +91,9 @@ pub struct RecipeBuild {
     pub payload: PayloadSpec,
     #[serde(default)]
     pub allow_network: bool,
+    /// Extra private-library directories, relative to the installed channel root.
+    #[serde(default)]
+    pub private_library_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -162,6 +167,11 @@ impl RecipeSpec {
     pub fn source_inputs(&self) -> impl Iterator<Item = &SourceSpec> {
         self.source.iter().chain(self.sources.iter())
     }
+
+    /// Returns whether the package is installed outside the system channel root.
+    pub fn uses_private_channel(&self) -> bool {
+        self.package.channel != "system" && !self.package.channel.ends_with("/system")
+    }
 }
 
 /// Global reproducible-build and sandbox policy.
@@ -175,6 +185,8 @@ pub struct BuildConfig {
     pub cxx: String,
     pub linker: String,
     pub rustc: String,
+    #[serde(default = "default_patchelf")]
+    pub patchelf: PathBuf,
     #[serde(default)]
     pub cflags: String,
     #[serde(default)]
@@ -200,6 +212,10 @@ pub struct BuildConfig {
 
 fn default_pids() -> u32 {
     2048
+}
+
+fn default_patchelf() -> PathBuf {
+    PathBuf::from("patchelf")
 }
 
 impl BuildConfig {
@@ -618,6 +634,13 @@ pub struct ElfSymbols {
 
 pub struct ElfScanner;
 
+/// Summary of deterministic RUNPATH updates made below one DESTDIR.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RunpathReport {
+    pub library_dirs: Vec<PathBuf>,
+    pub rewritten: Vec<PathBuf>,
+}
+
 impl ElfScanner {
     /// Scans regular files once and ignores non-ELF payloads without error.
     pub fn scan(root: &Path) -> Result<ElfSymbols, BuildError> {
@@ -643,6 +666,131 @@ impl ElfScanner {
         }
         Ok(symbols)
     }
+
+    /// Replaces host-dependent ELF search paths with paths relative to each file.
+    ///
+    /// Directories containing a shared object with a SONAME are discovered in one
+    /// pass. `extra_dirs` covers libraries supplied by another package in the same
+    /// private channel. Every input must be relative to `root`, so generated paths
+    /// cannot escape the future channel installation root.
+    pub fn rewrite_private_runpaths(
+        root: &Path,
+        extra_dirs: &[PathBuf],
+        patchelf: &Path,
+    ) -> Result<RunpathReport, BuildError> {
+        let mut library_dirs = BTreeSet::new();
+        for directory in extra_dirs {
+            validate_relative_path(directory)?;
+            library_dirs.insert(directory.clone());
+        }
+
+        let mut dynamic_files = Vec::new();
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            if !bytes.starts_with(b"\x7fELF") {
+                continue;
+            }
+            let goblin::Object::Elf(elf) = goblin::Object::parse(&bytes)? else {
+                continue;
+            };
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|_| BuildError::InvalidSpec("ELF escaped DESTDIR".into()))?
+                .to_path_buf();
+            if elf.soname.is_some() {
+                library_dirs.insert(relative.parent().unwrap_or(Path::new("")).to_path_buf());
+            }
+            if !elf.libraries.is_empty() {
+                let retained = elf
+                    .runpaths
+                    .iter()
+                    .chain(elf.rpaths.iter())
+                    .flat_map(|paths| paths.split(':'))
+                    .filter(|path| path == &"$ORIGIN" || path.starts_with("$ORIGIN/"))
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                dynamic_files.push((relative, retained));
+            }
+        }
+
+        let mut report = RunpathReport {
+            library_dirs: library_dirs.iter().cloned().collect(),
+            rewritten: Vec::new(),
+        };
+        if library_dirs.is_empty() {
+            return Ok(report);
+        }
+        for (file, mut runpaths) in dynamic_files {
+            let parent = file.parent().unwrap_or(Path::new(""));
+            for directory in &library_dirs {
+                runpaths.insert(origin_path(parent, directory)?);
+            }
+            let value = runpaths.into_iter().collect::<Vec<_>>().join(":");
+            let output = Command::new(patchelf)
+                .arg("--set-rpath")
+                .arg(value)
+                .arg(root.join(&file))
+                .output()?;
+            if !output.status.success() {
+                return Err(BuildError::Patchelf {
+                    path: file,
+                    message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            report.rewritten.push(file);
+        }
+        Ok(report)
+    }
+}
+
+fn validate_relative_path(path: &Path) -> Result<(), BuildError> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(BuildError::InvalidSpec(format!(
+            "private library directory must be a non-empty relative path: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Computes a lexical relative path because both inputs are already confined to
+/// one DESTDIR. No filesystem canonicalization is used, so symlinks cannot change
+/// the result or make a reproducible build depend on the host filesystem.
+fn origin_path(from: &Path, to: &Path) -> Result<String, BuildError> {
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec!["..".to_owned(); from.len() - common];
+    for part in &to[common..] {
+        let std::path::Component::Normal(part) = part else {
+            return Err(BuildError::InvalidSpec(
+                "invalid private library path".into(),
+            ));
+        };
+        parts.push(
+            part.to_str()
+                .ok_or_else(|| BuildError::InvalidSpec("non-UTF-8 private library path".into()))?
+                .to_owned(),
+        );
+    }
+    Ok(if parts.is_empty() {
+        "$ORIGIN".into()
+    } else {
+        format!("$ORIGIN/{}", parts.join("/"))
+    })
 }
 
 #[cfg(test)]
@@ -784,5 +932,34 @@ sha256="{}"
     fn elf_scanner_reads_dynamic_dependencies() {
         let symbols = ElfScanner::scan(Path::new("/bin/ls")).unwrap();
         assert!(!symbols.dependencies.is_empty());
+    }
+
+    #[test]
+    fn private_runpaths_are_relative_and_passed_without_a_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("dest");
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::create_dir_all(root.join("usr/lib")).unwrap();
+        fs::copy("/bin/ls", root.join("usr/bin/tool")).unwrap();
+
+        let patchelf = directory.path().join("patchelf");
+        fs::write(
+            &patchelf,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&patchelf, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report =
+            ElfScanner::rewrite_private_runpaths(&root, &[PathBuf::from("usr/lib")], &patchelf)
+                .unwrap();
+        assert_eq!(report.rewritten, [PathBuf::from("usr/bin/tool")]);
+        assert_eq!(report.library_dirs, [PathBuf::from("usr/lib")]);
+        let arguments = fs::read_to_string(directory.path().join("args")).unwrap();
+        assert!(arguments.lines().any(|line| line == "$ORIGIN/../lib"));
+        assert!(origin_path(Path::new("lib"), Path::new("lib")).unwrap() == "$ORIGIN");
+        assert!(validate_relative_path(Path::new("../lib")).is_err());
     }
 }

@@ -151,3 +151,18 @@ The first archive supplies the primary source tree and is unpacked with its lead
 directory removed. Later archives overlay their native layout in declaration order.
 Files in the recipe's `patches/` directory are copied into the sandbox and applied
 with `patch -p1` in bytewise filename order during `src_prepare`.
+
+### 3.4 Private-channel ELF lookup
+
+Packages whose channel is neither `system` nor `*/system` have their ELF RUNPATHs
+rewritten before payload carving. Directories containing ELF files with a SONAME
+are discovered automatically. Libraries supplied by a separate package can be
+declared relative to the channel root:
+
+```toml
+[build]
+private_library_dirs = ["lib", "lib64"]
+```
+
+The builder rejects absolute paths and parent traversal. It passes only computed
+`$ORIGIN`-relative paths to the globally configured `patchelf` executable.

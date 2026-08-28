@@ -990,6 +990,18 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
         toolchain: None,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
+    if recipe.uses_private_channel() {
+        let report = sage_build::ElfScanner::rewrite_private_runpaths(
+            &destdir,
+            &recipe.build.private_library_dirs,
+            &config.patchelf,
+        )?;
+        tracing::info!(
+            files = report.rewritten.len(),
+            directories = report.library_dirs.len(),
+            "rewrote private-channel ELF RUNPATHs"
+        );
+    }
     let areas = sage_build::PayloadCarver::carve_packages(&destdir, &recipe)?;
     let output_dir = recipe_path.parent().unwrap_or(Path::new("."));
     for area in areas {

@@ -21,6 +21,7 @@ cc = "clang"
 cxx = "clang++"
 linker = "ld.lld"
 rustc = "rustc"
+patchelf = "patchelf"               # 私有通道 ELF RUNPATH 改写器
 
 # 回退工具链偏好
 fallback_cc = "gcc"
@@ -58,3 +59,7 @@ ccache_dir = "/var/cache/sage/ccache"
 
 ### 2.2 确定性时间戳 (`source_date_epoch`)
 沙箱内的环境变量 `SOURCE_DATE_EPOCH` 将被强行重设为该值，并且构建时间、归档时间戳均统一规范化，保证二进制可重现（Bit-for-Bit Reproducible Builds）。
+
+### 2.3 私有通道 RUNPATH
+
+非 `system` 子通道在拆包前自动扫描整个 DESTDIR。包含 SONAME 的 ELF 所在目录会成为私有库目录，`patchelf` 将动态 ELF 的 RUNPATH 改写为相对该文件的 `$ORIGIN` 路径。绝对 RPATH 不会继承到包中，因此构建主机路径不能泄漏进产物。
