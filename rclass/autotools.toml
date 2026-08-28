@@ -1,0 +1,37 @@
+schema_version = 1
+name = "autotools"
+description = "GNU Autoconf, Automake, Libtool and Make build class"
+
+implicit_build_dependencies = ["autoconf", "automake", "libtool", "make", "pkgconf"]
+allowed_compilers = ["clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.configure_args" = ""
+"args.make_args" = ""
+"args.install_args" = ""
+"args.test" = "0"
+
+[phases]
+src_unpack = """
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"
+    mkdir -p "$target"
+    tar -xf "${SRC_DIR}/.distfiles/$archive" --strip-components="$strip" -C "$target"
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+fi
+if [ ! -x "${SRC_DIR}/configure" ]; then autoreconf -fi "${SRC_DIR}"; fi
+"""
+src_configure = """
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
+"${SRC_DIR}/configure" --prefix=/usr --build="${BUILD_TRIPLE}" --host="${HOST_TRIPLE}" ${args.configure_args}
+"""
+src_compile = "make -C \"${BUILD_DIR}\" -j \"${JOBS}\" ${args.make_args}"
+src_test = "if [ \"${args.test}\" = 1 ]; then make -C \"${BUILD_DIR}\" check; fi"
+src_install = "make -C \"${BUILD_DIR}\" DESTDIR=\"${DESTDIR}\" install ${args.install_args}"

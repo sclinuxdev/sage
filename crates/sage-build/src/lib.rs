@@ -417,6 +417,9 @@ pub struct Rclass {
     pub allowed_compilers: Vec<String>,
     #[serde(default)]
     pub allowed_linkers: Vec<String>,
+    /// Data-owned defaults overridden by later rclasses and recipe arguments.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -492,10 +495,13 @@ pub fn compose_runner(
 ) -> Result<String, BuildError> {
     let mut env = BTreeMap::new();
     let mut phases = BTreeMap::new();
+    let mut expanded_variables = BTreeMap::new();
     for class in classes {
+        expanded_variables.extend(class.defaults.clone());
         env.extend(class.env.clone());
         phases.extend(class.phases.clone());
     }
+    expanded_variables.extend(variables.clone());
     let mut script = String::from(
         "#!/bin/bash\nset -euo pipefail\ntrap 'printf >&2 \"sage-build: line %s failed\\n\" \"$LINENO\"' ERR\n",
     );
@@ -504,7 +510,7 @@ pub fn compose_runner(
         script.push_str("export ");
         script.push_str(&name);
         script.push('=');
-        script.push_str(&shell_quote(&expand(&value, variables)?));
+        script.push_str(&shell_quote(&expand(&value, &expanded_variables)?));
         script.push('\n');
     }
     for phase in PHASE_ORDER.iter().copied().chain(
@@ -520,7 +526,7 @@ pub fn compose_runner(
         script.push_str("\n# rclass phase: ");
         script.push_str(phase);
         script.push('\n');
-        script.push_str(&expand(body, variables)?);
+        script.push_str(&expand(body, &expanded_variables)?);
         if !body.ends_with('\n') {
             script.push('\n');
         }
@@ -1015,6 +1021,7 @@ mod tests {
             implicit_build_dependencies: vec![],
             allowed_compilers: vec![],
             allowed_linkers: vec![],
+            defaults: BTreeMap::new(),
             env: BTreeMap::from([("PARALLEL".into(), "${JOBS}".into())]),
             phases: BTreeMap::from([
                 ("src_compile".into(), "make -j ${JOBS}".into()),

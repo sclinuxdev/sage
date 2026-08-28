@@ -1,0 +1,37 @@
+schema_version = 1
+name = "go"
+description = "Reproducible Go module build class"
+
+implicit_build_dependencies = ["go"]
+allowed_compilers = ["go", "clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.cgo" = "0"
+"args.ldflags" = "-s -w"
+"args.output" = "app"
+"args.packages" = "."
+
+[env]
+GOMODCACHE = "${BUILD_DIR}/gomodcache"
+GOCACHE = "${BUILD_DIR}/gocache"
+CGO_ENABLED = "${args.cgo}"
+GOOS = "${GOOS}"
+GOARCH = "${GOARCH}"
+
+[phases]
+src_unpack = """
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"; mkdir -p "$target"
+    tar -xf "${SRC_DIR}/.distfiles/$archive" --strip-components="$strip" -C "$target"
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+fi
+"""
+src_compile = "cd \"${SRC_DIR}\" && go build -trimpath -buildvcs=false -ldflags=\"${args.ldflags}\" -o \"${BUILD_DIR}/${args.output}\" ${args.packages}"
+src_test = "if [ \"${args.test}\" = 1 ]; then cd \"${SRC_DIR}\" && go test ${args.packages}; fi"
+src_install = "install -Dm755 \"${BUILD_DIR}/${args.output}\" \"${DESTDIR}/usr/bin/${args.output}\""

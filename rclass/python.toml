@@ -1,0 +1,33 @@
+schema_version = 1
+name = "python"
+description = "PEP 517 Python wheel build class"
+
+implicit_build_dependencies = ["python", "python-build", "python-installer"]
+allowed_compilers = ["clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.build_args" = ""
+"args.test_args" = ""
+"args.test" = "0"
+
+[env]
+PYTHONHASHSEED = "0"
+PYTHONDONTWRITEBYTECODE = "1"
+
+[phases]
+src_unpack = """
+tab=$(printf '\t')
+while IFS="$tab" read -r archive strip destination; do
+    target="${SRC_DIR}/$destination"; mkdir -p "$target"
+    tar -xf "${SRC_DIR}/.distfiles/$archive" --strip-components="$strip" -C "$target"
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+src_prepare = """
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+fi
+"""
+src_compile = "python -m build --wheel --no-isolation --outdir \"${BUILD_DIR}\" \"${SRC_DIR}\" ${args.build_args}"
+src_test = "if [ \"${args.test}\" = 1 ]; then python -m pytest -q \"${SRC_DIR}\" ${args.test_args}; fi"
+src_install = "python -m installer --destdir \"${DESTDIR}\" \"${BUILD_DIR}\"/*.whl"

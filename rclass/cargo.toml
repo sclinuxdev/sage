@@ -6,6 +6,9 @@ implicit_build_dependencies = ["rustc", "cargo"]
 allowed_compilers = ["rustc", "clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
+[defaults]
+"args.target_arg" = ""
+
 [env]
 CARGO_BUILD_JOBS = "${JOBS}"
 RUSTFLAGS = "${RUSTFLAGS}"
@@ -29,9 +32,9 @@ fi
 """
 
 src_compile = """
-cargo build --release --locked --manifest-path "${SRC_DIR}/Cargo.toml" --target-dir "${BUILD_DIR}/target"
+cargo build --release --locked --manifest-path "${SRC_DIR}/Cargo.toml" --target-dir "${BUILD_DIR}/target" ${args.target_arg}
 """
 
 src_install = """
-cargo install --locked --root "${DESTDIR}/usr" --path "${SRC_DIR}"
+cargo install --locked --root "${DESTDIR}/usr" --path "${SRC_DIR}" ${args.target_arg}
 """
