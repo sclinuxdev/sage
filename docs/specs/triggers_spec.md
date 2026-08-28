@@ -68,7 +68,7 @@ priority = 20
 ignore_missing_binary = true
 ```
 
-`${path}` 展开为匹配的事务相对路径，`${path[N]}` 展开为从零开始的路径组件。引擎不调用 shell，并对展开后的完整命令去重；同一事务写入同一内核 Slot 的多个 `.ko` 文件只运行一次 `depmod`，不同 Slot 则各运行一次。
+`${path}` 展开为匹配的事务相对路径，`${path[N]}` 展开为从零开始的路径组件，`${sysroot}` 展开为事务目标根。引擎不调用 shell、关闭标准输入，并对展开后的完整命令去重；同一事务写入同一内核 Slot 的多个 `.ko` 文件只运行一次 `depmod`，不同 Slot 则各运行一次。
 
 ---
 
@@ -106,7 +106,7 @@ home = "/var/lib/redis"
 shell = "/usr/bin/nologin"
 ```
 
-事务后，`sage-sys` 优先调用 `systemd-sysusers`，若不存在则回退调用标准 `useradd` / `groupadd` 工具以幂等方式创建系统账号。
+事务后，声明式 `sysusers` 触发器调用独立的 `systemd-sysusers --root=${sysroot}` 应用全部记录。工具缺失会使事务失败，不会静默跳过账户创建或回退到包内脚本。
 
 ---
 

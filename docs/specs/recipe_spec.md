@@ -191,3 +191,15 @@ The package step rejects any `usr/lib/modules/<version>` tree that differs from
 the declared Slot. This gives DKMS-style out-of-tree sources reproducible Kmod
 artifacts whose installed versions are tracked independently by the solver and
 database instead of being rebuilt as untracked host mutations.
+
+### 3.6 Declarative installation lifecycle
+
+Recipes may declare system accounts with `[[sysusers]]`; the builder emits a
+deterministic `usr/lib/sysusers.d/<package>.conf`. Optional `service.toml` and
+`triggers.toml` files beside `recipe.toml` are schema-validated and copied into
+the main package's `.METADATA` section. Package-specific triggers use the same
+single-trigger schema as files under `/usr/share/sage/triggers`.
+
+Executable lifecycle hooks such as `preinst`, `postinst`, `prerm`, and `postrm`
+are rejected. Transactions never treat package metadata as executable content and
+never open standard input for configuration prompts.

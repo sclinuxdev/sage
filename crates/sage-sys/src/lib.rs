@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -73,15 +73,7 @@ impl TriggerEngine {
                 if file.path().extension().and_then(|value| value.to_str()) != Some("toml") {
                     continue;
                 }
-                let trigger: TriggerSpec = toml::from_str(&fs::read_to_string(file.path())?)?;
-                validate_schema(trigger.schema_version)?;
-                if trigger.name.is_empty() || trigger.exec.is_empty() || trigger.on_paths.is_empty()
-                {
-                    return Err(SysError::Invalid(format!(
-                        "incomplete trigger {}",
-                        file.path().display()
-                    )));
-                }
+                let trigger = TriggerSpec::load(file.path())?;
                 triggers.insert(trigger.name.clone(), trigger);
             }
         }
@@ -115,7 +107,7 @@ impl TriggerEngine {
                     trigger
                         .exec
                         .iter()
-                        .map(|argument| expand_trigger_argument(argument, path))
+                        .map(|argument| expand_trigger_argument(argument, path, sysroot))
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
@@ -135,6 +127,7 @@ impl TriggerEngine {
                     .env_clear()
                     .env("PATH", "/usr/bin:/bin")
                     .env("SAGE_SYSROOT", sysroot)
+                    .stdin(Stdio::null())
                     .status()?;
                 if !status.success() {
                     return Err(SysError::Trigger {
@@ -152,10 +145,44 @@ impl TriggerEngine {
     }
 }
 
+impl TriggerSpec {
+    /// Loads and validates one schema-v1 trigger declaration.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
+        Self::parse(&fs::read(path)?)
+    }
+
+    /// Parses and validates one trigger without executing its command.
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SysError::Invalid("trigger document is not UTF-8".into()))?;
+        let trigger: Self = toml::from_str(text)?;
+        validate_schema(trigger.schema_version)?;
+        if !valid_declaration_name(&trigger.name)
+            || trigger.exec.is_empty()
+            || trigger.on_paths.is_empty()
+            || trigger.exec.iter().any(|value| value.contains('\0'))
+        {
+            return Err(SysError::Invalid(format!(
+                "incomplete or invalid trigger '{}'",
+                trigger.name
+            )));
+        }
+        for pattern in &trigger.on_paths {
+            glob::Pattern::new(pattern)
+                .map_err(|error| SysError::Invalid(format!("trigger {}: {error}", trigger.name)))?;
+        }
+        Ok(trigger)
+    }
+}
+
 /// Expands path data without invoking a shell. Only `${path}` and the indexed
 /// `${path[N]}` form are accepted, keeping trigger commands deterministic and
 /// preventing configuration typos from silently reaching privileged tools.
-fn expand_trigger_argument(template: &str, path: &Path) -> Result<String, SysError> {
+fn expand_trigger_argument(
+    template: &str,
+    path: &Path,
+    sysroot: &Path,
+) -> Result<String, SysError> {
     let mut output = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("${") {
@@ -167,6 +194,8 @@ fn expand_trigger_argument(template: &str, path: &Path) -> Result<String, SysErr
         let variable = &expression[..end];
         let value = if variable == "path" {
             path.to_str()
+        } else if variable == "sysroot" {
+            sysroot.to_str()
         } else if let Some(index) = variable
             .strip_prefix("path[")
             .and_then(|value| value.strip_suffix(']'))
@@ -240,7 +269,7 @@ impl ServiceSpec {
     }
 
     fn validate(&self) -> Result<(), SysError> {
-        if self.name.is_empty() || self.command.is_empty() {
+        if !valid_declaration_name(&self.name) || self.command.is_empty() {
             return Err(SysError::Invalid(
                 "service name and command are required".into(),
             ));
@@ -266,8 +295,27 @@ impl ServiceSpec {
                 self.name
             )));
         }
+        if self
+            .command
+            .iter()
+            .chain(&self.stop_command)
+            .chain(&self.reload_command)
+            .any(|value| value.contains(['\n', '\r', '\0']))
+        {
+            return Err(SysError::Invalid(format!(
+                "control character in service command {}",
+                self.name
+            )));
+        }
         Ok(())
     }
+}
+
+fn valid_declaration_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,6 +475,7 @@ fn run_validation(command: &str, sysroot: &Path) -> Result<(), SysError> {
         .args(words)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
         .status()?;
     if status.success() {
         Ok(())
@@ -753,7 +802,34 @@ mod tests {
             fs::read_to_string(root.path().join("result")).unwrap(),
             "6.12\n6.13\n"
         );
-        assert!(expand_trigger_argument("${unknown}", &modified[0]).is_err());
+        assert!(expand_trigger_argument("${unknown}", &modified[0], root.path()).is_err());
+    }
+
+    #[test]
+    fn sysusers_trigger_receives_the_transaction_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        let recorder = root.path().join("usr/bin/record-root");
+        fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$SAGE_SYSROOT/sysusers-args\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut trigger =
+            TriggerSpec::parse(include_bytes!("../../../triggers/sysusers.toml")).unwrap();
+        trigger.exec[0] = "/usr/bin/record-root".into();
+
+        TriggerEngine::execute_triggers(
+            &[trigger],
+            &[PathBuf::from("usr/lib/sysusers.d/daemon.conf")],
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("sysusers-args")).unwrap(),
+            format!("--root={}\n", root.path().display())
+        );
     }
 
     #[test]

@@ -115,6 +115,29 @@ pub struct SubpackageSpec {
     pub payload: PayloadSpec,
 }
 
+/// One declarative account emitted in systemd-sysusers compatible syntax.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SysuserSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub id: Option<u32>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_home")]
+    pub home: String,
+    #[serde(default = "default_shell")]
+    pub shell: String,
+}
+
+fn default_home() -> String {
+    "/".into()
+}
+
+fn default_shell() -> String {
+    "/usr/bin/nologin".into()
+}
+
 /// Complete single-build, multiple-output recipe.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecipeSpec {
@@ -128,13 +151,16 @@ pub struct RecipeSpec {
     pub build: RecipeBuild,
     #[serde(default)]
     pub subpackages: Vec<SubpackageSpec>,
+    #[serde(default)]
+    pub sysusers: Vec<SysuserSpec>,
 }
 
 impl RecipeSpec {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, BuildError> {
+        let path = path.as_ref();
         let recipe: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(recipe.schema_version)?;
-        if recipe.package.name.is_empty() || recipe.package.arch.is_empty() {
+        if !valid_package_name(&recipe.package.name) || recipe.package.arch.is_empty() {
             return Err(BuildError::InvalidSpec(
                 "package name and architecture are required".into(),
             ));
@@ -166,12 +192,14 @@ impl RecipeSpec {
                 "every source SHA-256 must contain 64 hex digits".into(),
             ));
         }
+        for user in &recipe.sysusers {
+            user.validate()?;
+        }
+        reject_lifecycle_scripts(path.parent().unwrap_or_else(|| Path::new(".")))?;
         let mut names = BTreeSet::from([recipe.package.name.as_str()]);
-        if recipe
-            .subpackages
-            .iter()
-            .any(|subpackage| !names.insert(&subpackage.name))
-        {
+        if recipe.subpackages.iter().any(|subpackage| {
+            !valid_package_name(&subpackage.name) || !names.insert(&subpackage.name)
+        }) {
             return Err(BuildError::InvalidSpec(
                 "subpackage names must be unique".into(),
             ));
@@ -188,6 +216,76 @@ impl RecipeSpec {
     pub fn uses_private_channel(&self) -> bool {
         self.package.channel != "system" && !self.package.channel.ends_with("/system")
     }
+}
+
+impl SysuserSpec {
+    fn validate(&self) -> Result<(), BuildError> {
+        if !matches!(self.kind.as_str(), "user" | "group")
+            || self.name.is_empty()
+            || !self
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || self.description.contains(['\n', '\r', '\0', '"'])
+            || !Path::new(&self.home).is_absolute()
+            || !Path::new(&self.shell).is_absolute()
+            || [&self.home, &self.shell].iter().any(|value| {
+                value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\'))
+            })
+        {
+            return Err(BuildError::InvalidSpec(format!(
+                "invalid sysusers declaration for '{}'",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+fn reject_lifecycle_scripts(recipe_dir: &Path) -> Result<(), BuildError> {
+    const FORBIDDEN: &[&str] = &["preinst", "postinst", "prerm", "postrm"];
+    if let Some(name) = FORBIDDEN.iter().find(|name| recipe_dir.join(name).exists()) {
+        return Err(BuildError::InvalidSpec(format!(
+            "interactive lifecycle script '{name}' is not supported; use declarative metadata"
+        )));
+    }
+    Ok(())
+}
+
+/// Writes all recipe accounts into one deterministic sysusers payload file.
+pub fn stage_sysusers(root: &Path, recipe: &RecipeSpec) -> Result<(), BuildError> {
+    if recipe.sysusers.is_empty() {
+        return Ok(());
+    }
+    let directory = root.join("usr/lib/sysusers.d");
+    fs::create_dir_all(&directory)?;
+    let mut output = String::new();
+    for account in &recipe.sysusers {
+        let id = account.id.map_or_else(|| "-".into(), |id| id.to_string());
+        if account.kind == "group" {
+            output.push_str(&format!("g {} {id}\n", account.name));
+        } else {
+            let description = account.description.replace('\\', "\\\\");
+            output.push_str(&format!(
+                "u {} {id} \"{}\" {} {}\n",
+                account.name, description, account.home, account.shell
+            ));
+        }
+    }
+    fs::write(
+        directory.join(format!("{}.conf", recipe.package.name)),
+        output,
+    )?;
+    Ok(())
 }
 
 /// Global reproducible-build and sandbox policy.
@@ -901,6 +999,55 @@ sha256="{}"
     }
 
     #[test]
+    fn sysusers_are_staged_and_lifecycle_scripts_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recipe.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"schema_version=1
+[package]
+name="daemon"
+version="1"
+release=1
+description="daemon"
+license="MIT"
+channel="system"
+arch="any"
+
+[source]
+url="https://example.invalid/daemon.tar"
+sha256="{}"
+
+[[sysusers]]
+type="user"
+name="daemon"
+id=75
+description="Daemon User"
+home="/var/lib/daemon"
+shell="/usr/bin/nologin"
+"#,
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(&path).unwrap();
+        let root = directory.path().join("dest");
+        fs::create_dir(&root).unwrap();
+        stage_sysusers(&root, &recipe).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("usr/lib/sysusers.d/daemon.conf")).unwrap(),
+            "u daemon 75 \"Daemon User\" /var/lib/daemon /usr/bin/nologin\n"
+        );
+
+        fs::write(directory.path().join("preinst"), "#!/bin/sh\nread answer\n").unwrap();
+        assert!(RecipeSpec::load(path)
+            .unwrap_err()
+            .to_string()
+            .contains("preinst"));
+    }
+
+    #[test]
     fn shell_quote_does_not_open_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(tool_family("/usr/bin/clang++"), "clang");
@@ -961,6 +1108,7 @@ sha256="{}"
                     },
                 },
             ],
+            sysusers: vec![],
         };
         let areas = PayloadCarver::carve_packages(dest.path(), &recipe).unwrap();
         assert!(areas[0].path().join("data/usr/bin/x").exists());

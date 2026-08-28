@@ -96,6 +96,7 @@ pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, Arch
             break;
         }
         if path.starts_with(".METADATA") && entry.header().entry_type().is_file() {
+            validate_metadata_path(&path)?;
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes)?;
             metadata.insert(path.to_string_lossy().into_owned(), bytes);
@@ -234,22 +235,49 @@ pub fn create_package(
             return Err(ArchiveError::InvalidMetadata(format!("missing {required}")));
         }
     }
+    let mut paths = collect_paths(source)?;
+    for path in &paths {
+        let relative = path
+            .strip_prefix(source)
+            .expect("collected path stays below source");
+        if relative.starts_with(".METADATA") && path.is_file() {
+            validate_metadata_path(relative)?;
+        }
+    }
+    paths.sort_by_key(|path| {
+        let relative = path.strip_prefix(source).unwrap();
+        (!relative.starts_with(".METADATA"), relative.to_path_buf())
+    });
     let file = File::create(output)?;
     let mut encoder = zstd::Encoder::new(file, compression_level)?;
     encoder.include_checksum(true)?;
     let mut builder = tar::Builder::new(encoder);
     builder.mode(tar::HeaderMode::Deterministic);
-    let mut paths = collect_paths(source)?;
-    paths.sort_by_key(|path| {
-        let relative = path.strip_prefix(source).unwrap();
-        (!relative.starts_with(".METADATA"), relative.to_path_buf())
-    });
     for path in paths {
         append_deterministic(&mut builder, source, &path)?;
     }
     let encoder = builder.into_inner()?;
     encoder.finish()?;
     Ok(())
+}
+
+/// Keeps package installation declarative by rejecting executable lifecycle
+/// hooks and every other metadata extension not defined by schema v1.
+fn validate_metadata_path(path: &Path) -> Result<(), ArchiveError> {
+    const ALLOWED: &[&str] = &[
+        ".METADATA/manifest.toml",
+        ".METADATA/files.idx",
+        ".METADATA/service.toml",
+        ".METADATA/triggers.toml",
+    ];
+    if ALLOWED.iter().any(|allowed| path == Path::new(allowed)) {
+        Ok(())
+    } else {
+        Err(ArchiveError::InvalidMetadata(format!(
+            "unsupported metadata entry {}; lifecycle scripts are not permitted",
+            path.display()
+        )))
+    }
 }
 
 fn collect_paths(root: &Path) -> Result<Vec<PathBuf>, ArchiveError> {
@@ -351,8 +379,17 @@ pub fn extract_package_with_config(
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = clean_archive_path(&entry.path()?)?;
-        let Ok(relative) = path.strip_prefix("data") else {
+        if path.starts_with(".METADATA") {
+            if entry.header().entry_type().is_file() {
+                validate_metadata_path(&path)?;
+            }
             continue;
+        }
+        let Ok(relative) = path.strip_prefix("data") else {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "unsupported top-level entry {}",
+                path.display()
+            )));
         };
         if relative.as_os_str().is_empty() {
             continue;
@@ -713,6 +750,44 @@ mod tests {
             parse_file_index(format_file_index(&records).as_bytes()).unwrap(),
             records
         );
+    }
+
+    #[test]
+    fn package_creation_rejects_lifecycle_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        fs::create_dir(stage.join("data")).unwrap();
+        fs::write(stage.join(".METADATA/manifest.toml"), b"").unwrap();
+        fs::write(stage.join(".METADATA/files.idx"), b"").unwrap();
+        fs::write(stage.join(".METADATA/preinst"), b"#!/bin/sh").unwrap();
+        let error = create_package(&stage, temp.path().join("bad.pkg.tar.zst"), 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lifecycle scripts are not permitted"));
+    }
+
+    #[test]
+    fn package_inspection_rejects_remote_lifecycle_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("hostile.pkg.tar.zst");
+        let encoder = zstd::Encoder::new(File::create(&package).unwrap(), 1).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        let body = b"#!/bin/sh\nread answer\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o755);
+        header.set_size(body.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, ".METADATA/preinst", &body[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let error = inspect_package(package).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lifecycle scripts are not permitted"));
     }
 
     #[test]

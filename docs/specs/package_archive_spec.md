@@ -22,6 +22,8 @@ pkgname-1.0.0-1-amd64.pkg.tar.zst
     └── etc/
 ```
 
+`.METADATA` 采用严格白名单，仅允许上图中的声明式 TOML 与必要索引。`preinst`、`postinst`、`prerm`、`postrm` 等可执行生命周期脚本属于非法归档内容；检视、创建和解包路径均不会执行包内程序。
+
 ---
 
 ## 2. 元数据清单 (`.METADATA/manifest.toml` v1)

@@ -470,8 +470,16 @@ async fn publish_packages(
         } else {
             None
         };
+        let trigger = if let Some(bytes) = inspection.optional.get(".METADATA/triggers.toml") {
+            Some((sage_sys::TriggerSpec::parse(bytes)?, bytes.clone()))
+        } else {
+            None
+        };
         if let Some((service, _)) = &service {
             ownership.push(format!("usr/share/sage/services/{}.toml", service.name));
+        }
+        if let Some((trigger, _)) = &trigger {
+            ownership.push(format!("usr/share/sage/triggers/{}.toml", trigger.name));
         }
         for path in &ownership {
             let owners = database.owners(path)?;
@@ -494,6 +502,13 @@ async fn publish_packages(
             write_atomic_under_root(
                 root,
                 &Path::new("usr/share/sage/services").join(format!("{}.toml", service.name)),
+                &bytes,
+            )?;
+        }
+        if let Some((trigger, bytes)) = trigger {
+            write_atomic_under_root(
+                root,
+                &Path::new("usr/share/sage/triggers").join(format!("{}.toml", trigger.name)),
                 &bytes,
             )?;
         }
@@ -990,6 +1005,7 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
         toolchain: None,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
+    sage_build::stage_sysusers(&destdir, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
         let report = sage_build::ElfScanner::rewrite_private_runpaths(
@@ -1085,6 +1101,9 @@ fn package_staging(
     let elf = sage_build::ElfScanner::scan(&data)?;
     let metadata = area.path().join(".METADATA");
     std::fs::create_dir(&metadata)?;
+    if area.name == recipe.package.name {
+        stage_declarative_metadata(output_dir, &metadata)?;
+    }
     std::fs::write(
         metadata.join("files.idx"),
         sage_archive::format_file_index(&records),
@@ -1133,4 +1152,61 @@ fn package_staging(
     sage_archive::create_package(area.path(), &output, 15)?;
     println!("Created {}", output.display());
     Ok(())
+}
+
+fn stage_declarative_metadata(recipe_dir: &Path, metadata: &Path) -> Result<()> {
+    let service = recipe_dir.join("service.toml");
+    if service.exists() {
+        sage_sys::ServiceSpec::load(&service)?;
+        std::fs::copy(service, metadata.join("service.toml"))?;
+    }
+    let triggers = recipe_dir.join("triggers.toml");
+    if triggers.exists() {
+        sage_sys::TriggerSpec::load(&triggers)?;
+        std::fs::copy(triggers, metadata.join("triggers.toml"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declarative_metadata_is_validated_and_staged() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = directory.path().join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(
+            directory.path().join("service.toml"),
+            r#"schema_version=1
+[service]
+name="daemon"
+description="Daemon"
+command=["/usr/bin/daemon","--foreground"]
+user="daemon"
+group="daemon"
+working_dir="/"
+restart="on-failure"
+type="simple"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("triggers.toml"),
+            r#"schema_version=1
+name="daemon-cache"
+description="Refresh daemon cache"
+on_paths=["usr/share/daemon/**"]
+exec=["/usr/bin/daemon","--refresh-cache"]
+priority=50
+ignore_missing_binary=false
+"#,
+        )
+        .unwrap();
+
+        stage_declarative_metadata(directory.path(), &metadata).unwrap();
+        sage_sys::ServiceSpec::load(metadata.join("service.toml")).unwrap();
+        sage_sys::TriggerSpec::load(metadata.join("triggers.toml")).unwrap();
+    }
 }
