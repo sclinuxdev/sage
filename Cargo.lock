@@ -1450,9 +1450,12 @@ dependencies = [
  "nix",
  "rayon",
  "sage-core",
+ "serde",
  "sha2",
  "tar",
+ "tempfile",
  "thiserror",
+ "toml",
  "tracing",
  "zstd",
 ]

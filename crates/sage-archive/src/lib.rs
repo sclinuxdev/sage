@@ -1,70 +1,495 @@
-//! Streaming tar.zst packaging and openat/dirfd path-traversal-safe unpacking.
-//!
-//! This crate handles the creation, inspection, and extraction of `*.pkg.tar.zst` packages,
-//! including metadata scanning, SHA-256 verification, and `.sage-new` configuration file protection.
+//! Deterministic tar.zst packaging, constant-cost inspection, and safe extraction.
 
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use nix::errno::Errno;
+use nix::fcntl::{open, openat, renameat, OFlag};
+use nix::sys::stat::{fchmod, mkdirat, Mode};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-/// Archive error variants.
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Archive format and extraction failures.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Tar archive error: {0}")]
-    Tar(String),
-
-    #[error("Zstandard compression/decompression error: {0}")]
-    Zstd(String),
-
-    #[error("Checksum mismatch for {path}: expected {expected}, calculated {actual}")]
+    Io(#[from] io::Error),
+    #[error("system call failed: {0}")]
+    Nix(#[from] Errno),
+    #[error("TOML metadata error: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("invalid archive metadata: {0}")]
+    InvalidMetadata(String),
+    #[error("checksum mismatch for {path}: expected {expected}, calculated {actual}")]
     ChecksumMismatch {
         path: PathBuf,
         expected: String,
         actual: String,
     },
-
-    #[error("Path traversal detected: {0}")]
-    PathTraversal(String),
+    #[error("unsafe or unsupported archive path: {0}")]
+    UnsafePath(String),
 }
 
-/// Inspects package metadata headers without unpacking the full payload.
-pub fn inspect_package(pkg_path: impl AsRef<Path>) -> Result<Vec<u8>, ArchiveError> {
-    let file = File::open(pkg_path)?;
-    let mut decoder = zstd::Decoder::new(file).map_err(|e| ArchiveError::Zstd(e.to_string()))?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 8192];
+/// Schema-v1 package manifest stored at the front of every archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageManifest {
+    pub schema_version: u32,
+    pub name: String,
+    #[serde(default = "default_slot")]
+    pub slot: String,
+    pub version: String,
+    pub release: u32,
+    #[serde(default)]
+    pub epoch: u32,
+    pub arch: String,
+    pub channel: String,
+    pub description: String,
+    pub license: String,
+    pub installed_size: u64,
+    pub build_time: u64,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+}
 
-    // Read initial metadata slice
-    while let Ok(n) = decoder.read(&mut chunk) {
-        if n == 0 {
+fn default_slot() -> String {
+    "0".into()
+}
+
+/// One integrity record from `.METADATA/files.idx`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    pub path: PathBuf,
+    pub mode: u32,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Metadata read before the first payload entry.
+#[derive(Debug, Clone)]
+pub struct PackageInspection {
+    pub manifest: PackageManifest,
+    pub files: Vec<FileRecord>,
+    pub optional: BTreeMap<String, Vec<u8>>,
+}
+
+/// Reads only the leading metadata section and stops at the first `data/` entry.
+pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, ArchiveError> {
+    let file = File::open(path)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut metadata = BTreeMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = clean_archive_path(&entry.path()?)?;
+        if path.starts_with("data") {
             break;
         }
-        buffer.extend_from_slice(&chunk[..n]);
-        if buffer.len() > 65536 {
-            break;
+        if path.starts_with(".METADATA") && entry.header().entry_type().is_file() {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            metadata.insert(path.to_string_lossy().into_owned(), bytes);
         }
     }
-
-    Ok(buffer)
+    let manifest_bytes = metadata
+        .remove(".METADATA/manifest.toml")
+        .ok_or_else(|| ArchiveError::InvalidMetadata("missing manifest.toml".into()))?;
+    let manifest: PackageManifest = toml::from_str(
+        std::str::from_utf8(&manifest_bytes)
+            .map_err(|_| ArchiveError::InvalidMetadata("manifest is not UTF-8".into()))?,
+    )?;
+    sage_core::validate_schema(manifest.schema_version)
+        .map_err(|error| ArchiveError::InvalidMetadata(error.to_string()))?;
+    let index = metadata
+        .remove(".METADATA/files.idx")
+        .ok_or_else(|| ArchiveError::InvalidMetadata("missing files.idx".into()))?;
+    let files = parse_file_index(&index)?;
+    Ok(PackageInspection {
+        manifest,
+        files,
+        optional: metadata,
+    })
 }
 
-/// Creates a compressed `*.pkg.tar.zst` archive from a staged directory.
+/// Parses the compact TSV index while validating all paths and hashes.
+pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ArchiveError::InvalidMetadata("files.idx is not UTF-8".into()))?;
+    text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let path = clean_archive_path(Path::new(fields.next().unwrap_or_default()))?;
+            let mode = u32::from_str_radix(fields.next().unwrap_or_default(), 8)
+                .map_err(|_| ArchiveError::InvalidMetadata(format!("invalid mode in '{line}'")))?;
+            let size =
+                fields.next().unwrap_or_default().parse().map_err(|_| {
+                    ArchiveError::InvalidMetadata(format!("invalid size in '{line}'"))
+                })?;
+            let sha256 = fields.next().unwrap_or_default();
+            if fields.next().is_some()
+                || sha256.len() != 64
+                || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "invalid SHA-256 in '{line}'"
+                )));
+            }
+            Ok(FileRecord {
+                path,
+                mode,
+                size,
+                sha256: sha256.to_ascii_lowercase(),
+            })
+        })
+        .collect()
+}
+
+/// Creates a deterministic archive with metadata entries before payload entries.
 pub fn create_package(
     source_dir: impl AsRef<Path>,
-    output_pkg: impl AsRef<Path>,
+    output: impl AsRef<Path>,
     compression_level: i32,
 ) -> Result<(), ArchiveError> {
-    let out_file = File::create(output_pkg)?;
-    let encoder = zstd::Encoder::new(out_file, compression_level)
-        .map_err(|e| ArchiveError::Zstd(e.to_string()))?;
-    let mut tar_builder = tar::Builder::new(encoder.auto_finish());
-
-    tar_builder.append_dir_all(".", source_dir)?;
-    tar_builder.finish()?;
-
+    let source = source_dir.as_ref();
+    for required in [".METADATA/manifest.toml", ".METADATA/files.idx", "data"] {
+        if !source.join(required).exists() {
+            return Err(ArchiveError::InvalidMetadata(format!("missing {required}")));
+        }
+    }
+    let file = File::create(output)?;
+    let mut encoder = zstd::Encoder::new(file, compression_level)?;
+    encoder.include_checksum(true)?;
+    let mut builder = tar::Builder::new(encoder);
+    builder.mode(tar::HeaderMode::Deterministic);
+    let mut paths = collect_paths(source)?;
+    paths.sort_by_key(|path| {
+        let relative = path.strip_prefix(source).unwrap();
+        (!relative.starts_with(".METADATA"), relative.to_path_buf())
+    });
+    for path in paths {
+        append_deterministic(&mut builder, source, &path)?;
+    }
+    let encoder = builder.into_inner()?;
+    encoder.finish()?;
     Ok(())
+}
+
+fn collect_paths(root: &Path) -> Result<Vec<PathBuf>, ArchiveError> {
+    fn visit(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            paths.push(path.clone());
+            if entry.file_type()?.is_dir() {
+                visit(&path, paths)?;
+            }
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    visit(root, &mut paths)?;
+    Ok(paths)
+}
+
+fn append_deterministic<W: Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    path: &Path,
+) -> Result<(), ArchiveError> {
+    let relative = path
+        .strip_prefix(root)
+        .expect("collected path stays below root");
+    let metadata = fs::symlink_metadata(path)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_mode(metadata.mode() & 0o7777);
+    if metadata.is_dir() {
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_data(&mut header, relative, io::empty())?;
+    } else if metadata.is_file() {
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(metadata.len());
+        header.set_cksum();
+        builder.append_data(&mut header, relative, File::open(path)?)?;
+    } else if metadata.file_type().is_symlink() {
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_link_name(fs::read_link(path)?)?;
+        header.set_cksum();
+        builder.append_data(&mut header, relative, io::empty())?;
+    } else {
+        return Err(ArchiveError::UnsafePath(relative.display().to_string()));
+    }
+    Ok(())
+}
+
+/// Extracts verified regular payload files through dirfd-relative operations.
+///
+/// Intermediate directories are opened with `O_NOFOLLOW`; writes land in an
+/// exclusive temporary file and become visible through an atomic `renameat`.
+pub fn extract_package(
+    package: impl AsRef<Path>,
+    sysroot: impl AsRef<Path>,
+    index: &[FileRecord],
+) -> Result<Vec<PathBuf>, ArchiveError> {
+    let expected: BTreeMap<_, _> = index
+        .iter()
+        .map(|record| (record.path.clone(), record))
+        .collect();
+    let root_raw = open(
+        sysroot.as_ref(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: `open` returned a new descriptor whose ownership transfers here once.
+    let root = unsafe { OwnedFd::from_raw_fd(root_raw) };
+    let decoder = zstd::Decoder::new(File::open(package)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut written = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = clean_archive_path(&entry.path()?)?;
+        let Ok(relative) = path.strip_prefix("data") else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if entry.header().entry_type().is_dir() {
+            ensure_directory(&root, relative)?;
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(ArchiveError::UnsafePath(format!(
+                "unsupported entry {}",
+                relative.display()
+            )));
+        }
+        let record = expected.get(relative).ok_or_else(|| {
+            ArchiveError::InvalidMetadata(format!("unindexed file {}", relative.display()))
+        })?;
+        if entry.size() != record.size {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "size mismatch for {}",
+                relative.display()
+            )));
+        }
+        write_verified(&root, relative, record, &mut entry)?;
+        written.push(relative.to_path_buf());
+    }
+    if written.len() != expected.len() {
+        return Err(ArchiveError::InvalidMetadata(
+            "archive payload does not match files.idx".into(),
+        ));
+    }
+    Ok(written)
+}
+
+fn write_verified(
+    root: &OwnedFd,
+    path: &Path,
+    record: &FileRecord,
+    reader: &mut impl Read,
+) -> Result<(), ArchiveError> {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let directory = ensure_directory(root, parent)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| ArchiveError::UnsafePath(path.display().to_string()))?;
+    let temp = format!(
+        ".sage-tmp-{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let raw = openat(
+        Some(directory.as_raw_fd()),
+        temp.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(record.mode),
+    )?;
+    let mut temporary = TempGuard {
+        dirfd: directory.as_raw_fd(),
+        name: temp.clone(),
+        active: true,
+    };
+    // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
+    let mut output = unsafe { File::from_raw_fd(raw) };
+    let mut hasher = Sha256::new();
+    let copied = io::copy(
+        &mut reader.take(record.size + 1),
+        &mut HashWriter {
+            output: &mut output,
+            hash: &mut hasher,
+        },
+    )?;
+    if copied != record.size {
+        return Err(ArchiveError::InvalidMetadata(format!(
+            "short payload for {}",
+            path.display()
+        )));
+    }
+    fchmod(output.as_raw_fd(), Mode::from_bits_truncate(record.mode))?;
+    output.sync_all()?;
+    let actual = hex::encode(hasher.finalize());
+    if actual != record.sha256 {
+        return Err(ArchiveError::ChecksumMismatch {
+            path: path.into(),
+            expected: record.sha256.clone(),
+            actual,
+        });
+    }
+    drop(output);
+    renameat(
+        Some(directory.as_raw_fd()),
+        temp.as_str(),
+        Some(directory.as_raw_fd()),
+        name,
+    )?;
+    temporary.active = false;
+    Ok(())
+}
+
+struct TempGuard {
+    dirfd: i32,
+    name: String,
+    active: bool,
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = nix::unistd::unlinkat(
+                Some(self.dirfd),
+                self.name.as_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            );
+        }
+    }
+}
+
+struct HashWriter<'a> {
+    output: &'a mut File,
+    hash: &'a mut Sha256,
+}
+impl Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.output.write(bytes)?;
+        self.hash.update(&bytes[..count]);
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn ensure_directory(root: &OwnedFd, path: &Path) -> Result<OwnedFd, ArchiveError> {
+    let duplicate = openat(
+        Some(root.as_raw_fd()),
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: the newly duplicated descriptor has one owner.
+    let mut current = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(ArchiveError::UnsafePath(path.display().to_string()));
+        };
+        match mkdirat(
+            Some(current.as_raw_fd()),
+            name,
+            Mode::from_bits_truncate(0o755),
+        ) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let next = openat(
+            Some(current.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )?;
+        // SAFETY: `openat` returned a new descriptor replacing the previous guard.
+        current = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Ok(current)
+}
+
+fn clean_archive_path(path: &Path) -> Result<PathBuf, ArchiveError> {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => clean.push(value),
+            _ => return Err(ArchiveError::UnsafePath(path.display().to_string())),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(ArchiveError::UnsafePath(path.display().to_string()));
+    }
+    Ok(clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_rejects_parent_paths() {
+        assert!(parse_file_index(b"../etc/passwd\t0644\t1\t0000000000000000000000000000000000000000000000000000000000000000\n").is_err());
+    }
+
+    #[test]
+    fn package_round_trip_inspection_and_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
+        fs::write(stage.join("data/usr/bin/hello"), b"hello").unwrap();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        fs::write(
+            stage.join(".METADATA/files.idx"),
+            format!("usr/bin/hello\t0755\t5\t{hash}\n"),
+        )
+        .unwrap();
+        fs::write(
+            stage.join(".METADATA/manifest.toml"),
+            r#"schema_version=1
+name="hello"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="hello"
+license="MIT"
+installed_size=5
+build_time=1
+"#,
+        )
+        .unwrap();
+        let package = temp.path().join("hello.pkg.tar.zst");
+        create_package(&stage, &package, 1).unwrap();
+        let inspection = inspect_package(&package).unwrap();
+        assert_eq!(inspection.manifest.name, "hello");
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        extract_package(&package, &root, &inspection.files).unwrap();
+        assert_eq!(fs::read(root.join("usr/bin/hello")).unwrap(), b"hello");
+    }
 }
