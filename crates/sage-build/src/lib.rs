@@ -109,7 +109,10 @@ pub struct SubpackageSpec {
 pub struct RecipeSpec {
     pub schema_version: u32,
     pub package: RecipePackage,
-    pub source: SourceSpec,
+    #[serde(default)]
+    pub source: Option<SourceSpec>,
+    #[serde(default)]
+    pub sources: Vec<SourceSpec>,
     #[serde(default)]
     pub build: RecipeBuild,
     #[serde(default)]
@@ -125,15 +128,21 @@ impl RecipeSpec {
                 "package name and architecture are required".into(),
             ));
         }
-        if recipe.source.sha256.len() != 64
-            || !recipe
-                .source
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        if recipe.source.is_some() && !recipe.sources.is_empty() {
             return Err(BuildError::InvalidSpec(
-                "source SHA-256 must contain 64 hex digits".into(),
+                "use either [source] or [[sources]], not both".into(),
+            ));
+        }
+        if recipe.source.is_none() && recipe.sources.is_empty() {
+            return Err(BuildError::InvalidSpec(
+                "at least one source is required".into(),
+            ));
+        }
+        if recipe.source_inputs().any(|source| {
+            source.sha256.len() != 64 || !source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(BuildError::InvalidSpec(
+                "every source SHA-256 must contain 64 hex digits".into(),
             ));
         }
         let mut names = BTreeSet::from([recipe.package.name.as_str()]);
@@ -147,6 +156,11 @@ impl RecipeSpec {
             ));
         }
         Ok(recipe)
+    }
+
+    /// Iterates the legacy singleton or the schema-v1 multi-source array.
+    pub fn source_inputs(&self) -> impl Iterator<Item = &SourceSpec> {
+        self.source.iter().chain(self.sources.iter())
     }
 }
 
@@ -661,6 +675,44 @@ mod tests {
     }
 
     #[test]
+    fn recipe_accepts_ordered_multiple_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recipe.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"schema_version=1
+[package]
+name="demo"
+version="1"
+release=1
+description="demo"
+license="MIT"
+channel="system"
+arch="any"
+
+[[sources]]
+url="https://example.invalid/main.tar"
+sha256="{}"
+
+[[sources]]
+url="https://example.invalid/languages.tar"
+sha256="{}"
+"#,
+                "00".repeat(32),
+                "11".repeat(32)
+            ),
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(path).unwrap();
+        assert_eq!(recipe.source_inputs().count(), 2);
+        assert_eq!(
+            recipe.source_inputs().nth(1).unwrap().url,
+            "https://example.invalid/languages.tar"
+        );
+    }
+
+    #[test]
     fn shell_quote_does_not_open_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(tool_family("/usr/bin/clang++"), "clang");
@@ -690,10 +742,11 @@ mod tests {
                 dependencies: vec![],
                 provides: vec![],
             },
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 url: "https://example.invalid/x".into(),
                 sha256: "00".repeat(32),
-            },
+            }),
+            sources: vec![],
             build: RecipeBuild::default(),
             subpackages: vec![
                 SubpackageSpec {

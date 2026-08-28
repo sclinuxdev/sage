@@ -953,26 +953,31 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
     std::fs::create_dir_all(&source)?;
     std::fs::create_dir(&build)?;
     std::fs::create_dir(&destdir)?;
-    let source_name = recipe
-        .source
-        .url
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .filter(|name| {
-            Path::new(name)
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
-        })
-        .unwrap_or("source.archive");
+    let distfiles = source.join(".distfiles");
+    std::fs::create_dir(&distfiles)?;
     let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
-    engine
-        .download_url(
-            &recipe.source.url,
-            &source.join(source_name),
-            &recipe.source.sha256,
-        )
-        .await?;
+    for (index, input) in recipe.source_inputs().enumerate() {
+        let source_name = input
+            .url
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.split('?').next())
+            .filter(|name| !name.is_empty())
+            .filter(|name| {
+                Path::new(name)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+            .unwrap_or("source.archive");
+        engine
+            .download_url(
+                &input.url,
+                &distfiles.join(format!("{index:03}-{source_name}")),
+                &input.sha256,
+            )
+            .await?;
+    }
+    stage_patches(recipe_path.parent().unwrap_or(Path::new(".")), &source)?;
     let variables = build_variables(&config, &recipe);
     let runner_contents = sage_build::compose_runner(&classes, &variables)?;
     let runner = workspace.path().join("sage-build-runner.sh");
@@ -989,6 +994,27 @@ async fn build_recipe(root: &Path, recipe_dir: &Path, dry_run: bool) -> Result<(
     let output_dir = recipe_path.parent().unwrap_or(Path::new("."));
     for area in areas {
         package_staging(&recipe, &area, output_dir, config.source_date_epoch)?;
+    }
+    Ok(())
+}
+
+fn stage_patches(recipe_dir: &Path, source: &Path) -> Result<()> {
+    let patches = recipe_dir.join("patches");
+    if !patches.exists() {
+        return Ok(());
+    }
+    let target = source.join(".patches");
+    std::fs::create_dir(&target)?;
+    let mut entries: Vec<_> = std::fs::read_dir(&patches)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if !entry.file_type()?.is_file() {
+            bail!(
+                "patch entry must be a regular file: {}",
+                entry.path().display()
+            );
+        }
+        std::fs::copy(entry.path(), target.join(entry.file_name()))?;
     }
     Ok(())
 }

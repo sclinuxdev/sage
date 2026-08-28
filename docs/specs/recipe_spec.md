@@ -130,3 +130,24 @@ files = [
 - `[subpackages.payload]`:
   - `files`: Glob 模式列表，匹配归属于该子包的文件。
   - `excludes`: 额外排除的 Glob 列表。
+
+### 3.3 Multiple sources and patches
+
+Recipes that require additional distfiles use an ordered array of tables instead of
+the legacy singleton `[source]`. The two forms are mutually exclusive and every
+distfile is independently verified before the sandbox starts:
+
+```toml
+[[sources]]
+url = "https://example.org/project-1.0.tar.xz"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[[sources]]
+url = "https://example.org/project-languages-1.0.tar.xz"
+sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+```
+
+The first archive supplies the primary source tree and is unpacked with its leading
+directory removed. Later archives overlay their native layout in declaration order.
+Files in the recipe's `patches/` directory are copied into the sandbox and applied
+with `patch -p1` in bytewise filename order during `src_prepare`.
