@@ -12,3 +12,4 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
 nix = { workspace = true }
+spdx = { workspace = true }

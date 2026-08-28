@@ -440,6 +440,8 @@ impl RecipeSpec {
                 "package name and architecture are required".into(),
             ));
         }
+        sage_core::validate_spdx_expression(&recipe.package.license)
+            .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;
         if recipe.package.slot.is_empty()
             || !recipe.package.slot.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')

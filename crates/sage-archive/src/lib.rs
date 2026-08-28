@@ -114,6 +114,8 @@ pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, Arch
     )?;
     sage_core::validate_schema(manifest.schema_version)
         .map_err(|error| ArchiveError::InvalidMetadata(error.to_string()))?;
+    sage_core::validate_spdx_expression(&manifest.license)
+        .map_err(|error| ArchiveError::InvalidMetadata(error.to_string()))?;
     let index = metadata
         .remove(".METADATA/files.idx")
         .ok_or_else(|| ArchiveError::InvalidMetadata("missing files.idx".into()))?;

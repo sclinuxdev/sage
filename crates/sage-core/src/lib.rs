@@ -11,6 +11,23 @@ use thiserror::Error;
 
 /// Schema version understood by the Sage 0.4 metadata readers.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Validates a strict SPDX license expression against the license-list version
+/// embedded in the `spdx` crate. Recipe and archive readers share this gate so
+/// invalid identifiers can never enter a repository index or installed state.
+pub fn validate_spdx_expression(expression: &str) -> Result<(), CoreError> {
+    if expression.is_empty() {
+        return Err(CoreError::InvalidMetadata(
+            "SPDX license expression is required".into(),
+        ));
+    }
+    spdx::Expression::parse(expression)
+        .map(|_| ())
+        .map_err(|error| {
+            CoreError::InvalidMetadata(format!("invalid SPDX license expression: {error}"))
+        })
+}
+
 /// Slot selected when metadata omits one.
 pub const DEFAULT_SLOT: &str = "0";
 
@@ -30,6 +47,8 @@ pub enum CoreError {
     InvalidPackageKey(String),
     #[error("invalid dependency string '{0}'")]
     InvalidDependency(String),
+    #[error("invalid metadata: {0}")]
+    InvalidMetadata(String),
     #[error("unsupported schema version {found}; expected {SCHEMA_VERSION}")]
     UnsupportedSchema { found: u32 },
     #[error("symbol table exhausted its 32-bit address space")]
@@ -467,5 +486,14 @@ mod tests {
         assert_eq!(first, symbols.intern("system").unwrap());
         assert_eq!(symbols.resolve(first), Some("system"));
         assert_eq!(symbols.len(), 1);
+    }
+
+    #[test]
+    fn spdx_validation_accepts_expressions_and_rejects_unknown_licenses() {
+        validate_spdx_expression("Apache-2.0 OR MIT").unwrap();
+        validate_spdx_expression("GPL-2.0-or-later WITH Classpath-exception-2.0").unwrap();
+        validate_spdx_expression("LicenseRef-Public-Domain").unwrap();
+        assert!(validate_spdx_expression("public-domain").is_err());
+        assert!(validate_spdx_expression("").is_err());
     }
 }
