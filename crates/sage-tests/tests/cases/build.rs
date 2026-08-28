@@ -570,7 +570,7 @@ destination="{destination}"
         .unwrap();
         let runner_path = directory.path().join("runner.sh");
         fs::write(&runner_path, runner).unwrap();
-        assert!(Command::new("/bin/sh")
+        assert!(Command::new("bash")
             .arg(runner_path)
             .status()
             .unwrap()
