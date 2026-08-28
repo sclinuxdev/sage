@@ -103,6 +103,9 @@ pub struct RecipeBuild {
     pub inherit: Vec<String>,
     #[serde(default)]
     pub args: BTreeMap<String, String>,
+    /// Explicit packages needed only while building this recipe.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
     #[serde(default)]
     pub payload: PayloadSpec,
     #[serde(default)]
@@ -615,6 +618,31 @@ pub fn compose_runner(
     Ok(script)
 }
 
+/// Returns the unique package constraints required to construct `/toolchain`.
+pub fn build_dependencies(
+    recipe: &RecipeSpec,
+    classes: &[Rclass],
+    features: &EffectiveFeatures,
+) -> Result<Vec<sage_core::Dependency>, BuildError> {
+    let mut values = recipe.build.dependencies.clone();
+    values.extend(features.build_dependencies.clone());
+    values.extend(
+        classes
+            .iter()
+            .flat_map(|class| class.implicit_build_dependencies.clone()),
+    );
+    values.sort();
+    values.dedup();
+    values
+        .into_iter()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error: sage_core::CoreError| BuildError::InvalidSpec(error.to_string()))
+        })
+        .collect()
+}
+
 fn validate_shell_name(value: &str) -> Result<(), BuildError> {
     if !value.is_empty()
         && value
@@ -735,11 +763,11 @@ impl<'a> SandboxRunner<'a> {
 
     fn environment(&self, toolchain: bool) -> BTreeMap<String, String> {
         let path = if toolchain {
-            "/toolchain/bin:/usr/bin:/bin"
+            "/toolchain/usr/bin:/toolchain/bin:/usr/bin:/bin"
         } else {
             "/usr/bin:/bin"
         };
-        BTreeMap::from([
+        let mut environment = BTreeMap::from([
             ("LC_ALL".into(), "C".into()),
             ("TZ".into(), "UTC".into()),
             ("HOME".into(), "/build".into()),
@@ -761,7 +789,26 @@ impl<'a> SandboxRunner<'a> {
             ("CPPFLAGS".into(), self.config.cppflags.clone()),
             ("LDFLAGS".into(), self.config.ldflags.clone()),
             ("RUSTFLAGS".into(), self.config.rustflags.clone()),
-        ])
+        ]);
+        if toolchain {
+            environment.extend([
+                (
+                    "PKG_CONFIG_PATH".into(),
+                    "/toolchain/usr/lib/pkgconfig:/toolchain/usr/share/pkgconfig".into(),
+                ),
+                ("CMAKE_PREFIX_PATH".into(), "/toolchain/usr".into()),
+                ("ACLOCAL_PATH".into(), "/toolchain/usr/share/aclocal".into()),
+                (
+                    "PYTHONPATH".into(),
+                    "/toolchain/usr/lib/python/site-packages".into(),
+                ),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    "/toolchain/usr/lib:/toolchain/usr/lib64".into(),
+                ),
+            ]);
+        }
+        environment
     }
 }
 

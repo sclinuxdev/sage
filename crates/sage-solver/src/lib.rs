@@ -90,14 +90,60 @@ impl<'a> SageSolver<'a> {
 
     /// Resolves all requested roots together so shared dependencies cannot diverge.
     pub fn resolve(&self, requested: &[PackageKey]) -> Result<Solution, SolverError> {
+        let dependencies = requested
+            .iter()
+            .cloned()
+            .map(|key| (key, VersionRange::full()))
+            .collect();
+        self.resolve_root(dependencies)
+    }
+
+    /// Resolves arbitrary root constraints in one pass. Source builds use this
+    /// for explicit and rclass-provided build dependencies without installing
+    /// them into the host package database.
+    pub fn resolve_dependencies(
+        &self,
+        channel: &str,
+        requested: &[Dependency],
+    ) -> Result<Solution, SolverError> {
         let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
         let root_version = Version::new(0, "0", 0);
-        let provider =
-            SageProvider::build(self.universe, &self.locked, &root, &root_version, requested);
-        match resolve(&provider, root.clone(), root_version) {
+        let parent = PackageKey::new(channel, "__build", DEFAULT_SLOT);
+        let mut dependencies = DependencyMap::default();
+        for dependency in requested {
+            let key = dependency_key(self.universe, &self.locked, &parent, dependency);
+            let range = dependency_range(dependency);
+            dependencies
+                .entry(key)
+                .and_modify(|current| *current = current.intersection(&range))
+                .or_insert(range);
+        }
+        self.resolve_root_with(&root, &root_version, dependencies)
+    }
+
+    fn resolve_root(&self, dependencies: DependencyMap) -> Result<Solution, SolverError> {
+        let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
+        let root_version = Version::new(0, "0", 0);
+        self.resolve_root_with(&root, &root_version, dependencies)
+    }
+
+    fn resolve_root_with(
+        &self,
+        root: &PackageKey,
+        root_version: &Version,
+        dependencies: DependencyMap,
+    ) -> Result<Solution, SolverError> {
+        let provider = SageProvider::build(
+            self.universe,
+            &self.locked,
+            root,
+            root_version,
+            dependencies,
+        );
+        match resolve(&provider, root.clone(), root_version.clone()) {
             Ok(selected) => Ok(selected
                 .into_iter()
-                .filter(|(key, _)| key != &root)
+                .filter(|(key, _)| key != root)
                 .collect()),
             Err(PubGrubError::NoSolution(mut tree)) => {
                 tree.collapse_no_versions();
@@ -121,7 +167,7 @@ impl SageProvider {
         locked: &BTreeMap<PackageKey, Version>,
         root: &PackageKey,
         root_version: &Version,
-        requested: &[PackageKey],
+        root_dependencies: DependencyMap,
     ) -> Self {
         let mut releases = BTreeMap::new();
         for (key, versions) in &universe.releases {
@@ -141,11 +187,6 @@ impl SageProvider {
                     .insert(release.version.clone(), dependencies);
             }
         }
-        let root_dependencies = requested
-            .iter()
-            .cloned()
-            .map(|key| (key, VersionRange::full()))
-            .collect();
         releases
             .entry(root.clone())
             .or_insert_with(BTreeMap::new)
@@ -338,6 +379,21 @@ mod tests {
         assert_eq!(
             solver.resolve(std::slice::from_ref(&key)).unwrap()[&key],
             "1.0-1".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn root_dependency_constraints_apply_to_build_environments() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release("main/system", "cmake", "3.20-1", &[]));
+        universe.insert(release("main/system", "cmake", "4.0-1", &[]));
+        let dependency = "cmake < 4.0-1".parse().unwrap();
+        let solution = SageSolver::new(&universe)
+            .resolve_dependencies("main/system", &[dependency])
+            .unwrap();
+        assert_eq!(
+            solution[&PackageKey::new("main/system", "cmake", "0")],
+            "3.20-1".parse().unwrap()
         );
     }
 }

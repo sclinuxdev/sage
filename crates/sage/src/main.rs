@@ -996,6 +996,7 @@ async fn build_recipe(
         });
     }
     sage_build::validate_toolchain(&classes, &config)?;
+    let build_dependencies = sage_build::build_dependencies(&recipe, &classes, &features)?;
     if dry_run {
         println!(
             "Would build {}-{}-{} for {} using {:?}",
@@ -1005,6 +1006,9 @@ async fn build_recipe(
             recipe.package.arch,
             recipe.build.inherit
         );
+        for dependency in &build_dependencies {
+            println!("Build-depends: {}", dependency.name);
+        }
         return Ok(());
     }
     let workspace = tempfile::Builder::new().prefix("sage-build-").tempdir()?;
@@ -1014,6 +1018,13 @@ async fn build_recipe(
     std::fs::create_dir_all(&source)?;
     std::fs::create_dir(&build)?;
     std::fs::create_dir(&destdir)?;
+    let toolchain = prepare_build_toolchain(
+        root,
+        workspace.path(),
+        &recipe.package.channel,
+        &build_dependencies,
+    )
+    .await?;
     let distfiles = source.join(".distfiles");
     std::fs::create_dir(&distfiles)?;
     let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
@@ -1037,7 +1048,7 @@ async fn build_recipe(
         build,
         destdir: destdir.clone(),
         runner,
-        toolchain: None,
+        toolchain,
     };
     sage_build::SandboxRunner::new(&config).run(&paths, recipe.build.allow_network)?;
     sage_build::stage_sysusers(&destdir, &recipe)?;
@@ -1066,6 +1077,56 @@ async fn build_recipe(
         )?;
     }
     Ok(())
+}
+
+/// Resolves, downloads, and extracts build-only packages into an ephemeral
+/// prefix. The resulting tree is mounted read-only and is never registered in
+/// the host database, so failed builds leave no installed state behind.
+async fn prepare_build_toolchain(
+    root: &Path,
+    workspace: &Path,
+    channel: &str,
+    dependencies: &[sage_core::Dependency],
+) -> Result<Option<PathBuf>> {
+    if dependencies.is_empty() {
+        return Ok(None);
+    }
+    let available = load_available(root)?;
+    let channel = canonical_channel(&available, Some(channel))?;
+    let solution = sage_solver::SageSolver::new(&available.universe)
+        .resolve_dependencies(&channel, dependencies)?;
+    let toolchain = workspace.join("toolchain");
+    std::fs::create_dir(&toolchain)?;
+    let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
+    let engine = sage_repo::DownloadEngine::new(&package_cache)?;
+    let mut owned = std::collections::BTreeSet::new();
+    for (key, version) in solution {
+        let source = available
+            .releases
+            .get(&(key.clone(), version.clone()))
+            .with_context(|| format!("index record disappeared for build dependency {key}"))?;
+        let archive = package_cache.join(&source.release.sha256);
+        let url = format!(
+            "{}/{}",
+            source.url.trim_end_matches('/'),
+            source.release.archive
+        );
+        engine
+            .download_url(&url, &archive, &source.release.sha256)
+            .await?;
+        let inspection = sage_archive::inspect_package(&archive)?;
+        if let Some(path) = inspection
+            .files
+            .iter()
+            .map(|record| &record.path)
+            .find(|path| !owned.insert((*path).clone()))
+        {
+            bail!("build dependency file conflict at {}", path.display());
+        }
+        sage_archive::extract_package(&archive, &toolchain, &inspection.files)?;
+        println!("Build dependency {} {}", key, version);
+    }
+    Ok(Some(toolchain))
 }
 
 fn stage_patches(recipe_dir: &Path, source: &Path) -> Result<()> {
