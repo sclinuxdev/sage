@@ -19,7 +19,8 @@ tab=$(printf '\t')
 while IFS="$tab" read -r archive strip destination; do
     target="${SRC_DIR}/$destination"
     mkdir -p "$target"
-    tar -xf "${SRC_DIR}/.distfiles/$archive" --strip-components="$strip" -C "$target"
+    input="${SRC_DIR}/.distfiles/$archive"
+    if [ -d "$input" ]; then cp -a "$input"/. "$target"/; else tar -xf "$input" --strip-components="$strip" -C "$target"; fi
 done < "${SRC_DIR}/.distfiles/manifest"
 """
 src_prepare = """

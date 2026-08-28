@@ -43,19 +43,42 @@ pub enum BuildError {
     UnauthorizedTool { tool: String },
     #[error("patchelf failed for {path}: {message}")]
     Patchelf { path: PathBuf, message: String },
+    #[error("git operation '{operation}' exited with {status}")]
+    GitFailed {
+        operation: String,
+        status: ExitStatus,
+    },
 }
 
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceSpec {
+    #[serde(default)]
+    pub kind: SourceKind,
     pub url: String,
+    #[serde(default)]
     pub sha256: String,
+    /// Exact SHA-1 or SHA-256 object ID required for Git sources.
+    #[serde(default)]
+    pub commit: String,
+    /// Recursively materialize submodules at superproject-pinned commits.
+    #[serde(default)]
+    pub submodules: bool,
     /// Leading archive components removed during extraction.
     #[serde(default)]
     pub strip_components: Option<u32>,
     /// Extraction directory relative to the shared source root.
     #[serde(default = "default_source_destination")]
     pub destination: PathBuf,
+}
+
+/// Fetch protocol selected by one source declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    #[default]
+    Archive,
+    Git,
 }
 
 fn default_source_destination() -> PathBuf {
@@ -235,15 +258,9 @@ impl RecipeSpec {
                 "at least one source is required".into(),
             ));
         }
-        if recipe.source_inputs().any(|source| {
-            source.sha256.len() != 64 || !source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            return Err(BuildError::InvalidSpec(
-                "every source SHA-256 must contain 64 hex digits".into(),
-            ));
-        }
         for source in recipe.source_inputs() {
             validate_source_destination(&source.destination)?;
+            source.validate()?;
         }
         for user in &recipe.sysusers {
             user.validate()?;
@@ -270,13 +287,17 @@ impl RecipeSpec {
         self.source.iter().chain(self.sources.iter())
     }
 
-    /// Produces the ordered extraction plan consumed by every archive rclass.
+    /// Produces the ordered materialization plan consumed by every build rclass.
     pub fn source_manifest(&self) -> String {
         let mut manifest = String::new();
         for (index, source) in self.source_inputs().enumerate() {
-            let strip = source
-                .strip_components
-                .unwrap_or(if index == 0 { 1 } else { 0 });
+            let strip = if source.kind == SourceKind::Git {
+                0
+            } else {
+                source
+                    .strip_components
+                    .unwrap_or(if index == 0 { 1 } else { 0 })
+            };
             manifest.push_str(&format!(
                 "{}\t{strip}\t{}\n",
                 source_archive_name(index),
@@ -336,6 +357,150 @@ impl RecipeSpec {
         result.target_dependencies.dedup();
         Ok(result)
     }
+}
+
+impl SourceSpec {
+    fn validate(&self) -> Result<(), BuildError> {
+        match self.kind {
+            SourceKind::Archive => {
+                if self.sha256.len() != 64
+                    || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !self.commit.is_empty()
+                    || self.submodules
+                {
+                    return Err(BuildError::InvalidSpec(
+                        "archive sources require one SHA-256 and no Git fields".into(),
+                    ));
+                }
+            }
+            SourceKind::Git => {
+                let exact_commit = matches!(self.commit.len(), 40 | 64)
+                    && self.commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+                let network_url = self.url.starts_with("https://")
+                    || self.url.starts_with("http://")
+                    || self.url.starts_with("ssh://")
+                    || self.url.starts_with("git://")
+                    || (self.url.starts_with("git@") && self.url.contains(':'));
+                if !exact_commit
+                    || !network_url
+                    || !self.sha256.is_empty()
+                    || self.strip_components.is_some()
+                {
+                    return Err(BuildError::InvalidSpec(
+                        "Git sources require a full commit ID and a network URL".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fetches an exact Git object and exports its worktree without VCS metadata.
+pub fn fetch_git_source(
+    git: &Path,
+    source: &SourceSpec,
+    checkout: &Path,
+    destination: &Path,
+) -> Result<(), BuildError> {
+    source.validate()?;
+    if source.kind != SourceKind::Git {
+        return Err(BuildError::InvalidSpec(
+            "fetch_git_source requires kind='git'".into(),
+        ));
+    }
+    run_git(git, checkout, "init", ["init", "--quiet"])?;
+    run_git(
+        git,
+        checkout,
+        "remote add",
+        ["remote", "add", "origin", source.url.as_str()],
+    )?;
+    run_git(
+        git,
+        checkout,
+        "fetch commit",
+        ["fetch", "--quiet", "--depth=1", "origin", &source.commit],
+    )?;
+    run_git(
+        git,
+        checkout,
+        "checkout commit",
+        ["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+    )?;
+    if source.submodules {
+        run_git(
+            git,
+            checkout,
+            "submodule checkout",
+            ["submodule", "update", "--init", "--recursive", "--depth=1"],
+        )?;
+    }
+    export_git_tree(checkout, destination)
+}
+
+fn run_git<const N: usize>(
+    git: &Path,
+    checkout: &Path,
+    operation: &str,
+    arguments: [&str; N],
+) -> Result<(), BuildError> {
+    fs::create_dir_all(checkout)?;
+    let status = Command::new(git)
+        .args(["-c", "protocol.file.allow=never", "-C"])
+        .arg(checkout)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", checkout)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(BuildError::GitFailed {
+            operation: operation.into(),
+            status,
+        })
+    }
+}
+
+fn export_git_tree(checkout: &Path, destination: &Path) -> Result<(), BuildError> {
+    fs::create_dir_all(destination)?;
+    for entry in walkdir::WalkDir::new(checkout).follow_links(false) {
+        let entry = entry?;
+        let relative = entry
+            .path()
+            .strip_prefix(checkout)
+            .expect("Git walk remains below checkout");
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|part| part.as_os_str() == ".git")
+        {
+            continue;
+        }
+        let first = relative.components().next().map(|part| part.as_os_str());
+        if matches!(first, Some(name) if name == ".distfiles" || name == ".patches") {
+            return Err(BuildError::InvalidSpec(
+                "Git source uses a reserved build-input path".into(),
+            ));
+        }
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(target)?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), &target)?;
+            fs::set_permissions(&target, fs::metadata(entry.path())?.permissions())?;
+        }
+    }
+    Ok(())
 }
 
 fn valid_feature_name(name: &str) -> bool {
@@ -451,6 +616,8 @@ pub struct BuildConfig {
     pub schema_version: u32,
     pub fakeroot: PathBuf,
     pub bwrap: PathBuf,
+    #[serde(default = "default_git")]
+    pub git: PathBuf,
     pub sysroot: PathBuf,
     pub cc: String,
     pub cxx: String,
@@ -510,6 +677,10 @@ fn default_endian() -> String {
 
 fn default_pids() -> u32 {
     2048
+}
+
+fn default_git() -> PathBuf {
+    PathBuf::from("git")
 }
 
 fn default_patchelf() -> PathBuf {
@@ -1377,6 +1548,62 @@ sha256="{}"
     }
 
     #[test]
+    fn git_sources_require_pins_and_join_the_ordered_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recipe.toml");
+        fs::write(
+            &path,
+            r#"schema_version=1
+[package]
+name="demo"
+version="1"
+release=1
+description="demo"
+license="MIT"
+channel="system"
+arch="any"
+[source]
+kind="git"
+url="https://example.invalid/project.git"
+commit="0123456789abcdef0123456789abcdef01234567"
+submodules=true
+destination="vendor/project"
+"#,
+        )
+        .unwrap();
+        let recipe = RecipeSpec::load(&path).unwrap();
+        let source = recipe.source_inputs().next().unwrap();
+        assert_eq!(source.kind, SourceKind::Git);
+        assert!(source.submodules);
+        assert_eq!(recipe.source_manifest(), "000-source\t0\tvendor/project\n");
+
+        let invalid = fs::read_to_string(&path)
+            .unwrap()
+            .replace("0123456789abcdef0123456789abcdef01234567", "main");
+        fs::write(&path, invalid).unwrap();
+        assert!(RecipeSpec::load(path).is_err());
+    }
+
+    #[test]
+    fn git_export_omits_repository_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        let output = directory.path().join("output");
+        fs::create_dir_all(checkout.join(".git/objects")).unwrap();
+        fs::create_dir_all(checkout.join("submodule")).unwrap();
+        fs::write(checkout.join(".git/config"), b"metadata").unwrap();
+        fs::write(checkout.join("submodule/.git"), b"gitdir: elsewhere").unwrap();
+        fs::write(checkout.join("submodule/source.c"), b"source").unwrap();
+        export_git_tree(&checkout, &output).unwrap();
+        assert!(!output.join(".git").exists());
+        assert!(!output.join("submodule/.git").exists());
+        assert_eq!(
+            fs::read(output.join("submodule/source.c")).unwrap(),
+            b"source"
+        );
+    }
+
+    #[test]
     fn five_tarballs_follow_the_declarative_extraction_plan() {
         let directory = tempfile::tempdir().unwrap();
         let recipe_path = directory.path().join("recipe.toml");
@@ -1539,8 +1766,11 @@ shell="/usr/bin/nologin"
                 provides: vec![],
             },
             source: Some(SourceSpec {
+                kind: SourceKind::Archive,
                 url: "https://example.invalid/x".into(),
                 sha256: "00".repeat(32),
+                commit: String::new(),
+                submodules: false,
                 strip_components: None,
                 destination: default_source_destination(),
             }),

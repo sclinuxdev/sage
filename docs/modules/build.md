@@ -77,3 +77,10 @@ CMake sysroot variables point there, while executable build tools remain native.
 Feature folding and target selection happen before runner composition, leaving
 phase execution free of per-feature and per-architecture branches. Cross tools
 and platform facts come exclusively from the configured target table.
+
+Git source inputs are fetched before sandbox entry with system and user Git
+configuration disabled. Only explicit network transports are accepted, local
+file transport is disabled for the superproject and recursive submodules, and
+the resulting checkout is exported without VCS metadata into the immutable
+distfile area. Build rclasses materialize archive and Git inputs in one ordered
+plan.

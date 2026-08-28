@@ -1150,13 +1150,23 @@ async fn build_recipe(
     std::fs::create_dir(&distfiles)?;
     let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
     for (index, input) in recipe.source_inputs().enumerate() {
-        engine
-            .download_url(
-                &input.url,
-                &distfiles.join(sage_build::source_archive_name(index)),
-                &input.sha256,
-            )
-            .await?;
+        let staged = distfiles.join(sage_build::source_archive_name(index));
+        match input.kind {
+            sage_build::SourceKind::Archive => {
+                engine
+                    .download_url(&input.url, &staged, &input.sha256)
+                    .await?;
+            }
+            sage_build::SourceKind::Git => {
+                let git = config.git.clone();
+                let input = input.clone();
+                let checkout = workspace.path().join(format!("git-checkout-{index:03}"));
+                tokio::task::spawn_blocking(move || {
+                    sage_build::fetch_git_source(&git, &input, &checkout, &staged)
+                })
+                .await??;
+            }
+        }
     }
     std::fs::write(distfiles.join("manifest"), recipe.source_manifest())?;
     stage_patches(recipe_path.parent().unwrap_or(Path::new(".")), &source)?;

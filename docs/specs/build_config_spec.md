@@ -14,6 +14,7 @@ schema_version = 1
 # 沙箱基础设施
 fakeroot = "fakeroot"
 bwrap = "bwrap"
+git = "git"                         # exact-commit Git source fetcher
 sysroot = "/"
 
 # 默认工具链偏好

@@ -159,6 +159,25 @@ manifest and independently verifies all five archives before any extraction begi
 Files in the recipe's `patches/` directory are copied into the sandbox and applied
 with `patch -p1` in bytewise filename order during `src_prepare`.
 
+Git inputs use the same ordered source array but replace archive integrity with an
+exact full object ID:
+
+```toml
+[[sources]]
+kind = "git"
+url = "https://example.org/project.git"
+commit = "0123456789abcdef0123456789abcdef01234567"
+submodules = true
+destination = "."
+```
+
+`kind` defaults to `archive`. Git accepts only network URLs and full 40- or
+64-hex-digit commits; branches, tags, abbreviated IDs, `file://`, and Git external
+helpers are rejected. Recursive submodules are checked out at commits recorded by
+the superproject. The exported tree contains no `.git` metadata and joins archive
+inputs in declaration order. Git sources do not accept `sha256` or
+`strip_components`.
+
 ### 3.4 Private-channel ELF lookup
 
 Packages whose channel is neither `system` nor `*/system` have their ELF RUNPATHs
