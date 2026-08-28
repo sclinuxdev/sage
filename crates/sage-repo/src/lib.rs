@@ -311,6 +311,12 @@ impl DownloadEngine {
         destination: &Path,
         sha256: &str,
     ) -> Result<(), RepoError> {
+        // The package cache is content-addressed. A verified local hit avoids
+        // even a HEAD request while preserving the same integrity boundary as
+        // a fresh transfer. Corrupt or stale files are atomically replaced.
+        if destination.exists() && verify_hash(destination, sha256).await.is_ok() {
+            return Ok(());
+        }
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -725,5 +731,18 @@ provides=["cmd:demo"]
         let reader = RepositoryIndex::open(&artifacts.index).unwrap();
         assert_eq!(reader.releases("demo", "0").unwrap().len(), 1);
         assert_eq!(reader.providers("cmd:demo").unwrap(), vec!["demo:0"]);
+    }
+
+    #[tokio::test]
+    async fn verified_cache_hit_requires_no_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("artifact");
+        std::fs::write(&destination, b"cached package").unwrap();
+        let hash = hex::encode(Sha256::digest(b"cached package"));
+        let engine = DownloadEngine::new(directory.path().join("cache")).unwrap();
+        engine
+            .download_url("http://127.0.0.1:1/unreachable", &destination, &hash)
+            .await
+            .unwrap();
     }
 }
