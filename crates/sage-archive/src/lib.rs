@@ -247,6 +247,8 @@ fn validate_metadata_path(path: &Path) -> Result<(), ArchiveError> {
         ".METADATA/files.idx",
         ".METADATA/service.toml",
         ".METADATA/triggers.toml",
+        ".METADATA/alternatives.toml",
+        ".METADATA/sysusers.toml",
     ];
     if ALLOWED.iter().any(|allowed| path == Path::new(allowed)) {
         Ok(())

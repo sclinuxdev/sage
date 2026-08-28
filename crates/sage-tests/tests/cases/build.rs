@@ -46,6 +46,7 @@ mod build_tests {
             pids_limit: 16,
             compiler_cache: String::new(),
             ccache_dir: PathBuf::new(),
+            sandbox_dependencies: vec![],
             build: String::new(),
             targets: BTreeMap::new(),
         };
@@ -254,7 +255,10 @@ destination="vendor/project"
         let source = recipe.source_inputs().next().unwrap();
         assert_eq!(source.kind, SourceKind::Git);
         assert!(source.submodules);
-        assert_eq!(recipe.source_manifest(), "000-source\t0\tvendor/project\n");
+        assert_eq!(
+            recipe.source_manifest(),
+            "000-source\ttree\t0\tvendor/project\n"
+        );
 
         let invalid = fs::read_to_string(&path)
             .unwrap()
@@ -429,6 +433,8 @@ destination="vendor/project"
             build: RecipeBuild::default(),
             subpackages: vec![],
             sysusers: vec![],
+            alternatives: vec![],
+            install: InstallSpec::default(),
             features: BTreeMap::new(),
         };
         BuildUnit::from_recipe(PathBuf::from(format!("{name}/recipe.toml")), &recipe).unwrap()
@@ -601,10 +607,16 @@ shell="/usr/bin/nologin"
         let recipe = RecipeSpec::load(&path).unwrap();
         let root = directory.path().join("dest");
         fs::create_dir(&root).unwrap();
-        stage_sysusers(&root, &recipe).unwrap();
+        fs::create_dir_all(root.join(".METADATA")).unwrap();
+        sage::stage_sysusers(&recipe, &root.join(".METADATA"), "daemon").unwrap();
         assert_eq!(
-            fs::read_to_string(root.join("usr/lib/sysusers.d/daemon.conf")).unwrap(),
-            "u daemon 75 \"Daemon User\" /var/lib/daemon /usr/bin/nologin\n"
+            sage_sys::SysusersDocument::parse(
+                &fs::read(root.join(".METADATA/sysusers.toml")).unwrap(),
+            )
+                .unwrap()
+                .accounts[0]
+                .name,
+            "daemon"
         );
 
         fs::write(directory.path().join("preinst"), "#!/bin/sh\nread answer\n").unwrap();
@@ -663,6 +675,8 @@ shell="/usr/bin/nologin"
             sources: vec![],
             build: RecipeBuild::default(),
             features: BTreeMap::new(),
+            alternatives: vec![],
+            install: InstallSpec::default(),
             subpackages: vec![
                 SubpackageSpec {
                     name: "x-libs".into(),

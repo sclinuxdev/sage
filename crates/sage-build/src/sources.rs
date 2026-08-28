@@ -1,18 +1,12 @@
-//! Source validation, Git fetching, and ordered source materialization.
-
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-
-use crate::recipe::{SourceKind, SourceSpec};
-use crate::BuildError;
-
 impl SourceSpec {
-    pub(crate) fn validate(&self) -> Result<(), BuildError> {
+    fn validate(&self) -> Result<(), BuildError> {
         match self.kind {
             SourceKind::Archive => {
                 if self.sha256.len() != 64
-                    || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !self
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
                     || !self.commit.is_empty()
                     || self.submodules
                 {
@@ -36,6 +30,23 @@ impl SourceSpec {
                 {
                     return Err(BuildError::InvalidSpec(
                         "Git sources require a full commit ID and a network URL".into(),
+                    ));
+                }
+            }
+            SourceKind::File => {
+                if self.sha256.len() != 64
+                    || !self
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    || !self.commit.is_empty()
+                    || self.submodules
+                    || self.strip_components.is_some()
+                    || self.destination == Path::new(".")
+                {
+                    return Err(BuildError::InvalidSpec(
+                        "file sources require one SHA-256, a destination, and no extraction fields"
+                            .into(),
                     ));
                 }
             }
@@ -120,7 +131,6 @@ fn run_git<const N: usize>(
     }
 }
 
-/// Exports a checked-out Git tree without VCS metadata.
 pub fn export_git_tree(checkout: &Path, destination: &Path) -> Result<(), BuildError> {
     fs::create_dir_all(destination)?;
     for entry in walkdir::WalkDir::new(checkout).follow_links(false) {
@@ -159,12 +169,19 @@ pub fn export_git_tree(checkout: &Path, destination: &Path) -> Result<(), BuildE
     Ok(())
 }
 
-/// Returns the stable sandbox filename for one verified source archive.
+fn valid_feature_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// Stable sandbox filename for an independently verified source archive.
 pub fn source_archive_name(index: usize) -> String {
     format!("{index:03}-source")
 }
 
-pub(crate) fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
+fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
     let valid = !path.as_os_str().is_empty()
         && path.components().all(|component| {
             matches!(

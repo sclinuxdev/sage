@@ -1,60 +1,3 @@
-//! Source builds, mass rebuilds, bootstrap orchestration, and package staging.
-
-use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use crate::package_model::{
-    canonical_channel, load_available_with_pool, obtain_release_archive, ReleaseLocation,
-};
-use crate::paths::under_root;
-
-pub(crate) struct BuildManager<'a> {
-    root: &'a Path,
-    dry_run: bool,
-}
-
-impl<'a> BuildManager<'a> {
-    pub(crate) fn new(root: &'a Path, dry_run: bool) -> Self {
-        Self { root, dry_run }
-    }
-
-    pub(crate) async fn build(
-        &self,
-        recipe_dir: &Path,
-        features: &[String],
-        use_default_features: bool,
-    ) -> Result<()> {
-        build_recipe(
-            self.root,
-            recipe_dir,
-            features,
-            use_default_features,
-            self.dry_run,
-            BuildInvocation::default(),
-        )
-        .await
-    }
-
-    pub(crate) async fn mass_rebuild(
-        &self,
-        recipe_root: &Path,
-        output: Option<&Path>,
-        jobs: usize,
-    ) -> Result<()> {
-        mass_rebuild(self.root, recipe_root, output, jobs, self.dry_run).await
-    }
-
-    pub(crate) async fn bootstrap(
-        &self,
-        plan: &Path,
-        output: Option<&Path>,
-        jobs: usize,
-    ) -> Result<()> {
-        bootstrap_sources(self.root, plan, output, jobs, self.dry_run).await
-    }
-}
-
 pub async fn mass_rebuild(
     root: &Path,
     recipe_root: &Path,
@@ -70,8 +13,6 @@ pub async fn mass_rebuild(
     prepare_source_pool(&pool, dry_run)?;
     execute_source_layers(root, &layers, &pool, jobs, dry_run).await
 }
-
-/// Executes the explicitly staged bootstrap plan.
 pub async fn bootstrap_sources(
     root: &Path,
     plan_path: &Path,
@@ -255,6 +196,21 @@ async fn build_recipe(
         recipe_dir.to_path_buf()
     };
     let mut recipe = sage_build::RecipeSpec::load(&recipe_path)?;
+    let service_path = recipe_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("service.toml");
+    if service_path.exists() {
+        let outputs = std::collections::BTreeSet::from_iter(
+            std::iter::once(recipe.package.name.clone()).chain(
+                recipe
+                    .subpackages
+                    .iter()
+                    .map(|package| package.name.clone()),
+            ),
+        );
+        sage_sys::ServiceDocument::load(service_path)?.validate_output_packages(&outputs)?;
+    }
     let features = recipe.effective_features(requested_features, use_default_features)?;
     recipe.package.dependencies.extend(
         features
@@ -265,7 +221,7 @@ async fn build_recipe(
     );
     recipe.package.dependencies.sort();
     recipe.package.dependencies.dedup();
-    recipe.build.args.extend(features.args.clone());
+    sage_build::merge_build_arguments(&mut recipe.build.args, &features.args);
     let build_config_path = under_root(root, Path::new("/etc/sage/build.toml"));
     let mut config = sage_build::BuildConfig::load(&build_config_path)
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
@@ -322,8 +278,8 @@ async fn build_recipe(
         selected_config.cc.clone_from(&target.cc);
         selected_config.cxx.clone_from(&target.cxx);
         let mut cross_env = BTreeMap::from([
-            ("CC".into(), target.cc.clone()),
-            ("CXX".into(), target.cxx.clone()),
+            ("CC".into(), "/build/.sage-tools/cc".into()),
+            ("CXX".into(), "/build/.sage-tools/cxx".into()),
             ("AR".into(), target.ar.clone()),
             ("STRIP".into(), target.strip.clone()),
             ("GOOS".into(), target.goos.clone()),
@@ -365,7 +321,21 @@ async fn build_recipe(
         });
     }
     sage_build::validate_toolchain(&classes, &selected_config)?;
-    let build_dependencies = sage_build::build_dependencies(&recipe, &classes, &features)?;
+    let mut build_dependencies = sage_build::build_dependencies(&recipe, &classes, &features)?;
+    build_dependencies.extend(
+        config
+            .sandbox_dependencies
+            .iter()
+            .map(|value| value.parse::<sage_core::Dependency>())
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let mut unique_build_dependencies = Vec::new();
+    for dependency in build_dependencies {
+        if !unique_build_dependencies.contains(&dependency) {
+            unique_build_dependencies.push(dependency);
+        }
+    }
+    let build_dependencies = unique_build_dependencies;
     let target_dependencies = sage_build::target_dependencies(&recipe, &features)?;
     if cross.is_none() && !target_dependencies.is_empty() {
         bail!("target_dependencies require [build].target");
@@ -427,6 +397,11 @@ async fn build_recipe(
                     .download_url(&input.url, &staged, &input.sha256)
                     .await?;
             }
+            sage_build::SourceKind::File => {
+                engine
+                    .download_url(&input.url, &staged, &input.sha256)
+                    .await?;
+            }
             sage_build::SourceKind::Git => {
                 let git = config.git.clone();
                 let input = input.clone();
@@ -445,7 +420,7 @@ async fn build_recipe(
     let runner = workspace.path().join("sage-build-runner.sh");
     std::fs::write(&runner, runner_contents)?;
     let paths = sage_build::SandboxPaths {
-        source,
+        source: source.clone(),
         build,
         destdir: destdir.clone(),
         runner,
@@ -454,7 +429,7 @@ async fn build_recipe(
     };
     let managed_build_tools =
         sage_build::SandboxRunner::new(&selected_config).run(&paths, recipe.build.allow_network)?;
-    sage_build::stage_sysusers(&destdir, &recipe)?;
+    sage_build::stage_declarative_install(&destdir, &source, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
     if recipe.uses_private_channel() {
         let report = sage_build::ElfScanner::rewrite_private_runpaths(
@@ -527,7 +502,7 @@ async fn prepare_package_tree(
         .releases
         .iter()
         .filter(|(_, source)| matches!(source.location, ReleaseLocation::Local(_)))
-        .map(|(coordinate, _)| (coordinate.key.clone(), coordinate.version.clone()));
+        .map(|((key, version), _)| (key.clone(), version.clone()));
     let solution = sage_solver::SageSolver::with_locked(&available.universe, local_locks)
         .resolve_dependencies(&channel, dependencies)?;
     let tree = workspace.join(tree_name);
@@ -536,10 +511,9 @@ async fn prepare_package_tree(
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let mut owned = std::collections::BTreeSet::new();
     for (key, version) in solution {
-        let coordinate = sage_core::PackageCoordinate::new(key.clone(), version.clone());
         let source = available
             .releases
-            .get(&coordinate)
+            .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for build dependency {key}"))?;
         let archive = obtain_release_archive(&engine, &package_cache, source).await?;
         let inspection = sage_archive::inspect_package(&archive)?;
@@ -555,6 +529,24 @@ async fn prepare_package_tree(
         println!("{} dependency {} {}", tree_name, key, version);
     }
     Ok(Some(tree))
+}
+
+async fn obtain_release_archive(
+    engine: &sage_repo::DownloadEngine,
+    cache: &Path,
+    source: &ReleaseSource,
+) -> Result<PathBuf> {
+    match &source.location {
+        ReleaseLocation::Local(path) => Ok(path.clone()),
+        ReleaseLocation::Remote(base) => {
+            let archive = cache.join(&source.release.sha256);
+            let url = format!("{}/{}", base.trim_end_matches('/'), source.release.archive);
+            engine
+                .download_url(&url, &archive, &source.release.sha256)
+                .await?;
+            Ok(archive)
+        }
+    }
 }
 
 fn stage_patches(recipe_dir: &Path, source: &Path) -> Result<()> {
@@ -660,9 +652,9 @@ fn package_staging(
     let elf = sage_build::ElfScanner::scan(&data)?;
     let metadata = area.path().join(".METADATA");
     std::fs::create_dir(&metadata)?;
-    if area.name == recipe.package.name {
-        stage_declarative_metadata(recipe_dir, &metadata)?;
-    }
+    stage_declarative_metadata(recipe_dir, &metadata, &area.name, &recipe.package.name)?;
+    stage_alternatives(recipe, &metadata, &area.name)?;
+    stage_sysusers(recipe, &metadata, &area.name)?;
     std::fs::write(
         metadata.join("files.idx"),
         sage_archive::format_file_index(&records),
@@ -719,15 +711,102 @@ fn package_staging(
     Ok(())
 }
 
-/// Validates and copies declarative service and trigger metadata into a package.
-pub fn stage_declarative_metadata(recipe_dir: &Path, metadata: &Path) -> Result<()> {
+fn stage_alternatives(
+    recipe: &sage_build::RecipeSpec,
+    metadata: &Path,
+    output_package: &str,
+) -> Result<()> {
+    let alternatives: Vec<_> = recipe
+        .alternatives
+        .iter()
+        .filter(|alternative| {
+            alternative.package == output_package
+                || (alternative.package.is_empty() && output_package == recipe.package.name)
+        })
+        .map(|alternative| sage_sys::AlternativeDeclaration {
+            link: alternative.link.clone(),
+            target: alternative.target.clone(),
+            priority: alternative.priority,
+        })
+        .collect();
+    if alternatives.is_empty() {
+        return Ok(());
+    }
+    let document = sage_sys::AlternativesDocument {
+        schema_version: sage_core::SCHEMA_VERSION,
+        package: sage_core::PackageKey::new(
+            &recipe.package.channel,
+            output_package,
+            &recipe.package.slot,
+        ),
+        alternatives,
+    };
+    std::fs::write(
+        metadata.join("alternatives.toml"),
+        toml::to_string_pretty(&document)?,
+    )?;
+    Ok(())
+}
+
+pub fn stage_sysusers(
+    recipe: &sage_build::RecipeSpec,
+    metadata: &Path,
+    output_package: &str,
+) -> Result<()> {
+    let accounts: Vec<_> = recipe
+        .sysusers
+        .iter()
+        .filter(|account| {
+            account.package == output_package
+                || (account.package.is_empty() && output_package == recipe.package.name)
+        })
+        .map(|account| sage_sys::SysuserDeclaration {
+            kind: account.kind.clone(),
+            name: account.name.clone(),
+            id: account.id,
+            description: account.description.clone(),
+            home: account.home.clone(),
+            shell: account.shell.clone(),
+        })
+        .collect();
+    if accounts.is_empty() {
+        return Ok(());
+    }
+    let document = sage_sys::SysusersDocument {
+        schema_version: sage_core::SCHEMA_VERSION,
+        package: sage_core::PackageKey::new(
+            &recipe.package.channel,
+            output_package,
+            &recipe.package.slot,
+        ),
+        accounts,
+    };
+    std::fs::write(
+        metadata.join("sysusers.toml"),
+        toml::to_string_pretty(&document)?,
+    )?;
+    Ok(())
+}
+
+pub fn stage_declarative_metadata(
+    recipe_dir: &Path,
+    metadata: &Path,
+    output_package: &str,
+    main_package: &str,
+) -> Result<()> {
     let service = recipe_dir.join("service.toml");
     if service.exists() {
-        sage_sys::ServiceSpec::load(&service)?;
-        std::fs::copy(service, metadata.join("service.toml"))?;
+        let document =
+            sage_sys::ServiceDocument::load(&service)?.for_package(output_package, main_package);
+        if document.services().next().is_some() {
+            std::fs::write(
+                metadata.join("service.toml"),
+                toml::to_string_pretty(&document)?,
+            )?;
+        }
     }
     let triggers = recipe_dir.join("triggers.toml");
-    if triggers.exists() {
+    if output_package == main_package && triggers.exists() {
         sage_sys::TriggerSpec::load(&triggers)?;
         std::fs::copy(triggers, metadata.join("triggers.toml"))?;
     }

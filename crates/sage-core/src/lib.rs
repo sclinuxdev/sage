@@ -11,6 +11,23 @@ use thiserror::Error;
 
 /// Schema version understood by the Sage 0.4 metadata readers.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Validates a strict SPDX license expression against the license-list version
+/// embedded in the `spdx` crate. Recipe and archive readers share this gate so
+/// invalid identifiers can never enter a repository index or installed state.
+pub fn validate_spdx_expression(expression: &str) -> Result<(), CoreError> {
+    if expression.is_empty() {
+        return Err(CoreError::InvalidMetadata(
+            "SPDX license expression is required".into(),
+        ));
+    }
+    spdx::Expression::parse(expression)
+        .map(|_| ())
+        .map_err(|error| {
+            CoreError::InvalidMetadata(format!("invalid SPDX license expression: {error}"))
+        })
+}
+
 /// Slot selected when metadata omits one.
 pub const DEFAULT_SLOT: &str = "0";
 
@@ -43,20 +60,6 @@ pub fn validate_schema(found: u32) -> Result<(), CoreError> {
     (found == SCHEMA_VERSION)
         .then_some(())
         .ok_or(CoreError::UnsupportedSchema { found })
-}
-
-/// Validates a non-empty SPDX license expression against the embedded SPDX list.
-pub fn validate_spdx_expression(expression: &str) -> Result<(), CoreError> {
-    if expression.is_empty() {
-        return Err(CoreError::InvalidMetadata(
-            "SPDX license expression is required".into(),
-        ));
-    }
-    spdx::Expression::parse(expression)
-        .map(|_| ())
-        .map_err(|error| {
-            CoreError::InvalidMetadata(format!("invalid SPDX license expression: {error}"))
-        })
 }
 
 /// Unique package identity `(channel, name, slot)` independent of its version.
@@ -289,21 +292,6 @@ impl ConstraintOp {
     }
 }
 
-impl fmt::Display for ConstraintOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Any => "",
-            Self::Equal => "=",
-            Self::NotEqual => "!=",
-            Self::Greater => ">",
-            Self::GreaterOrEqual => ">=",
-            Self::Less => "<",
-            Self::LessOrEqual => "<=",
-        };
-        f.write_str(value)
-    }
-}
-
 /// Dependency with optional channel, slot, and version restrictions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Dependency {
@@ -358,6 +346,21 @@ impl FromStr for Dependency {
     }
 }
 
+impl fmt::Display for ConstraintOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Any => "",
+            Self::Equal => "=",
+            Self::NotEqual => "!=",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+        };
+        f.write_str(value)
+    }
+}
+
 impl fmt::Display for Dependency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(channel) = &self.channel {
@@ -396,8 +399,8 @@ fn default_schema_version() -> u32 {
 
 /// Canonical package record shared by recipes, archives, indexes, and solving.
 ///
-/// Dependencies are serialized as their compact string syntax at TOML and
-/// binary storage seams, but are parsed exactly once when the record is read.
+/// Dependencies stay in their compact string form at TOML and bincode seams,
+/// while callers use one parsed domain type after deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
     #[serde(default = "default_schema_version")]
@@ -430,7 +433,7 @@ pub struct Package {
 }
 
 impl Package {
-    /// Returns the package identity and version represented by this record.
+    /// Returns the package identity and ordered version represented by the record.
     pub fn coordinate(&self) -> PackageCoordinate {
         PackageCoordinate::new(
             PackageKey::new(&self.channel, &self.name, &self.slot),
@@ -453,7 +456,7 @@ impl Package {
         package
     }
 
-    /// Builds the compact package record needed by a solver-only caller.
+    /// Builds the compact package record used by solver-focused callers.
     pub fn from_release(
         key: PackageKey,
         version: Version,

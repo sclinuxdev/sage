@@ -4,28 +4,38 @@ description = "Systemd Service Generator and Controller Class"
 
 [service_generator]
 target_path = "/usr/lib/systemd/system/${service.name}.service"
-mode = 0644
+mode = 420
 
-enable_cmd = "/bin/systemctl enable ${service.name}.service"
-disable_cmd = "/bin/systemctl disable ${service.name}.service"
-start_cmd = "/bin/systemctl start ${service.name}.service"
-stop_cmd = "/bin/systemctl stop ${service.name}.service"
-restart_cmd = "/bin/systemctl restart ${service.name}.service"
-reload_cmd = "/bin/systemctl reload-or-restart ${service.name}.service"
+enable_cmd = "/usr/bin/systemctl --root ${SYSROOT} enable ${service.name}.service"
+disable_cmd = "/usr/bin/systemctl --root ${SYSROOT} disable ${service.name}.service"
+service_dependency_suffix = ".service"
+supported_types = ["simple", "forking", "notify", "oneshot"]
 
 template = """
 [Unit]
 Description=${service.description}
 After=${service.after_space}
+Before=${service.before_space}
 
 [Service]
 Type=${service.type}
-ExecStart=${service.command_str}
+ExecStart=${service.command_quoted}
+ExecStop=${service.stop_command_quoted}
+ExecReload=${service.reload_command_quoted}
 User=${service.user}
 Group=${service.group}
 WorkingDirectory=${service.working_dir}
+PIDFile=${service.pid_file}
 Restart=${service.restart}
 
 [Install]
 WantedBy=multi-user.target
 """
+
+[service_generator.dependency_aliases]
+basic = "basic.target"
+dbus = "dbus.service"
+local-fs = "local-fs.target"
+network = "network.target"
+network-online = "network-online.target"
+syslog = "syslog.target"

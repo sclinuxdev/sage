@@ -1,25 +1,6 @@
-//! Toolchain policy, runner composition, sandbox execution, and build observations.
-
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use crate::recipe::{EffectiveFeatures, RecipeSpec};
-use crate::{validate_schema, BuildError};
-
-const PHASE_ORDER: &[&str] = &[
-    "src_unpack",
-    "src_prepare",
-    "src_configure",
-    "src_compile",
-    "src_test",
-    "src_install",
-];
-
+/// Global reproducible-build and sandbox policy.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildConfig {
     pub schema_version: u32,
     pub fakeroot: PathBuf,
@@ -54,6 +35,10 @@ pub struct BuildConfig {
     pub compiler_cache: String,
     #[serde(default)]
     pub ccache_dir: PathBuf,
+    /// Data-owned tools needed to enter every build sandbox. They are solved
+    /// into the ephemeral toolchain and never registered as host state.
+    #[serde(default)]
+    pub sandbox_dependencies: Vec<String>,
     /// Native machine triple used as the GNU build/host default.
     #[serde(default)]
     pub build: String,
@@ -64,6 +49,7 @@ pub struct BuildConfig {
 
 /// Commands and platform facts for one configured cross-compilation target.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrossTarget {
     pub cc: String,
     pub cxx: String,
@@ -191,7 +177,6 @@ pub fn validate_toolchain(classes: &[Rclass], config: &BuildConfig) -> Result<()
     Ok(())
 }
 
-/// Classifies a compiler or linker executable name for policy checks.
 pub fn tool_family(tool: &str) -> String {
     let name = Path::new(tool)
         .file_name()
@@ -199,7 +184,7 @@ pub fn tool_family(tool: &str) -> String {
         .unwrap_or(tool);
     if name.contains("clang") {
         "clang".into()
-    } else if name.contains("gcc") || name == "g++" || name.ends_with("-g++") {
+    } else if name.contains("gcc") || name == "g++" {
         "gcc".into()
     } else if name.contains("lld") {
         "lld".into()
@@ -209,6 +194,14 @@ pub fn tool_family(tool: &str) -> String {
         "ld".into()
     } else {
         name.into()
+    }
+}
+
+fn validate_schema(version: u32) -> Result<(), BuildError> {
+    if version == sage_core::SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(BuildError::Schema(version))
     }
 }
 
@@ -227,7 +220,7 @@ pub fn compose_runner(
     }
     expanded_variables.extend(variables.clone());
     let mut script = String::from(
-        "#!/bin/bash\nset -euo pipefail\ntrap 'printf >&2 \"sage-build: line %s failed\\n\" \"$LINENO\"' ERR\n",
+        "#!/usr/bin/bash\nset -euo pipefail\ntrap 'printf >&2 \"sage-build: line %s failed\\n\" \"$LINENO\"' ERR\n",
     );
     for (name, value) in env {
         validate_shell_name(&name)?;
@@ -351,7 +344,6 @@ pub fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<St
     Ok(result)
 }
 
-/// Quotes one value for inclusion in a single-quoted shell assignment.
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -436,7 +428,6 @@ impl<'a> SandboxRunner<'a> {
         command
     }
 
-    /// Executes the build and returns only tools whose wrappers were invoked.
     pub fn run(
         &self,
         paths: &SandboxPaths,
@@ -447,7 +438,7 @@ impl<'a> SandboxRunner<'a> {
         if !status.success() {
             return Err(BuildError::SandboxFailed(status));
         }
-        self.observed_tools(paths)
+        self.read_build_tools(paths)
     }
 
     /// Creates narrow observation wrappers for configured compilers and the
@@ -476,13 +467,7 @@ impl<'a> SandboxRunner<'a> {
         for (name, role, tool, driver, rustc) in [
             (&self.config.cc, "cc", &self.config.cc, true, false),
             (&self.config.cxx, "cxx", &self.config.cxx, true, false),
-            (
-                &self.config.linker,
-                "linker",
-                &self.config.linker,
-                false,
-                false,
-            ),
+            (&self.config.linker, "linker", &self.config.linker, false, false),
             (&self.config.rustc, "rustc", &self.config.rustc, false, true),
         ] {
             self.write_tool_wrapper(&directory.join(name), role, tool, driver, rustc)?;
@@ -518,8 +503,7 @@ impl<'a> SandboxRunner<'a> {
         Ok(())
     }
 
-    /// Reads and resolves the tool observations produced by a completed build.
-    pub fn observed_tools(
+    fn read_build_tools(
         &self,
         paths: &SandboxPaths,
     ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
@@ -531,14 +515,7 @@ impl<'a> SandboxRunner<'a> {
                     "malformed managed build-tool observation".into(),
                 ));
             };
-            let executable_path = Path::new(executable);
-            if !matches!(role, "cc" | "cxx" | "linker" | "rustc")
-                || executable.is_empty()
-                || !executable_path.is_absolute()
-                || executable_path
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir)
-            {
+            if !matches!(role, "cc" | "cxx" | "linker" | "rustc") || executable.is_empty() {
                 return Err(BuildError::InvalidSpec(
                     "unknown managed build-tool observation".into(),
                 ));
@@ -557,11 +534,7 @@ impl<'a> SandboxRunner<'a> {
                         "failed to probe observed build tool {executable}"
                     )));
                 }
-                let version_output = if output.stdout.is_empty() {
-                    String::from_utf8_lossy(&output.stderr)
-                } else {
-                    String::from_utf8_lossy(&output.stdout)
-                };
+                let version_output = String::from_utf8_lossy(&output.stdout);
                 let version = version_output
                     .lines()
                     .next()
@@ -596,6 +569,14 @@ impl<'a> SandboxRunner<'a> {
                 })
             })
             .collect()
+    }
+
+    /// Reads the attested tool log without executing a sandbox.
+    pub fn observed_tools(
+        &self,
+        paths: &SandboxPaths,
+    ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
+        self.read_build_tools(paths)
     }
 
     fn host_tool_path(

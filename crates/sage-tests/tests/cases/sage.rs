@@ -34,7 +34,7 @@ ignore_missing_binary=false
         )
         .unwrap();
 
-        stage_declarative_metadata(directory.path(), &metadata).unwrap();
+        stage_declarative_metadata(directory.path(), &metadata, "daemon", "daemon").unwrap();
         sage_sys::ServiceSpec::load(metadata.join("service.toml")).unwrap();
         sage_sys::TriggerSpec::load(metadata.join("triggers.toml")).unwrap();
     }
@@ -143,7 +143,7 @@ recipes=["app/recipe.toml"]
         let key = sage_core::PackageKey::new("main/system", "seed", "0");
         let version = sage_core::Version::new(0, "1", 1);
         assert!(matches!(
-            available.releases[&sage_core::PackageCoordinate::new(key, version)].location,
+            available.releases[&(key, version)].location,
             ReleaseLocation::Local(_)
         ));
     }

@@ -1,8 +1,6 @@
-//! Sage command-line entry point.
-
-use clap::Parser;
+use anyhow::Result;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    sage::execute(sage::Cli::parse()).await
+async fn main() -> Result<()> {
+    sage::run().await
 }

@@ -1,11 +1,14 @@
-//! Application services for the Sage package manager CLI.
+//! Main entry point for the Sage package manager CLI.
 //!
 //! Provides fast, pure CLI argument parsing based on `clap` derive,
 //! supporting package installation, atomic upgrades, source builds,
 //! repository index generation, and declarative system reconciliation.
 
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -151,19 +154,114 @@ pub enum QueryAction {
     },
 }
 
-mod build_ops;
-mod commands;
-mod package_model;
-mod package_ops;
-mod paths;
+pub async fn run() -> Result<()> {
+    let cli = Cli::parse();
 
-pub use build_ops::stage_declarative_metadata;
-pub use build_ops::{bootstrap_sources, mass_rebuild};
-pub use package_model::{
-    load_available_with_pool, AvailablePackages, ReleaseLocation, ReleaseSource,
-};
+    if cli.verbose {
+        tracing_subscriber::fmt::init();
+    }
 
-/// Executes one parsed Sage command.
-pub async fn execute(cli: Cli) -> anyhow::Result<()> {
-    commands::execute(cli).await
+    let read_only = matches!(
+        &cli.command,
+        Commands::Channel {
+            action: ChannelAction::List
+        } | Commands::Query { .. }
+    );
+    let lock_path = under_root(&cli.root, Path::new("/run/sage/operation.lock"));
+    let _lock = if cli.dry_run || read_only {
+        sage_core::HostLock::acquire_shared(lock_path)?
+    } else {
+        sage_core::HostLock::acquire_exclusive(lock_path)?
+    };
+    if !cli.dry_run && !read_only {
+        settle_journals(&cli.root)?;
+    }
+
+    match cli.command {
+        Commands::Install {
+            packages,
+            channel,
+            no_save: _,
+        } => {
+            apply_packages(&cli.root, &packages, channel.as_deref(), false, cli.dry_run).await?;
+        }
+        Commands::Remove { packages, channel } => {
+            remove_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run)?;
+        }
+        Commands::Upgrade {
+            packages,
+            channel,
+            sync,
+        } => {
+            if sync {
+                sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
+            }
+            upgrade_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run).await?;
+        }
+        Commands::Sync { channel } => {
+            sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
+        }
+        Commands::Rebuild { no_prune } => {
+            rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
+        }
+        Commands::Repo { action } => match action {
+            RepoAction::Index { dir, sign_key } => {
+                let key = sign_key.context("repo index requires --sign-key")?;
+                if cli.dry_run {
+                    println!("Would index packages in {}", dir.display());
+                } else {
+                    let artifacts = sage_repo::build_index(&dir, &dir, &key)?;
+                    println!(
+                        "Indexed {} packages into {}",
+                        artifacts.packages,
+                        artifacts.index.display()
+                    );
+                }
+            }
+        },
+        Commands::Build {
+            recipe_dir,
+            features,
+            no_default_features,
+        } => {
+            build_recipe(
+                &cli.root,
+                &recipe_dir,
+                &features,
+                !no_default_features,
+                cli.dry_run,
+                BuildInvocation::default(),
+            )
+            .await?;
+        }
+        Commands::MassRebuild {
+            recipe_root,
+            output,
+            jobs,
+        } => {
+            mass_rebuild(
+                &cli.root,
+                &recipe_root,
+                output.as_deref(),
+                jobs,
+                cli.dry_run,
+            )
+            .await?;
+        }
+        Commands::Bootstrap { plan, output, jobs } => {
+            bootstrap_sources(&cli.root, &plan, output.as_deref(), jobs, cli.dry_run).await?;
+        }
+        Commands::Channel { action } => match action {
+            ChannelAction::List => list_channels(&cli.root)?,
+        },
+        Commands::Toolchain { action } => match action {
+            ToolchainAction::Use { channel } => use_toolchain(&cli.root, &channel, cli.dry_run)?,
+        },
+        Commands::Query { action } => query_state(&cli.root, action)?,
+    }
+
+    Ok(())
 }
+
+include!("package_ops.rs");
+include!("build_ops.rs");

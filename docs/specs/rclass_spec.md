@@ -62,7 +62,7 @@ description = "OpenRC Service Generator Class"
 
 [service_generator]
 target_path = "/etc/init.d/${service.name}"
-mode = 0755
+mode = 493 # 0755
 
 template = """
 #!/usr/bin/openrc-run
@@ -88,24 +88,33 @@ description = "Systemd Service Generator Class"
 
 [service_generator]
 target_path = "/usr/lib/systemd/system/${service.name}.service"
-mode = 0644
+mode = 420 # 0644
+service_dependency_suffix = ".service"
 
 template = """
 [Unit]
 Description=${service.description}
 After=${service.after_space}
+Before=${service.before_space}
 
 [Service]
 Type=${service.type}
-ExecStart=${service.command_str}
+ExecStart=${service.command_quoted}
+ExecStop=${service.stop_command_quoted}
+ExecReload=${service.reload_command_quoted}
 User=${service.user}
 Group=${service.group}
 WorkingDirectory=${service.working_dir}
 Restart=${service.restart}
+PIDFile=${service.pid_file}
 
 [Install]
 WantedBy=multi-user.target
 """
+
+[service_generator.dependency_aliases]
+network = "network.target"
+syslog = "syslog.target"
 ```
 
 ### 示例 4: `rclass/init-loom.toml`
@@ -116,7 +125,7 @@ description = "Loom Service Generator Class"
 
 [service_generator]
 target_path = "/usr/lib/loom/services/${service.name}.toml"
-mode = 0644
+mode = 420 # 0644
 
 # 生成完成后触发全局拓扑校验命令 (Fail-Closed)
 validate_command = "/usr/lib/loom/loom validate --root ${SYSROOT}"
@@ -125,9 +134,13 @@ template = """
 name = "${service.name}"
 description = "${service.description}"
 exec = ${service.command_json}
+stop_exec = ${service.stop_command_json}
+reload_exec = ${service.reload_command_json}
 user = "${service.user}"
 group = "${service.group}"
 depends_on = ${service.after_json}
+before = ${service.before_json}
+runtime = ${service.runtime_json}
 """
 ```
 
@@ -144,14 +157,23 @@ depends_on = ${service.after_json}
 | `${service.command[0]}` | 服务执行可执行文件绝对路径 |
 | `${service.command[1:]}` | 传给可执行文件的命令行参数 |
 | `${service.command_str}` | 空格拼接的完整启动命令 |
+| `${service.command_quoted}` | 每个参数独立引用的完整启动命令 |
 | `${service.command_json}`| JSON 数组格式命令 `["/usr/sbin/sshd", "-D"]` |
+| `${service.stop_command_*}` / `${service.reload_command_*}` | 停止和重载命令的 `str`、`quoted`、`json` 形式 |
 | `${service.user}` / `${service.group}` | 运行用户与用户组 |
 | `${service.after_space}` | 空格分隔的依赖项（如 `network.target syslog.target`） |
 | `${service.after_json}` | JSON 数组格式依赖 `["net", "syslog"]` |
+| `${service.before_space}` / `${service.before_json}` | 服务先后约束；由 init rclass 映射为原生名称 |
 | `${service.working_dir}` | 工作目录 |
 | `${service.pid_file}` | PID 文件路径 |
 | `${service.restart}` | 重启策略 (`always`, `on-failure`, `no`) |
+| `${service.runtime}` / `${service.runtime_json}` | 可选运行时约束 |
 | `${SYSROOT}` | 目标系统的根文件系统挂载点 |
+
+`dependency_aliases` and `service_dependency_suffix` belong to the init rclass,
+not to package service declarations. This keeps package dependencies expressed
+as init-independent logical names while allowing each provider to render its
+native identifiers.
 
 ## 5. Standard build-class library
 

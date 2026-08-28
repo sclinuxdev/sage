@@ -159,6 +159,22 @@ manifest and independently verifies all five archives before any extraction begi
 Files in the recipe's `patches/` directory are copied into the sandbox and applied
 with `patch -p1` in bytewise filename order during `src_prepare`.
 
+Independently published raw inputs such as upstream patch-series files use
+`kind = "file"`. They require a lowercase SHA-256 and a non-root `destination`,
+are copied without extraction, and retain declaration order:
+
+```toml
+[[sources]]
+kind = "file"
+url = "https://example.org/project/fix-001.patch"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+destination = ".source-patches/001"
+```
+
+The standard autotools class applies `.source-patches/*` bytewise and exposes
+`source_patch_strip` for upstream series that do not use the repository's fixed
+`patches/` convention.
+
 Git inputs use the same ordered source array but replace archive integrity with an
 exact full object ID:
 
@@ -219,8 +235,36 @@ database instead of being rebuilt as untracked host mutations.
 
 ### 3.6 Declarative installation lifecycle
 
-Recipes may declare system accounts with `[[sysusers]]`; the builder emits a
-deterministic `usr/lib/sysusers.d/<package>.conf`. Optional `service.toml` and
+Source-free data and policy packages use `[install]` entries instead of a
+`custom` build class. All paths are relative to DESTDIR, duplicate or escaping
+paths are rejected, and numeric modes use TOML decimal notation:
+
+```toml
+[[install.directories]]
+path = "tmp"
+mode = 1023 # 01777
+
+[[install.files]]
+path = "usr/lib/os-release"
+content = "NAME=Example\n"
+mode = 420 # 0644
+
+[[install.symlinks]]
+path = "etc/os-release"
+target = "../usr/lib/os-release"
+
+[[install.copies]]
+source = "policy"
+path = "usr/share/example/policy"
+recursive = true
+```
+
+Recipes with no upstream source are valid when their payload is fully
+declarative, including pure meta-packages whose only state is dependencies.
+
+Recipes may declare system accounts with `[[sysusers]]`; Sage stores the
+declaration as package metadata and reconciles `/etc/passwd`, `/etc/group`, and
+`/etc/shadow` directly without calling an init-system utility. Optional `service.toml` and
 `triggers.toml` files beside `recipe.toml` are schema-validated and copied into
 the main package's `.METADATA` section. Package-specific triggers use the same
 single-trigger schema as files under `/usr/share/sage/triggers`.

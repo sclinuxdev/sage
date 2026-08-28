@@ -1,13 +1,4 @@
-//! Payload carving, ELF inspection, and kernel-module validation.
-
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use crate::recipe::RecipeSpec;
-use crate::BuildError;
-
+/// One mutually exclusive package tree carved from a shared DESTDIR.
 pub struct PackageStagingArea {
     pub name: String,
     root: tempfile::TempDir,

@@ -1,15 +1,6 @@
-//! Recipe, package, version, and bootstrap-plan models.
-
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use crate::sources::validate_source_destination;
-use crate::{source_archive_name, validate_schema, BuildError};
-
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     #[serde(default)]
     pub kind: SourceKind,
@@ -37,6 +28,7 @@ pub enum SourceKind {
     #[default]
     Archive,
     Git,
+    File,
 }
 
 fn default_source_destination() -> PathBuf {
@@ -48,6 +40,7 @@ pub type RecipePackage = sage_core::Package;
 
 /// Ordered glob claims used to partition one DESTDIR.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadSpec {
     #[serde(default)]
     pub files: Vec<String>,
@@ -58,6 +51,7 @@ pub struct PayloadSpec {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeBuild {
     #[serde(default)]
     pub inherit: Vec<String>,
@@ -84,6 +78,7 @@ pub struct RecipeBuild {
 /// One opt-in build feature. Rules are folded before dependency solving or
 /// runner generation, keeping feature checks out of all execution hot paths.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureSpec {
     #[serde(default)]
     pub default: bool,
@@ -111,6 +106,7 @@ pub struct EffectiveFeatures {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubpackageSpec {
     pub name: String,
     pub description: Option<String>,
@@ -123,9 +119,13 @@ pub struct SubpackageSpec {
     pub payload: PayloadSpec,
 }
 
-/// One declarative account emitted in systemd-sysusers compatible syntax.
+/// One declarative account staged as Sage-owned package metadata.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SysuserSpec {
+    /// Output package that owns this declaration; empty selects the main one.
+    #[serde(default)]
+    pub package: String,
     #[serde(rename = "type")]
     pub kind: String,
     pub name: String,
@@ -138,6 +138,76 @@ pub struct SysuserSpec {
     pub shell: String,
 }
 
+/// One command-name provider managed transactionally by Sage.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlternativeSpec {
+    /// Output package that carries this declaration; empty selects the main one.
+    #[serde(default)]
+    pub package: String,
+    pub link: PathBuf,
+    pub target: PathBuf,
+    pub priority: i32,
+}
+
+/// Declarative filesystem payload for source-free data and policy packages.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallSpec {
+    #[serde(default)]
+    pub directories: Vec<InstallDirectory>,
+    #[serde(default)]
+    pub files: Vec<InstallFile>,
+    #[serde(default)]
+    pub symlinks: Vec<InstallSymlink>,
+    /// Source-tree files copied after the sandbox build without shell hooks.
+    #[serde(default)]
+    pub copies: Vec<InstallCopy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallDirectory {
+    pub path: PathBuf,
+    #[serde(default = "default_directory_mode")]
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallFile {
+    pub path: PathBuf,
+    pub content: String,
+    #[serde(default = "default_file_mode")]
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallSymlink {
+    pub path: PathBuf,
+    pub target: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallCopy {
+    /// Safe path below the extracted source root.
+    pub source: PathBuf,
+    /// Safe package path below DESTDIR.
+    pub path: PathBuf,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+fn default_directory_mode() -> u32 {
+    0o755
+}
+
+fn default_file_mode() -> u32 {
+    0o644
+}
+
 fn default_home() -> String {
     "/".into()
 }
@@ -148,6 +218,7 @@ fn default_shell() -> String {
 
 /// Complete single-build, multiple-output recipe.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeSpec {
     pub schema_version: u32,
     pub package: RecipePackage,
@@ -161,6 +232,10 @@ pub struct RecipeSpec {
     pub subpackages: Vec<SubpackageSpec>,
     #[serde(default)]
     pub sysusers: Vec<SysuserSpec>,
+    #[serde(default)]
+    pub alternatives: Vec<AlternativeSpec>,
+    #[serde(default)]
+    pub install: InstallSpec,
     #[serde(default)]
     pub features: BTreeMap<String, FeatureSpec>,
 }
@@ -256,12 +331,25 @@ impl BuildGraph {
             })
             .collect::<Result<_, _>>()?;
         recipes.sort();
-        recipes
-            .into_iter()
-            .map(|path| {
-                let recipe = RecipeSpec::load(&path)?;
-                BuildUnit::from_recipe(path, &recipe)
-            })
+        let mut latest = BTreeMap::new();
+        for path in recipes {
+            let recipe = RecipeSpec::load(&path)?;
+            let key = (recipe.package.name.clone(), recipe.package.arch.clone());
+            let version = sage_core::Version::new(
+                recipe.package.epoch,
+                recipe.package.version.clone(),
+                recipe.package.release,
+            );
+            let replace = latest
+                .get(&key)
+                .is_none_or(|(selected, _, _)| version > *selected);
+            if replace {
+                latest.insert(key, (version, path, recipe));
+            }
+        }
+        latest
+            .into_values()
+            .map(|(_, path, recipe)| BuildUnit::from_recipe(path, &recipe))
             .collect()
     }
 
@@ -399,11 +487,6 @@ impl RecipeSpec {
                 "use either [source] or [[sources]], not both".into(),
             ));
         }
-        if recipe.source.is_none() && recipe.sources.is_empty() {
-            return Err(BuildError::InvalidSpec(
-                "at least one source is required".into(),
-            ));
-        }
         for source in recipe.source_inputs() {
             validate_source_destination(&source.destination)?;
             source.validate()?;
@@ -411,6 +494,31 @@ impl RecipeSpec {
         for user in &recipe.sysusers {
             user.validate()?;
         }
+        for alternative in &recipe.alternatives {
+            if (!alternative.package.is_empty() && !valid_package_name(&alternative.package))
+                || alternative.link.as_os_str().is_empty()
+                || alternative.link.is_absolute()
+                || alternative.target.as_os_str().is_empty()
+                || alternative.target.is_absolute()
+                || alternative.link.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+                || alternative.target.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+            {
+                return Err(BuildError::InvalidSpec(
+                    "alternatives require safe relative package, link, and target values".into(),
+                ));
+            }
+        }
+        recipe.install.validate()?;
         if recipe.features.keys().any(|name| !valid_feature_name(name)) {
             return Err(BuildError::InvalidSpec(
                 "feature names must use lowercase ASCII letters, digits, '_' or '-'".into(),
@@ -423,6 +531,22 @@ impl RecipeSpec {
         }) {
             return Err(BuildError::InvalidSpec(
                 "subpackage names must be unique".into(),
+            ));
+        }
+        if recipe
+            .sysusers
+            .iter()
+            .any(|account| !account.package.is_empty() && !names.contains(account.package.as_str()))
+        {
+            return Err(BuildError::InvalidSpec(
+                "sysuser owner must name an output package".into(),
+            ));
+        }
+        if recipe.alternatives.iter().any(|alternative| {
+            !alternative.package.is_empty() && !names.contains(alternative.package.as_str())
+        }) {
+            return Err(BuildError::InvalidSpec(
+                "alternative owner must name an output package".into(),
             ));
         }
         for subpackage in &recipe.subpackages {
@@ -443,15 +567,20 @@ impl RecipeSpec {
     pub fn source_manifest(&self) -> String {
         let mut manifest = String::new();
         for (index, source) in self.source_inputs().enumerate() {
-            let strip = if source.kind == SourceKind::Git {
+            let strip = if matches!(source.kind, SourceKind::Git | SourceKind::File) {
                 0
             } else {
                 source
                     .strip_components
                     .unwrap_or(if index == 0 { 1 } else { 0 })
             };
+            let kind = match source.kind {
+                SourceKind::Archive => "archive",
+                SourceKind::Git => "tree",
+                SourceKind::File => "file",
+            };
             manifest.push_str(&format!(
-                "{}\t{strip}\t{}\n",
+                "{}\t{kind}\t{strip}\t{}\n",
                 source_archive_name(index),
                 source.destination.display()
             ));
@@ -498,7 +627,7 @@ impl RecipeSpec {
             result
                 .target_dependencies
                 .extend(rule.target_dependencies.clone());
-            result.args.extend(rule.args.clone());
+            merge_build_arguments(&mut result.args, &rule.args);
             result.env.extend(rule.env.clone());
         }
         result.dependencies.sort();
@@ -511,28 +640,212 @@ impl RecipeSpec {
     }
 }
 
-fn valid_feature_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+impl InstallSpec {
+    fn validate(&self) -> Result<(), BuildError> {
+        let mut paths = BTreeSet::new();
+        for (path, mode) in self
+            .directories
+            .iter()
+            .map(|entry| (&entry.path, entry.mode))
+            .chain(self.files.iter().map(|entry| (&entry.path, entry.mode)))
+        {
+            validate_install_path(path)?;
+            if mode > 0o7777 || !paths.insert(path) {
+                return Err(BuildError::InvalidSpec(format!(
+                    "duplicate path or invalid mode in declarative install: {}",
+                    path.display()
+                )));
+            }
+        }
+        for entry in &self.symlinks {
+            validate_install_path(&entry.path)?;
+            if entry.target.as_os_str().is_empty()
+                || entry.target.to_string_lossy().contains(['\n', '\r', '\0'])
+                || !paths.insert(&entry.path)
+            {
+                return Err(BuildError::InvalidSpec(format!(
+                    "invalid declarative symlink {}",
+                    entry.path.display()
+                )));
+            }
+        }
+        for entry in &self.copies {
+            validate_install_path(&entry.source)?;
+            validate_install_path(&entry.path)?;
+            if !paths.insert(&entry.path) {
+                return Err(BuildError::InvalidSpec(format!(
+                    "duplicate declarative copy destination {}",
+                    entry.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_install_path(path: &Path) -> Result<(), BuildError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
         })
+    {
+        return Err(BuildError::InvalidSpec(format!(
+            "declarative install path must be safe and relative: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Materializes a validated declarative payload into DESTDIR without invoking
+/// a shell or allowing a recipe path to escape the staging root.
+pub fn stage_declarative_install(
+    root: &Path,
+    source_root: &Path,
+    recipe: &RecipeSpec,
+) -> Result<(), BuildError> {
+    recipe.install.validate()?;
+    for entry in &recipe.install.directories {
+        let path = root.join(&entry.path);
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
+    }
+    for entry in &recipe.install.files {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, entry.content.as_bytes())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
+    }
+    for entry in &recipe.install.symlinks {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::os::unix::fs::symlink(&entry.target, path)?;
+    }
+    for entry in &recipe.install.copies {
+        let source = source_root.join(&entry.source);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            BuildError::InvalidSpec(format!(
+                "declarative copy source {} is unavailable: {error}",
+                entry.source.display()
+            ))
+        })?;
+        if metadata.is_dir() {
+            if !entry.recursive {
+                return Err(BuildError::InvalidSpec(format!(
+                    "declarative directory copy {} requires recursive = true",
+                    entry.source.display()
+                )));
+            }
+            for child in walkdir::WalkDir::new(&source).follow_links(false) {
+                let child = child?;
+                let relative = child.path().strip_prefix(&source).map_err(|_| {
+                    BuildError::InvalidSpec("declarative copy escaped its source root".into())
+                })?;
+                copy_install_entry(child.path(), &root.join(&entry.path).join(relative))?;
+            }
+        } else {
+            if entry.recursive {
+                return Err(BuildError::InvalidSpec(format!(
+                    "recursive declarative copy source {} is not a directory",
+                    entry.source.display()
+                )));
+            }
+            copy_install_entry(&source, &root.join(&entry.path))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_install_entry(source: &Path, target: &Path) -> Result<(), BuildError> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(target)?;
+        fs::set_permissions(target, metadata.permissions())?;
+    } else {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if metadata.file_type().is_symlink() {
+            let link = fs::read_link(source)?;
+            if link.is_absolute()
+                || link.components().any(|component| {
+                    matches!(component, std::path::Component::ParentDir)
+                })
+            {
+                return Err(BuildError::InvalidSpec(format!(
+                    "unsafe symlink in declarative copy: {} -> {}",
+                    source.display(),
+                    link.display()
+                )));
+            }
+            std::os::unix::fs::symlink(link, target)?;
+        } else if metadata.is_file() {
+            fs::copy(source, target)?;
+            fs::set_permissions(target, metadata.permissions())?;
+        } else {
+            return Err(BuildError::InvalidSpec(format!(
+                "unsupported declarative copy input {}",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Folds rclass-style free-form argument channels without allowing one feature
+/// to erase arguments selected by the recipe or an earlier feature. Keys ending
+/// in `_args` are ordered command fragments and therefore concatenate; scalar
+/// keys retain ordinary last-writer-wins semantics.
+pub fn merge_build_arguments(
+    target: &mut BTreeMap<String, String>,
+    additions: &BTreeMap<String, String>,
+) {
+    for (key, value) in additions {
+        if key.ends_with("_args") && !value.is_empty() {
+            target
+                .entry(key.clone())
+                .and_modify(|current| {
+                    if !current.is_empty() {
+                        current.push(' ');
+                    }
+                    current.push_str(value);
+                })
+                .or_insert_with(|| value.clone());
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 impl SysuserSpec {
     fn validate(&self) -> Result<(), BuildError> {
-        if !matches!(self.kind.as_str(), "user" | "group")
+        if (!self.package.is_empty() && !valid_package_name(&self.package))
+            || !matches!(self.kind.as_str(), "user" | "group")
             || self.name.is_empty()
             || !self
                 .name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            || self.description.contains(['\n', '\r', '\0', '"'])
+            || self.description.contains(['\n', '\r', '\0', '"', ':'])
             || !Path::new(&self.home).is_absolute()
             || !Path::new(&self.shell).is_absolute()
             || [&self.home, &self.shell].iter().any(|value| {
                 value
                     .bytes()
-                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\'))
+                    .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b':'))
             })
         {
             return Err(BuildError::InvalidSpec(format!(
@@ -558,32 +871,5 @@ fn reject_lifecycle_scripts(recipe_dir: &Path) -> Result<(), BuildError> {
             "interactive lifecycle script '{name}' is not supported; use declarative metadata"
         )));
     }
-    Ok(())
-}
-
-/// Writes all recipe accounts into one deterministic sysusers payload file.
-pub fn stage_sysusers(root: &Path, recipe: &RecipeSpec) -> Result<(), BuildError> {
-    if recipe.sysusers.is_empty() {
-        return Ok(());
-    }
-    let directory = root.join("usr/lib/sysusers.d");
-    fs::create_dir_all(&directory)?;
-    let mut output = String::new();
-    for account in &recipe.sysusers {
-        let id = account.id.map_or_else(|| "-".into(), |id| id.to_string());
-        if account.kind == "group" {
-            output.push_str(&format!("g {} {id}\n", account.name));
-        } else {
-            let description = account.description.replace('\\', "\\\\");
-            output.push_str(&format!(
-                "u {} {id} \"{}\" {} {}\n",
-                account.name, description, account.home, account.shell
-            ));
-        }
-    }
-    fs::write(
-        directory.join(format!("{}.conf", recipe.package.name)),
-        output,
-    )?;
     Ok(())
 }

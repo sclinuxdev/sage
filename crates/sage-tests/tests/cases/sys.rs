@@ -43,7 +43,7 @@ mod sys_tests {
             let trigger = TriggerSpec::load(file.path()).unwrap();
             assert!(names.insert(trigger.name));
         }
-        assert!(names.len() >= 9);
+        assert!(names.len() >= 8);
     }
 
     #[test]
@@ -53,14 +53,20 @@ mod sys_tests {
             target_path_template: "/etc/init/${service.name}".into(),
             mode: 0o755,
             template: "exec ${service.command_json}\n".into(),
+            dependency_aliases: BTreeMap::new(),
+            service_dependency_suffix: String::new(),
+            supported_types: vec![],
+            compile_command: vec![],
+            managed_directory: None,
             validate_command: None,
             enable_command: None,
             disable_command: None,
         };
         let service = ServiceSpec {
+            package: String::new(),
             name: "demo".into(),
             description: "demo".into(),
-            command: vec!["/bin/demo".into(), "--run".into()],
+            command: vec!["/usr/bin/demo".into(), "--run".into()],
             stop_command: vec![],
             reload_command: vec![],
             user: "root".into(),
@@ -76,7 +82,7 @@ mod sys_tests {
         let path = generator.render_service(&service, root.path()).unwrap();
         assert_eq!(
             fs::read_to_string(path).unwrap(),
-            "exec [\"/bin/demo\",\"--run\"]\n"
+            "exec [\"/usr/bin/demo\",\"--run\"]\n"
         );
     }
 
@@ -86,14 +92,20 @@ mod sys_tests {
             target_path_template: "../../etc/passwd".into(),
             mode: 0o755,
             template: "service".into(),
+            dependency_aliases: BTreeMap::new(),
+            service_dependency_suffix: String::new(),
+            supported_types: vec![],
+            compile_command: vec![],
+            managed_directory: None,
             validate_command: None,
             enable_command: None,
             disable_command: None,
         };
         let service = ServiceSpec {
+            package: String::new(),
             name: "demo".into(),
             description: "demo".into(),
-            command: vec!["/bin/demo".into()],
+            command: vec!["/usr/bin/demo".into()],
             stop_command: vec![],
             reload_command: vec![],
             user: "root".into(),
@@ -171,23 +183,23 @@ mod sys_tests {
         let recorder = root.path().join("usr/bin/record-root");
         fs::write(
             &recorder,
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$SAGE_SYSROOT/sysusers-args\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$SAGE_SYSROOT\" > \"$SAGE_SYSROOT/trigger-root\"\n",
         )
         .unwrap();
         fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
         let mut trigger =
-            TriggerSpec::parse(include_bytes!("../../../../triggers/sysusers.toml")).unwrap();
+            TriggerSpec::parse(include_bytes!("../../../../triggers/depmod.toml")).unwrap();
         trigger.exec[0] = "/usr/bin/record-root".into();
 
         TriggerEngine::execute_triggers(
             &[trigger],
-            &[PathBuf::from("usr/lib/sysusers.d/daemon.conf")],
+            &[PathBuf::from("usr/lib/modules/6.12/a.ko")],
             root.path(),
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(root.path().join("sysusers-args")).unwrap(),
-            format!("--root={}\n", root.path().display())
+            fs::read_to_string(root.path().join("trigger-root")).unwrap(),
+            format!("{}\n", root.path().display())
         );
     }
 

@@ -1,8 +1,21 @@
-//! Hermetic build descriptions, execution, and package payload preparation.
+//! Declarative rclass execution, Bubblewrap isolation, payload carving, and ELF scans.
 
-use std::path::PathBuf;
-use std::process::ExitStatus;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use thiserror::Error;
+
+const PHASE_ORDER: &[&str] = &[
+    "src_unpack",
+    "src_prepare",
+    "src_configure",
+    "src_compile",
+    "src_test",
+    "src_install",
+];
 
 /// Build description or execution failures.
 #[derive(Debug, Error)]
@@ -38,20 +51,7 @@ pub enum BuildError {
     },
 }
 
-pub(crate) fn validate_schema(version: u32) -> Result<(), BuildError> {
-    if version == sage_core::SCHEMA_VERSION {
-        Ok(())
-    } else {
-        Err(BuildError::Schema(version))
-    }
-}
-
-mod execution;
-mod payload;
-mod recipe;
-mod sources;
-
-pub use execution::*;
-pub use payload::*;
-pub use recipe::*;
-pub use sources::*;
+include!("recipe.rs");
+include!("sources.rs");
+include!("execution.rs");
+include!("payload.rs");

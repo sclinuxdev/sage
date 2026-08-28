@@ -1,101 +1,4 @@
-//! Package installation, removal, upgrade, reconciliation, and state queries.
-
-use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use crate::package_model::{
-    canonical_channel, load_available, obtain_release_archive, AvailablePackages,
-};
-use crate::paths::under_root;
-use crate::QueryAction;
-
-pub(crate) struct PackageManager<'a> {
-    root: &'a Path,
-    dry_run: bool,
-}
-
-impl<'a> PackageManager<'a> {
-    pub(crate) fn new(root: &'a Path, dry_run: bool) -> Self {
-        Self { root, dry_run }
-    }
-
-    pub(crate) fn settle_journals(&self) -> Result<()> {
-        settle_journals(self.root)
-    }
-
-    pub(crate) fn is_dry_run(&self) -> bool {
-        self.dry_run
-    }
-
-    pub(crate) async fn install(
-        &self,
-        names: &[String],
-        channel: Option<&str>,
-        _no_save: bool,
-    ) -> Result<()> {
-        apply_packages(self.root, names, channel, false, self.dry_run).await
-    }
-
-    pub(crate) fn remove(&self, names: &[String], channel: Option<&str>) -> Result<()> {
-        remove_packages(self.root, names, channel, self.dry_run)
-    }
-
-    pub(crate) async fn upgrade(&self, names: &[String], channel: Option<&str>) -> Result<()> {
-        upgrade_packages(self.root, names, channel, self.dry_run).await
-    }
-
-    pub(crate) async fn rebuild(&self, no_prune: bool) -> Result<()> {
-        rebuild_system(self.root, no_prune, self.dry_run).await
-    }
-
-    pub(crate) async fn sync_channels(&self, selected: Option<&str>) -> Result<()> {
-        sync_channels(self.root, selected, self.dry_run).await
-    }
-
-    pub(crate) fn list_channels(&self) -> Result<()> {
-        list_channels(self.root)
-    }
-
-    pub(crate) fn use_toolchain(&self, channel: &str) -> Result<()> {
-        use_toolchain(self.root, channel, self.dry_run)
-    }
-
-    pub(crate) fn query(&self, action: QueryAction) -> Result<()> {
-        query_state(self.root, action)
-    }
-}
-
-fn settle_journals(root: &Path) -> Result<()> {
-    let path = under_root(root, Path::new("/var/lib/sage"));
-    if !path.exists() {
-        return Ok(());
-    }
-    let database = sage_db::SageDatabase::open(path)?;
-    for journal in database.pending_journals()? {
-        let present = journal
-            .affected_packages
-            .iter()
-            .map(|key| database.package(key))
-            .collect::<Result<Vec<_>, _>>()?;
-        let complete = match journal.stage.as_str() {
-            "publish" => present.iter().all(Option::is_some),
-            "remove" => present.iter().all(Option::is_none),
-            _ => false,
-        };
-        if complete {
-            database.finish_journal(&journal.op_id)?;
-            eprintln!("Recovered completed operation {}", journal.op_id);
-        } else {
-            eprintln!(
-                "Resuming convergence with unfinished operation {} ({})",
-                journal.op_id, journal.stage
-            );
-        }
-    }
-    Ok(())
-}
+pub use sage_repo::{ReleaseLocation, ReleaseSource};
 
 async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/channels.toml"));
@@ -137,6 +40,187 @@ async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Re
     }
     Ok(())
 }
+fn under_root(root: &Path, path: &Path) -> PathBuf {
+    root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+fn alternative_declaration_path(key: &sage_core::PackageKey) -> PathBuf {
+    let digest = hex::encode(Sha256::digest(key.canonical_id().as_bytes()));
+    PathBuf::from("usr/share/sage/alternatives").join(format!("{digest}.toml"))
+}
+
+fn sysusers_declaration_path(key: &sage_core::PackageKey) -> PathBuf {
+    let digest = hex::encode(Sha256::digest(key.canonical_id().as_bytes()));
+    PathBuf::from("usr/share/sage/sysusers").join(format!("{digest}.toml"))
+}
+
+fn settle_journals(root: &Path) -> Result<()> {
+    let path = under_root(root, Path::new("/var/lib/sage"));
+    if !path.exists() {
+        return Ok(());
+    }
+    let database = sage_db::SageDatabase::open(path)?;
+    for journal in database.pending_journals()? {
+        let present = journal
+            .affected_packages
+            .iter()
+            .map(|key| database.package(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let complete = match journal.stage.as_str() {
+            "publish" => present.iter().all(Option::is_some),
+            "remove" => present.iter().all(Option::is_none),
+            _ => false,
+        };
+        if complete {
+            database.finish_journal(&journal.op_id)?;
+            eprintln!("Recovered completed operation {}", journal.op_id);
+        } else {
+            eprintln!(
+                "Resuming convergence with unfinished operation {} ({})",
+                journal.op_id, journal.stage
+            );
+        }
+    }
+    Ok(())
+}
+
+pub struct AvailablePackages {
+    pub universe: sage_solver::PackageUniverse,
+    pub releases: BTreeMap<(sage_core::PackageKey, sage_core::Version), ReleaseSource>,
+    pub aliases: BTreeMap<String, String>,
+}
+
+fn load_available(root: &Path) -> Result<AvailablePackages> {
+    load_available_for_arch(root, None)
+}
+
+fn load_available_for_arch(root: &Path, architecture: Option<&str>) -> Result<AvailablePackages> {
+    load_available_with_pool(root, architecture, None)
+}
+
+pub fn load_available_with_pool(
+    root: &Path,
+    architecture: Option<&str>,
+    local_pool: Option<&Path>,
+) -> Result<AvailablePackages> {
+    let config =
+        sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
+    let cache = under_root(root, Path::new("/var/cache/sage/channels"));
+    let mut universe = sage_solver::PackageUniverse::default();
+    let mut releases = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    let mut target_roots = BTreeMap::new();
+    for (channel_name, channel) in config.channels {
+        if !channel.enabled {
+            continue;
+        }
+        for (sub_name, subchannel) in &channel.subchannels {
+            if !subchannel.enabled {
+                continue;
+            }
+            let alias = subchannel.alias.as_deref().unwrap_or(sub_name);
+            let canonical = format!("{channel_name}/{alias}");
+            let index_path = cache.join(&channel_name).join(alias).join("index.mdb");
+            if !index_path.exists() {
+                continue;
+            }
+            aliases.insert(alias.into(), canonical.clone());
+            aliases.insert(canonical.clone(), canonical.clone());
+            target_roots.insert(canonical.clone(), subchannel.target_root.clone());
+            let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
+            for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
+                if architecture.is_some_and(|wanted| {
+                    release.package.arch != wanted
+                        && release.package.arch != "any"
+                        && release.package.arch != "noarch"
+                }) {
+                    continue;
+                }
+                let coordinate = release.coordinate_for_channel(&canonical);
+                universe.insert(release.package.for_channel(&canonical));
+                releases.insert(
+                    (coordinate.key, coordinate.version),
+                    ReleaseSource {
+                        release,
+                        location: ReleaseLocation::Remote(url.clone()),
+                        target_root: subchannel.target_root.clone(),
+                    },
+                );
+            }
+        }
+    }
+    if let Some(pool) = local_pool.filter(|pool| pool.exists()) {
+        let mut packages: Vec<_> = std::fs::read_dir(pool)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+            })
+            .collect();
+        packages.sort();
+        for path in packages {
+            let inspection = sage_archive::inspect_package(&path)?;
+            if architecture.is_some_and(|wanted| {
+                inspection.manifest.arch != wanted
+                    && inspection.manifest.arch != "any"
+                    && inspection.manifest.arch != "noarch"
+            }) {
+                continue;
+            }
+            let canonical = aliases
+                .get(&inspection.manifest.channel)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if inspection.manifest.channel.contains('/') {
+                        inspection.manifest.channel.clone()
+                    } else {
+                        format!("main/{}", inspection.manifest.channel)
+                    }
+                });
+            aliases
+                .entry(inspection.manifest.channel.clone())
+                .or_insert_with(|| canonical.clone());
+            aliases
+                .entry(canonical.clone())
+                .or_insert_with(|| canonical.clone());
+            let package = inspection.manifest.for_channel(&canonical);
+            let coordinate = package.coordinate();
+            universe.insert(package);
+            releases.insert(
+                (coordinate.key, coordinate.version),
+                ReleaseSource {
+                    release: sage_repo::IndexedRelease {
+                        package: inspection.manifest,
+                        archive: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        sha256: String::new(),
+                    },
+                    location: ReleaseLocation::Local(path),
+                    target_root: target_roots
+                        .get(&canonical)
+                        .cloned()
+                        .unwrap_or_else(|| PathBuf::from("/")),
+                },
+            );
+        }
+    }
+    Ok(AvailablePackages {
+        universe,
+        releases,
+        aliases,
+    })
+}
+
+fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
+    let selected = selected.unwrap_or("system");
+    available
+        .aliases
+        .get(selected)
+        .cloned()
+        .with_context(|| format!("channel '{selected}' has no synchronized index"))
+}
 
 async fn apply_packages(
     root: &Path,
@@ -171,19 +255,18 @@ async fn apply_packages(
         .collect();
     let changes: Vec<_> = solution
         .into_iter()
-        .map(|(key, version)| sage_core::PackageCoordinate::new(key, version))
-        .filter(|coordinate| current.get(&coordinate.key) != Some(&coordinate.version))
+        .filter(|(key, version)| current.get(key) != Some(version))
         .collect();
-    for coordinate in &changes {
+    for (key, version) in &changes {
         println!(
             "{} {} {}",
-            if current.contains_key(&coordinate.key) {
+            if current.contains_key(key) {
                 "Upgrade"
             } else {
                 "Install"
             },
-            coordinate.key,
-            coordinate.version
+            key,
+            version
         );
     }
     if dry_run || changes.is_empty() {
@@ -197,7 +280,7 @@ async fn publish_packages(
     root: &Path,
     database: &sage_db::SageDatabase,
     available: &AvailablePackages,
-    changes: &[sage_core::PackageCoordinate],
+    changes: &[(sage_core::PackageKey, sage_core::Version)],
 ) -> Result<()> {
     let timestamp = unix_timestamp()?;
     let op_id = format!("install-{}-{timestamp}", std::process::id());
@@ -205,22 +288,18 @@ async fn publish_packages(
     database.write_journal(&sage_db::JournalRecord {
         op_id: op_id.clone(),
         stage: "publish".into(),
-        affected_packages: changes
-            .iter()
-            .map(|coordinate| coordinate.key.clone())
-            .collect(),
+        affected_packages: changes.iter().map(|(key, _)| key.clone()).collect(),
         journal_sha256: digest,
         timestamp,
     })?;
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
+    let previous_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
     let mut modified = Vec::new();
-    for coordinate in changes {
-        let key = &coordinate.key;
-        let version = &coordinate.version;
+    for (key, version) in changes {
         let source = available
             .releases
-            .get(coordinate)
+            .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for {key} {version}"))?;
         let archive = obtain_release_archive(&engine, &package_cache, source).await?;
         let inspection = sage_archive::inspect_package(&archive)?;
@@ -235,21 +314,64 @@ async fn publish_packages(
             .iter()
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
-        let service = if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
-            Some((sage_sys::ServiceSpec::parse(bytes)?, bytes.clone()))
+        let services = if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
+            sage_sys::ServiceDocument::parse(bytes)?
+                .into_services()
+                .into_iter()
+                .map(|service| {
+                    let bytes = toml::to_string_pretty(&sage_sys::ServiceDocument {
+                        schema_version: sage_core::SCHEMA_VERSION,
+                        service: Some(service.clone()),
+                        services: Vec::new(),
+                    })?
+                    .into_bytes();
+                    Ok((service, bytes))
+                })
+                .collect::<Result<Vec<_>>>()?
         } else {
-            None
+            Vec::new()
         };
         let trigger = if let Some(bytes) = inspection.optional.get(".METADATA/triggers.toml") {
             Some((sage_sys::TriggerSpec::parse(bytes)?, bytes.clone()))
         } else {
             None
         };
-        if let Some((service, _)) = &service {
+        let alternatives =
+            if let Some(bytes) = inspection.optional.get(".METADATA/alternatives.toml") {
+                let mut document = sage_sys::AlternativesDocument::parse(bytes)?;
+                document.package.clone_from(key);
+                let bytes = toml::to_string_pretty(&document)?.into_bytes();
+                Some((document, bytes))
+            } else {
+                None
+            };
+        let sysusers = if let Some(bytes) = inspection.optional.get(".METADATA/sysusers.toml") {
+            let mut document = sage_sys::SysusersDocument::parse(bytes)?;
+            document.package.clone_from(key);
+            let bytes = toml::to_string_pretty(&document)?.into_bytes();
+            Some((document, bytes))
+        } else {
+            None
+        };
+        for (service, _) in &services {
             ownership.push(format!("usr/share/sage/services/{}.toml", service.name));
         }
         if let Some((trigger, _)) = &trigger {
             ownership.push(format!("usr/share/sage/triggers/{}.toml", trigger.name));
+        }
+        if alternatives.is_some() {
+            ownership.push(
+                alternative_declaration_path(key)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if sysusers.is_some() {
+            ownership.push(
+                sysusers_declaration_path(key)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
         for path in &ownership {
             let owners = database.owners(path)?;
@@ -268,7 +390,7 @@ async fn publish_packages(
             &inspection.files,
             &previous,
         )?;
-        if let Some((service, bytes)) = service {
+        for (service, bytes) in services {
             write_atomic_under_root(
                 root,
                 &Path::new("usr/share/sage/services").join(format!("{}.toml", service.name)),
@@ -281,6 +403,12 @@ async fn publish_packages(
                 &Path::new("usr/share/sage/triggers").join(format!("{}.toml", trigger.name)),
                 &bytes,
             )?;
+        }
+        if let Some((_, bytes)) = alternatives {
+            write_atomic_under_root(root, &alternative_declaration_path(key), &bytes)?;
+        }
+        if let Some((_, bytes)) = sysusers {
+            write_atomic_under_root(root, &sysusers_declaration_path(key), &bytes)?;
         }
         modified.extend(ownership.iter().map(PathBuf::from));
         let config_hashes = inspection
@@ -326,6 +454,14 @@ async fn publish_packages(
             eprintln!("Configuration update requires review: {}", path.display());
         }
     }
+    let current_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
+    sage_sys::ProfileEngine::reconcile_alternatives(
+        root,
+        &previous_alternatives,
+        &current_alternatives,
+    )?;
+    let accounts = sage_sys::SysusersDocument::load_installed(root)?;
+    sage_sys::SysusersEngine::reconcile(root, &accounts)?;
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
     sage_sys::TriggerEngine::execute_triggers_for(
         &triggers,
@@ -419,6 +555,7 @@ fn remove_packages(
     // Keep declarations in memory before package-owned trigger files disappear;
     // post-remove actions must observe the completed filesystem transaction.
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+    let previous_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
     let database = sage_db::SageDatabase::open(&db_path)?;
     let timestamp = unix_timestamp()?;
     let op_id = format!("remove-{}-{timestamp}", std::process::id());
@@ -445,6 +582,14 @@ fn remove_packages(
             modified.push(PathBuf::from(relative));
         }
     }
+    let current_alternatives = sage_sys::AlternativesDocument::load_installed(root)?;
+    sage_sys::ProfileEngine::reconcile_alternatives(
+        root,
+        &previous_alternatives,
+        &current_alternatives,
+    )?;
+    let accounts = sage_sys::SysusersDocument::load_installed(root)?;
+    sage_sys::SysusersEngine::reconcile(root, &accounts)?;
     sage_sys::TriggerEngine::execute_triggers_for(
         &triggers,
         &modified,
@@ -577,23 +722,100 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
         root,
         &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
     );
+    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
+    let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
+    let mut installed = Vec::new();
+    if service_dir.exists() {
+        let mut declarations = std::fs::read_dir(&service_dir)?.collect::<Result<Vec<_>, _>>()?;
+        declarations.sort_by_key(std::fs::DirEntry::file_name);
+        for declaration in declarations {
+            if declaration.path().extension().and_then(|value| value.to_str()) == Some("toml") {
+                installed.push(sage_sys::ServiceSpec::load(declaration.path())?);
+            }
+        }
+    }
+    let installed_names = installed
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(service) = config
+        .services
+        .iter()
+        .find(|service| !installed_names.contains(service.as_str()))
+    {
+        bail!("enabled service '{service}' has no installed declaration");
+    }
+    let state_relative = Path::new("var/lib/sage/rendered-services.toml");
+    let state_path = under_root(root, state_relative);
+    let previous = if state_path.exists() {
+        Some(sage_sys::RenderedServicesState::load(&state_path)?)
+    } else {
+        None
+    };
     if dry_run {
-        for service in &config.services {
-            println!("Would render service {service} with {}", rclass.display());
+        if let Some(previous) = &previous {
+            for service in &previous.services {
+                let provider_changed = previous.provider != *provider;
+                let removed = !installed
+                    .iter()
+                    .any(|candidate| candidate.name == service.name);
+                let disabled = previous.enabled.contains(&service.name)
+                    && !config.services.contains(&service.name);
+                if provider_changed || removed || disabled {
+                    println!(
+                        "Would disable service {} from init provider {}",
+                        service.name, previous.provider
+                    );
+                }
+                if provider_changed || removed {
+                    println!(
+                        "Would remove stale native definition for service {}",
+                        service.name
+                    );
+                }
+            }
+        }
+        for service in &installed {
+            println!("Would render service {} with {}", service.name, rclass.display());
         }
         return Ok(());
     }
-    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
-    let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
-    for service in &config.services {
-        let path = service_dir.join(format!("{service}.toml"));
-        if !path.exists() {
-            bail!("enabled service '{service}' has no installed declaration");
+    if let Some(previous) = &previous {
+        let previous_rclass = under_root(
+            root,
+            &Path::new("/usr/share/sage/rclass")
+                .join(format!("init-{}.toml", previous.provider)),
+        );
+        let previous_generator =
+            sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
+        for service in &previous.services {
+            let provider_changed = previous.provider != *provider;
+            let removed = !installed
+                .iter()
+                .any(|candidate| candidate.name == service.name);
+            let disabled = previous.enabled.contains(&service.name)
+                && !config.services.contains(&service.name);
+            if provider_changed || removed || disabled {
+                previous_generator.disable_service(service, root)?;
+            }
+            if provider_changed || removed {
+                previous_generator.remove_service(service, root)?;
+            }
         }
-        let service = sage_sys::ServiceSpec::load(path)?;
-        generator.render_service(&service, root)?;
-        generator.enable_service(&service, root)?;
     }
+    generator.render_service_set(&installed, root)?;
+    for service in &installed {
+        if config.services.contains(&service.name) {
+            generator.enable_service(service, root)?;
+        }
+    }
+    let state = sage_sys::RenderedServicesState {
+        schema_version: sage_core::SCHEMA_VERSION,
+        provider: provider.clone(),
+        services: installed,
+        enabled: config.services.clone(),
+    };
+    write_atomic_under_root(root, state_relative, toml::to_string_pretty(&state)?.as_bytes())?;
     Ok(())
 }
 
