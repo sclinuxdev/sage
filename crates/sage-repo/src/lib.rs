@@ -1,10 +1,12 @@
 //! Conditional repository synchronization, signature verification, and range downloads.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use heed::types::{Bytes, Str};
 use heed::{Env, EnvFlags, EnvOpenOptions};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, RANGE};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,6 +37,8 @@ pub enum RepoError {
     Mirrors(String),
     #[error("download task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("index serialization failed: {0}")]
+    Serialization(#[from] bincode::Error),
 }
 
 /// One root repository and its nested subchannels.
@@ -62,6 +66,162 @@ pub struct SubchannelConfig {
 
 fn enabled() -> bool {
     true
+}
+
+/// Release record stored in the repository packages table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedRelease {
+    pub manifest: sage_archive::PackageManifest,
+    pub dependencies: Vec<sage_core::Dependency>,
+    pub archive: String,
+    pub sha256: String,
+}
+
+/// Files emitted by one repository indexing pass.
+#[derive(Debug, Clone)]
+pub struct IndexArtifacts {
+    pub index: PathBuf,
+    pub compressed: PathBuf,
+    pub signature: PathBuf,
+    pub packages: usize,
+}
+
+/// Builds, signs, and compresses the schema-v1 single-file LMDB index.
+pub fn build_index(
+    pool: &Path,
+    output_dir: &Path,
+    signing_key: &Path,
+) -> Result<IndexArtifacts, RepoError> {
+    std::fs::create_dir_all(output_dir)?;
+    let mut package_files: Vec<_> = std::fs::read_dir(pool)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+        })
+        .collect();
+    package_files.sort();
+    let mut releases: std::collections::BTreeMap<String, Vec<IndexedRelease>> =
+        std::collections::BTreeMap::new();
+    let mut providers: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in &package_files {
+        let inspection = sage_archive::inspect_package(path)
+            .map_err(|error| RepoError::InvalidConfig(error.to_string()))?;
+        let key = format!("{}:{}", inspection.manifest.name, inspection.manifest.slot);
+        let dependencies = inspection
+            .manifest
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.parse())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error: sage_core::CoreError| RepoError::InvalidConfig(error.to_string()))?;
+        for symbol in &inspection.manifest.provides {
+            let entries = providers.entry(symbol.clone()).or_default();
+            if !entries.contains(&key) {
+                entries.push(key.clone());
+            }
+        }
+        releases.entry(key).or_default().push(IndexedRelease {
+            manifest: inspection.manifest,
+            dependencies,
+            archive: path.file_name().unwrap().to_string_lossy().into_owned(),
+            sha256: hash_file(path)?,
+        });
+    }
+    for versions in releases.values_mut() {
+        versions.sort_by_key(release_version);
+    }
+    let temporary = temporary_path(&output_dir.join("index.mdb"));
+    {
+        let mut options = EnvOpenOptions::new();
+        options.map_size(1024 * 1024 * 1024).max_dbs(8);
+        // SAFETY: this new temporary file has exactly one writer until publication.
+        unsafe {
+            options.flags(EnvFlags::NO_SUB_DIR);
+        }
+        let env = unsafe { options.open(&temporary)? };
+        let mut txn = env.write_txn()?;
+        let packages: heed::Database<Str, Bytes> =
+            env.create_database(&mut txn, Some("packages"))?;
+        let provides: heed::Database<Str, Bytes> =
+            env.create_database(&mut txn, Some("provides"))?;
+        let dependencies: heed::Database<Str, Bytes> =
+            env.create_database(&mut txn, Some("dependencies"))?;
+        let metadata: heed::Database<Str, Str> = env.create_database(&mut txn, Some("metadata"))?;
+        for (key, versions) in &releases {
+            packages.put(&mut txn, key, &bincode::serialize(versions)?)?;
+            let latest_dependencies = versions
+                .last()
+                .map(|release| &release.dependencies)
+                .unwrap();
+            dependencies.put(&mut txn, key, &bincode::serialize(latest_dependencies)?)?;
+        }
+        for (symbol, entries) in &providers {
+            provides.put(&mut txn, symbol, &bincode::serialize(entries)?)?;
+        }
+        metadata.put(
+            &mut txn,
+            "schema_version",
+            &sage_core::SCHEMA_VERSION.to_string(),
+        )?;
+        metadata.put(&mut txn, "timestamp", &unix_timestamp()?.to_string())?;
+        txn.commit()?;
+        env.force_sync()?;
+    }
+    let key = decode_fixed::<32>(&std::fs::read(signing_key)?)?;
+    let signature = sign_file(&temporary, &SigningKey::from_bytes(&key))?;
+    let signature_temporary = temporary.with_extension("sig");
+    std::fs::write(&signature_temporary, signature.to_bytes())?;
+    let compressed_temporary = temporary.with_extension("zst");
+    compress_file(&temporary, &compressed_temporary)?;
+    let index = output_dir.join("index.mdb");
+    let signature_path = output_dir.join("index.mdb.sig");
+    let compressed = output_dir.join("index.mdb.zst");
+    // The signature is the commit marker fetched by clients, so publish it last.
+    std::fs::rename(compressed_temporary, &compressed)?;
+    std::fs::rename(temporary, &index)?;
+    std::fs::rename(signature_temporary, &signature_path)?;
+    Ok(IndexArtifacts {
+        index,
+        compressed,
+        signature: signature_path,
+        packages: package_files.len(),
+    })
+}
+
+fn release_version(release: &IndexedRelease) -> sage_core::Version {
+    sage_core::Version::new(
+        release.manifest.epoch,
+        &release.manifest.version,
+        release.manifest.release,
+    )
+}
+
+fn sign_file(path: &Path, key: &SigningKey) -> Result<Signature, RepoError> {
+    let file = File::open(path)?;
+    // SAFETY: the published index is not mutated while the map is alive.
+    let bytes = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(key.sign(&bytes))
+}
+
+fn compress_file(source: &Path, destination: &Path) -> Result<(), RepoError> {
+    let mut input = File::open(source)?;
+    let mut encoder = zstd::Encoder::new(File::create(destination)?, 15)?;
+    encoder.include_checksum(true)?;
+    std::io::copy(&mut input, &mut encoder)?;
+    encoder.finish()?.sync_all()?;
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<u64, RepoError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| RepoError::InvalidConfig(error.to_string()))?
+        .as_secs())
 }
 
 /// Reusable HTTP client and cache location.
@@ -330,6 +490,7 @@ fn decode_fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], RepoError> {
 /// Opens an immutable single-file LMDB index through a read-only mmap.
 pub fn open_index(path: &Path) -> Result<Env, RepoError> {
     let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
     // SAFETY: repository indexes are immutable after atomic publication. NO_LOCK
     // is therefore safe, and NO_SUB_DIR matches the protocol's single data file.
     unsafe {
@@ -410,5 +571,51 @@ mod tests {
         let output = dir.path().join("data");
         decompress(&compressed, &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), b"index");
+    }
+
+    #[test]
+    fn repository_index_contains_inspected_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(stage.join(".METADATA")).unwrap();
+        std::fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
+        std::fs::write(stage.join("data/usr/bin/demo"), b"demo").unwrap();
+        let hash = hex::encode(Sha256::digest(b"demo"));
+        std::fs::write(
+            stage.join(".METADATA/files.idx"),
+            format!("usr/bin/demo\t0755\t4\t{hash}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join(".METADATA/manifest.toml"),
+            r#"schema_version=1
+name="demo"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+installed_size=4
+build_time=1
+provides=["cmd:demo"]
+"#,
+        )
+        .unwrap();
+        let package = dir.path().join("demo-1.0-1-amd64.pkg.tar.zst");
+        sage_archive::create_package(&stage, &package, 1).unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, [3u8; 32]).unwrap();
+        let output = dir.path().join("repo");
+        let artifacts = build_index(dir.path(), &output, &key).unwrap();
+        assert_eq!(artifacts.packages, 1);
+        let env = open_index(&artifacts.index).unwrap();
+        let txn = env.read_txn().unwrap();
+        let packages: heed::Database<Str, Bytes> =
+            env.open_database(&txn, Some("packages")).unwrap().unwrap();
+        let releases: Vec<IndexedRelease> =
+            bincode::deserialize(packages.get(&txn, "demo:0").unwrap().unwrap()).unwrap();
+        assert_eq!(releases[0].manifest.name, "demo");
+        assert!(artifacts.compressed.exists() && artifacts.signature.exists());
     }
 }
