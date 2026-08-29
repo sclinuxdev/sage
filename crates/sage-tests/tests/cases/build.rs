@@ -379,21 +379,40 @@ destination="vendor/project"
                 "daemon",
                 "--reuseaddr",
                 "--export-all",
+                "--verbose",
                 "--listen=127.0.0.1",
                 &format!("--port={port}"),
                 &format!("--base-path={}", repositories.display()),
                 repositories.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        for _ in 0..100 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
+        // Git emits this line only after bind/listen succeeds. Waiting on the
+        // daemon pipe is a deterministic barrier and avoids timing-dependent
+        // connection retries in slow or heavily loaded CI workers.
+        let stderr = daemon.stderr.take().unwrap();
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let background_diagnostics = diagnostics.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        use std::io::BufRead as _;
+        let _log_reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                if line.contains("Ready to rumble") {
+                    let _ = ready_tx.send(());
+                }
+                background_diagnostics.lock().unwrap().push(line);
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        });
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "git daemon failed before readiness: {:?}",
+            diagnostics.lock().unwrap()
+        );
         let source = SourceSpec {
             kind: SourceKind::Git,
             url: format!("git://127.0.0.1:{port}/project.git"),
@@ -753,12 +772,14 @@ shell="/usr/bin/nologin"
         assert!(!areas[0].path().join("data/usr/lib/libx.so.1").exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn elf_scanner_reads_dynamic_dependencies() {
         let symbols = ElfScanner::scan(Path::new("/bin/ls")).unwrap();
         assert!(!symbols.dependencies.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn private_runpaths_are_relative_and_passed_without_a_shell() {
         use std::os::unix::fs::PermissionsExt;
