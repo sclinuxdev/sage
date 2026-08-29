@@ -100,6 +100,18 @@ pub enum Commands {
 ```
 
 ### CLI 常见用法示例
+
+Release diagnostics also expose two direct, read-only compatibility commands:
+
+```bash
+sage count
+sage verify
+```
+
+`count` prints the number of installed `(channel, name, slot)` instances.
+`verify` checks package records, reverse ownership indexes, safe persisted paths,
+and rootfs path existence without opening an LMDB write transaction. SCLinux's
+boot gate may use these commands before image publication.
 ```bash
 # 1. 刷新源索引并全量升级系统已安装包
 sage sync
