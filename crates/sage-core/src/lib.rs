@@ -41,6 +41,8 @@ pub enum CoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("host lock at {0} is busy")]
+    LockBusy(PathBuf),
     #[error("invalid version string '{0}'")]
     InvalidVersion(String),
     #[error("invalid package key string '{0}'")]
@@ -593,6 +595,12 @@ impl HostLock {
     pub fn acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::acquire(path, true)
     }
+    pub fn try_acquire_shared(path: impl AsRef<Path>) -> Result<Self, CoreError> {
+        Self::try_acquire(path, false)
+    }
+    pub fn try_acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
+        Self::try_acquire(path, true)
+    }
 
     fn acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
         let path = path.as_ref().to_path_buf();
@@ -616,6 +624,31 @@ impl HostLock {
             source,
         })?;
         Ok(Self { file, path })
+    }
+
+    fn try_acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        let result = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&file)
+        } else {
+            fs2::FileExt::try_lock_shared(&file)
+        };
+        match result {
+            Ok(()) => Ok(Self { file, path }),
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(CoreError::LockBusy(path))
+            }
+            Err(source) => Err(CoreError::LockFailed { path, source }),
+        }
     }
 
     pub fn path(&self) -> &Path {

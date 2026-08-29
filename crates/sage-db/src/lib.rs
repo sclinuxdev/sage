@@ -28,6 +28,15 @@ pub enum DbError {
     },
     #[error("operation journal '{0}' failed its integrity check")]
     InvalidJournal(String),
+    #[error("injected database fault at {0:?}")]
+    InjectedFault(DbFault),
+}
+
+/// Explicit write-transaction boundaries used only by reliability tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbFault {
+    BeforeWrite,
+    BeforeCommit,
 }
 /// Complete installed state required for removal and reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,25 +175,63 @@ impl SageDatabase {
     }
     /// Publishes a package and all reverse indexes in one write transaction.
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
+        self.install_with_fault(package, allow_shared, None)
+    }
+    /// Executes the normal install transaction with an optional test fault.
+    pub fn install_with_fault(
+        &self,
+        package: &InstalledPackage,
+        allow_shared: bool,
+        fault: Option<DbFault>,
+    ) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
+        if fault == Some(DbFault::BeforeWrite) {
+            return Err(DbError::InjectedFault(DbFault::BeforeWrite));
+        }
+        self.install_in_txn(&mut txn, package, allow_shared)?;
+        if fault == Some(DbFault::BeforeCommit) {
+            return Err(DbError::InjectedFault(DbFault::BeforeCommit));
+        }
+        txn.commit()?;
+        Ok(())
+    }
+    /// Publishes a complete package set in one all-or-nothing LMDB transaction.
+    pub fn install_batch(
+        &self,
+        packages: &[InstalledPackage],
+        allow_shared: bool,
+    ) -> Result<(), DbError> {
+        let mut txn = self.env.write_txn()?;
+        for package in packages {
+            self.install_in_txn(&mut txn, package, allow_shared)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+    fn install_in_txn(
+        &self,
+        txn: &mut RwTxn<'_>,
+        package: &InstalledPackage,
+        allow_shared: bool,
+    ) -> Result<(), DbError> {
         let id = package.key.canonical_id();
         // Replacing an installed version is one transaction: remove reverse
         // indexes that disappeared before validating and adding the new set.
-        if let Some(previous) = get_owned::<InstalledPackage>(&self.packages, &txn, &id)? {
+        if let Some(previous) = get_owned::<InstalledPackage>(&self.packages, txn, &id)? {
             for path in previous.files {
                 if !package.files.contains(&path) {
-                    remove_member(&self.files, &mut txn, &path, &package.key)?;
+                    remove_member(&self.files, txn, &path, &package.key)?;
                 }
             }
             for symbol in previous.provides {
                 if !package.provides.contains(&symbol) {
-                    remove_member(&self.provides, &mut txn, &symbol, &package.key)?;
+                    remove_member(&self.provides, txn, &symbol, &package.key)?;
                 }
             }
         }
         for path in &package.files {
             let mut owners: Vec<PackageKey> =
-                get_owned(&self.files, &txn, path)?.unwrap_or_default();
+                get_owned(&self.files, txn, path)?.unwrap_or_default();
             if !owners.is_empty() && !owners.contains(&package.key) && !allow_shared {
                 return Err(DbError::FileConflict {
                     path: path.clone(),
@@ -193,19 +240,18 @@ impl SageDatabase {
             }
             if !owners.contains(&package.key) {
                 owners.push(package.key.clone());
-                put_encoded(&self.files, &mut txn, path, &owners)?;
+                put_encoded(&self.files, txn, path, &owners)?;
             }
         }
         for symbol in &package.provides {
             let mut providers: Vec<PackageKey> =
-                get_owned(&self.provides, &txn, symbol)?.unwrap_or_default();
+                get_owned(&self.provides, txn, symbol)?.unwrap_or_default();
             if !providers.contains(&package.key) {
                 providers.push(package.key.clone());
-                put_encoded(&self.provides, &mut txn, symbol, &providers)?;
+                put_encoded(&self.provides, txn, symbol, &providers)?;
             }
         }
-        put_encoded(&self.packages, &mut txn, &id, package)?;
-        txn.commit()?;
+        put_encoded(&self.packages, txn, &id, package)?;
         Ok(())
     }
     /// Removes a package and prunes empty ownership/provider entries atomically.
@@ -327,6 +373,34 @@ pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> 
         .map(decode)
         .transpose()?
         .unwrap_or_default())
+}
+/// Reads the complete ownership table for consistency verification.
+pub fn read_ownerships(path: &Path) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: this environment is strictly read-only and keeps LMDB locking enabled.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let files: Database<Str, Bytes> = env.open_database(&txn, Some("files"))?.ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing files table",
+        ))
+    })?;
+    let ownerships = files
+        .iter(&txn)?
+        .map(|item| {
+            let (path, bytes) = item?;
+            Ok((path.to_owned(), decode(bytes)?))
+        })
+        .collect();
+    ownerships
 }
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DbError> {
     Ok(bincode::serialize(value)?)
