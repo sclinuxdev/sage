@@ -233,6 +233,23 @@ the declared Slot. This gives DKMS-style out-of-tree sources reproducible Kmod
 artifacts whose installed versions are tracked independently by the solver and
 database instead of being rebuilt as untracked host mutations.
 
+The `kmod` class installs with `INSTALL_MOD_PATH=/usr`, so the result remains
+usr-merged. Header packages are explicit build dependencies with the matching
+Slot; the class does not assume a global or ambiguous `linux-headers` package.
+
+Kernel packages that need an initramfs declare `virtual/initramfs-generator` as
+a runtime dependency. The selected provider is configured by
+`[providers].initramfs-generator` in `/etc/sage/system.toml`. The provider
+package owns the package-specific trigger and its exact command-line arguments;
+kernel recipes do not carry a generator trigger, and Sage does not assume a
+common command or `-P` option.
+
+Compiler and interpreter packages use versioned channels. For example,
+`gcc16/gcc:16`, `llvm22/clang`, `rust1.98/rust-bin:1.98.0`, and
+`python3.14/python:3.14` select managed toolchains without binding a recipe to
+the host or to an unversioned compiler name. Short channel aliases are resolved
+inside the repository root by Sage.
+
 ### 3.6 Declarative installation lifecycle
 
 Source-free data and policy packages use `[install]` entries instead of a

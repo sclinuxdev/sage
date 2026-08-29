@@ -21,7 +21,9 @@ profile = "default"
 # 注: Shell (如 bash/zsh/dash) 为普通独立包或由 alternatives 仲裁，不属于 providers 管理范围
 [providers]
 init = "loom"                 # 候选: loom | systemd
-initramfs-generator = "mkinitcpio" # 候选: mkinitcpio | dracut
+# Optional: choose the provider package; its package trigger owns the exact
+# command and arguments (for example mkinitcpio or dracut).
+# initramfs-generator = "mkinitcpio"
 udev = "eudev"               # 候选: eudev | systemd-udev | busybox-mdev
 libc = "glibc"               # 候选: glibc | musl
 coreutils = "gnu-coreutils"  # 候选: gnu-coreutils | uutils-coreutils | busybox
@@ -64,6 +66,10 @@ services = [
 - **零硬编码接口**: 系统不硬编码固定的虚拟接口枚举，`[providers]` 表现为动态的 `HashMap<String, String>`（`interface -> provider_pkg`）。
 - **非 providers 范围**: 诸如 Shell（`/bin/sh`、`bash`、`zsh`）等基础命令为标准独立软件包，由常规包依赖或 `alternatives` 机制管理，不通过 `[providers]` 进行互斥锁定。
 - **求解器优先权**: 当求解器在依赖图中遇到 `virtual/<interface>` 符号时，自动以最高权重（+1000）选取 `[providers]` 中指定的提供者包。
+- **initramfs provider**: `initramfs-generator` is optional system policy. The
+  selected provider package must carry its own package trigger with the
+  provider-specific command-line interface; Sage does not assume mkinitcpio,
+  dracut, or any other generator.
 - **原子状态切换**: 当用户将 `init = "loom"` 修改为 `init = "systemd"` 并执行 `sage rebuild` 时，系统自动计算差集，完成旧包卸载、新包安装以及全量服务配置重编译。
 
 ### 2.3 `packages` 与 `services`

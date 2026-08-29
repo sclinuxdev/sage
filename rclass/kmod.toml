@@ -2,12 +2,15 @@ schema_version = 1
 name = "kmod"
 description = "Reproducible out-of-tree Linux kernel module build class"
 
-implicit_build_dependencies = ["linux-headers", "kmod"]
+implicit_build_dependencies = ["kmod"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
 [env]
 KERNELRELEASE = "${PACKAGE_SLOT}"
+
+[defaults]
+"args.make_args" = ""
 
 [phases]
 src_unpack = """
@@ -55,7 +58,7 @@ make -C "/usr/lib/modules/${PACKAGE_SLOT}/build" \
 src_install = """
 make -C "/usr/lib/modules/${PACKAGE_SLOT}/build" \
     M="${SRC_DIR}" \
-    INSTALL_MOD_PATH="${DESTDIR}" \
+    INSTALL_MOD_PATH="${DESTDIR}/usr" \
     INSTALL_MOD_DIR=updates \
     ${args.make_args} \
     modules_install

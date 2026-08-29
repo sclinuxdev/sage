@@ -178,7 +178,7 @@ native identifiers.
 ## 5. Standard build-class library
 
 The standard library contains `autotools`, `meson`, `python` (PEP 517), `go`,
-`cmake`, `cargo`, `npm`, `pnpm`, `gradle`, `maven`, and `kmod`. Tool defaults
+`cmake`, `cargo`, `npm`, `pnpm`, `gradle`, `maven`, `kmod`, and `kernel`. Tool defaults
 remain data-owned:
 
 ```toml
@@ -193,14 +193,41 @@ Later rclasses and recipe arguments override defaults. Implicit dependencies
 participate in the constrained build-environment solve. The verified result is
 mounted read-only at `/toolchain` and exposed through standard tool search paths.
 
-### 5.1 Node.js classes
+### 5.1 Linux kernel class
+
+The `kernel` class consumes the kernel source, patches, and configuration only
+through ordered recipe source declarations. It applies `.source-patches/*` in
+filename order, accepts compressed `.zst` patch inputs, runs `olddefconfig`, and
+requires the resulting `kernelrelease` to equal the package Slot. The install
+phase writes the kernel image and modules below `usr/lib/modules/<Slot>` and
+produces the external-module build tree for a separate headers subpackage.
+
+The class does not select a kernel configuration, patch URL, hostname, initramfs
+tool, or init system. Those are recipe and system declarations. A kernel recipe
+that needs an out-of-tree module build must declare the matching header package
+with its Slot in `[build].dependencies`, for example
+`linux-zen-headers:7.1.11-zen1`.
+
+Toolchains selected by kernel configuration are recipe dependencies rather than
+unconditional class dependencies. For example, the Arch linux-zen configuration
+sets `CONFIG_RUST=y`, so its recipe declares `rust-bin`, `rust-src`, and
+`rust-bindgen` explicitly. The kernel build does not invoke Cargo; recipes should
+not add `cargo` unless their selected kernel configuration or an extra build step
+actually uses it.
+
+The CMake class accepts `args.source_dir` and `args.patch_root` for monorepos,
+and applies recipe-declared `.source-patches/*` in bytewise order. This keeps
+LLVM and its Clang/LLD/compiler-rt outputs in one build unit while retaining
+separate package payloads.
+
+### 5.2 Node.js classes
 
 `npm` requires `npm ci`; `pnpm` requires a frozen lockfile. Both isolate their
 cache/store below `/build`, run a configurable build and test script, pack one
 deterministic tarball, and install it below DESTDIR without running installation
 lifecycle scripts. Native addons use the ordinary configured C/C++ toolchain.
 
-### 5.2 JVM classes
+### 5.3 JVM classes
 
 `gradle` uses a private `GRADLE_USER_HOME`, disables the daemon, and caps workers
 to `${JOBS}`. `maven` uses a private local repository, batch mode, and the same

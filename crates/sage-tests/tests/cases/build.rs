@@ -799,6 +799,6 @@ shell="/usr/bin/nologin"
         ]);
         let runner = compose_runner(&[class], &variables).unwrap();
         assert!(runner.contains("/usr/lib/modules/6.12.4/build"));
-        assert!(runner.contains("INSTALL_MOD_PATH=\"/dest\""));
+        assert!(runner.contains("INSTALL_MOD_PATH=\"/dest/usr\""));
     }
 }
