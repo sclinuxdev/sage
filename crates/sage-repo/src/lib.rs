@@ -84,8 +84,48 @@ impl ChannelsConfig {
                 config.schema_version
             )));
         }
+        for (name, channel) in &config.channels {
+            if !valid_identifier(name)
+                || channel.url.is_empty()
+                || !safe_absolute_path(&channel.signing_key)
+            {
+                return Err(RepoError::InvalidConfig(format!(
+                    "unsafe or incomplete channel '{name}'"
+                )));
+            }
+            for (sub_name, subchannel) in &channel.subchannels {
+                if !valid_identifier(sub_name)
+                    || subchannel
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| !valid_identifier(alias))
+                    || !safe_absolute_path(&subchannel.target_root)
+                {
+                    return Err(RepoError::InvalidConfig(format!(
+                        "unsafe subchannel '{name}/{sub_name}'"
+                    )));
+                }
+            }
+        }
         Ok(config)
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn safe_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 /// Derives a subchannel URL solely from configuration values.

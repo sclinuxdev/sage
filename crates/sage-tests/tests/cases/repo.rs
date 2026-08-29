@@ -39,6 +39,51 @@ mod repo_tests {
     }
 
     #[test]
+    fn channel_paths_and_identifiers_cannot_escape_the_target_root() {
+        for document in [
+            r#"schema_version=1
+[channels."../outside"]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/../outside"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels.system]
+alias="../outside"
+scope="system"
+target_root="/"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels.system]
+scope="system"
+target_root="/../outside"
+"#,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("channels.toml");
+            std::fs::write(&path, document).unwrap();
+            assert!(matches!(
+                ChannelsConfig::load(path),
+                Err(RepoError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
     fn decompression_is_streaming_and_exact() {
         let dir = tempfile::tempdir().unwrap();
         let compressed = dir.path().join("data.zst");
