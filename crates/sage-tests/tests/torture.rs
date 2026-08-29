@@ -133,8 +133,7 @@ fn archive_attack_matrix_is_fail_closed() {
     assert!(sage_archive::parse_file_index(&[0xff, b'\n']).is_err());
     let hash = "0".repeat(64);
     assert!(sage_archive::parse_file_index(
-        format!("usr//bin/tool\t0644\t1\t{hash}\nusr/bin/tool\t0644\t1\t{hash}\n")
-            .as_bytes()
+        format!("usr//bin/tool\t0644\t1\t{hash}\nusr/bin/tool\t0644\t1\t{hash}\n").as_bytes()
     )
     .is_err());
 
