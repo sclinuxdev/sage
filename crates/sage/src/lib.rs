@@ -63,6 +63,10 @@ pub enum Commands {
         #[arg(long)]
         no_prune: bool,
     },
+    /// Count installed package instances (SCLinux compatibility command).
+    Count,
+    /// Verify package records, ownership indexes, and managed path existence.
+    Verify,
     /// Manage software channels and repository indexes.
     Repo {
         #[command(subcommand)]
@@ -156,6 +160,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Commands::Channel {
             action: ChannelAction::List
         } | Commands::Query { .. }
+            | Commands::Count
+            | Commands::Verify
     );
     let lock_path = under_root(&cli.root, Path::new("/run/sage/operation.lock"));
     let _lock = if cli.dry_run || read_only {
@@ -201,6 +207,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Commands::Rebuild { no_prune } => {
             rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
         }
+        Commands::Count => println!(
+            "{}",
+            sage_db::read_packages(&under_root(&cli.root, Path::new("/var/lib/sage")))?.len()
+        ),
+        Commands::Verify => verify_state(&cli.root)?,
         Commands::Repo { action } => match action {
             RepoAction::Index { dir, sign_key } => {
                 let key = sign_key.context("repo index requires --sign-key")?;
