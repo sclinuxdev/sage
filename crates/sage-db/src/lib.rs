@@ -124,13 +124,17 @@ pub struct SageDatabase {
 impl SageDatabase {
     /// Opens the state directory and creates all schema-v1 tables atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        Self::open_with_map_size(path, MAP_SIZE)
+    }
+    /// Opens the state directory with an explicit LMDB map size for boundary tests.
+    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self, DbError> {
         let db_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&db_path)?;
         // SAFETY: Sage owns this directory, uses one fixed map size for every opener,
         // and never opens the same LMDB files through a second environment in-process.
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(MAP_SIZE)
+                .map_size(map_size)
                 .max_dbs(8)
                 .open(&db_path)?
         };

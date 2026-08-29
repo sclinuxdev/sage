@@ -482,8 +482,70 @@ pub async fn run_quick() -> Result<Vec<String>> {
     Ok(lab.steps)
 }
 
+#[derive(Debug, Clone)]
+enum RandomOperation {
+    Install(usize),
+    Remove(usize),
+    Reinstall(usize),
+    Conflict,
+    FaultRetry(usize),
+    Upgrade(usize),
+    RollbackAttempt(usize),
+    ToggleRuntime,
+    ToggleToolchain,
+    DependencyReplacement,
+}
+
 /// Model-driven random sequence. Every mutation is followed by a full state audit.
+/// A failure is replayed against progressively shorter prefixes so the report
+/// contains the smallest reproducing prefix, not only the original seed.
 pub async fn run_random(seed: u64, operations: usize) -> Result<Vec<String>> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let sequence = (0..operations)
+        .map(|_| {
+            let package = rng.gen_range(0..8);
+            match rng.gen_range(0..10) {
+                0 => RandomOperation::Install(package),
+                1 => RandomOperation::Remove(package),
+                2 => RandomOperation::Reinstall(package),
+                3 => RandomOperation::Conflict,
+                4 => RandomOperation::FaultRetry(package),
+                5 => RandomOperation::Upgrade(package),
+                6 => RandomOperation::RollbackAttempt(package),
+                7 => RandomOperation::ToggleRuntime,
+                8 => RandomOperation::ToggleToolchain,
+                _ => RandomOperation::DependencyReplacement,
+            }
+        })
+        .collect::<Vec<_>>();
+    match execute_random_sequence(seed, &sequence).await {
+        Ok(steps) => Ok(steps),
+        Err(original) => {
+            if sequence.is_empty() {
+                bail!("seed {seed} failed during fixture setup: {original:#}");
+            }
+            let mut low = 1_usize;
+            let mut high = sequence.len();
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if execute_random_sequence(seed, &sequence[..middle])
+                    .await
+                    .is_err()
+                {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            bail!(
+                "seed {seed} failed; minimal reproducing prefix={low}; operations={:?}; original={original:#}",
+                &sequence[..low]
+            )
+        }
+    }
+}
+
+async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Result<Vec<String>> {
     let mut lab = TortureLab::new()?;
     let package_count = 8;
     for index in 0..package_count {
@@ -503,39 +565,96 @@ pub async fn run_random(seed: u64, operations: usize) -> Result<Vec<String>> {
         "usr/lib/torture/p0",
         "intruder",
     ))?;
+    lab.add_package(PackageSpec::new(
+        "runtime",
+        "switchable",
+        1,
+        "bin/switchable",
+        "runtime",
+    ))?;
+    lab.add_package(PackageSpec::new(
+        "toolchain",
+        "switchable",
+        1,
+        "bin/switchable",
+        "toolchain",
+    ))?;
+    lab.add_package(PackageSpec::new(
+        "system",
+        "dep-a",
+        1,
+        "usr/lib/torture/dep-a",
+        "dep-a",
+    ))?;
+    lab.add_package(PackageSpec::new(
+        "system",
+        "dep-b",
+        1,
+        "usr/lib/torture/dep-b",
+        "dep-b",
+    ))?;
+    let mut consumer = PackageSpec::new(
+        "system",
+        "consumer",
+        1,
+        "usr/lib/torture/consumer",
+        "consumer-v1",
+    );
+    consumer.dependencies.push("dep-a".into());
+    lab.add_package(consumer)?;
     lab.publish()?;
-    let mut model = BTreeSet::new();
-    let mut rng = SmallRng::seed_from_u64(seed);
-    for step in 0..operations {
-        let name = format!("p{}", rng.gen_range(0..package_count));
-        let operation = rng.gen_range(0..5);
+    let mut model = BTreeMap::<String, u32>::new();
+    let mut version_two = BTreeSet::new();
+    let mut dependency_replaced = false;
+    for (step, operation) in sequence.iter().enumerate() {
         let before = lab.snapshot()?;
         match operation {
-            0 | 1 => {
+            RandomOperation::Install(index) => {
+                let name = format!("p{index}");
                 lab.install(&name, "system").await?;
-                model.insert(name.clone());
+                model.insert(
+                    model_key("system", &name),
+                    if version_two.contains(index) { 2 } else { 1 },
+                );
                 let converged = lab.audit()?;
                 lab.install(&name, "system").await?;
                 if lab.audit()? != converged {
                     bail!("seed {seed} step {step}: repeated install was not idempotent");
                 }
             }
-            2 if model.contains(&name) => {
-                lab.remove(&name, "system").await?;
-                model.remove(&name);
-                let removed = lab.audit()?;
-                if lab.remove(&name, "system").await.is_ok() || lab.snapshot()? != removed {
-                    bail!("seed {seed} step {step}: repeated remove changed state");
-                }
-            }
-            2 => {
-                if lab.remove(&name, "system").await.is_ok() || lab.snapshot()? != before {
+            RandomOperation::Remove(index) => {
+                let name = format!("p{index}");
+                let key = model_key("system", &name);
+                if model.contains_key(&key) {
+                    lab.remove(&name, "system").await?;
+                    model.remove(&key);
+                    let removed = lab.audit()?;
+                    if lab.remove(&name, "system").await.is_ok() || lab.snapshot()? != removed {
+                        bail!("seed {seed} step {step}: repeated remove changed state");
+                    }
+                } else if lab.remove(&name, "system").await.is_ok() || lab.snapshot()? != before {
                     bail!("seed {seed} step {step}: absent remove changed state");
                 }
             }
-            3 => {
+            RandomOperation::Reinstall(index) => {
+                let name = format!("p{index}");
+                lab.install(&name, "system").await?;
+                model.insert(
+                    model_key("system", &name),
+                    if version_two.contains(index) { 2 } else { 1 },
+                );
+                let converged = lab.audit()?;
+                lab.install(&name, "system").await?;
+                if lab.audit()? != converged {
+                    bail!("seed {seed} step {step}: reinstall accumulated side effects");
+                }
+            }
+            RandomOperation::Conflict => {
                 lab.install("p0", "system").await?;
-                model.insert("p0".into());
+                model.insert(
+                    model_key("system", "p0"),
+                    if version_two.contains(&0) { 2 } else { 1 },
+                );
                 let conflict_baseline = lab.audit()?;
                 if lab.install("intruder", "system").await.is_ok()
                     || lab.audit()? != conflict_baseline
@@ -543,16 +662,98 @@ pub async fn run_random(seed: u64, operations: usize) -> Result<Vec<String>> {
                     bail!("seed {seed} step {step}: conflict was not atomic");
                 }
             }
-            _ if !model.contains(&name) => {
-                lab.inject("before-lmdb-write")?;
-                if lab.install(&name, "system").await.is_ok() {
-                    bail!("seed {seed} step {step}: injected failure succeeded");
+            RandomOperation::FaultRetry(index) => {
+                let name = format!("p{index}");
+                let key = model_key("system", &name);
+                match model.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        lab.inject("before-lmdb-write")?;
+                        if lab.install(&name, "system").await.is_ok() {
+                            bail!("seed {seed} step {step}: injected failure succeeded");
+                        }
+                        lab.install(&name, "system").await?;
+                        entry.insert(if version_two.contains(index) { 2 } else { 1 });
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        lab.install(&name, "system").await?;
+                    }
                 }
-                lab.install(&name, "system").await?;
-                model.insert(name.clone());
             }
-            _ => {
-                lab.install(&name, "system").await?;
+            RandomOperation::Upgrade(index) => {
+                let name = format!("p{index}");
+                if version_two.insert(*index) {
+                    lab.add_package(PackageSpec::new(
+                        "system",
+                        &name,
+                        2,
+                        &format!("usr/lib/torture/{name}"),
+                        &format!("{name}-v2"),
+                    ))?;
+                    lab.publish()?;
+                }
+                lab.upgrade(&name, "system").await?;
+                model.insert(model_key("system", &name), 2);
+                let converged = lab.audit()?;
+                lab.upgrade(&name, "system").await?;
+                if lab.audit()? != converged {
+                    bail!("seed {seed} step {step}: repeated upgrade changed state");
+                }
+            }
+            RandomOperation::RollbackAttempt(index) => {
+                let name = format!("p{index}");
+                let key = model_key("system", &name);
+                if version_two.contains(index) && model.get(&key) == Some(&2) {
+                    let stable = lab.audit()?;
+                    lab.remove_archive("system", &name, 2)?;
+                    lab.publish()?;
+                    lab.upgrade(&name, "system").await?;
+                    if lab.audit()? != stable {
+                        bail!("seed {seed} step {step}: repository rollback downgraded state");
+                    }
+                    lab.add_package(PackageSpec::new(
+                        "system",
+                        &name,
+                        2,
+                        &format!("usr/lib/torture/{name}"),
+                        &format!("{name}-v2"),
+                    ))?;
+                    lab.publish()?;
+                } else {
+                    lab.install(&name, "system").await?;
+                    model.insert(key, if version_two.contains(index) { 2 } else { 1 });
+                }
+            }
+            RandomOperation::ToggleRuntime => {
+                toggle_channel(&mut lab, &mut model, "runtime").await?;
+            }
+            RandomOperation::ToggleToolchain => {
+                toggle_channel(&mut lab, &mut model, "toolchain").await?;
+            }
+            RandomOperation::DependencyReplacement if !dependency_replaced => {
+                lab.install("consumer", "system").await?;
+                model.insert(model_key("system", "consumer"), 1);
+                model.insert(model_key("system", "dep-a"), 1);
+                let mut replacement = PackageSpec::new(
+                    "system",
+                    "consumer",
+                    2,
+                    "usr/lib/torture/consumer",
+                    "consumer-v2",
+                );
+                replacement.dependencies.push("dep-b".into());
+                lab.add_package(replacement)?;
+                lab.publish()?;
+                lab.upgrade("consumer", "system").await?;
+                model.insert(model_key("system", "consumer"), 2);
+                model.insert(model_key("system", "dep-b"), 1);
+                lab.remove("dep-a", "system").await?;
+                model.remove(&model_key("system", "dep-a"));
+                dependency_replaced = true;
+            }
+            RandomOperation::DependencyReplacement => {
+                lab.install("consumer", "system").await?;
+                model.insert(model_key("system", "consumer"), 2);
+                model.insert(model_key("system", "dep-b"), 1);
             }
         }
         let state = lab
@@ -560,16 +761,41 @@ pub async fn run_random(seed: u64, operations: usize) -> Result<Vec<String>> {
             .with_context(|| format!("seed {seed} step {step}; reproduction: {:?}", lab.steps()))?;
         let actual = state
             .packages
-            .keys()
-            .filter_map(|key| key.strip_prefix("main/system:")?.strip_suffix(":0"))
-            .filter(|name| name.starts_with('p'))
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
+            .into_iter()
+            .map(|(key, version)| {
+                let release = version
+                    .split('-')
+                    .next()
+                    .context("installed version has no release value")?
+                    .parse::<u32>()?;
+                Ok((key, release))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         if actual != model {
             bail!("seed {seed} step {step}: model={model:?}, actual={actual:?}");
         }
     }
     Ok(lab.steps)
+}
+
+fn model_key(channel: &str, name: &str) -> String {
+    format!("main/{channel}:{name}:0")
+}
+
+async fn toggle_channel(
+    lab: &mut TortureLab,
+    model: &mut BTreeMap<String, u32>,
+    channel: &str,
+) -> Result<()> {
+    let key = model_key(channel, "switchable");
+    if model.get(&key).is_some() {
+        lab.remove("switchable", channel).await?;
+        model.remove(&key);
+    } else {
+        lab.install("switchable", channel).await?;
+        model.insert(key, 1);
+    }
+    Ok(())
 }
 
 /// Repeatable microbenchmarks. They intentionally report measurements without pass/fail claims.
@@ -722,6 +948,7 @@ fn cli(root: &Path, command: Commands) -> Cli {
         verbose: false,
         dry_run: false,
         root: root.into(),
+        lock_timeout: None,
         command,
     }
 }

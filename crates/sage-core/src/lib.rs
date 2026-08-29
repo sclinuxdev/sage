@@ -1,11 +1,16 @@
 //! Core domain models, version algebra, symbol interning, and host locking.
 
+use nix::errno::Errno;
+use nix::fcntl::{open, openat, OFlag};
+use nix::sys::stat::{mkdirat, Mode};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -43,6 +48,8 @@ pub enum CoreError {
     },
     #[error("host lock at {0} is busy")]
     LockBusy(PathBuf),
+    #[error("timed out waiting for host lock at {0}")]
+    LockTimedOut(PathBuf),
     #[error("invalid version string '{0}'")]
     InvalidVersion(String),
     #[error("invalid package key string '{0}'")]
@@ -601,19 +608,22 @@ impl HostLock {
     pub fn try_acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::try_acquire(path, true)
     }
+    pub fn acquire_shared_for(
+        path: impl AsRef<Path>,
+        timeout: std::time::Duration,
+    ) -> Result<Self, CoreError> {
+        Self::acquire_for(path, false, timeout)
+    }
+    pub fn acquire_exclusive_for(
+        path: impl AsRef<Path>,
+        timeout: std::time::Duration,
+    ) -> Result<Self, CoreError> {
+        Self::acquire_for(path, true, timeout)
+    }
 
     fn acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Never truncate: all processes must continue locking the same inode.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = open_lock_file(&path)?;
         let result = if exclusive {
             fs2::FileExt::lock_exclusive(&file)
         } else {
@@ -628,15 +638,7 @@ impl HostLock {
 
     fn try_acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = open_lock_file(&path)?;
         let result = if exclusive {
             fs2::FileExt::try_lock_exclusive(&file)
         } else {
@@ -651,9 +653,107 @@ impl HostLock {
         }
     }
 
+    fn acquire_for(
+        path: impl AsRef<Path>,
+        exclusive: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Self, CoreError> {
+        let path = path.as_ref().to_path_buf();
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                CoreError::InvalidMetadata("operation lock timeout is out of range".into())
+            })?;
+        loop {
+            match Self::try_acquire(&path, exclusive) {
+                Ok(lock) => return Ok(lock),
+                Err(CoreError::LockBusy(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(CoreError::LockBusy(_)) => return Err(CoreError::LockTimedOut(path)),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Opens the lock through an anchored directory walk. Every component after
+/// the filesystem root is opened with `O_NOFOLLOW`, so an attacker cannot
+/// redirect two Sage processes onto different lock inodes through a symlink.
+fn open_lock_file(path: &Path) -> Result<File, CoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CoreError::InvalidMetadata("operation lock has no parent".into()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CoreError::InvalidMetadata("operation lock has no file name".into()))?;
+    let base = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let raw = open(
+        base,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(errno_io)?;
+    // SAFETY: `open` returned a fresh descriptor transferred exactly once.
+    let mut current = unsafe { OwnedFd::from_raw_fd(raw) };
+    for component in parent.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => {
+                return Err(CoreError::InvalidMetadata(format!(
+                    "unsafe operation lock path {}",
+                    path.display()
+                )))
+            }
+        };
+        match mkdirat(
+            Some(current.as_raw_fd()),
+            name,
+            Mode::from_bits_truncate(0o700),
+        ) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(error) => return Err(errno_io(error)),
+        }
+        let next = openat(
+            Some(current.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(errno_io)?;
+        // SAFETY: `openat` returned a new descriptor replacing the previous guard.
+        current = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    let raw = openat(
+        Some(current.as_raw_fd()),
+        file_name,
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(errno_io)?;
+    // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
+    let file = unsafe { File::from_raw_fd(raw) };
+    if !file.metadata()?.is_file() {
+        return Err(CoreError::InvalidMetadata(format!(
+            "operation lock is not a regular file: {}",
+            path.display()
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn errno_io(error: Errno) -> CoreError {
+    CoreError::Io(std::io::Error::from_raw_os_error(error as i32))
 }
 
 impl Drop for HostLock {

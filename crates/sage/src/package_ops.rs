@@ -1018,6 +1018,11 @@ fn should_preserve_config(
     Ok(hex::encode(Sha256::digest(bytes)) != *expected)
 }
 fn remove_file_beneath(root: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     let parent = path.parent().context("installed path has no parent")?;
     let canonical_root = std::fs::canonicalize(root)?;
     let canonical_parent = std::fs::canonicalize(parent)?;

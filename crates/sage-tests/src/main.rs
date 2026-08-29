@@ -4,6 +4,17 @@ use anyhow::{bail, Context, Result};
 async fn main() -> Result<()> {
     let mut arguments = std::env::args().skip(1);
     let mode = arguments.next().unwrap_or_else(|| "quick".into());
+    if mode == "worker-verify" {
+        let root = std::path::PathBuf::from(arguments.next().context("worker requires root")?);
+        return sage::execute(sage::Cli {
+            verbose: false,
+            dry_run: false,
+            root,
+            lock_timeout: None,
+            command: sage::Commands::Verify,
+        })
+        .await;
+    }
     if mode.starts_with("worker-") {
         let root = std::path::PathBuf::from(arguments.next().context("worker requires root")?);
         let package = arguments.next().context("worker requires package")?;
@@ -29,6 +40,7 @@ async fn main() -> Result<()> {
             verbose: false,
             dry_run: false,
             root,
+            lock_timeout: None,
             command,
         })
         .await;

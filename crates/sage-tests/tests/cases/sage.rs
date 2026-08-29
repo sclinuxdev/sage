@@ -155,6 +155,7 @@ recipes=["app/recipe.toml"]
             verbose: false,
             dry_run: false,
             root: root.into(),
+            lock_timeout: None,
             command,
         }
     }
