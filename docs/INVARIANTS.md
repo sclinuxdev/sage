@@ -58,6 +58,8 @@ describe observable state, not implementation details.
   checkpoint boundaries.
 - Abrupt process termination releases the kernel advisory lock. The next writer
   validates and resumes every pending journal before planning new work.
+- A second failure while replaying installation or partial removal retains the
+  same integrity-sealed journal and remains retryable.
 - Trigger completion is checkpointed before journal retirement. A crash after
   that checkpoint does not replay the trigger group.
 - Arbitrary external trigger commands have at-least-once semantics in the narrow
@@ -82,7 +84,12 @@ describe observable state, not implementation details.
 
 - Writers use one target-root operation lock. Multiple writers are serialized;
   shared readers may coexist, and a nonblocking lock attempt reports `LockBusy`.
+- Lock directories and the final file are opened through an anchored
+  `openat(O_NOFOLLOW)` walk. `--lock-timeout` provides a deterministic bounded
+  wait without changing the historical blocking default.
 - LMDB remains single-writer/multi-reader. A package operation never relies on
   timing sleeps for correctness.
+- LMDB map-full aborts the complete write transaction; package, owner and
+  provider indexes remain unchanged.
 - The release tests use process boundaries and lock barriers to cover concurrent
   installs, install/remove races, lock release, and read/write contention.

@@ -112,6 +112,9 @@ sage verify
 `verify` checks package records, reverse ownership indexes, safe persisted paths,
 and rootfs path existence without opening an LMDB write transaction. SCLinux's
 boot gate may use these commands before image publication.
+
+`--lock-timeout SECONDS` bounds shared or exclusive operation-lock acquisition.
+When omitted, Sage preserves the existing blocking behavior.
 ```bash
 # 1. 刷新源索引并全量升级系统已安装包
 sage sync

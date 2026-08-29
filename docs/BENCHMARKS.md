@@ -6,21 +6,21 @@ sample for regression orientation, not a cross-machine performance promise.
 
 | Metric | 100 packages | 1,000 packages | 10,000 packages |
 | --- | ---: | ---: | ---: |
-| Empty LMDB startup (ms) | 4.728 | 5.729 | 10.649 |
-| Individual insert transactions (ms) | 333.712 | 3,528.507 | 33,471.385 |
-| One batch transaction (ms) | 3.996 | 3.956 | 12.023 |
-| Hot package lookups total (ms) | 0.102 | 0.534 | 5.545 |
-| Hot lookup average (ns) | 1,017 | 534 | 554 |
-| Cold reopen + one lookup (ms) | 0.140 | 0.176 | 0.265 |
-| Ownership lookups total (ms) | 0.035 | 0.321 | 3.677 |
-| Conflict rejection (ms) | 0.011 | 0.011 | 0.017 |
+| Empty LMDB startup (ms) | 8.079 | 8.308 | 7.167 |
+| Individual insert transactions (ms) | 326.462 | 3,926.302 | 38,713.203 |
+| One batch transaction (ms) | 3.826 | 5.974 | 21.981 |
+| Hot package lookups total (ms) | 0.163 | 1.881 | 12.454 |
+| Hot lookup average (ns) | 1,626 | 1,881 | 1,245 |
+| Cold reopen + one lookup (ms) | 0.222 | 0.588 | 1.512 |
+| Ownership lookups total (ms) | 0.052 | 0.915 | 7.798 |
+| Conflict rejection (ms) | 0.015 | 0.026 | 0.031 |
 | LMDB `data.mdb` logical bytes | 294,912 | 606,208 | 3,227,648 |
-| One-file package install (ms) | 29.465 | 31.810 | 32.381 |
-| 1,000-file package install (ms) | 4,071.157 | 4,041.059 | 4,023.220 |
-| Model/audit operations per second | 59.4 | 62.1 | 55.7 |
+| One-file package install (ms) | 36.530 | 41.373 | 41.607 |
+| 1,000-file package install (ms) | 4,107.308 | 4,222.314 | 4,169.260 |
+| Model/audit operations per second | 24.2 | 22.1 | 22.6 |
 
-The 10,000-package command completed in 39.28 seconds and `/usr/bin/time -l`
-reported a 93,061,120-byte maximum resident set size (87,802,336-byte peak
+The 10,000-package command completed in 48.11 seconds and `/usr/bin/time -l`
+reported a 92,291,072-byte maximum resident set size (84,394,488-byte peak
 memory footprint).
 
 ## Interpretation boundary

@@ -28,6 +28,15 @@
 9. **Channel configuration paths could contain parent traversal.** Repository
    channel identifiers, aliases, signing keys and target roots are now rejected
    unless they are normalized values that remain within their configured roots.
+10. **Removing a package could loop forever after its parent directory was
+    already missing.** Missing paths now satisfy idempotent removal, allowing
+    the journal and stale LMDB record to retire.
+11. **The Rust operation lock followed symlinks.** Every directory and the final
+    lock file now use an anchored `openat(O_NOFOLLOW)` walk; regressions cover
+    both intermediate and final-component redirection.
+12. **Lock waits and LMDB map exhaustion lacked deterministic boundaries.** The
+    CLI now exposes `--lock-timeout`, and a 1 MiB map-full regression proves all
+    reverse indexes roll back together.
 
 Each item has a deterministic regression in `crates/sage-tests`.
 
@@ -57,8 +66,8 @@ rootfs/QEMU boot. Package-repository evidence alone is not that proof.
 - `sage verify` detects missing files and ownership disagreement; it does not
   reconstruct missing payloads automatically or hash every non-configuration
   file because schema-v1 installed records do not retain every archive hash.
-- LMDB uses a fixed 8 GiB virtual map. The 10,000-package benchmark exercises
-  normal growth, not a real map-full recovery at multi-gigabyte scale.
+- A synthetic 1 MiB LMDB map-full is covered. Exhausting the production 8 GiB
+  map with multi-gigabyte data remains a heavy platform test.
 - Real ENOSPC requires a bounded filesystem/loop device and remains a privileged
   platform job; ordinary CI covers equivalent short-write and pre-commit abort
   cleanup through deterministic injection.
@@ -67,7 +76,7 @@ rootfs/QEMU boot. Package-repository evidence alone is not that proof.
 - SCLinux's network pin gate currently fails on the orphaned `77b0e29` Sage
   bootstrap pin. Resolving it requires the Rust bootstrap migration or an
   upstream branch-retention policy for the legacy C++ source.
-- Production Rust source is 9,568 physical lines after the reliability fixes,
+- Production Rust source is 9,689 physical lines after the reliability fixes,
   above the documented 9,000-line budget. Reducing it safely requires a focused
   consolidation pass; this run did not trade away recovery evidence or path
   validation merely to satisfy the count.

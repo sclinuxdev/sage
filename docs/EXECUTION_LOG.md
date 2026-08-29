@@ -13,15 +13,21 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | `cargo fmt --all -- --check` | passed after final formatting |
 | `cargo check --all-targets` | passed |
 | `cargo clippy --all-targets -- -D warnings` | passed with zero warnings |
-| `cargo test --all-targets` | passed: 65 existing integration tests and 11 Torture Lab tests |
+| `cargo test --all-targets` | passed: 65 existing integration tests and 16 Torture Lab tests |
 | `cargo run -p sage-tests --bin sage-torture -- quick` | passed; 17 recorded real package operations |
-| production Rust physical-line count | 9,568 lines; recorded as a release risk |
+| production Rust physical-line count | 9,689 lines; recorded as a release risk |
 | fixed-seed 24-step state-machine test | passed with seed `0x5a6e2026` |
+| expanded 200-step state-machine | passed with seed `1517166630`; 329 recorded steps |
+| nightly-scale 1,000-step state-machine | passed with seed `1517166630`; 1,667 recorded steps |
 | focused provider-backtracking test | passed |
 | focused channel-path traversal test | passed |
 | focused local Git-daemon readiness test | passed without timing sleeps |
 | focused multi-process and abrupt-termination tests | passed |
-| full Torture Lab test target | passed: archive faults, DB faults, attacks, locks, concurrency, recovery, verification, model and benchmark smoke |
+| Linux Torture Lab binary | 16 passed in Debian sid as uid 1000 |
+| focused filesystem matrix | passed: file/directory swaps, read-only target, long path, hard link and equal-content conflict |
+| focused concurrency matrix | passed: same-package updates, cross-channel writers and reader/writer serialization |
+| focused LMDB map-full | passed with a 1 MiB map and zero partial indexes |
+| repeated recovery failure | passed for install and partial removal journals |
 
 The first macOS Rust baseline exposed the `u32`/Darwin `mode_t` compile error.
 After that fix, an in-sandbox run still produced expected `EPERM` failures for
@@ -40,7 +46,7 @@ cargo run --release -p sage-tests --bin sage-torture -- bench --packages 1000
 ```
 
 The complete results and measurement boundary are in `BENCHMARKS.md`. The
-10,000-package run completed in 39.28 seconds with a 93,061,120-byte maximum
+10,000-package run completed in 48.11 seconds with a 92,291,072-byte maximum
 resident set size.
 
 ## SCLinux integration
@@ -61,10 +67,27 @@ The final failure is a verified integration blocker, not a flaky test. All C++
 Sage 0.2.x/0.3.x tags are outside the current Rust default-branch ancestry, and
 SCLinux Stage1 has no Rust/Cargo bootstrap closure.
 
-## Linux validation boundary
+## Linux validation
 
-An official `rust:1.96-bookworm` image pull was attempted for a fresh Linux
-rerun. The registry transfer remained near 2 MiB across the large layers and
-was cancelled. Therefore the current checkout has complete macOS evidence and
-Linux CI definitions, while a fresh local Linux execution of this exact branch
-remains pending. Linux-only ELF/RUNPATH tests are still present in normal CI.
+The official `rust:1.96-bookworm` image pull and a Debian `apt-get update` both
+stalled and were cancelled. A second path succeeded:
+
+```bash
+brew install zig
+rustup target add aarch64-unknown-linux-gnu
+cargo zigbuild --target aarch64-unknown-linux-gnu --all-targets
+```
+
+The first Homebrew attempt failed after a partial LLVM bottle transfer; the
+retry resumed and installed Zig 0.16.0, LLVM 21 and LLD 21. The cross-build
+completed and produced ARM64 GNU/Linux ELF binaries. Those exact binaries were
+executed in the existing Debian sid image as uid 1000:
+
+- Torture Lab: 16 passed, zero failed.
+- Main integration binary: 66 passed, zero failed, one filtered out. The only
+  filtered test was the local git-daemon fixture because the minimal Debian
+  runtime image does not contain git; that same fixture passed on macOS.
+
+An attempt to create the remote SCLinux migration issue was rejected by the
+external-write approval gate. The blocker remains recorded locally and no
+workaround write was attempted.

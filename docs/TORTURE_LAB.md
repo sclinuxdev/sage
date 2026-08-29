@@ -29,11 +29,12 @@ binary gate. `.github/workflows/torture.yml` runs the long random sequence and
 
 ## Failure reproduction
 
-Every random run prints its seed before the first operation. A failed audit adds
-the operation number and the recorded action sequence to the error. Re-run the
-same command with the printed seed and operation count. Reduce a failure by
-halving `--operations` until the failing prefix is minimal, then add that prefix
-as a deterministic regression.
+Every random run prints its seed before the first operation. The generated state
+machine includes install, remove, reinstall, upgrade, repository rollback
+attempts, dependency replacement, failed install/retry, conflicts, and runtime /
+toolchain channel switching. A failed run automatically replays shorter prefixes
+and reports the smallest failing prefix plus its operation list. Re-run that seed
+and prefix length, then preserve the sequence as a deterministic regression.
 
 The reference model tracks installed `(channel, name, slot, version)` instances
 and expected physical payload contents. After every mutation the Lab verifies:
@@ -83,12 +84,17 @@ specified in `INVARIANTS.md`.
 
 ## Attack and boundary coverage
 
-The quick suite covers parent/absolute/empty/non-UTF-8 paths, intermediate
-symlink redirection, escaping symlink targets, unsupported hard links and entry
-types, duplicate payload aliases, file conflicts, partial writes, rename
-boundaries, and LMDB rollback. Linux CI additionally exercises real ELF and
-private RUNPATH behavior. Read-only directories and generic I/O failures use
-the same error/cleanup path as injected write faults.
+The quick suite covers parent/absolute/empty/non-UTF-8 paths, duplicate
+separators, 300-byte components, intermediate symlink redirection, escaping
+symlink targets, hard links, file/directory swaps, read-only destinations,
+duplicate payload aliases, equal/different-content ownership conflicts, partial
+writes, rename boundaries, LMDB pre-commit rollback and a synthetic map-full.
+Linux CI additionally exercises real ELF and private RUNPATH behavior.
+
+Concurrency tests use real child processes and an explicit parent-held lock as a
+barrier. They cover two installs, two updates of the same package, install/remove,
+different runtime/toolchain channels, a shared read-only verifier versus a
+writer, abrupt owner death, fail-fast probes, and bounded `--lock-timeout`.
 
 ## Platform limits
 
