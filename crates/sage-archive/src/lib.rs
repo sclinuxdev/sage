@@ -531,7 +531,7 @@ fn write_verified(
         Some(directory.as_raw_fd()),
         temp.as_str(),
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::from_bits_truncate(record.mode),
+        archive_mode(record.mode),
     )?;
     let mut temporary = TempGuard {
         dirfd: directory.as_raw_fd(),
@@ -554,7 +554,7 @@ fn write_verified(
             path.display()
         )));
     }
-    fchmod(output.as_raw_fd(), Mode::from_bits_truncate(record.mode))?;
+    fchmod(output.as_raw_fd(), archive_mode(record.mode))?;
     output.sync_all()?;
     let actual = hex::encode(hasher.finalize());
     if actual != record.sha256 {
@@ -577,6 +577,15 @@ fn write_verified(
     } else {
         WriteOutcome::Written
     })
+}
+
+/// Converts the portable `u32` mode stored in `files.idx` into the host
+/// `mode_t`. Darwin defines `mode_t` as `u16` while Linux uses `u32`; the
+/// archive schema intentionally stores the wider representation so packages
+/// remain architecture independent. `Mode` discards bits it does not support,
+/// so narrowing here preserves every portable permission and special bit.
+fn archive_mode(mode: u32) -> Mode {
+    Mode::from_bits_truncate(mode as nix::libc::mode_t)
 }
 
 fn hash_at(directory: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<String>, ArchiveError> {
