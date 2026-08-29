@@ -4,7 +4,7 @@ use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::sys::stat::{fchmod, mkdirat, Mode};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -34,6 +34,18 @@ pub enum ArchiveError {
     },
     #[error("unsafe or unsupported archive path: {0}")]
     UnsafePath(String),
+    #[error("injected extraction fault at {0:?}")]
+    InjectedFault(ExtractionFault),
+}
+
+/// Explicit test hook for durable publication boundaries. Production callers
+/// use the ordinary extraction functions, which never inject a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionFault {
+    BeforeTemporary,
+    AfterPartialWrite,
+    BeforeRename,
+    AfterRename,
 }
 
 /// Schema-v1 package manifest shared with recipes and solver records.
@@ -104,7 +116,8 @@ pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, Arch
 pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ArchiveError::InvalidMetadata("files.idx is not UTF-8".into()))?;
-    text.lines()
+    let records = text
+        .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
             let mut fields = line.split('\t');
@@ -131,7 +144,17 @@ pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
                 sha256: sha256.to_ascii_lowercase(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = BTreeSet::new();
+    if records
+        .iter()
+        .any(|record| !paths.insert(record.path.clone()))
+    {
+        return Err(ArchiveError::InvalidMetadata(
+            "files.idx contains duplicate canonical paths".into(),
+        ));
+    }
+    Ok(records)
 }
 
 /// Builds a sorted integrity index for a staged payload tree.
@@ -163,12 +186,13 @@ pub fn build_file_index(root: &Path) -> Result<Vec<FileRecord>, ArchiveError> {
                 });
             } else if metadata.file_type().is_symlink() {
                 let target = fs::read_link(&path)?;
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("recursive walk stays below root");
+                validate_link_target(relative, &target)?;
                 let bytes = target.as_os_str().as_encoded_bytes();
                 output.push(FileRecord {
-                    path: path
-                        .strip_prefix(root)
-                        .expect("recursive walk stays below root")
-                        .to_path_buf(),
+                    path: relative.to_path_buf(),
                     mode: 0o777,
                     size: bytes.len() as u64,
                     sha256: hex::encode(Sha256::digest(bytes)),
@@ -341,12 +365,46 @@ pub fn extract_package_with_config(
     index: &[FileRecord],
     previous_hashes: &BTreeMap<String, String>,
 ) -> Result<ExtractionReport, ArchiveError> {
+    extract_package_internal(
+        package.as_ref(),
+        sysroot.as_ref(),
+        index,
+        previous_hashes,
+        None,
+    )
+}
+
+/// Runs extraction with one explicit, one-shot failure boundary. This API is
+/// intended for the Torture Lab and preserves the production extraction path.
+pub fn extract_package_with_fault(
+    package: impl AsRef<Path>,
+    sysroot: impl AsRef<Path>,
+    index: &[FileRecord],
+    fault: ExtractionFault,
+) -> Result<ExtractionReport, ArchiveError> {
+    extract_package_internal(
+        package.as_ref(),
+        sysroot.as_ref(),
+        index,
+        &BTreeMap::new(),
+        Some(fault),
+    )
+}
+
+fn extract_package_internal(
+    package: &Path,
+    sysroot: &Path,
+    index: &[FileRecord],
+    previous_hashes: &BTreeMap<String, String>,
+    fault: Option<ExtractionFault>,
+) -> Result<ExtractionReport, ArchiveError> {
+    validate_payload(package, index)?;
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
         .collect();
     let root_raw = open(
-        sysroot.as_ref(),
+        sysroot,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
@@ -408,7 +466,7 @@ pub fn extract_package_with_config(
         let previous = previous_hashes
             .get(&relative.to_string_lossy().into_owned())
             .map(String::as_str);
-        match write_verified(&root, relative, record, previous, &mut entry)? {
+        match write_verified(&root, relative, record, previous, &mut entry, fault)? {
             WriteOutcome::Written => report.written.push(relative.to_path_buf()),
             WriteOutcome::Preserved => report.preserved.push(relative.to_path_buf()),
             WriteOutcome::SageNew => report.sage_new.push(relative.with_file_name(format!(
@@ -424,6 +482,86 @@ pub fn extract_package_with_config(
         ));
     }
     Ok(report)
+}
+
+/// Scans every payload header before the first write. This keeps unsupported
+/// hard links, duplicate aliases, and malformed late entries from leaving a
+/// partially published package merely because they followed valid files.
+fn validate_payload(package: &Path, index: &[FileRecord]) -> Result<(), ArchiveError> {
+    let expected: BTreeMap<_, _> = index
+        .iter()
+        .map(|record| (record.path.clone(), record))
+        .collect();
+    if expected.len() != index.len() {
+        return Err(ArchiveError::InvalidMetadata(
+            "files.idx contains duplicate canonical paths".into(),
+        ));
+    }
+    let decoder = zstd::Decoder::new(File::open(package)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut seen = BTreeSet::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = clean_archive_path(&entry.path()?)?;
+        if path.starts_with(".METADATA") {
+            if entry.header().entry_type().is_file() {
+                validate_metadata_path(&path)?;
+            }
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix("data") else {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "unsupported top-level entry {}",
+                path.display()
+            )));
+        };
+        if relative.as_os_str().is_empty() || entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let record = expected.get(relative).ok_or_else(|| {
+            ArchiveError::InvalidMetadata(format!("unindexed payload {}", relative.display()))
+        })?;
+        if !seen.insert(relative.to_path_buf()) {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "duplicate payload {}",
+                relative.display()
+            )));
+        }
+        if entry.header().entry_type().is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| ArchiveError::InvalidMetadata("symlink has no target".into()))?;
+            validate_link_target(relative, &target)?;
+            let bytes = target.as_os_str().as_encoded_bytes();
+            if bytes.len() as u64 != record.size
+                || hex::encode(Sha256::digest(bytes)) != record.sha256
+            {
+                return Err(ArchiveError::ChecksumMismatch {
+                    path: relative.into(),
+                    expected: record.sha256.clone(),
+                    actual: hex::encode(Sha256::digest(bytes)),
+                });
+            }
+        } else if entry.header().entry_type().is_file() {
+            if entry.size() != record.size {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "size mismatch for {}",
+                    relative.display()
+                )));
+            }
+        } else {
+            return Err(ArchiveError::UnsafePath(format!(
+                "unsupported entry {}",
+                relative.display()
+            )));
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(ArchiveError::InvalidMetadata(
+            "archive payload does not match files.idx".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_verified_symlink(
@@ -497,6 +635,7 @@ fn write_verified(
     record: &FileRecord,
     previous_hash: Option<&str>,
     reader: &mut impl Read,
+    fault: Option<ExtractionFault>,
 ) -> Result<WriteOutcome, ArchiveError> {
     let parent = path.parent().unwrap_or(Path::new(""));
     let directory = ensure_directory(root, parent)?;
@@ -527,6 +666,11 @@ fn write_verified(
         std::process::id(),
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     );
+    if fault == Some(ExtractionFault::BeforeTemporary) {
+        return Err(ArchiveError::InjectedFault(
+            ExtractionFault::BeforeTemporary,
+        ));
+    }
     let raw = openat(
         Some(directory.as_raw_fd()),
         temp.as_str(),
@@ -541,6 +685,20 @@ fn write_verified(
     // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
     let mut output = unsafe { File::from_raw_fd(raw) };
     let mut hasher = Sha256::new();
+    if fault == Some(ExtractionFault::AfterPartialWrite) {
+        let limit = (record.size / 2).max(1).min(record.size);
+        io::copy(
+            &mut reader.take(limit),
+            &mut HashWriter {
+                output: &mut output,
+                hash: &mut hasher,
+            },
+        )?;
+        output.sync_all()?;
+        return Err(ArchiveError::InjectedFault(
+            ExtractionFault::AfterPartialWrite,
+        ));
+    }
     let copied = io::copy(
         &mut reader.take(record.size + 1),
         &mut HashWriter {
@@ -565,6 +723,9 @@ fn write_verified(
         });
     }
     drop(output);
+    if fault == Some(ExtractionFault::BeforeRename) {
+        return Err(ArchiveError::InjectedFault(ExtractionFault::BeforeRename));
+    }
     renameat(
         Some(directory.as_raw_fd()),
         temp.as_str(),
@@ -572,6 +733,9 @@ fn write_verified(
         destination.as_str(),
     )?;
     temporary.active = false;
+    if fault == Some(ExtractionFault::AfterRename) {
+        return Err(ArchiveError::InjectedFault(ExtractionFault::AfterRename));
+    }
     Ok(if conflict {
         WriteOutcome::SageNew
     } else {
