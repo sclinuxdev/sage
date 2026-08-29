@@ -21,8 +21,7 @@
 6. **Second-resolution operation IDs repeated.** IDs now include nanoseconds and
    an in-process sequence, keeping concurrent/retried diagnostics distinct.
 7. **No production state consistency command existed.** `sage verify` now checks
-   package records, reverse ownership and managed-path existence. `sage count`
-   restores the SCLinux boot-gate compatibility command.
+   package records, reverse ownership and managed-path existence.
 8. **The local Git fixture guessed readiness with sleeps.** It now waits on the
    daemon readiness stream and continuously drains diagnostics.
 9. **Channel configuration paths could contain parent traversal.** Repository
@@ -40,6 +39,19 @@
 
 Each item has a deterministic regression in `crates/sage-tests`.
 
+## Post-review simplification
+
+- Archive/database fault injection, custom LMDB map sizes and batch benchmark
+  transactions are exposed only when the `torture` Cargo features are enabled.
+- `HostLock` keeps ordinary and bounded shared/exclusive acquisition; test-only
+  `try_*` entry points and the public busy error were removed.
+- Package service/trigger/alternatives/sysusers parsing is shared by preflight
+  and recovery through one local value object.
+- The speculative `sage count` compatibility command was removed until a real
+  SCLinux 0.4 consumer exists; `sage verify` remains production behavior.
+- Normal CI no longer re-runs the quick scenario, and benchmark smoke is ignored
+  in ordinary tests while remaining executable in the Torture Lab workflow.
+
 ## SCLinux integration status
 
 The current SCLinux Stage1 recipe pins C++ Sage commit
@@ -50,10 +62,11 @@ current Rust default branch. Neither bootstrap stage contains Rust or Cargo
 recipes, so repointing those recipes to Sage 0.4 would break the bootstrap
 closure rather than prove integration.
 
-The safe integration delivered here is the compatibility behavior SCLinux's
-QEMU gate consumes (`sage count` and `sage verify`) plus a documented migration
-gate. A full pin migration requires an explicit Rust bootstrap/toolchain recipe,
-new Cargo build commands, updated 0.4 configuration/package schemas, and a fresh
+The safe integration delivered here is `sage verify` plus a documented migration
+gate. The legacy `sage count` compatibility command remains part of the future
+SCLinux migration rather than entering Sage before a real 0.4 consumer exists.
+A full pin migration requires an explicit Rust bootstrap/toolchain recipe, new
+Cargo build commands, updated 0.4 configuration/package schemas, and a fresh
 rootfs/QEMU boot. Package-repository evidence alone is not that proof.
 
 ## Remaining explicit risks
@@ -76,10 +89,8 @@ rootfs/QEMU boot. Package-repository evidence alone is not that proof.
 - SCLinux's network pin gate currently fails on the orphaned `77b0e29` Sage
   bootstrap pin. Resolving it requires the Rust bootstrap migration or an
   upstream branch-retention policy for the legacy C++ source.
-- Production Rust source is 9,689 physical lines after the reliability fixes,
-  above the documented 9,000-line budget. Reducing it safely requires a focused
-  consolidation pass; this run did not trade away recovery evidence or path
-  validation merely to satisfy the count.
+- Production Rust source size is informational for this release; correctness
+  gates are not weakened to meet the historical 9,000-line target.
 
 These are release decisions or schema/platform projects, not hidden passing
 tests. None is silently treated as successful behavior.

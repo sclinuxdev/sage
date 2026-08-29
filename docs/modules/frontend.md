@@ -101,17 +101,14 @@ pub enum Commands {
 
 ### CLI 常见用法示例
 
-Release diagnostics also expose two direct, read-only compatibility commands:
+Release diagnostics expose one direct, read-only consistency command:
 
 ```bash
-sage count
 sage verify
 ```
 
-`count` prints the number of installed `(channel, name, slot)` instances.
 `verify` checks package records, reverse ownership indexes, safe persisted paths,
-and rootfs path existence without opening an LMDB write transaction. SCLinux's
-boot gate may use these commands before image publication.
+and rootfs path existence without opening an LMDB write transaction.
 
 `--lock-timeout SECONDS` bounds shared or exclusive operation-lock acquisition.
 When omitted, Sage preserves the existing blocking behavior.

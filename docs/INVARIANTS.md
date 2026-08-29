@@ -83,7 +83,7 @@ describe observable state, not implementation details.
 ## Concurrency
 
 - Writers use one target-root operation lock. Multiple writers are serialized;
-  shared readers may coexist, and a nonblocking lock attempt reports `LockBusy`.
+  shared readers may coexist, and a zero-duration bounded wait fails immediately.
 - Lock directories and the final file are opened through an anchored
   `openat(O_NOFOLLOW)` walk. `--lock-timeout` provides a deterministic bounded
   wait without changing the historical blocking default.

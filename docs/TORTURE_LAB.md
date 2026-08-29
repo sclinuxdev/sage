@@ -23,9 +23,9 @@ cargo run --release -p sage-tests --bin sage-torture -- all \
   --seed 1517166630 --operations 1000 --packages 10000
 ```
 
-The ordinary CI suite runs the quick integration tests and the explicit quick
-binary gate. `.github/workflows/torture.yml` runs the long random sequence and
-10,000-package benchmark nightly or on manual dispatch.
+The ordinary CI suite runs the quick integration tests once through
+`cargo test --all-targets`. `.github/workflows/torture.yml` runs the long random
+sequence and 10,000-package benchmark nightly or on manual dispatch.
 
 ## Failure reproduction
 
@@ -48,7 +48,8 @@ and expected physical payload contents. After every mutation the Lab verifies:
 
 ## Fault injection
 
-Production calls never select library fault enums. Tests opt in explicitly:
+Normal production builds do not expose library fault enums. The `sage-tests`
+crate explicitly enables the `torture` features on `sage-archive` and `sage-db`:
 
 | Layer | Hook | Boundary |
 | --- | --- | --- |
