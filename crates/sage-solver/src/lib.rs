@@ -52,6 +52,11 @@ impl PackageUniverse {
             .into_iter()
             .flat_map(|items| items.keys())
     }
+
+    /// Returns one exact release selected by the solver.
+    pub fn release(&self, key: &PackageKey, version: &Version) -> Option<&PackageRelease> {
+        self.releases.get(key)?.get(version)
+    }
 }
 /// Resolver configuration including versions pinned by the installed system.
 pub struct SageSolver<'a> {

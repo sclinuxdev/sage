@@ -959,10 +959,7 @@ fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result
 async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
-    let mut desired: Vec<_> = config.packages.iter().cloned().collect();
-    desired.extend(config.providers.values().cloned());
-    desired.sort();
-    desired.dedup();
+    let desired: Vec<_> = config.packages.iter().cloned().collect();
     apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
     let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));

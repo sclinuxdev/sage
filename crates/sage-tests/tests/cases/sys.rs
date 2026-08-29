@@ -294,6 +294,42 @@ mod sys_tests {
     }
 
     #[test]
+    fn reconciliation_backtracks_from_conflicting_provider_preference() {
+        let mut universe = sage_solver::PackageUniverse::default();
+        let mut app = sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", "app", "0"),
+            "1-1".parse().unwrap(),
+            vec!["virtual/libc".parse().unwrap()],
+            vec![],
+        );
+        app.conflicts.push("musl".into());
+        universe.insert(app);
+        for name in ["glibc", "musl"] {
+            universe.insert(sage_core::Package::from_release(
+                sage_core::PackageKey::new("main/system", name, "0"),
+                "1-1".parse().unwrap(),
+                vec![],
+                vec!["virtual/libc".into()],
+            ));
+        }
+        let config = SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::from([("libc".into(), "musl".into())]),
+            packages: BTreeSet::from(["app".into()]),
+            services: BTreeSet::new(),
+        };
+
+        let plan = ReconcilePlan::compute(&config, &[], &universe, false).unwrap();
+        assert!(plan.install.iter().any(|(key, _)| key.name == "glibc"));
+        assert!(!plan.install.iter().any(|(key, _)| key.name == "musl"));
+        assert_eq!(plan.provider_bindings["libc"].name, "glibc");
+    }
+
+    #[test]
     fn alternatives_choose_priority_and_publish_atomically() {
         let root = tempfile::tempdir().unwrap();
         let candidates = [
