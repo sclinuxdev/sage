@@ -48,8 +48,9 @@ and expected physical payload contents. After every mutation the Lab verifies:
 
 ## Fault injection
 
-Normal production builds do not expose library fault enums. The `sage-tests`
-crate explicitly enables the `torture` features on `sage-archive` and `sage-db`:
+Normal production builds do not expose fault enums or honor crash markers. The
+`sage-tests` crate explicitly enables the `torture` feature on `sage`, which
+forwards it to `sage-archive` and `sage-db`:
 
 | Layer | Hook | Boundary |
 | --- | --- | --- |

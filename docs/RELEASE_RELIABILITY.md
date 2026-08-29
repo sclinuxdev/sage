@@ -41,7 +41,7 @@ Each item has a deterministic regression in `crates/sage-tests`.
 
 ## Post-review simplification
 
-- Archive/database fault injection, custom LMDB map sizes and batch benchmark
+- CLI/archive/database fault injection, custom LMDB map sizes and batch benchmark
   transactions are exposed only when the `torture` Cargo features are enabled.
 - `HostLock` keeps ordinary and bounded shared/exclusive acquisition; test-only
   `try_*` entry points and the public busy error were removed.
