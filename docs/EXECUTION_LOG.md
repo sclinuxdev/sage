@@ -15,6 +15,7 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | `cargo clippy --all-targets -- -D warnings` | passed with zero warnings |
 | `cargo test --all-targets` | passed: 65 existing integration tests and 11 Torture Lab tests |
 | `cargo run -p sage-tests --bin sage-torture -- quick` | passed; 17 recorded real package operations |
+| production Rust physical-line count | 9,568 lines; recorded as a release risk |
 | fixed-seed 24-step state-machine test | passed with seed `0x5a6e2026` |
 | focused provider-backtracking test | passed |
 | focused channel-path traversal test | passed |

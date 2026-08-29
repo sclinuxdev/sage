@@ -67,6 +67,10 @@ rootfs/QEMU boot. Package-repository evidence alone is not that proof.
 - SCLinux's network pin gate currently fails on the orphaned `77b0e29` Sage
   bootstrap pin. Resolving it requires the Rust bootstrap migration or an
   upstream branch-retention policy for the legacy C++ source.
+- Production Rust source is 9,568 physical lines after the reliability fixes,
+  above the documented 9,000-line budget. Reducing it safely requires a focused
+  consolidation pass; this run did not trade away recovery evidence or path
+  validation merely to satisfy the count.
 
 These are release decisions or schema/platform projects, not hidden passing
 tests. None is silently treated as successful behavior.
