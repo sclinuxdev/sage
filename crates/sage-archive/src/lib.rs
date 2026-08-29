@@ -34,6 +34,7 @@ pub enum ArchiveError {
     },
     #[error("unsafe or unsupported archive path: {0}")]
     UnsafePath(String),
+    #[cfg(feature = "torture")]
     #[error("injected extraction fault at {0:?}")]
     InjectedFault(ExtractionFault),
 }
@@ -41,11 +42,32 @@ pub enum ArchiveError {
 /// Explicit test hook for durable publication boundaries. Production callers
 /// use the ordinary extraction functions, which never inject a fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "torture")]
 pub enum ExtractionFault {
     BeforeTemporary,
     AfterPartialWrite,
     BeforeRename,
     AfterRename,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultPoint {
+    BeforeTemporary,
+    AfterPartialWrite,
+    BeforeRename,
+    AfterRename,
+}
+
+#[cfg(feature = "torture")]
+impl From<ExtractionFault> for FaultPoint {
+    fn from(value: ExtractionFault) -> Self {
+        match value {
+            ExtractionFault::BeforeTemporary => Self::BeforeTemporary,
+            ExtractionFault::AfterPartialWrite => Self::AfterPartialWrite,
+            ExtractionFault::BeforeRename => Self::BeforeRename,
+            ExtractionFault::AfterRename => Self::AfterRename,
+        }
+    }
 }
 
 /// Schema-v1 package manifest shared with recipes and solver records.
@@ -376,6 +398,7 @@ pub fn extract_package_with_config(
 
 /// Runs extraction with one explicit, one-shot failure boundary. This API is
 /// intended for the Torture Lab and preserves the production extraction path.
+#[cfg(feature = "torture")]
 pub fn extract_package_with_fault(
     package: impl AsRef<Path>,
     sysroot: impl AsRef<Path>,
@@ -387,7 +410,7 @@ pub fn extract_package_with_fault(
         sysroot.as_ref(),
         index,
         &BTreeMap::new(),
-        Some(fault),
+        Some(fault.into()),
     )
 }
 
@@ -396,7 +419,7 @@ fn extract_package_internal(
     sysroot: &Path,
     index: &[FileRecord],
     previous_hashes: &BTreeMap<String, String>,
-    fault: Option<ExtractionFault>,
+    fault: Option<FaultPoint>,
 ) -> Result<ExtractionReport, ArchiveError> {
     validate_payload(package, index)?;
     let expected: BTreeMap<_, _> = index
@@ -635,7 +658,7 @@ fn write_verified(
     record: &FileRecord,
     previous_hash: Option<&str>,
     reader: &mut impl Read,
-    fault: Option<ExtractionFault>,
+    fault: Option<FaultPoint>,
 ) -> Result<WriteOutcome, ArchiveError> {
     let parent = path.parent().unwrap_or(Path::new(""));
     let directory = ensure_directory(root, parent)?;
@@ -666,10 +689,8 @@ fn write_verified(
         std::process::id(),
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     );
-    if fault == Some(ExtractionFault::BeforeTemporary) {
-        return Err(ArchiveError::InjectedFault(
-            ExtractionFault::BeforeTemporary,
-        ));
+    if fault == Some(FaultPoint::BeforeTemporary) {
+        return Err(injected_fault(FaultPoint::BeforeTemporary));
     }
     let raw = openat(
         Some(directory.as_raw_fd()),
@@ -685,7 +706,7 @@ fn write_verified(
     // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
     let mut output = unsafe { File::from_raw_fd(raw) };
     let mut hasher = Sha256::new();
-    if fault == Some(ExtractionFault::AfterPartialWrite) {
+    if fault == Some(FaultPoint::AfterPartialWrite) {
         let limit = (record.size / 2).max(1).min(record.size);
         io::copy(
             &mut reader.take(limit),
@@ -695,9 +716,7 @@ fn write_verified(
             },
         )?;
         output.sync_all()?;
-        return Err(ArchiveError::InjectedFault(
-            ExtractionFault::AfterPartialWrite,
-        ));
+        return Err(injected_fault(FaultPoint::AfterPartialWrite));
     }
     let copied = io::copy(
         &mut reader.take(record.size + 1),
@@ -723,8 +742,8 @@ fn write_verified(
         });
     }
     drop(output);
-    if fault == Some(ExtractionFault::BeforeRename) {
-        return Err(ArchiveError::InjectedFault(ExtractionFault::BeforeRename));
+    if fault == Some(FaultPoint::BeforeRename) {
+        return Err(injected_fault(FaultPoint::BeforeRename));
     }
     renameat(
         Some(directory.as_raw_fd()),
@@ -733,14 +752,30 @@ fn write_verified(
         destination.as_str(),
     )?;
     temporary.active = false;
-    if fault == Some(ExtractionFault::AfterRename) {
-        return Err(ArchiveError::InjectedFault(ExtractionFault::AfterRename));
+    if fault == Some(FaultPoint::AfterRename) {
+        return Err(injected_fault(FaultPoint::AfterRename));
     }
     Ok(if conflict {
         WriteOutcome::SageNew
     } else {
         WriteOutcome::Written
     })
+}
+
+#[cfg(feature = "torture")]
+fn injected_fault(point: FaultPoint) -> ArchiveError {
+    let point = match point {
+        FaultPoint::BeforeTemporary => ExtractionFault::BeforeTemporary,
+        FaultPoint::AfterPartialWrite => ExtractionFault::AfterPartialWrite,
+        FaultPoint::BeforeRename => ExtractionFault::BeforeRename,
+        FaultPoint::AfterRename => ExtractionFault::AfterRename,
+    };
+    ArchiveError::InjectedFault(point)
+}
+
+#[cfg(not(feature = "torture"))]
+fn injected_fault(_point: FaultPoint) -> ArchiveError {
+    unreachable!("production extraction never selects a fault point")
 }
 
 /// Converts the portable `u32` mode stored in `files.idx` into the host

@@ -448,6 +448,86 @@ async fn publish_packages(
     resume_install(root, database, available, &mut journal).await
 }
 
+struct PackageDeclarations {
+    services: Vec<(String, Vec<u8>)>,
+    trigger: Option<(String, Vec<u8>)>,
+    alternatives: Option<Vec<u8>>,
+    sysusers: Option<Vec<u8>>,
+}
+
+impl PackageDeclarations {
+    fn parse(inspection: &sage_archive::PackageInspection, key: &sage_core::PackageKey) -> Result<Self> {
+        let services = if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
+            sage_sys::ServiceDocument::parse(bytes)?
+                .into_services()
+                .into_iter()
+                .map(|service| {
+                    let name = service.name.clone();
+                    let bytes = toml::to_string_pretty(&sage_sys::ServiceDocument {
+                        schema_version: sage_core::SCHEMA_VERSION,
+                        service: Some(service),
+                        services: Vec::new(),
+                    })?
+                    .into_bytes();
+                    Ok((name, bytes))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let trigger = inspection
+            .optional
+            .get(".METADATA/triggers.toml")
+            .map(|bytes| -> Result<(String, Vec<u8>)> {
+                let trigger = sage_sys::TriggerSpec::parse(bytes)?;
+                Ok((trigger.name, bytes.clone()))
+            })
+            .transpose()?;
+        let alternatives = inspection
+            .optional
+            .get(".METADATA/alternatives.toml")
+            .map(|bytes| -> Result<Vec<u8>> {
+                let mut document = sage_sys::AlternativesDocument::parse(bytes)?;
+                document.package.clone_from(key);
+                Ok(toml::to_string_pretty(&document)?.into_bytes())
+            })
+            .transpose()?;
+        let sysusers = inspection
+            .optional
+            .get(".METADATA/sysusers.toml")
+            .map(|bytes| -> Result<Vec<u8>> {
+                let mut document = sage_sys::SysusersDocument::parse(bytes)?;
+                document.package.clone_from(key);
+                Ok(toml::to_string_pretty(&document)?.into_bytes())
+            })
+            .transpose()?;
+        Ok(Self {
+            services,
+            trigger,
+            alternatives,
+            sysusers,
+        })
+    }
+
+    fn ownership_paths(&self, key: &sage_core::PackageKey) -> Vec<String> {
+        let mut paths = self
+            .services
+            .iter()
+            .map(|(name, _)| format!("usr/share/sage/services/{name}.toml"))
+            .collect::<Vec<_>>();
+        if let Some((name, _)) = &self.trigger {
+            paths.push(format!("usr/share/sage/triggers/{name}.toml"));
+        }
+        if self.alternatives.is_some() {
+            paths.push(alternative_declaration_path(key).to_string_lossy().into_owned());
+        }
+        if self.sysusers.is_some() {
+            paths.push(sysusers_declaration_path(key).to_string_lossy().into_owned());
+        }
+        paths
+    }
+}
+
 /// Validates the complete transaction before creating a durable recovery record.
 /// A rejected archive or ownership conflict has made no filesystem or LMDB
 /// mutation, so it must not become an endlessly retried startup journal.
@@ -498,34 +578,7 @@ async fn preflight_packages(
             .iter()
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
-        if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
-            ownership.extend(
-                sage_sys::ServiceDocument::parse(bytes)?
-                    .into_services()
-                    .into_iter()
-                    .map(|service| format!("usr/share/sage/services/{}.toml", service.name)),
-            );
-        }
-        if let Some(bytes) = inspection.optional.get(".METADATA/triggers.toml") {
-            let trigger = sage_sys::TriggerSpec::parse(bytes)?;
-            ownership.push(format!("usr/share/sage/triggers/{}.toml", trigger.name));
-        }
-        if let Some(bytes) = inspection.optional.get(".METADATA/alternatives.toml") {
-            sage_sys::AlternativesDocument::parse(bytes)?;
-            ownership.push(
-                alternative_declaration_path(key)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-        if let Some(bytes) = inspection.optional.get(".METADATA/sysusers.toml") {
-            sage_sys::SysusersDocument::parse(bytes)?;
-            ownership.push(
-                sysusers_declaration_path(key)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
+        ownership.extend(PackageDeclarations::parse(&inspection, key)?.ownership_paths(key));
         for path in ownership {
             let owners = database.owners(&path)?;
             if owners.iter().any(|owner| owner != key) {
@@ -597,65 +650,8 @@ async fn resume_install(
             .iter()
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
-        let services = if let Some(bytes) = inspection.optional.get(".METADATA/service.toml") {
-            sage_sys::ServiceDocument::parse(bytes)?
-                .into_services()
-                .into_iter()
-                .map(|service| {
-                    let bytes = toml::to_string_pretty(&sage_sys::ServiceDocument {
-                        schema_version: sage_core::SCHEMA_VERSION,
-                        service: Some(service.clone()),
-                        services: Vec::new(),
-                    })?
-                    .into_bytes();
-                    Ok((service, bytes))
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            Vec::new()
-        };
-        let trigger = if let Some(bytes) = inspection.optional.get(".METADATA/triggers.toml") {
-            Some((sage_sys::TriggerSpec::parse(bytes)?, bytes.clone()))
-        } else {
-            None
-        };
-        let alternatives =
-            if let Some(bytes) = inspection.optional.get(".METADATA/alternatives.toml") {
-                let mut document = sage_sys::AlternativesDocument::parse(bytes)?;
-                document.package.clone_from(key);
-                let bytes = toml::to_string_pretty(&document)?.into_bytes();
-                Some((document, bytes))
-            } else {
-                None
-            };
-        let sysusers = if let Some(bytes) = inspection.optional.get(".METADATA/sysusers.toml") {
-            let mut document = sage_sys::SysusersDocument::parse(bytes)?;
-            document.package.clone_from(key);
-            let bytes = toml::to_string_pretty(&document)?.into_bytes();
-            Some((document, bytes))
-        } else {
-            None
-        };
-        for (service, _) in &services {
-            ownership.push(format!("usr/share/sage/services/{}.toml", service.name));
-        }
-        if let Some((trigger, _)) = &trigger {
-            ownership.push(format!("usr/share/sage/triggers/{}.toml", trigger.name));
-        }
-        if alternatives.is_some() {
-            ownership.push(
-                alternative_declaration_path(key)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-        if sysusers.is_some() {
-            ownership.push(
-                sysusers_declaration_path(key)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
+        let declarations = PackageDeclarations::parse(&inspection, key)?;
+        ownership.extend(declarations.ownership_paths(key));
         for path in &ownership {
             let owners = database.owners(path)?;
             if owners.iter().any(|owner| owner != key) {
@@ -674,24 +670,24 @@ async fn resume_install(
             &previous,
         )?;
         crash_point(root, "extraction")?;
-        for (service, bytes) in services {
+        for (name, bytes) in declarations.services {
             write_atomic_under_root(
                 root,
-                &Path::new("usr/share/sage/services").join(format!("{}.toml", service.name)),
+                &Path::new("usr/share/sage/services").join(format!("{name}.toml")),
                 &bytes,
             )?;
         }
-        if let Some((trigger, bytes)) = trigger {
+        if let Some((name, bytes)) = declarations.trigger {
             write_atomic_under_root(
                 root,
-                &Path::new("usr/share/sage/triggers").join(format!("{}.toml", trigger.name)),
+                &Path::new("usr/share/sage/triggers").join(format!("{name}.toml")),
                 &bytes,
             )?;
         }
-        if let Some((_, bytes)) = alternatives {
+        if let Some(bytes) = declarations.alternatives {
             write_atomic_under_root(root, &alternative_declaration_path(key), &bytes)?;
         }
-        if let Some((_, bytes)) = sysusers {
+        if let Some(bytes) = declarations.sysusers {
             write_atomic_under_root(root, &sysusers_declaration_path(key), &bytes)?;
         }
         modified.extend(ownership.iter().map(PathBuf::from));

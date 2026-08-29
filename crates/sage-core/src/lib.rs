@@ -46,8 +46,6 @@ pub enum CoreError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("host lock at {0} is busy")]
-    LockBusy(PathBuf),
     #[error("timed out waiting for host lock at {0}")]
     LockTimedOut(PathBuf),
     #[error("invalid version string '{0}'")]
@@ -595,18 +593,17 @@ pub struct HostLock {
     path: PathBuf,
 }
 
+enum TryLockError {
+    Busy,
+    Fatal(CoreError),
+}
+
 impl HostLock {
     pub fn acquire_shared(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::acquire(path, false)
     }
     pub fn acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::acquire(path, true)
-    }
-    pub fn try_acquire_shared(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::try_acquire(path, false)
-    }
-    pub fn try_acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::try_acquire(path, true)
     }
     pub fn acquire_shared_for(
         path: impl AsRef<Path>,
@@ -636,9 +633,9 @@ impl HostLock {
         Ok(Self { file, path })
     }
 
-    fn try_acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
+    fn try_acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, TryLockError> {
         let path = path.as_ref().to_path_buf();
-        let file = open_lock_file(&path)?;
+        let file = open_lock_file(&path).map_err(TryLockError::Fatal)?;
         let result = if exclusive {
             fs2::FileExt::try_lock_exclusive(&file)
         } else {
@@ -647,9 +644,9 @@ impl HostLock {
         match result {
             Ok(()) => Ok(Self { file, path }),
             Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(CoreError::LockBusy(path))
+                Err(TryLockError::Busy)
             }
-            Err(source) => Err(CoreError::LockFailed { path, source }),
+            Err(source) => Err(TryLockError::Fatal(CoreError::LockFailed { path, source })),
         }
     }
 
@@ -667,11 +664,11 @@ impl HostLock {
         loop {
             match Self::try_acquire(&path, exclusive) {
                 Ok(lock) => return Ok(lock),
-                Err(CoreError::LockBusy(_)) if std::time::Instant::now() < deadline => {
+                Err(TryLockError::Busy) if std::time::Instant::now() < deadline => {
                     std::thread::yield_now();
                 }
-                Err(CoreError::LockBusy(_)) => return Err(CoreError::LockTimedOut(path)),
-                Err(error) => return Err(error),
+                Err(TryLockError::Busy) => return Err(CoreError::LockTimedOut(path)),
+                Err(TryLockError::Fatal(error)) => return Err(error),
             }
         }
     }

@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "LMDB state storage, transaction journaling, and ownership tracking for Sage"
 
+[features]
+torture = []
+
 [dependencies]
 sage-core = { workspace = true }
 heed = { workspace = true }

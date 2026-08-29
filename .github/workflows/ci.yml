@@ -20,7 +20,5 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run all targets
         run: cargo test --all-targets
-      - name: Run hermetic package-manager release gate
-        run: cargo run -p sage-tests --bin sage-torture -- quick
       - name: Deny Clippy warnings
         run: cargo clippy --all-targets -- -D warnings

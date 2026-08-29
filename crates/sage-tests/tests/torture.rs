@@ -9,6 +9,7 @@ async fn fixed_seed_state_machine_matches_the_reference_model() {
 }
 
 #[tokio::test]
+#[ignore = "full benchmarks run in the Torture Lab workflow"]
 async fn benchmark_smoke_records_database_metrics() {
     let report = sage_tests::run_bench(100).await.unwrap();
     assert_eq!(report["packages"], 100.0);
@@ -280,15 +281,11 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
     let path = canonical.join("run/sage/operation.lock");
     let exclusive = sage_core::HostLock::acquire_exclusive(&path).unwrap();
     assert!(matches!(
-        sage_core::HostLock::try_acquire_exclusive(&path),
-        Err(sage_core::CoreError::LockBusy(_))
-    ));
-    assert!(matches!(
-        sage_core::HostLock::try_acquire_shared(&path),
-        Err(sage_core::CoreError::LockBusy(_))
-    ));
-    assert!(matches!(
         sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO),
+        Err(sage_core::CoreError::LockTimedOut(_))
+    ));
+    assert!(matches!(
+        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO),
         Err(sage_core::CoreError::LockTimedOut(_))
     ));
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -298,25 +295,31 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
             dry_run: false,
             root: canonical.clone(),
             lock_timeout: Some(0),
-            command: sage::Commands::Count,
+            command: sage::Commands::Verify,
         }))
         .unwrap_err();
     assert!(error.to_string().contains("timed out"));
     drop(exclusive);
-    let first_reader = sage_core::HostLock::try_acquire_shared(&path).unwrap();
-    let second_reader = sage_core::HostLock::try_acquire_shared(&path).unwrap();
+    let first_reader =
+        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO).unwrap();
+    let second_reader =
+        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO).unwrap();
     assert!(matches!(
-        sage_core::HostLock::try_acquire_exclusive(&path),
-        Err(sage_core::CoreError::LockBusy(_))
+        sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO),
+        Err(sage_core::CoreError::LockTimedOut(_))
     ));
     drop((first_reader, second_reader));
-    sage_core::HostLock::try_acquire_exclusive(&path).unwrap();
+    sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO).unwrap();
 
     let outside = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(canonical.join("run")).unwrap();
     let redirected = canonical.join("run/redirected");
     std::os::unix::fs::symlink(outside.path(), &redirected).unwrap();
-    assert!(sage_core::HostLock::try_acquire_exclusive(redirected.join("operation.lock")).is_err());
+    assert!(sage_core::HostLock::acquire_exclusive_for(
+        redirected.join("operation.lock"),
+        std::time::Duration::ZERO
+    )
+    .is_err());
     assert!(!outside.path().join("operation.lock").exists());
 
     let final_directory = canonical.join("run/final-link");
@@ -324,9 +327,11 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
     let outside_file = outside.path().join("outside-lock");
     std::fs::write(&outside_file, b"outside").unwrap();
     std::os::unix::fs::symlink(&outside_file, final_directory.join("operation.lock")).unwrap();
-    assert!(
-        sage_core::HostLock::try_acquire_exclusive(final_directory.join("operation.lock")).is_err()
-    );
+    assert!(sage_core::HostLock::acquire_exclusive_for(
+        final_directory.join("operation.lock"),
+        std::time::Duration::ZERO
+    )
+    .is_err());
     assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
 }
 
@@ -636,15 +641,6 @@ async fn verify_detects_database_and_rootfs_divergence() {
         root: lab.root().into(),
         lock_timeout: None,
         command: sage::Commands::Verify,
-    })
-    .await
-    .unwrap();
-    sage::execute(sage::Cli {
-        verbose: false,
-        dry_run: false,
-        root: lab.root().into(),
-        lock_timeout: None,
-        command: sage::Commands::Count,
     })
     .await
     .unwrap();

@@ -28,12 +28,14 @@ pub enum DbError {
     },
     #[error("operation journal '{0}' failed its integrity check")]
     InvalidJournal(String),
+    #[cfg(feature = "torture")]
     #[error("injected database fault at {0:?}")]
     InjectedFault(DbFault),
 }
 
 /// Explicit write-transaction boundaries used only by reliability tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "torture")]
 pub enum DbFault {
     BeforeWrite,
     BeforeCommit,
@@ -124,11 +126,15 @@ pub struct SageDatabase {
 impl SageDatabase {
     /// Opens the state directory and creates all schema-v1 tables atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
-        Self::open_with_map_size(path, MAP_SIZE)
+        Self::open_inner(path.as_ref(), MAP_SIZE)
     }
     /// Opens the state directory with an explicit LMDB map size for boundary tests.
+    #[cfg(feature = "torture")]
     pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self, DbError> {
-        let db_path = path.as_ref().to_path_buf();
+        Self::open_inner(path.as_ref(), map_size)
+    }
+    fn open_inner(path: &Path, map_size: usize) -> Result<Self, DbError> {
+        let db_path = path.to_path_buf();
         fs::create_dir_all(&db_path)?;
         // SAFETY: Sage owns this directory, uses one fixed map size for every opener,
         // and never opens the same LMDB files through a second environment in-process.
@@ -179,9 +185,13 @@ impl SageDatabase {
     }
     /// Publishes a package and all reverse indexes in one write transaction.
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
-        self.install_with_fault(package, allow_shared, None)
+        let mut txn = self.env.write_txn()?;
+        self.install_in_txn(&mut txn, package, allow_shared)?;
+        txn.commit()?;
+        Ok(())
     }
     /// Executes the normal install transaction with an optional test fault.
+    #[cfg(feature = "torture")]
     pub fn install_with_fault(
         &self,
         package: &InstalledPackage,
@@ -200,6 +210,7 @@ impl SageDatabase {
         Ok(())
     }
     /// Publishes a complete package set in one all-or-nothing LMDB transaction.
+    #[cfg(feature = "torture")]
     pub fn install_batch(
         &self,
         packages: &[InstalledPackage],
