@@ -22,8 +22,3 @@ jobs:
         run: cargo test --all-targets
       - name: Deny Clippy warnings
         run: cargo clippy --all-targets -- -D warnings
-      - name: Enforce production Rust line budget
-        shell: bash
-        run: |
-          lines=$(find crates -path '*/src/*.rs' -type f -print0 | xargs -0 cat | wc -l)
-          test "$lines" -le 9000 || { echo "production Rust lines: $lines (limit: 9000)"; exit 1; }

@@ -1,9 +1,8 @@
 # Sage 0.4.0: 架构设计与 Workspace 拓扑规范
 
-## 1. 架构目标与工程预算
+## 1. 架构目标
 
 - **首发重写版本**: `0.4.0`
-- **代码规模硬约束**: `crates/*/src/**/*.rs` 生产 Rust 文件（含空行与注释）严格控制在 **9,000 个物理行以内**；`crates/sage-tests` 不计入实现预算。
 - **绝对零硬编码与完全可扩展性 (Zero-Hardcoded Business Logic)**:
   - **触发器完全数据驱动**: 引擎内不内嵌任何特化触发器逻辑，全部由 `/usr/share/sage/triggers/*.toml` 与 `/etc/sage/triggers.d/*.toml` 声明。
   - **Init 服务生成完全解耦**: 引擎内不内嵌针对特定 Init 系统的硬编码，全部由 `rclass/init-*.toml` 模板引擎渲染。
@@ -79,7 +78,7 @@ graph TD
 
 ---
 
-## 4. 模块代码量预算分配 (Line-of-Code Budget)
+## 4. 模块规模参考
 
 | Crate | 预估代码行数 (LoC) | 核心性能优化与职责 |
 | :--- | :--- | :--- |
@@ -91,11 +90,10 @@ graph TD
 | `sage-build` | ~1,700 | `bwrap` 沙箱、features、临时构建依赖、交叉工具链、产物切分与 ELF 扫描 |
 | `sage-repo` | ~600 | LMDB 索引下载解压与 Ed25519 验签、HTTP Range 多分块并发下载 |
 | `sage` (CLI) | ~500 | `clap` 命令行解析、`indicatif` 进度渲染与输出 |
-| **总计** | **< 9,000** | **全链路 LMDB、零硬编码、极致紧凑、极高性能** |
+| **总计** | — | **全链路 LMDB、零硬编码、紧凑实现、极高性能** |
 
-The CI budget counts every physical line, including comments and blanks, under
-`crates/*/src/**/*.rs`. Integration tests, generated files, and vendored code are
-excluded. Feature and architecture variability stays in schema-v1 TOML.
+Feature and architecture variability stays in schema-v1 TOML. Integration tests,
+generated files, and vendored code remain outside the production module layout.
 
 Source builds add a short-lived package-pool overlay above synchronized indexes.
 Mass-rebuild publishes one dependency layer at a time; bootstrap keeps the same

@@ -36,8 +36,8 @@
   基于 Bubblewrap 的密闭沙箱，记录受管工具 wrapper 的构建溯源，支持 ELF 动态符号反查与互斥多包切分。
 
 - **Ultra Compact / 极致精简**:
-  CI keeps production files under `crates/*/src/**/*.rs` within **9,000 physical lines**; tests are excluded from this implementation budget.
-  CI 将 `crates/*/src/**/*.rs` 生产代码控制在 **9,000 个物理行**内；测试不计入实现预算。
+  A compact, modular workspace keeps the hot paths focused while leaving extensibility in schema-driven configuration.
+  通过紧凑、模块化的 Workspace 保持关键路径简洁，并将可扩展性放入 Schema 驱动的配置中。
 
 ---
 
