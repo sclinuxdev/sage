@@ -28,6 +28,9 @@ describe observable state, not implementation details.
 - `packages`, `files`, and `provides` are updated in one LMDB write transaction.
 - A regular file or symbolic link has exactly one package owner. Batch conflicts
   abort the complete LMDB transaction.
+- A path may move between two packages upgraded in the same transaction only
+  when the old owner releases it; publication orders the release before the new
+  claim. Cyclic ownership swaps are rejected before journaling.
 - Every file listed by an installed package exists below the target root, and
   the reverse ownership index contains that exact package identity.
 - Every ownership entry names an installed package whose file list contains the

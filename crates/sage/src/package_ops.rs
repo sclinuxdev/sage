@@ -426,7 +426,7 @@ async fn publish_packages(
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
 ) -> Result<()> {
-    preflight_packages(root, database, available, architecture, changes).await?;
+    let changes = preflight_packages(root, database, available, architecture, changes).await?;
     let op_id = operation_id("install")?;
     // Recovery must not consult records that installation may already have replaced.
     let previous_packages = changes
@@ -441,7 +441,7 @@ async fn publish_packages(
         "packages",
         sage_db::JournalAction::Install {
             architecture: architecture.into(),
-            changes: changes.to_vec(),
+            changes: changes.clone(),
             previous_packages,
             modified_paths: Vec::new(),
             previous_alternative_documents: read_documents(
@@ -534,7 +534,7 @@ impl PackageDeclarations {
     }
 }
 
-/// Validates the complete transaction before creating a durable recovery record.
+/// Validates and orders the complete transaction before creating a durable recovery record.
 /// A rejected archive or ownership conflict has made no filesystem or LMDB
 /// mutation, so it must not become an endlessly retried startup journal.
 async fn preflight_packages(
@@ -543,10 +543,11 @@ async fn preflight_packages(
     available: &AvailablePackages,
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
-) -> Result<()> {
+) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
+    let mut final_paths = BTreeMap::<sage_core::PackageKey, BTreeSet<String>>::new();
     for (key, version) in changes {
         let source = available
             .releases
@@ -585,19 +586,78 @@ async fn preflight_packages(
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
         ownership.extend(PackageDeclarations::parse(&inspection, key)?.ownership_paths(key));
-        for path in ownership {
-            let owners = database.owners(&path)?;
-            if owners.iter().any(|owner| owner != key) {
-                bail!("file conflict for {path}: {owners:?}");
-            }
+        for path in &ownership {
             if let Some(owner) = planned.insert(path.clone(), key.clone()) {
                 if owner != *key {
                     bail!("transaction packages {owner} and {key} both own {path}");
                 }
             }
         }
+        final_paths.insert(key.clone(), ownership.into_iter().collect());
     }
-    Ok(())
+
+    // A current owner may release a path in this same transaction. Add a
+    // publication edge so its replacement commits before the new claimant;
+    // owners absent from the plan, or retaining the path, remain conflicts.
+    let mut successors = changes
+        .iter()
+        .map(|(key, _)| (key.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = changes
+        .iter()
+        .map(|(key, _)| (key.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for (path, claimant) in &planned {
+        for owner in database.owners(path)? {
+            if owner == *claimant {
+                continue;
+            }
+            let releases = final_paths
+                .get(&owner)
+                .is_some_and(|paths| !paths.contains(path));
+            if !releases {
+                bail!("file conflict for {path}: currently owned by {owner}");
+            }
+            if successors
+                .get_mut(&owner)
+                .expect("planned owner has a successor set")
+                .insert(claimant.clone())
+            {
+                *indegree
+                    .get_mut(claimant)
+                    .expect("planned claimant has an indegree") += 1;
+            }
+        }
+    }
+
+    let positions = changes
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| (key.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let versions = changes.iter().cloned().collect::<BTreeMap<_, _>>();
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(key, _)| (positions[key], key.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(changes.len());
+    while let Some((_, key)) = ready.pop_first() {
+        ordered.push((key.clone(), versions[&key].clone()));
+        for claimant in &successors[&key] {
+            let degree = indegree
+                .get_mut(claimant)
+                .expect("planned claimant has an indegree");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert((positions[claimant], claimant.clone()));
+            }
+        }
+    }
+    if ordered.len() != changes.len() {
+        bail!("cyclic file ownership handoff in package transaction");
+    }
+    Ok(ordered)
 }
 async fn resume_install(
     root: &Path,

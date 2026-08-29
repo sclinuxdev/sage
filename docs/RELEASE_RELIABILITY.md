@@ -36,6 +36,11 @@
 12. **Lock waits and LMDB map exhaustion lacked deterministic boundaries.** The
     CLI now exposes `--lock-timeout`, and a 1 MiB map-full regression proves all
     reverse indexes roll back together.
+13. **Preflight treated an owner being upgraded as permanent.** It now computes
+    every changed package final path set and orders a releasing owner before the
+    new claimant; cyclic swaps fail before the journal is created.
+14. **Bounded lock waits busy-spun.** Contended retries now sleep for at most
+    10 ms or the remaining deadline, avoiding a full CPU core during waits.
 
 Each item has a deterministic regression in `crates/sage-tests`.
 

@@ -274,6 +274,129 @@ fn hardlinks_and_equal_content_cross_package_claims_are_rejected() {
     assert_eq!(lab.audit().unwrap(), before);
 }
 
+#[tokio::test]
+async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    lab.add_package(sage_tests::PackageSpec::new(
+        "system",
+        "z-owner",
+        1,
+        "usr/lib/torture/handoff",
+        "old-owner",
+    ))
+    .unwrap();
+    lab.add_package(sage_tests::PackageSpec::new(
+        "system",
+        "a-claimant",
+        1,
+        "usr/lib/torture/claimant-old",
+        "old-claimant",
+    ))
+    .unwrap();
+    lab.publish().unwrap();
+    lab.install("z-owner", "system").await.unwrap();
+    lab.install("a-claimant", "system").await.unwrap();
+
+    lab.add_package(sage_tests::PackageSpec::new(
+        "system",
+        "z-owner",
+        2,
+        "usr/lib/torture/owner-new",
+        "new-owner",
+    ))
+    .unwrap();
+    lab.add_package(sage_tests::PackageSpec::new(
+        "system",
+        "a-claimant",
+        2,
+        "usr/lib/torture/handoff",
+        "new-claimant",
+    ))
+    .unwrap();
+    lab.publish().unwrap();
+    sage::execute(sage::Cli {
+        verbose: false,
+        dry_run: false,
+        root: lab.root().into(),
+        lock_timeout: None,
+        command: sage::Commands::Upgrade {
+            packages: vec!["a-claimant".into(), "z-owner".into()],
+            channel: Some("system".into()),
+            sync: false,
+        },
+    })
+    .await
+    .unwrap();
+    let state = lab.audit().unwrap();
+    assert_eq!(state.packages["main/system:a-claimant:0"], "2-1");
+    assert_eq!(state.packages["main/system:z-owner:0"], "2-1");
+    assert_eq!(
+        std::fs::read(lab.root().join("usr/lib/torture/handoff")).unwrap(),
+        b"new-claimant"
+    );
+    assert_eq!(
+        sage_db::read_owners(&lab.root().join("var/lib/sage"), "usr/lib/torture/handoff").unwrap(),
+        [sage_core::PackageKey::new("main/system", "a-claimant", "0")]
+    );
+
+    let mut cycle = sage_tests::TortureLab::new().unwrap();
+    cycle
+        .add_package(sage_tests::PackageSpec::new(
+            "system",
+            "cycle-a",
+            1,
+            "usr/lib/torture/cycle-p",
+            "a-v1",
+        ))
+        .unwrap();
+    cycle
+        .add_package(sage_tests::PackageSpec::new(
+            "system",
+            "cycle-b",
+            1,
+            "usr/lib/torture/cycle-q",
+            "b-v1",
+        ))
+        .unwrap();
+    cycle.publish().unwrap();
+    cycle.install("cycle-a", "system").await.unwrap();
+    cycle.install("cycle-b", "system").await.unwrap();
+    cycle
+        .add_package(sage_tests::PackageSpec::new(
+            "system",
+            "cycle-a",
+            2,
+            "usr/lib/torture/cycle-q",
+            "a-v2",
+        ))
+        .unwrap();
+    cycle
+        .add_package(sage_tests::PackageSpec::new(
+            "system",
+            "cycle-b",
+            2,
+            "usr/lib/torture/cycle-p",
+            "b-v2",
+        ))
+        .unwrap();
+    cycle.publish().unwrap();
+    let before = cycle.audit().unwrap();
+    assert!(sage::execute(sage::Cli {
+        verbose: false,
+        dry_run: false,
+        root: cycle.root().into(),
+        lock_timeout: None,
+        command: sage::Commands::Upgrade {
+            packages: vec!["cycle-a".into(), "cycle-b".into()],
+            channel: Some("system".into()),
+            sync: false,
+        },
+    })
+    .await
+    .is_err());
+    assert_eq!(cycle.audit().unwrap(), before);
+}
+
 #[test]
 fn host_lock_contention_is_nonblocking_and_recoverable() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -309,6 +432,14 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
         sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO),
         Err(sage_core::CoreError::LockTimedOut(_))
     ));
+    let wait_started = std::time::Instant::now();
+    assert!(matches!(
+        sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::from_millis(25)),
+        Err(sage_core::CoreError::LockTimedOut(_))
+    ));
+    let waited = wait_started.elapsed();
+    assert!(waited >= std::time::Duration::from_millis(20));
+    assert!(waited < std::time::Duration::from_secs(2));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let error = runtime
         .block_on(sage::execute(sage::Cli {

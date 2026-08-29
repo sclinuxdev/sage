@@ -92,6 +92,8 @@ symlink targets, hard links, file/directory swaps, read-only destinations,
 duplicate payload aliases, equal/different-content ownership conflicts, partial
 writes, rename boundaries, LMDB pre-commit rollback and a synthetic map-full.
 Linux CI additionally exercises real ELF and private RUNPATH behavior.
+Multi-package upgrade fixtures cover one-way ownership handoff and atomic
+rejection of cyclic swaps.
 
 Concurrency tests use real child processes and an explicit parent-held lock as a
 barrier. They cover two installs, two updates of the same package, install/remove,

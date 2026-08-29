@@ -665,7 +665,8 @@ impl HostLock {
             match Self::try_acquire(&path, exclusive) {
                 Ok(lock) => return Ok(lock),
                 Err(TryLockError::Busy) if std::time::Instant::now() < deadline => {
-                    std::thread::yield_now();
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
                 }
                 Err(TryLockError::Busy) => return Err(CoreError::LockTimedOut(path)),
                 Err(TryLockError::Fatal(error)) => return Err(error),

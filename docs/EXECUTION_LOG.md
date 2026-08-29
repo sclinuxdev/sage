@@ -14,7 +14,7 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | `cargo check --all-targets` | passed |
 | `cargo check -p sage --no-default-features` | passed without Torture Lab APIs |
 | `cargo clippy --all-targets -- -D warnings` | passed with zero warnings |
-| `cargo test --all-targets` | passed: 65 existing tests, 15 Torture Lab tests, 1 benchmark ignored |
+| `cargo test --all-targets` | passed: 65 existing tests, 16 Torture Lab tests, 1 benchmark ignored |
 | `cargo run -p sage-tests --bin sage-torture -- quick` | passed; 17 recorded real package operations |
 | production Rust physical-line count | 9,721 lines; informational, not a release gate |
 | fixed-seed 24-step state-machine test | passed with seed `0x5a6e2026` |
@@ -24,12 +24,14 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | focused channel-path traversal test | passed |
 | focused local Git-daemon readiness test | passed without timing sleeps |
 | focused multi-process and abrupt-termination tests | passed |
-| Linux Torture Lab binary | 15 passed, 1 benchmark ignored in Debian sid as uid 1000 |
+| Linux Torture Lab binary | 16 passed, 1 benchmark ignored in Debian sid as uid 1000 |
 | focused filesystem matrix | passed: file/directory swaps, read-only target, long path, hard link and equal-content conflict |
 | focused concurrency matrix | passed: same-package updates, cross-channel writers and reader/writer serialization |
 | focused LMDB map-full | passed with a 1 MiB map and zero partial indexes |
 | repeated recovery failure | passed for install and partial removal journals |
 | ignored benchmark smoke | passed when invoked explicitly |
+| ownership handoff regression | passed for one-way package split; cyclic swap remained atomic |
+| nonzero operation-lock timeout | passed with bounded retry sleeps |
 
 The first macOS Rust baseline exposed the `u32`/Darwin `mode_t` compile error.
 After that fix, an in-sandbox run still produced expected `EPERM` failures for
@@ -85,7 +87,7 @@ retry resumed and installed Zig 0.16.0, LLVM 21 and LLD 21. The cross-build
 completed and produced ARM64 GNU/Linux ELF binaries. Those exact binaries were
 executed in the existing Debian sid image as uid 1000:
 
-- Torture Lab: 15 passed, zero failed, one benchmark ignored. The ignored
+- Torture Lab: 16 passed, zero failed, one benchmark ignored. The ignored
   benchmark smoke passed when invoked explicitly.
 - Main integration binary: 66 passed, zero failed, one filtered out. The only
   filtered test was the local git-daemon fixture because the minimal Debian
