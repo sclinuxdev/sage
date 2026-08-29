@@ -276,10 +276,31 @@ fn hardlinks_and_equal_content_cross_package_claims_are_rejected() {
 
 #[test]
 fn host_lock_contention_is_nonblocking_and_recoverable() {
+    use std::os::unix::fs::PermissionsExt as _;
     let directory = tempfile::tempdir().unwrap();
     let canonical = directory.path().canonicalize().unwrap();
     let path = canonical.join("run/sage/operation.lock");
     let exclusive = sage_core::HostLock::acquire_exclusive(&path).unwrap();
+    assert_eq!(
+        std::fs::metadata(canonical.join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(canonical.join("run/sage"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(matches!(
         sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO),
         Err(sage_core::CoreError::LockTimedOut(_))

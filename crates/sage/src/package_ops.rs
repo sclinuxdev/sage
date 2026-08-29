@@ -77,6 +77,7 @@ fn trigger_documents(root: &Path) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 /// One-shot sysroot-local crash injection; the next startup exercises recovery.
+#[cfg(feature = "torture")]
 fn crash_point(root: &Path, stage: &str) -> Result<()> {
     let marker = under_root(root, Path::new("/run/sage/crash-point"));
     let requested = std::fs::read_to_string(&marker).ok();
@@ -91,6 +92,11 @@ fn crash_point(root: &Path, stage: &str) -> Result<()> {
         }
         bail!("injected crash after {stage}");
     }
+    Ok(())
+}
+
+#[cfg(not(feature = "torture"))]
+fn crash_point(_root: &Path, _stage: &str) -> Result<()> {
     Ok(())
 }
 async fn settle_journals(root: &Path) -> Result<()> {

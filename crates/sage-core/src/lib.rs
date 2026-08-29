@@ -701,10 +701,18 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     .map_err(errno_io)?;
     // SAFETY: `open` returned a fresh descriptor transferred exactly once.
     let mut current = unsafe { OwnedFd::from_raw_fd(raw) };
+    let normal_components = parent
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    let mut normal_index = 0_usize;
     for component in parent.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
+            Component::Normal(name) => {
+                normal_index += 1;
+                name
+            }
             _ => {
                 return Err(CoreError::InvalidMetadata(format!(
                     "unsafe operation lock path {}",
@@ -715,7 +723,11 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
         match mkdirat(
             Some(current.as_raw_fd()),
             name,
-            Mode::from_bits_truncate(0o700),
+            Mode::from_bits_truncate(if normal_index == normal_components {
+                0o700
+            } else {
+                0o755
+            }),
         ) {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(error) => return Err(errno_io(error)),

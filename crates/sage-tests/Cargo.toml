@@ -9,10 +9,10 @@ description = "Unified integration test target for Sage"
 
 [dependencies]
 anyhow = { workspace = true }
-sage = { workspace = true }
+sage = { workspace = true, features = ["torture"] }
 sage-core = { workspace = true }
-sage-db = { workspace = true, features = ["torture"] }
-sage-archive = { workspace = true, features = ["torture"] }
+sage-db = { workspace = true }
+sage-archive = { workspace = true }
 sage-solver = { workspace = true }
 sage-sys = { workspace = true }
 sage-build = { workspace = true }
