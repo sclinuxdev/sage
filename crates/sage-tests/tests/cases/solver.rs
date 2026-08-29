@@ -68,6 +68,27 @@ mod solver_tests {
     }
 
     #[test]
+    fn provider_symbol_dependencies_resolve_when_no_concrete_package_exists() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release(
+            "main/system",
+            "app",
+            "1-1",
+            &["system/zlib-libs >= 1.3-1"],
+        ));
+        let mut zlib = release("main/system", "zlib", "1.3.2-1", &[]);
+        zlib.provides.push("zlib-libs".into());
+        universe.insert(zlib);
+        let solution = SageSolver::new(&universe)
+            .resolve(&[PackageKey::new("main/system", "app", "0")])
+            .unwrap();
+        assert_eq!(
+            solution[&PackageKey::new("main/system", "zlib", "0")],
+            "1.3.2-1".parse().unwrap()
+        );
+    }
+
+    #[test]
     fn locked_satisfying_version_wins_over_newest() {
         let mut universe = PackageUniverse::default();
         universe.insert(release("main/system", "lib", "1.0-1", &[]));

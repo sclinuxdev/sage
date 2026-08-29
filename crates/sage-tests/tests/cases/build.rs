@@ -113,6 +113,9 @@ mod build_tests {
             ("TARGET_ARCH".into(), "".into()),
             ("TARGET_ENDIAN".into(), "".into()),
             ("GOOS".into(), "".into()),
+            ("CC_FAMILY".into(), "clang".into()),
+            ("PACKAGE_SLOT".into(), "6.12.4".into()),
+            ("BUILD_TRIPLE".into(), "x86_64-linux-gnu".into()),
         ]);
         for name in [
             "autotools",
@@ -125,6 +128,9 @@ mod build_tests {
             "pnpm",
             "gradle",
             "maven",
+            "gcc",
+            "rust-bin",
+            "kernel",
         ] {
             let class = Rclass::load(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../rclass/{name}.toml")),
@@ -132,6 +138,12 @@ mod build_tests {
             .unwrap();
             compose_runner(&[class], &variables).unwrap();
         }
+        let kernel = Rclass::load(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/kernel.toml"),
+        )
+        .unwrap();
+        let runner = compose_runner(&[kernel], &variables).unwrap();
+        assert!(runner.contains("llvm_arg=LLVM=1"));
     }
 
     #[test]

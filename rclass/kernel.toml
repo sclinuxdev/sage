@@ -1,0 +1,212 @@
+schema_version = 1
+name = "kernel"
+description = "Declarative Linux kernel build, module installation, and external-module headers class"
+
+implicit_build_dependencies = [
+    "system/bc",
+    "system/binutils",
+    "system/cpio",
+    "system/gettext",
+    "system/libelf-dev",
+    "gcc16/gcc-libs:16",
+    "system/make",
+    "system/openssl",
+    "system/openssl-dev",
+    "system/pahole",
+    "system/perl",
+    "python3.14/python:3.14",
+    "system/tar",
+    "system/xxhash",
+    "system/xz",
+    "system/zlib-dev",
+    "system/zstd",
+    "system/zstd-dev",
+    "virtual/libc-dev",
+]
+allowed_compilers = ["clang", "gcc"]
+allowed_linkers = ["lld", "mold", "ld"]
+
+[defaults]
+"args.config" = ""
+"args.hostname" = ""
+"args.kernel_arch" = "x86"
+"args.make_args" = ""
+"args.package_name" = ""
+"args.patch_strip" = "1"
+
+[env]
+KBUILD_BUILD_HOST = "sage"
+KBUILD_BUILD_USER = "${args.package_name}"
+
+[phases]
+src_unpack = """
+tab=$(printf '\\t')
+while IFS="$tab" read -r source kind strip destination; do
+    input="${SRC_DIR}/.distfiles/$source"
+    target="${SRC_DIR}/$destination"
+    case "$kind" in
+        archive)
+            mkdir -p "$target"
+            tar -xf "$input" --strip-components="$strip" -C "$target"
+            ;;
+        tree)
+            mkdir -p "$target"
+            cp -a "$input"/. "$target"/
+            ;;
+        file)
+            mkdir -p "$(dirname "$target")"
+            cp -a "$input" "$target"
+            ;;
+        *)
+            echo "unsupported source manifest kind: $kind" >&2
+            exit 1
+            ;;
+    esac
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+
+src_prepare = """
+export KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH"
+llvm_arg=""
+if [ "${CC_FAMILY}" = "clang" ]; then
+    llvm_arg=LLVM=1
+fi
+make_kernel() {
+    make -C "${SRC_DIR}" ARCH="${args.kernel_arch}" \
+        ${args.make_args} \
+        $llvm_arg \
+        CC="$CC" HOSTCC="$CC" HOSTCXX="$CXX" LD="$LD" RUSTC="$RUSTC" \
+        "$@"
+}
+if [ -d "${SRC_DIR}/.patches" ]; then
+    for patch_file in "${SRC_DIR}"/.patches/*; do
+        [ -f "$patch_file" ] || continue
+        patch -d "${SRC_DIR}" -p"${args.patch_strip}" < "$patch_file"
+    done
+fi
+if [ -d "${SRC_DIR}/.source-patches" ]; then
+    for patch_file in "${SRC_DIR}"/.source-patches/*; do
+        [ -f "$patch_file" ] || continue
+        case "$patch_file" in
+            *.zst)
+                zstd -dc "$patch_file" | patch -d "${SRC_DIR}" -p"${args.patch_strip}"
+                ;;
+            *)
+                patch -d "${SRC_DIR}" -p"${args.patch_strip}" < "$patch_file"
+                ;;
+        esac
+    done
+fi
+if [ -n "${args.config}" ]; then
+    cp "${SRC_DIR}/${args.config}" "${SRC_DIR}/.config"
+fi
+if [ -n "${args.hostname}" ]; then
+    if grep -q '^CONFIG_DEFAULT_HOSTNAME=' "${SRC_DIR}/.config"; then
+        sed -i 's|^CONFIG_DEFAULT_HOSTNAME=.*|CONFIG_DEFAULT_HOSTNAME="${args.hostname}"|' "${SRC_DIR}/.config"
+    else
+        printf 'CONFIG_DEFAULT_HOSTNAME="%s"\\n' "${args.hostname}" >> "${SRC_DIR}/.config"
+    fi
+fi
+make_kernel olddefconfig
+make_kernel -s kernelrelease > "${SRC_DIR}/version"
+"""
+
+src_compile = """
+make_kernel -j "${JOBS}" all
+if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_BPF_SYSCALL)" = y ]; then
+    make -C "${SRC_DIR}/tools/bpf/bpftool" ARCH="${args.kernel_arch}" \
+        $llvm_arg \
+        CC="$CC" HOSTCC="$CC" HOSTCXX="$CXX" LD="$LD" RUSTC="$RUSTC" \
+        vmlinux.h feature-clang-bpf-co-re=1
+fi
+"""
+
+src_install = """
+kernel_release="$(make_kernel -s kernelrelease)"
+if [ "$kernel_release" != "${PACKAGE_SLOT}" ]; then
+    echo "kernel release $kernel_release does not match package slot ${PACKAGE_SLOT}" >&2
+    exit 1
+fi
+
+modules_dir="${DESTDIR}/usr/lib/modules/$kernel_release"
+build_dir="$modules_dir/build"
+make_kernel \
+    ZSTD_CLEVEL=19 \
+    INSTALL_MOD_PATH="${DESTDIR}/usr" \
+    INSTALL_MOD_STRIP=1 \
+    DEPMOD=/does/not/exist \
+    modules_install
+install -Dm644 "$(make_kernel -s image_name)" "$modules_dir/vmlinuz"
+printf '%s\\n' "${args.package_name}" | install -Dm644 /dev/stdin "$modules_dir/pkgbase"
+
+rm -f "$modules_dir/build" "$modules_dir/source"
+make_kernel modules_prepare
+mkdir -p "$build_dir"
+install -Dm644 "${SRC_DIR}/.config" "$build_dir/.config"
+install -Dm644 "${SRC_DIR}/Makefile" "$build_dir/Makefile"
+install -Dm644 "${SRC_DIR}/kernel/Makefile" "$build_dir/kernel/Makefile"
+install -Dm644 "${SRC_DIR}/Module.symvers" "$build_dir/Module.symvers"
+install -Dm644 "${SRC_DIR}/System.map" "$build_dir/System.map"
+install -Dm644 "${SRC_DIR}/version" "$build_dir/version"
+if [ -f "${SRC_DIR}/vmlinux" ]; then
+    install -Dm644 "${SRC_DIR}/vmlinux" "$build_dir/vmlinux"
+    strip --strip-debug "$build_dir/vmlinux"
+fi
+for localversion in "${SRC_DIR}"/localversion.*; do
+    [ -f "$localversion" ] || continue
+    install -Dm644 "$localversion" "$build_dir/$(basename "$localversion")"
+done
+if [ -f "${SRC_DIR}/tools/bpf/bpftool/vmlinux.h" ]; then
+    install -Dm644 "${SRC_DIR}/tools/bpf/bpftool/vmlinux.h" "$build_dir/tools/bpf/bpftool/vmlinux.h"
+fi
+
+cp -a "${SRC_DIR}/scripts" "$build_dir/"
+cp -a "${SRC_DIR}/include" "$build_dir/"
+mkdir -p "$build_dir/arch/${args.kernel_arch}"
+cp -a "${SRC_DIR}/arch/${args.kernel_arch}/include" "$build_dir/arch/${args.kernel_arch}/"
+install -Dm644 "${SRC_DIR}/arch/${args.kernel_arch}/Makefile" "$build_dir/arch/${args.kernel_arch}/Makefile"
+if [ -f "${SRC_DIR}/arch/${args.kernel_arch}/kernel/asm-offsets.s" ]; then
+    install -Dm644 "${SRC_DIR}/arch/${args.kernel_arch}/kernel/asm-offsets.s" \
+        "$build_dir/arch/${args.kernel_arch}/kernel/asm-offsets.s"
+fi
+if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_HAVE_STACK_VALIDATION)" = y ]; then
+    install -Dm755 "${SRC_DIR}/tools/objtool/objtool" "$build_dir/tools/objtool/objtool"
+fi
+if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_DEBUG_INFO_BTF_MODULES)" = y ]; then
+    install -Dm755 "${SRC_DIR}/tools/bpf/resolve_btfids/resolve_btfids" \
+        "$build_dir/tools/bpf/resolve_btfids/resolve_btfids"
+fi
+if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_RUST)" = y ]; then
+    for rust_file in "${SRC_DIR}"/rust/*.rmeta "${SRC_DIR}"/rust/*.so; do
+        [ -f "$rust_file" ] || continue
+        install -Dm644 "$rust_file" "$build_dir/rust/$(basename "$rust_file")"
+    done
+fi
+
+find "${SRC_DIR}" -type f -name 'Kconfig*' -print0 | while IFS= read -r -d '' kconfig; do
+    relative="$(printf '%s\\n' "$kconfig" | sed "s|^$SRC_DIR/||")"
+    install -Dm644 "$kconfig" "$build_dir/$relative"
+done
+for header in \
+    drivers/md/*.h \
+    net/mac80211/*.h \
+    drivers/media/i2c/msp3400-driver.h \
+    drivers/media/usb/dvb-usb/*.h \
+    drivers/media/dvb-frontends/*.h \
+    drivers/media/tuners/*.h \
+    drivers/iio/common/hid-sensors/*.h; do
+    [ -f "${SRC_DIR}/$header" ] || continue
+    install -Dm644 "${SRC_DIR}/$header" "$build_dir/$header"
+done
+make_kernel INSTALL_MOD_PATH="${DESTDIR}/usr" vdso_install link=
+
+for architecture in "$build_dir"/arch/*/; do
+    [ "$(basename "$architecture")" = "${args.kernel_arch}" ] && continue
+    rm -rf "$architecture"
+done
+rm -rf "$build_dir/Documentation"
+find -L "$build_dir" -type l -delete
+find "$build_dir" -type f -name '*.o' -delete
+mkdir -p "${DESTDIR}/usr/src"
+ln -sr "$build_dir" "${DESTDIR}/usr/src/${args.package_name}"
+"""

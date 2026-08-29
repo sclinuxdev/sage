@@ -2,13 +2,16 @@ schema_version = 1
 name = "cmake"
 description = "CMake and Ninja build class"
 
-implicit_build_dependencies = ["cmake", "ninja"]
+implicit_build_dependencies = ["system/cmake", "system/ninja"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
 [defaults]
 "args.cmake_args" = ""
 "args.cross_args" = ""
+"args.patch_strip" = "1"
+"args.patch_root" = "."
+"args.source_dir" = "."
 
 [env]
 CMAKE_BUILD_PARALLEL_LEVEL = "${JOBS}"
@@ -43,7 +46,22 @@ done < "${SRC_DIR}/.distfiles/manifest"
 src_prepare = """
 if [ -d "${SRC_DIR}/.patches" ]; then
     for patch_file in "${SRC_DIR}"/.patches/*; do
+        [ -f "$patch_file" ] || continue
         patch -d "${SRC_DIR}" -p1 < "$patch_file"
+    done
+fi
+patch_root="${SRC_DIR}/${args.patch_root}"
+if [ -d "${SRC_DIR}/.source-patches" ]; then
+    for patch_file in "${SRC_DIR}"/.source-patches/*; do
+        [ -f "$patch_file" ] || continue
+        case "$patch_file" in
+            *.zst)
+                zstd -dc "$patch_file" | patch -d "$patch_root" -p"${args.patch_strip}"
+                ;;
+            *)
+                patch -d "$patch_root" -p"${args.patch_strip}" < "$patch_file"
+                ;;
+        esac
     done
 fi
 """
@@ -58,7 +76,7 @@ cmake -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS}" \
     ${args.cross_args} \
     ${args.cmake_args} \
-    "${SRC_DIR}"
+    "${SRC_DIR}/${args.source_dir}"
 """
 
 src_compile = """

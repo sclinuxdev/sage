@@ -1,0 +1,65 @@
+schema_version = 1
+name = "rust-bin"
+description = "Declarative installation class for the official Rust binary distribution"
+
+implicit_build_dependencies = ["system/tar"]
+allowed_compilers = []
+allowed_linkers = []
+
+[defaults]
+"args.install_args" = ""
+"args.patch_root" = "."
+
+[phases]
+src_unpack = """
+tab=$(printf '\\t')
+while IFS="$tab" read -r source kind strip destination; do
+    input="${SRC_DIR}/.distfiles/$source"
+    target="${SRC_DIR}/$destination"
+    case "$kind" in
+        archive)
+            mkdir -p "$target"
+            tar -xf "$input" --strip-components="$strip" -C "$target"
+            ;;
+        tree)
+            mkdir -p "$target"
+            cp -a "$input"/. "$target"/
+            ;;
+        file)
+            mkdir -p "$(dirname "$target")"
+            cp -a "$input" "$target"
+            ;;
+        *)
+            echo "unsupported source manifest kind: $kind" >&2
+            exit 1
+            ;;
+    esac
+done < "${SRC_DIR}/.distfiles/manifest"
+"""
+
+src_prepare = """
+patch_root="${SRC_DIR}/${args.patch_root}"
+if [ -d "${SRC_DIR}/.source-patches" ]; then
+    for patch_file in "${SRC_DIR}"/.source-patches/*; do
+        [ -f "$patch_file" ] || continue
+        case "$patch_file" in
+            *.zst)
+                zstd -dc "$patch_file" | patch -d "$patch_root" -p1
+                ;;
+            *)
+                patch -d "$patch_root" -p1 < "$patch_file"
+                ;;
+        esac
+    done
+fi
+"""
+
+src_install = """
+install -d "${DESTDIR}/usr"
+"${SRC_DIR}/rust-bin/install.sh" \
+    --prefix="${DESTDIR}/usr" \
+    --disable-verify \
+    ${args.install_args}
+mkdir -p "${DESTDIR}/usr/lib/rustlib/src"
+cp -a "${SRC_DIR}/rust-src/lib/rustlib/src/rust" "${DESTDIR}/usr/lib/rustlib/src/"
+"""

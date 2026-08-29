@@ -2,7 +2,7 @@ schema_version = 1
 name = "maven"
 description = "Reproducible Maven JVM build class"
 
-implicit_build_dependencies = ["jdk", "maven"]
+implicit_build_dependencies = ["system/jdk", "system/maven"]
 allowed_compilers = ["clang", "gcc", "java", "javac"]
 allowed_linkers = ["lld", "mold", "ld"]
 

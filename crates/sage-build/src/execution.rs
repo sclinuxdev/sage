@@ -122,7 +122,8 @@ impl BuildConfig {
     }
 }
 
-/// Declarative build class. No tool-specific behavior exists in Rust.
+/// Declarative build class. Tool-family facts are supplied as template data by
+/// the frontend; classes remain free of package-specific compiler probing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rclass {
     pub schema_version: u32,

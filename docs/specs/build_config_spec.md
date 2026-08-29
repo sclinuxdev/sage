@@ -85,3 +85,8 @@ Recipe `[build].target` selects an exact entry. Sage injects the compiler,
 binutils, Go platform, Meson cross file, CMake platform, and Cargo target into
 all inherited classes. Adding an architecture changes TOML only; Rust contains
 no architecture mapping table.
+
+Rclass templates also receive `CC_FAMILY`, derived from the selected native or
+cross-target C compiler (`clang`, `gcc`, or its validated tool name). Classes
+may use this fact for compiler-specific upstream switches without probing the
+host or duplicating compiler selection in recipes.

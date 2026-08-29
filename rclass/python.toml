@@ -2,6 +2,9 @@ schema_version = 1
 name = "python"
 description = "PEP 517 Python wheel build class"
 
+# Python package builds select their interpreter and PEP 517 frontend from the
+# active versioned Python channel. The frontend packages are explicit because
+# their bootstrap recipes cannot depend on themselves.
 implicit_build_dependencies = ["python", "python-build", "python-installer"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]

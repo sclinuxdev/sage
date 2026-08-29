@@ -21,6 +21,7 @@ profile = "default"
 # 注: Shell (如 bash/zsh/dash) 为普通独立包或由 alternatives 仲裁，不属于 providers 管理范围
 [providers]
 init = "loom"                 # 候选: loom | systemd
+initramfs-generator = "mkinitcpio" # 候选: mkinitcpio | dracut
 udev = "eudev"               # 候选: eudev | systemd-udev | busybox-mdev
 libc = "glibc"               # 候选: glibc | musl
 coreutils = "gnu-coreutils"  # 候选: gnu-coreutils | uutils-coreutils | busybox

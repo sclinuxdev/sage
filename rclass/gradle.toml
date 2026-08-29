@@ -2,7 +2,7 @@ schema_version = 1
 name = "gradle"
 description = "Reproducible Gradle JVM build class"
 
-implicit_build_dependencies = ["jdk", "gradle"]
+implicit_build_dependencies = ["system/jdk", "system/gradle"]
 allowed_compilers = ["clang", "gcc", "java", "javac"]
 allowed_linkers = ["lld", "mold", "ld"]
 

@@ -2,7 +2,10 @@ schema_version = 1
 name = "cargo"
 description = "Rust Cargo build class"
 
-implicit_build_dependencies = ["rustc", "cargo"]
+# Rust toolchains are versioned channels. Each Cargo recipe declares the
+# selected rust-bin/cargo channel explicitly instead of silently binding to
+# an ambiguous system toolchain.
+implicit_build_dependencies = []
 allowed_compilers = ["rustc", "clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 

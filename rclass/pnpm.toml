@@ -2,7 +2,7 @@ schema_version = 1
 name = "pnpm"
 description = "Frozen-lockfile Node.js pnpm build class"
 
-implicit_build_dependencies = ["nodejs", "pnpm"]
+implicit_build_dependencies = ["system/nodejs", "system/pnpm"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 

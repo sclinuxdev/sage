@@ -2,7 +2,7 @@ schema_version = 1
 name = "npm"
 description = "Lockfile-driven Node.js npm build class"
 
-implicit_build_dependencies = ["nodejs", "npm"]
+implicit_build_dependencies = ["system/nodejs", "system/npm"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 

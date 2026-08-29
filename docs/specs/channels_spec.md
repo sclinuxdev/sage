@@ -12,6 +12,7 @@
 - Python 子通道规范：`python3.12`、`python3.13`、`python3.14` ...
 - GCC 工具链规范：`gcc14`、`gcc15` ...
 - LLVM 工具链规范：`llvm19`、`llvm20` ...
+- Rust 工具链规范：`rust1.97`、`rust1.98` ...
 
 各版本子通道拥有完全独立的物理基准目录 `/opt/channels/<subchannel>/`，使得不同大版本的 Python 运行环境或编译器套件在系统中**天然并存、互不污染**。
 
@@ -51,6 +52,14 @@ scope = "runtime"
 target_root = "/opt/channels/python3.13/site-packages"
 enabled = true
 
+# Python 3.14 independent subchannel
+[channels.main.subchannels.python314]
+alias = "python3.14"
+type = "python"
+scope = "runtime"
+target_root = "/opt/channels/python3.14/site-packages"
+enabled = true
+
 # GCC 14 工具链子通道
 [channels.main.subchannels.gcc14]
 type = "toolchain"
@@ -64,7 +73,38 @@ type = "toolchain"
 scope = "toolchain"
 target_root = "/opt/channels/gcc15"
 enabled = true
+
+# GCC 16 toolchain subchannel
+[channels.main.subchannels.gcc16]
+type = "toolchain"
+scope = "toolchain"
+target_root = "/opt/channels/gcc16"
+enabled = true
+
+# LLVM 22 toolchain subchannel
+[channels.main.subchannels.llvm22]
+type = "toolchain"
+scope = "toolchain"
+target_root = "/opt/channels/llvm22"
+enabled = true
+
+# Rust 1.98 toolchain subchannel
+[channels.main.subchannels.rust198]
+alias = "rust1.98"
+type = "toolchain"
+scope = "toolchain"
+target_root = "/opt/channels/rust1.98"
+enabled = true
 ```
+
+Compiler, linker, Rust, and Python packages belong to their versioned
+subchannels. A recipe dependency may use a short alias such as
+`gcc16/gcc:16` or `python3.14/python:3.14`; after the repository root is
+known, Sage canonicalizes it to `main/gcc16` or `main/python3.14`.
+
+When a dependency names a provider symbol rather than a concrete package, Sage
+keeps the same channel scope and resolves the declared provider releases. A
+concrete package key wins when both the key and a provider symbol are present.
 
 ---
 

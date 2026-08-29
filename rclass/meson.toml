@@ -2,7 +2,7 @@ schema_version = 1
 name = "meson"
 description = "Meson and Ninja build class"
 
-implicit_build_dependencies = ["meson", "ninja", "pkgconf"]
+implicit_build_dependencies = ["system/meson", "system/ninja", "system/pkgconf"]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 

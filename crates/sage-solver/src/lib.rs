@@ -107,8 +107,8 @@ impl<'a> SageSolver<'a> {
         let parent = PackageKey::new(channel, "__build", DEFAULT_SLOT);
         let mut dependencies = DependencyMap::default();
         for dependency in requested {
-            let key = dependency_key(&parent, dependency);
-            let range = if is_virtual(dependency) {
+            let key = dependency_key(self.universe, &parent, dependency);
+            let range = if is_proxy_key(&key) {
                 VersionRange::full()
             } else {
                 dependency_range(dependency)
@@ -173,10 +173,10 @@ impl SageProvider {
             for (version, release) in versions {
                 let mut dependencies = DependencyMap::default();
                 for dependency in &release.dependencies {
-                    let target = dependency_key(key, dependency);
+                    let target = dependency_key(universe, key, dependency);
                     // The private proxy key encodes this exact requirement;
                     // candidates are filtered below using the real provider version.
-                    let range = if is_virtual(dependency) {
+                    let range = if is_proxy_key(&target) {
                         VersionRange::full()
                     } else {
                         dependency_range(dependency)
@@ -214,18 +214,26 @@ impl SageProvider {
             .filter_map(virtual_requirement)
             .collect();
         for (target, channel, requirement) in virtuals {
-            let Some(providers) = universe.providers.get(&requirement.name) else {
+            let provider_name = provider_symbol(&requirement.name);
+            let Some(providers) = universe.providers.get(provider_name) else {
                 continue;
             };
             for (provider_index, key) in providers.iter().enumerate() {
                 if key.channel != channel {
                     continue;
                 }
+                if requirement
+                    .slot
+                    .as_deref()
+                    .is_some_and(|slot| key.slot != slot)
+                {
+                    continue;
+                }
                 for (version_index, version) in universe.versions(key).enumerate() {
                     if !dependency_range(&requirement).contains(version) {
                         continue;
                     }
-                    let preference = if preferred_providers.get(&requirement.name) == Some(key) {
+                    let preference = if preferred_providers.get(provider_name) == Some(key) {
                         3
                     } else if locked.contains_key(key) {
                         2
@@ -272,7 +280,7 @@ impl SageProvider {
                     .cloned()
                     .collect()
             } else {
-                vec![dependency_key(&owner, &conflict)]
+                vec![dependency_key(universe, &owner, &conflict)]
             };
             for target in targets {
                 if let Some(versions) = releases.get_mut(&target) {
@@ -356,18 +364,68 @@ impl DependencyProvider for SageProvider {
         )
     }
 }
-fn dependency_key(parent: &PackageKey, dependency: &Dependency) -> PackageKey {
+fn dependency_key(
+    universe: &PackageUniverse,
+    parent: &PackageKey,
+    dependency: &Dependency,
+) -> PackageKey {
     if is_virtual(dependency) {
         return virtual_key(&system_channel(&parent.channel), dependency);
     }
-    PackageKey::new(
-        dependency.channel.as_deref().unwrap_or(&parent.channel),
+    let concrete = PackageKey::new(
+        dependency_channel(parent, dependency.channel.as_deref()),
         &dependency.name,
         dependency.slot.as_deref().unwrap_or(DEFAULT_SLOT),
+    );
+    if universe.versions(&concrete).next().is_none()
+        && universe
+            .providers
+            .get(&dependency.name)
+            .into_iter()
+            .flatten()
+            .any(|provider| provider.channel == concrete.channel)
+    {
+        return virtual_key(
+            &concrete.channel,
+            &Dependency {
+                name: format!("virtual/provider/{}", dependency.name),
+                slot: dependency.slot.clone(),
+                channel: None,
+                op: dependency.op,
+                version: dependency.version.clone(),
+            },
+        );
+    }
+    concrete
+}
+
+/// Resolves a dependency channel alias in the root repository of its parent.
+///
+/// Recipe metadata intentionally uses short channel names such as `system` or
+/// `gcc16`. Once a repository index is loaded, those names become
+/// `main/system` and `main/gcc16`. Keeping this conversion at the solver seam
+/// lets recipe graphs stay readable while preserving exact cross-root channel
+/// references when a dependency already contains `/`.
+fn dependency_channel(parent: &PackageKey, requested: Option<&str>) -> String {
+    let Some(requested) = requested else {
+        return parent.channel.clone();
+    };
+    if requested.contains('/') {
+        return requested.into();
+    }
+    parent.channel.rsplit_once('/').map_or_else(
+        || requested.into(),
+        |(root, _)| format!("{root}/{requested}"),
     )
 }
 fn is_virtual(dependency: &Dependency) -> bool {
     dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:")
+}
+fn is_proxy_key(key: &PackageKey) -> bool {
+    key.channel == "__sage"
+}
+fn provider_symbol(name: &str) -> &str {
+    name.strip_prefix("virtual/provider/").unwrap_or(name)
 }
 fn virtual_key(channel: &str, dependency: &Dependency) -> PackageKey {
     PackageKey::new("__sage", format!("{channel}/{dependency}"), DEFAULT_SLOT)

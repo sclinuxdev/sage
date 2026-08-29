@@ -1,28 +1,32 @@
 schema_version = 1
-name = "autotools"
-description = "GNU Autoconf, Automake, Libtool and Make build class"
+name = "gcc"
+description = "GNU Compiler Collection out-of-tree build class"
 
 implicit_build_dependencies = [
-    "system/autoconf",
-    "system/automake",
-    "system/libtool",
+    "system/binutils",
+    "system/bison",
+    "system/flex",
+    "system/gawk",
+    "system/gmp-dev",
+    "system/isl-dev",
     "system/make",
-    "system/pkgconf",
+    "system/mpc-dev",
+    "system/mpfr-dev",
+    "system/texinfo",
+    "system/zlib-dev",
 ]
 allowed_compilers = ["clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
 [defaults]
 "args.configure_args" = ""
-"args.make_args" = ""
 "args.install_args" = ""
-"args.test" = "0"
-"args.configure_triples" = ""
-"args.source_patch_strip" = "1"
+"args.make_args" = ""
+"args.source_dir" = "."
 
 [phases]
 src_unpack = """
-tab=$(printf '\t')
+tab=$(printf '\\t')
 while IFS="$tab" read -r source kind strip destination; do
     input="${SRC_DIR}/.distfiles/$source"
     target="${SRC_DIR}/$destination"
@@ -46,22 +50,43 @@ while IFS="$tab" read -r source kind strip destination; do
     esac
 done < "${SRC_DIR}/.distfiles/manifest"
 """
+
 src_prepare = """
+patch_root="${SRC_DIR}/${args.source_dir}"
 if [ -d "${SRC_DIR}/.patches" ]; then
-    for patch_file in "${SRC_DIR}"/.patches/*; do patch -d "${SRC_DIR}" -p1 < "$patch_file"; done
+    for patch_file in "${SRC_DIR}"/.patches/*; do
+        [ -f "$patch_file" ] || continue
+        patch -d "$patch_root" -p1 < "$patch_file"
+    done
 fi
 if [ -d "${SRC_DIR}/.source-patches" ]; then
     for patch_file in "${SRC_DIR}"/.source-patches/*; do
-        patch -d "${SRC_DIR}" -p "${args.source_patch_strip}" < "$patch_file"
+        [ -f "$patch_file" ] || continue
+        patch -d "$patch_root" -p1 < "$patch_file"
     done
 fi
-if [ ! -x "${SRC_DIR}/configure" ]; then autoreconf -fi "${SRC_DIR}"; fi
 """
+
 src_configure = """
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
-"${SRC_DIR}/configure" --prefix=/usr ${args.configure_triples} ${args.configure_args}
+"${SRC_DIR}/${args.source_dir}/configure" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --enable-languages=c,c++ \
+    --disable-multilib \
+    --enable-default-pie \
+    --enable-default-ssp \
+    --enable-lto \
+    --enable-plugin \
+    --enable-threads=posix \
+    --enable-__cxa_atexit \
+    --enable-clocale=gnu \
+    --with-system-zlib \
+    --with-isl \
+    --disable-werror \
+    ${args.configure_args}
 """
+
 src_compile = "make -C \"${BUILD_DIR}\" -j \"${JOBS}\" ${args.make_args}"
-src_test = "if [ \"${args.test}\" = 1 ]; then make -C \"${BUILD_DIR}\" check; fi"
 src_install = "make -C \"${BUILD_DIR}\" DESTDIR=\"${DESTDIR}\" install ${args.install_args}"

@@ -596,6 +596,13 @@ fn build_variables(
     config: &sage_build::BuildConfig,
     recipe: &sage_build::RecipeSpec,
 ) -> std::collections::BTreeMap<String, String> {
+    let compiler = recipe
+        .build
+        .target
+        .is_empty()
+        .then_some(&config.cc)
+        .or_else(|| config.targets.get(&recipe.build.target).map(|target| &target.cc))
+        .unwrap_or(&config.cc);
     let mut variables = std::collections::BTreeMap::from([
         ("JOBS".into(), config.jobs.to_string()),
         ("CFLAGS".into(), config.cflags.clone()),
@@ -608,6 +615,7 @@ fn build_variables(
         ("DESTDIR".into(), "/dest".into()),
         ("PACKAGE_SLOT".into(), recipe.package.slot.clone()),
         ("BUILD_TRIPLE".into(), config.build.clone()),
+        ("CC_FAMILY".into(), sage_build::tool_family(compiler)),
         ("TARGET_TRIPLE".into(), recipe.build.target.clone()),
         (
             "TARGET_ARCH".into(),

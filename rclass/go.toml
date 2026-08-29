@@ -2,7 +2,7 @@ schema_version = 1
 name = "go"
 description = "Reproducible Go module build class"
 
-implicit_build_dependencies = ["go"]
+implicit_build_dependencies = ["system/go"]
 allowed_compilers = ["go", "clang", "gcc"]
 allowed_linkers = ["lld", "mold", "ld"]
 
