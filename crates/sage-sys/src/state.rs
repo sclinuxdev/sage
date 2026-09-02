@@ -92,13 +92,22 @@ impl ReconcilePlan {
                 .expect("retained package came from installed state");
             for dependency in &package.dependencies {
                 let preferred = preferences.get(&dependency.name);
+                let virtual_dependency = dependency.name.starts_with("virtual/")
+                    || dependency.name.starts_with("so:");
+                if virtual_dependency
+                    && preferred.is_some()
+                    && !installed.iter().any(|candidate| {
+                        preferred == Some(&candidate.key)
+                            && installed_satisfies(&package.key, dependency, candidate)
+                    })
+                {
+                    continue;
+                }
                 if let Some(candidate) = installed
                     .iter()
                     .filter(|candidate| installed_satisfies(&package.key, dependency, candidate))
                     .min_by_key(|candidate| {
-                        let direct = !dependency.name.starts_with("virtual/")
-                            && !dependency.name.starts_with("so:")
-                            && candidate.key.name == dependency.name;
+                        let direct = !virtual_dependency && candidate.key.name == dependency.name;
                         (!direct, preferred != Some(&candidate.key), candidate.key.clone())
                     })
                 {

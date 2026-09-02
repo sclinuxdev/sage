@@ -339,11 +339,30 @@ mod sys_tests {
         provider_config.providers.insert("libc".into(), "musl".into());
         let retained = ReconcilePlan::compute(
             &provider_config,
-            &[virtual_root, glibc.clone(), musl],
+            &[virtual_root.clone(), glibc.clone(), musl.clone()],
             &provider_universe,
             false,
         )
         .unwrap();
+        assert_eq!(retained.remove, vec![glibc.key.clone()]);
+
+        let mut switch_universe = provider_universe.clone();
+        let mut conflicting_musl = sage_core::Package::from_release(
+            musl.key.clone(),
+            musl.version.clone(),
+            vec![],
+            musl.provides.clone(),
+        );
+        conflicting_musl.conflicts.push("glibc".into());
+        switch_universe.insert(conflicting_musl);
+        let retained = ReconcilePlan::compute(
+            &provider_config,
+            &[virtual_root, glibc.clone()],
+            &switch_universe,
+            false,
+        )
+        .unwrap();
+        assert_eq!(retained.install, vec![(musl.key, musl.version)]);
         assert_eq!(retained.remove, vec![glibc.key]);
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
