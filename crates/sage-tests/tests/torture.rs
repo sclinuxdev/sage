@@ -348,6 +348,42 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     .await
     .is_err());
     assert_eq!(cycle.audit().unwrap(), before);
+
+    let mut hierarchy = sage_tests::TortureLab::new().unwrap();
+    for (name, path) in [
+        ("ancestor-owner", "usr/lib/torture/app"),
+        ("descendant-claimant", "usr/lib/torture/claimant-v1"),
+    ] {
+        hierarchy.add("system", name, 1, path, "v1").unwrap();
+    }
+    hierarchy.publish().unwrap();
+    hierarchy.install("ancestor-owner", "system").await.unwrap();
+    hierarchy
+        .install("descendant-claimant", "system")
+        .await
+        .unwrap();
+    for (name, path) in [
+        ("ancestor-owner", "usr/lib/torture/owner-v2"),
+        ("descendant-claimant", "usr/lib/torture/app/bin/tool"),
+    ] {
+        hierarchy.add("system", name, 2, path, "v2").unwrap();
+    }
+    hierarchy.publish().unwrap();
+    let before = hierarchy.audit().unwrap();
+    let error = sage::execute(sage::Cli {
+        verbose: false,
+        dry_run: false,
+        root: hierarchy.root().into(),
+        command: sage::Commands::Upgrade {
+            packages: vec!["ancestor-owner".into(), "descendant-claimant".into()],
+            channel: Some("system".into()),
+            sync: false,
+        },
+    })
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("file hierarchy conflict"));
+    assert_eq!(hierarchy.audit().unwrap(), before);
 }
 
 #[test]

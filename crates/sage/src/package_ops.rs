@@ -610,6 +610,46 @@ async fn preflight_packages(
         final_paths.insert(key.clone(), ownership.into_iter().collect());
     }
 
+    // Reject hierarchy replacements before journaling. Publishing cannot create
+    // a directory below a retained file, and recovery must not discover that late.
+    let mut installed_paths = BTreeMap::<String, BTreeSet<sage_core::PackageKey>>::new();
+    for package in database.packages()? {
+        for path in package.files {
+            installed_paths
+                .entry(path)
+                .or_default()
+                .insert(package.key.clone());
+        }
+    }
+    for (path, claimant) in &planned {
+        for ancestor in Path::new(path).ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            let ancestor = ancestor.to_string_lossy();
+            if let Some(owner) = planned.get(ancestor.as_ref()) {
+                bail!(
+                    "transaction ownership paths conflict: {owner} owns ancestor {ancestor} of {claimant}'s {path}"
+                );
+            }
+            if let Some(owners) = installed_paths.get(ancestor.as_ref()) {
+                bail!(
+                    "file hierarchy conflict for {path}: ancestor {ancestor} is currently owned by {owners:?}"
+                );
+            }
+        }
+        let descendant_prefix = format!("{path}/");
+        if let Some((descendant, owners)) = installed_paths
+            .range(descendant_prefix.clone()..)
+            .next()
+            .filter(|(descendant, _)| descendant.starts_with(&descendant_prefix))
+        {
+            bail!(
+                "file hierarchy conflict for {path}: descendant {descendant} is currently owned by {owners:?}"
+            );
+        }
+    }
+
     // A current owner may release a path in this same transaction. Add a
     // publication edge so its replacement commits before the new claimant;
     // owners absent from the plan, or retaining the path, remain conflicts.
