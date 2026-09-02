@@ -278,9 +278,10 @@ fn collect_paths(root: &Path) -> Result<Vec<PathBuf>, ArchiveError> {
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
-            paths.push(path.clone());
             if entry.file_type()?.is_dir() {
                 visit(&path, paths)?;
+            } else {
+                paths.push(path);
             }
         }
         Ok(())
@@ -304,12 +305,7 @@ fn append_deterministic<W: Write>(
     header.set_gid(0);
     header.set_mtime(0);
     header.set_mode(metadata.mode() & 0o7777);
-    if metadata.is_dir() {
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_size(0);
-        header.set_cksum();
-        builder.append_data(&mut header, relative, io::empty())?;
-    } else if metadata.is_file() {
+    if metadata.is_file() {
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(metadata.len());
         header.set_cksum();

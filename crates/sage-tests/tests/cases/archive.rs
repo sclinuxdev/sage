@@ -65,6 +65,7 @@ mod archive_tests {
         let stage = temp.path().join("stage");
         fs::create_dir_all(stage.join(".METADATA")).unwrap();
         fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
+        fs::create_dir_all(stage.join("data/var/lib/app")).unwrap();
         fs::write(stage.join("data/usr/bin/hello"), b"hello").unwrap();
         std::os::unix::fs::symlink("bin/hello", stage.join("data/usr/hello")).unwrap();
         let hash = hex::encode(Sha256::digest(b"hello"));
