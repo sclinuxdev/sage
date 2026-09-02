@@ -376,6 +376,15 @@ mod sys_tests {
         .unwrap();
         assert!(retained.install.iter().any(|(key, _)| key.name == "guard"));
         assert_eq!(retained.remove, vec![glibc.key.clone()]);
+        let retained = ReconcilePlan::compute(
+            &unconfigured,
+            &[virtual_root.clone(), glibc.clone()],
+            &guarded_universe,
+            false,
+        )
+        .unwrap();
+        assert!(retained.install.iter().any(|(key, _)| key.name == "musl"));
+        assert_eq!(retained.remove, vec![glibc.key.clone()]);
 
         let mut switch_universe = provider_universe.clone();
         let mut conflicting_musl = sage_core::Package::from_release(

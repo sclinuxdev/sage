@@ -94,6 +94,9 @@ impl ReconcilePlan {
                 let preferred = preferences.get(&dependency.name);
                 let virtual_dependency = dependency.name.starts_with("virtual/")
                     || dependency.name.starts_with("so:");
+                if virtual_dependency && preferred.is_none() {
+                    continue;
+                }
                 if virtual_dependency
                     && preferred.is_some()
                     && !installed.iter().any(|candidate| {
