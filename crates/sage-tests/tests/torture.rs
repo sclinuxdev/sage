@@ -269,6 +269,48 @@ fn equal_content_cross_package_claims_are_rejected() {
 }
 
 #[tokio::test]
+async fn dependency_removal_uses_solver_provider_semantics() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    lab.add("system", "lib", 1, "usr/lib/torture/lib", "lib")
+        .unwrap();
+    let mut alias =
+        sage_tests::PackageSpec::new("system", "alias", 1, "usr/lib/torture/alias", "alias");
+    alias.provides.push("lib".into());
+    lab.add_package(alias).unwrap();
+    let mut concrete_user = sage_tests::PackageSpec::new(
+        "system",
+        "concrete-user",
+        1,
+        "usr/lib/torture/concrete-user",
+        "user",
+    );
+    concrete_user.dependencies.push("lib".into());
+    lab.add_package(concrete_user).unwrap();
+
+    let mut libc =
+        sage_tests::PackageSpec::new("system", "libc", 1, "usr/lib/torture/libc-1", "libc");
+    libc.slot = "1".into();
+    libc.provides.push("virtual/libc".into());
+    lab.add_package(libc).unwrap();
+    let mut virtual_user = sage_tests::PackageSpec::new(
+        "system",
+        "virtual-user",
+        1,
+        "usr/lib/torture/virtual-user",
+        "user",
+    );
+    virtual_user.dependencies.push("virtual/libc".into());
+    lab.add_package(virtual_user).unwrap();
+    lab.publish().unwrap();
+
+    lab.install("concrete-user", "system").await.unwrap();
+    lab.install("alias", "system").await.unwrap();
+    assert!(lab.remove("lib", "system").await.is_err());
+    lab.install("virtual-user", "system").await.unwrap();
+    assert!(lab.remove("libc:1", "system").await.is_err());
+}
+
+#[tokio::test]
 async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
     for (name, path, content) in [

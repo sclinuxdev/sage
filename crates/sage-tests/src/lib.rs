@@ -17,6 +17,7 @@ pub struct PackageSpec {
     pub slot: String,
     pub version: u32,
     pub dependencies: Vec<String>,
+    pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub files: BTreeMap<String, Vec<u8>>,
 }
@@ -29,6 +30,7 @@ impl PackageSpec {
             slot: "0".into(),
             version,
             dependencies: Vec::new(),
+            provides: Vec::new(),
             conflicts: Vec::new(),
             files: BTreeMap::from([(path.into(), content.as_bytes().to_vec())]),
         }
@@ -147,7 +149,7 @@ target_root="/opt/channels/torture/1"
             description: format!("torture fixture {}", spec.name),
             license: "MIT".into(),
             dependencies,
-            provides: Vec::new(),
+            provides: spec.provides.clone(),
             conflicts: spec.conflicts.clone(),
             features: Vec::new(),
             installed_size,

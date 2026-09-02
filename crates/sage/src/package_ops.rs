@@ -1033,20 +1033,37 @@ fn remove_packages(
         if selected.iter().any(|removed| {
             dependent.key != removed.key
                 && dependent.dependencies.iter().any(|dependency| {
-                    let matched = (dependency.name == removed.key.name
+                    let virtual_dependency = dependency.name.starts_with("virtual/")
+                        || dependency.name.starts_with("so:");
+                    let removed_direct = dependency.name == removed.key.name;
+                    let matched = (removed_direct
                         || removed.provides.contains(&dependency.name))
-                        && dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT)
-                            == removed.key.slot
+                        && dependency.slot.as_deref().map_or_else(
+                            || {
+                                virtual_dependency
+                                    || !removed_direct
+                                    || removed.key.slot == sage_core::DEFAULT_SLOT
+                            },
+                            |slot| slot == removed.key.slot,
+                        )
                         && dependency
                             .channel
                             .as_deref()
                             .is_none_or(|channel| channel == removed.key.channel);
                     let replacement = installed.iter().any(|candidate| {
+                        let candidate_direct = dependency.name == candidate.key.name;
                         !selected.iter().any(|removed| removed.key == candidate.key)
-                            && (dependency.name == candidate.key.name
-                                || candidate.provides.contains(&dependency.name))
-                            && dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT)
-                                == candidate.key.slot
+                            && (candidate_direct
+                                || ((!removed_direct || virtual_dependency)
+                                    && candidate.provides.contains(&dependency.name)))
+                            && dependency.slot.as_deref().map_or_else(
+                                || {
+                                    virtual_dependency
+                                        || !candidate_direct
+                                        || candidate.key.slot == sage_core::DEFAULT_SLOT
+                                },
+                                |slot| slot == candidate.key.slot,
+                            )
                             && candidate.key.channel == removed.key.channel
                             && dependency.op.matches(&candidate.version, dependency.version.as_ref())
                     });
