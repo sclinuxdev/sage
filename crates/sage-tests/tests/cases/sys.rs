@@ -334,6 +334,14 @@ mod sys_tests {
         universe.insert(release("new-libc", "2-1", &[], &["virtual/libc"]));
         let config = provider_config("new-libc", &["old-app", "new-app"]);
         assert!(ReconcilePlan::compute(&config, &[], &universe, false).is_err());
+
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release("systemd", "1-1", &[], &["virtual/init"]));
+        let mut config = provider_config("systemd", &[]);
+        config.providers = BTreeMap::from([("init".into(), "systemd".into())]);
+        let plan = ReconcilePlan::compute(&config, &[], &universe, false).unwrap();
+        assert_eq!(plan.install[0].0.name, "systemd");
+        assert_eq!(plan.provider_bindings["init"].name, "systemd");
     }
 
     #[test]

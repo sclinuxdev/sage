@@ -73,14 +73,29 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
-        let roots = config.package_keys("main/system")?;
+        let mut roots = config.package_keys("main/system")?;
         let preferences = config.provider_preferences("main/system")?;
         let locks = installed
             .iter()
-            .map(|package| (package.key.clone(), package.version.clone()));
-        let (solution, selected_providers) = sage_solver::SageSolver::with_locked(universe, locks)
-            .prefer_providers(preferences.clone())
-            .resolve_with_provider_bindings(&roots)?;
+            .map(|package| (package.key.clone(), package.version.clone()))
+            .collect::<Vec<_>>();
+        let resolve = |roots: &[sage_core::PackageKey]| {
+            sage_solver::SageSolver::with_locked(universe, locks.clone())
+                .prefer_providers(preferences.clone())
+                .resolve_with_provider_bindings(roots)
+        };
+        let (mut solution, mut selected_providers) = resolve(&roots)?;
+        let missing = preferences
+            .iter()
+            .filter(|(symbol, _)| !selected_providers.contains_key(*symbol))
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            roots.extend(missing);
+            roots.sort();
+            roots.dedup();
+            (solution, selected_providers) = resolve(&roots)?;
+        }
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
@@ -100,15 +115,23 @@ impl ReconcilePlan {
                 .collect()
         };
         let provider_bindings = preferences
-            .into_keys()
-            .filter_map(|symbol| {
-                let selected = selected_providers.get(&symbol)?.clone();
-                Some((
-                    symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
-                    selected,
+            .iter()
+            .map(|(symbol, preferred)| {
+                let selected = selected_providers.get(symbol).unwrap_or(preferred);
+                let release = solution
+                    .get(selected)
+                    .and_then(|version| universe.release(selected, version));
+                if !release.is_some_and(|package| package.provides.contains(symbol)) {
+                    return Err(SysError::Invalid(format!(
+                        "configured provider {selected} does not provide {symbol}"
+                    )));
+                }
+                Ok((
+                    symbol.strip_prefix("virtual/").unwrap_or(symbol).into(),
+                    selected.clone(),
                 ))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             install,
             remove,

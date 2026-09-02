@@ -415,6 +415,14 @@ fn host_lock_namespace_is_anchored_and_private() {
         0o700
     );
     drop(insecure_lock);
+
+    let unsafe_root = tempfile::tempdir().unwrap();
+    let unsafe_run = unsafe_root.path().join("run");
+    std::fs::create_dir(&unsafe_run).unwrap();
+    std::fs::set_permissions(&unsafe_run, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        sage_core::HostLock::acquire_exclusive(unsafe_run.join("sage/operation.lock")).is_err()
+    );
 }
 
 #[test]

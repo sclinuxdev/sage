@@ -682,6 +682,9 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
         .map_err(errno_io)?;
         // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
         let next = unsafe { OwnedFd::from_raw_fd(next) };
+        if normal_index + 1 == normal_components {
+            validate_lock_ancestor(&next, path)?;
+        }
         if normal_index == normal_components {
             harden_lock_directory(&next, path)?;
         }
@@ -705,6 +708,20 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
+}
+
+fn validate_lock_ancestor(directory: &OwnedFd, path: &Path) -> Result<(), CoreError> {
+    let metadata = fstat(directory.as_raw_fd()).map_err(errno_io)?;
+    if metadata.st_uid != geteuid().as_raw() || metadata.st_mode & 0o022 != 0 {
+        return Err(CoreError::InvalidMetadata(format!(
+            "operation lock parent is not trusted: {}",
+            path.parent()
+                .and_then(Path::parent)
+                .unwrap_or(path)
+                .display()
+        )));
+    }
+    Ok(())
 }
 
 /// Makes the private lock namespace replace-safe before opening its lock file.

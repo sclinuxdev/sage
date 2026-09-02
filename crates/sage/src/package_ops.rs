@@ -937,7 +937,7 @@ fn remove_packages(
         if selected.iter().any(|removed| {
             dependent.key != removed.key
                 && dependent.dependencies.iter().any(|dependency| {
-                    (dependency.name == removed.key.name
+                    let matched = (dependency.name == removed.key.name
                         || removed.provides.contains(&dependency.name))
                         && dependency
                             .slot
@@ -946,7 +946,19 @@ fn remove_packages(
                         && dependency
                             .channel
                             .as_deref()
-                            .is_none_or(|channel| channel == removed.key.channel)
+                            .is_none_or(|channel| channel == removed.key.channel);
+                    let replacement = installed.iter().any(|candidate| {
+                        !selected.iter().any(|removed| removed.key == candidate.key)
+                            && (dependency.name == candidate.key.name
+                                || candidate.provides.contains(&dependency.name))
+                            && dependency
+                                .slot
+                                .as_deref()
+                                .is_none_or(|slot| slot == candidate.key.slot)
+                            && candidate.key.channel == removed.key.channel
+                            && dependency.op.matches(&candidate.version, dependency.version.as_ref())
+                    });
+                    matched && !replacement
                 })
         }) {
             bail!("cannot remove packages required by {}", dependent.key);
