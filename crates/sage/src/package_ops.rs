@@ -1315,7 +1315,11 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         sage_db::SageDatabase::open(&db_path)?
             .replace_system_providers(&plan.provider_bindings)?;
     }
-    render_services(root, &config, dry_run)?;
+    let init_provider = plan
+        .provider_bindings
+        .get("init")
+        .context("system providers must select an init implementation")?;
+    render_services(root, &config, &init_provider.name, dry_run)?;
     if !dry_run {
         let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
         sage_sys::TriggerEngine::execute_triggers_for(
@@ -1327,11 +1331,12 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     }
     Ok(())
 }
-fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) -> Result<()> {
-    let provider = config
-        .providers
-        .get("init")
-        .context("system providers must select an init implementation")?;
+fn render_services(
+    root: &Path,
+    config: &sage_sys::SystemConfig,
+    provider: &str,
+    dry_run: bool,
+) -> Result<()> {
     let rclass = under_root(
         root,
         &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
@@ -1369,7 +1374,7 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
     if dry_run {
         if let Some(previous) = &previous {
             for service in &previous.services {
-                let provider_changed = previous.provider != *provider;
+                let provider_changed = previous.provider != provider;
                 let removed = !installed
                     .iter()
                     .any(|candidate| candidate.name == service.name);
@@ -1403,7 +1408,7 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
         let previous_generator =
             sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
         for service in &previous.services {
-            let provider_changed = previous.provider != *provider;
+            let provider_changed = previous.provider != provider;
             let removed = !installed
                 .iter()
                 .any(|candidate| candidate.name == service.name);
@@ -1425,7 +1430,7 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
     }
     let state = sage_sys::RenderedServicesState {
         schema_version: sage_core::SCHEMA_VERSION,
-        provider: provider.clone(),
+        provider: provider.into(),
         services: installed,
         enabled: config.services.clone(),
     };
@@ -1556,4 +1561,38 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod package_ops_tests {
+    use super::*;
+
+    #[test]
+    fn service_rendering_uses_the_resolved_init_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let rclass = root.path().join("usr/share/sage/rclass");
+        std::fs::create_dir_all(&rclass).unwrap();
+        std::fs::write(
+            rclass.join("init-loom.toml"),
+            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n",
+        )
+        .unwrap();
+        let config = sage_sys::SystemConfig {
+            schema_version: 1,
+            system: sage_sys::SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::from([("init".into(), "systemd".into())]),
+            packages: BTreeSet::new(),
+            services: BTreeSet::new(),
+        };
+
+        render_services(root.path(), &config, "loom", false).unwrap();
+        let state = sage_sys::RenderedServicesState::load(
+            root.path().join("var/lib/sage/rendered-services.toml"),
+        )
+        .unwrap();
+        assert_eq!(state.provider, "loom");
+    }
 }
