@@ -216,6 +216,38 @@ fn payload_validation_precedes_all_filesystem_writes() {
     assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
     assert!(!root.path().join("opt/app").exists());
     assert!(!root.path().join("opt/app/bin/tool").exists());
+
+    let payload = b"owned";
+    let payload_hash = hex::encode(sha2::Sha256::digest(payload));
+    let (_archive_root, archive) = raw_archive_entries(
+        &format!("usr/owned/file\t0644\t{}\t{payload_hash}\n", payload.len()),
+        &[
+            ("data/var/unowned", tar::EntryType::Directory, b"", None),
+            (
+                "data/usr/owned/file",
+                tar::EntryType::Regular,
+                payload,
+                None,
+            ),
+        ],
+    );
+    let inspection = sage_archive::inspect_package(&archive).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
+    assert!(!root.path().join("var/unowned").exists());
+    assert!(!root.path().join("usr/owned/file").exists());
+
+    let (_archive_root, archive) = raw_archive_entries(
+        &format!("usr/collision\t0644\t{}\t{payload_hash}\n", payload.len()),
+        &[
+            ("data/usr/collision", tar::EntryType::Regular, payload, None),
+            ("data/usr/collision", tar::EntryType::Directory, b"", None),
+        ],
+    );
+    let inspection = sage_archive::inspect_package(&archive).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
+    assert!(!root.path().join("usr/collision").exists());
 }
 
 #[tokio::test]
@@ -585,6 +617,24 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
     )
     .is_err());
     assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+
+    let insecure_directory = canonical.join("run/insecure");
+    std::fs::create_dir(&insecure_directory).unwrap();
+    std::fs::set_permissions(&insecure_directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let insecure_lock = sage_core::HostLock::acquire_exclusive_for(
+        insecure_directory.join("operation.lock"),
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&insecure_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    drop(insecure_lock);
 }
 
 #[test]

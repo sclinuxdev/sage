@@ -2,7 +2,8 @@
 
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, OFlag};
-use nix::sys::stat::{mkdirat, Mode};
+use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
+use nix::unistd::{fchown, geteuid};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -740,8 +741,12 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
             Mode::empty(),
         )
         .map_err(errno_io)?;
-        // SAFETY: `openat` returned a new descriptor replacing the previous guard.
-        current = unsafe { OwnedFd::from_raw_fd(next) };
+        // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
+        let next = unsafe { OwnedFd::from_raw_fd(next) };
+        if normal_index == normal_components {
+            harden_lock_directory(&next, path)?;
+        }
+        current = next;
     }
     let raw = openat(
         Some(current.as_raw_fd()),
@@ -760,6 +765,32 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(file)
+}
+
+/// Makes the private lock namespace replace-safe before opening its lock file.
+///
+/// Root repairs a pre-created directory to its own ownership. An unprivileged
+/// caller can repair its own mode, while a directory owned by another account
+/// fails closed when `fchown` is denied. The descriptor remains anchored and
+/// `O_NOFOLLOW`, so validation never races through a replacement path.
+fn harden_lock_directory(directory: &OwnedFd, path: &Path) -> Result<(), CoreError> {
+    let expected_owner = geteuid();
+    let mut metadata = fstat(directory.as_raw_fd()).map_err(errno_io)?;
+    if metadata.st_uid != expected_owner.as_raw() {
+        fchown(directory.as_raw_fd(), Some(expected_owner), None).map_err(errno_io)?;
+        metadata = fstat(directory.as_raw_fd()).map_err(errno_io)?;
+    }
+    if metadata.st_mode & 0o7777 != 0o700 {
+        fchmod(directory.as_raw_fd(), Mode::from_bits_truncate(0o700)).map_err(errno_io)?;
+        metadata = fstat(directory.as_raw_fd()).map_err(errno_io)?;
+    }
+    if metadata.st_uid != expected_owner.as_raw() || metadata.st_mode & 0o7777 != 0o700 {
+        return Err(CoreError::InvalidMetadata(format!(
+            "operation lock directory is not private: {}",
+            path.parent().unwrap_or(path).display()
+        )));
+    }
+    Ok(())
 }
 
 fn errno_io(error: Errno) -> CoreError {

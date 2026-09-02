@@ -55,6 +55,12 @@
 19. **Indexed payload paths allowed non-directory ancestors.** Preflight rejects
     a file or symlink path that would need to become a directory for another
     indexed entry.
+20. **Unindexed directory headers created unmanaged paths.** Archive validation
+    now permits directory entries only when they are required ancestors of an
+    indexed payload path.
+21. **Pre-existing lock directories retained unsafe permissions.** The anchored
+    final directory is repaired to the effective owner and mode `0700` before
+    Sage opens `operation.lock`.
 
 Each item has a deterministic regression in `crates/sage-tests`.
 

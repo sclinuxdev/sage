@@ -526,6 +526,7 @@ pub fn validate_package_payload(
             "files.idx contains duplicate canonical paths".into(),
         ));
     }
+    let mut allowed_directories = BTreeSet::new();
     for path in expected.keys() {
         for ancestor in path.ancestors().skip(1) {
             if ancestor.as_os_str().is_empty() {
@@ -538,6 +539,7 @@ pub fn validate_package_payload(
                     ancestor.display()
                 )));
             }
+            allowed_directories.insert(ancestor.to_path_buf());
         }
     }
     let decoder = zstd::Decoder::new(File::open(package.as_ref())?)?;
@@ -558,7 +560,16 @@ pub fn validate_package_payload(
                 path.display()
             )));
         };
-        if relative.as_os_str().is_empty() || entry.header().entry_type().is_dir() {
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if entry.header().entry_type().is_dir() {
+            if !allowed_directories.contains(relative) {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "unindexed payload directory {}",
+                    relative.display()
+                )));
+            }
             continue;
         }
         let record = expected.get(relative).ok_or_else(|| {

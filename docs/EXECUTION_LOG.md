@@ -16,7 +16,7 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | `cargo clippy --all-targets -- -D warnings` | passed with zero warnings |
 | `cargo test --all-targets` | passed: 66 existing tests, 18 Torture Lab tests, 1 benchmark ignored |
 | `cargo run -p sage-tests --bin sage-torture -- quick` | passed; 17 recorded real package operations |
-| production Rust physical-line count | 9,883 lines; informational, not a release gate |
+| production Rust physical-line count | 9,925 lines; informational, not a release gate |
 | fixed-seed 24-step state-machine test | passed with seed `0x5a6e2026` |
 | expanded 200-step state-machine | passed with seed `1517166630`; 329 recorded steps |
 | nightly-scale 1,000-step state-machine | passed with seed `1517166630`; 1,667 recorded steps |
@@ -26,13 +26,13 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | focused multi-process and abrupt-termination tests | passed |
 | Linux Torture Lab binary | 16 passed, 1 benchmark ignored in Debian sid as uid 1000 |
 | focused filesystem matrix | passed: file/directory swaps, read-only target, long path, hard link and equal-content conflict |
-| focused archive preflight | passed: malformed journal rejection, late regular checksum and indexed ancestor collision |
+| focused archive preflight | passed: malformed journal rejection, late regular checksum, indexed ancestor collision and unindexed directory rejection |
 | focused concurrency matrix | passed: same-package updates, cross-channel writers and reader/writer serialization |
 | focused LMDB map-full | passed with a 1 MiB map and zero partial indexes |
 | repeated recovery failure | passed for install and partial removal journals |
 | ignored benchmark smoke | passed when invoked explicitly |
 | ownership handoff regression | passed for one-way package split; cyclic swap remained atomic |
-| nonzero operation-lock timeout | passed with bounded retry sleeps |
+| operation-lock hardening | passed with bounded retry sleeps and repair of pre-existing permissive directories |
 
 The first macOS Rust baseline exposed the `u32`/Darwin `mode_t` compile error.
 After that fix, an in-sandbox run still produced expected `EPERM` failures for
