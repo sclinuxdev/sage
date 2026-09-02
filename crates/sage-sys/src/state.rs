@@ -105,10 +105,14 @@ impl ReconcilePlan {
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
             .collect::<Vec<_>>();
+        let exact = retained
+            .iter()
+            .map(|package| (package.key.clone(), package.version.clone()))
+            .collect::<BTreeMap<_, _>>();
         let resolve = |roots: &[sage_core::PackageKey]| {
             sage_solver::SageSolver::with_locked(universe, locks.clone())
                 .prefer_providers(preferences.clone())
-                .resolve_with_provider_bindings(roots)
+                .resolve_with_provider_bindings(roots, &exact)
         };
         let (mut solution, mut selected_providers) = resolve(&roots)?;
         let missing = preferences

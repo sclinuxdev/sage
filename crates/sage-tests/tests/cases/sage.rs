@@ -637,6 +637,33 @@ target_root="/"
                 conflict: None,
                 files: &[("usr/lib/cycle-b", "b")],
             },
+            TestPackage {
+                name: "lib",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: None,
+                conflict: None,
+                files: &[("usr/lib/lib-default", "default")],
+            },
+            TestPackage {
+                name: "lib",
+                slot: "1",
+                version: "1",
+                arch: "amd64",
+                dependency: None,
+                conflict: None,
+                files: &[("usr/lib/lib-slot-1", "slot-1")],
+            },
+            TestPackage {
+                name: "uses-lib",
+                slot: "0",
+                version: "1",
+                arch: "amd64",
+                dependency: Some("lib"),
+                conflict: None,
+                files: &[("usr/bin/uses-lib", "uses")],
+            },
         ] {
             build_data_package(root.path(), recipes.path(), pool.path(), package).await;
         }
@@ -687,5 +714,25 @@ target_root="/"
         .unwrap();
         assert!(root.path().join("usr/lib/cycle-a").exists());
         assert!(root.path().join("usr/lib/cycle-b").exists());
+
+        execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["uses-lib".into(), "lib:1".into()],
+                channel: None,
+                no_save: true,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(execute(cli(
+            root.path(),
+            Commands::Remove {
+                packages: vec!["lib:0".into()],
+                channel: None,
+            },
+        ))
+        .await
+        .is_err());
     }
 }

@@ -281,6 +281,7 @@ mod sys_tests {
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
         universe.insert(old_release);
+        universe.insert(release("old", "2.0-1", &[], &[]));
         assert!(ReconcilePlan::compute(&config, std::slice::from_ref(&old), &universe, true).is_err());
     }
 

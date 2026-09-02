@@ -111,11 +111,18 @@ impl<'a> SageSolver<'a> {
     pub fn resolve_with_provider_bindings(
         &self,
         requested: &[PackageKey],
+        exact: &BTreeMap<PackageKey, Version>,
     ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
         let dependencies = requested
             .iter()
             .cloned()
-            .map(|key| (key, VersionRange::full()))
+            .map(|key| {
+                let range = exact
+                    .get(&key)
+                    .cloned()
+                    .map_or_else(VersionRange::full, VersionRange::singleton);
+                (key, range)
+            })
             .collect();
         let (solution, choices) = self.resolve_root(dependencies)?;
         let mut bindings = BTreeMap::new();

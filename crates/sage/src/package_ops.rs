@@ -995,10 +995,8 @@ fn remove_packages(
                 && dependent.dependencies.iter().any(|dependency| {
                     let matched = (dependency.name == removed.key.name
                         || removed.provides.contains(&dependency.name))
-                        && dependency
-                            .slot
-                            .as_deref()
-                            .is_none_or(|slot| slot == removed.key.slot)
+                        && dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT)
+                            == removed.key.slot
                         && dependency
                             .channel
                             .as_deref()
@@ -1007,10 +1005,8 @@ fn remove_packages(
                         !selected.iter().any(|removed| removed.key == candidate.key)
                             && (dependency.name == candidate.key.name
                                 || candidate.provides.contains(&dependency.name))
-                            && dependency
-                                .slot
-                                .as_deref()
-                                .is_none_or(|slot| slot == candidate.key.slot)
+                            && dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT)
+                                == candidate.key.slot
                             && candidate.key.channel == removed.key.channel
                             && dependency.op.matches(&candidate.version, dependency.version.as_ref())
                     });
