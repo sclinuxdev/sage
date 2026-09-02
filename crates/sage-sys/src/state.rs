@@ -108,16 +108,29 @@ impl ReconcilePlan {
                 {
                     continue;
                 }
-                if let Some(candidate) = installed
+                let candidates = installed
                     .iter()
                     .filter(|candidate| {
                         installed_satisfies(&package.key, dependency, candidate, universe)
                     })
-                    .min_by_key(|candidate| {
-                        let direct = !virtual_dependency && candidate.key.name == dependency.name;
-                        (!direct, preferred != Some(&candidate.key), candidate.key.clone())
-                    })
-                {
+                    .collect::<Vec<_>>();
+                let direct = candidates
+                    .iter()
+                    .find(|candidate| !virtual_dependency && candidate.key.name == dependency.name)
+                    .copied();
+                let preferred = preferred.and_then(|preferred| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.key == *preferred)
+                        .copied()
+                });
+                let candidate = direct.or(preferred).or_else(|| {
+                    let [candidate] = candidates.as_slice() else {
+                        return None;
+                    };
+                    Some(*candidate)
+                });
+                if let Some(candidate) = candidate {
                     if retained_keys.insert(candidate.key.clone()) {
                         pending.insert(candidate.key.clone());
                     }
@@ -128,9 +141,11 @@ impl ReconcilePlan {
             .iter()
             .map(|key| installed_by_key[key])
             .collect::<Vec<_>>();
+        // Reconstruct every installed release as a candidate, but exact-pin only
+        // the unambiguous retained closure above so PubGrub can backtrack providers.
         let retained_universe = (!retained.is_empty()).then(|| {
             let mut universe = universe.clone();
-            for package in &retained {
+            for package in installed {
                 if universe.release(&package.key, &package.version).is_none() {
                     let mut release = sage_core::Package::from_release(
                         package.key.clone(),
