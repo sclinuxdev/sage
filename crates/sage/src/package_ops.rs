@@ -1297,6 +1297,23 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         .provider_bindings
         .get("init")
         .context("system providers must select an init implementation")?;
+    let rendered_state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
+    let previous_services = rendered_state_path
+        .exists()
+        .then(|| sage_sys::RenderedServicesState::load(&rendered_state_path))
+        .transpose()?;
+    let previous_generator = if dry_run {
+        None
+    } else if let Some(previous) = &previous_services {
+        let rclass = under_root(
+            root,
+            &Path::new("/usr/share/sage/rclass")
+                .join(format!("init-{}.toml", previous.provider)),
+        );
+        Some(sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?)
+    } else {
+        None
+    };
     let current = installed
         .iter()
         .map(|package| (package.key.clone(), package.version.clone()))
@@ -1336,7 +1353,14 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         sage_db::SageDatabase::open(&db_path)?
             .replace_system_providers(&plan.provider_bindings)?;
     }
-    render_services(root, &config, &init_provider.name, dry_run)?;
+    render_services(
+        root,
+        &config,
+        &init_provider.name,
+        dry_run,
+        previous_services.as_ref(),
+        previous_generator.as_ref(),
+    )?;
     if !dry_run {
         let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
         sage_sys::TriggerEngine::execute_triggers_for(
@@ -1353,12 +1377,13 @@ fn render_services(
     config: &sage_sys::SystemConfig,
     provider: &str,
     dry_run: bool,
+    previous: Option<&sage_sys::RenderedServicesState>,
+    previous_generator: Option<&sage_sys::TemplateServiceGenerator>,
 ) -> Result<()> {
     let rclass = under_root(
         root,
         &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
     );
-    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
     let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
     let mut installed = Vec::new();
     if service_dir.exists() {
@@ -1382,14 +1407,8 @@ fn render_services(
         bail!("enabled service '{service}' has no installed declaration");
     }
     let state_relative = Path::new("var/lib/sage/rendered-services.toml");
-    let state_path = under_root(root, state_relative);
-    let previous = if state_path.exists() {
-        Some(sage_sys::RenderedServicesState::load(&state_path)?)
-    } else {
-        None
-    };
     if dry_run {
-        if let Some(previous) = &previous {
+        if let Some(previous) = previous {
             for service in &previous.services {
                 let provider_changed = previous.provider != provider;
                 let removed = !installed
@@ -1416,14 +1435,10 @@ fn render_services(
         }
         return Ok(());
     }
-    if let Some(previous) = &previous {
-        let previous_rclass = under_root(
-            root,
-            &Path::new("/usr/share/sage/rclass")
-                .join(format!("init-{}.toml", previous.provider)),
-        );
-        let previous_generator =
-            sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
+    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
+    if let Some(previous) = previous {
+        let previous_generator = previous_generator
+            .context("previous rendered services require their init generator")?;
         for service in &previous.services {
             let provider_changed = previous.provider != provider;
             let removed = !installed
@@ -1589,11 +1604,8 @@ mod package_ops_tests {
         let root = tempfile::tempdir().unwrap();
         let rclass = root.path().join("usr/share/sage/rclass");
         std::fs::create_dir_all(&rclass).unwrap();
-        std::fs::write(
-            rclass.join("init-loom.toml"),
-            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n",
-        )
-        .unwrap();
+        let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n";
+        std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
         let config = sage_sys::SystemConfig {
             schema_version: 1,
             system: sage_sys::SystemMetadata {
@@ -1605,12 +1617,49 @@ mod package_ops_tests {
             services: BTreeSet::new(),
         };
 
-        render_services(root.path(), &config, "loom", false).unwrap();
+        render_services(root.path(), &config, "loom", false, None, None).unwrap();
         let state = sage_sys::RenderedServicesState::load(
             root.path().join("var/lib/sage/rendered-services.toml"),
         )
         .unwrap();
         assert_eq!(state.provider, "loom");
+
+        let previous_generator = sage_sys::TemplateServiceGenerator::from_rclass(
+            &rclass.join("init-loom.toml"),
+        )
+        .unwrap();
+        std::fs::write(rclass.join("init-systemd.toml"), renderer).unwrap();
+        std::fs::remove_file(rclass.join("init-loom.toml")).unwrap();
+        render_services(
+            root.path(),
+            &config,
+            "systemd",
+            false,
+            Some(&state),
+            Some(&previous_generator),
+        )
+        .unwrap();
+        let state = sage_sys::RenderedServicesState::load(
+            root.path().join("var/lib/sage/rendered-services.toml"),
+        )
+        .unwrap();
+        assert_eq!(state.provider, "systemd");
+    }
+
+    #[test]
+    fn dry_run_does_not_load_a_planned_init_renderer() {
+        let root = tempfile::tempdir().unwrap();
+        let config = sage_sys::SystemConfig {
+            schema_version: 1,
+            system: sage_sys::SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::new(),
+            packages: BTreeSet::new(),
+            services: BTreeSet::new(),
+        };
+        render_services(root.path(), &config, "not-installed", true, None, None).unwrap();
     }
 
     #[tokio::test]
