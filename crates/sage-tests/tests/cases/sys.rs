@@ -261,12 +261,17 @@ mod sys_tests {
             packages: BTreeSet::from(["app".into()]),
             services: BTreeSet::new(),
         };
-        let plan = ReconcilePlan::compute(&config, &[old], &universe, false).unwrap();
+        let plan = ReconcilePlan::compute(&config, std::slice::from_ref(&old), &universe, false)
+            .unwrap();
         assert_eq!(plan.install.len(), 2);
         assert_eq!(
             plan.remove,
             vec![sage_core::PackageKey::new("main/system", "old", "0")]
         );
+        let mut old_release = release("old", "1.0-1", &[], &[]);
+        old_release.conflicts.push("app".into());
+        universe.insert(old_release);
+        assert!(ReconcilePlan::compute(&config, std::slice::from_ref(&old), &universe, true).is_err());
     }
 
     #[test]

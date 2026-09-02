@@ -75,6 +75,11 @@ impl ReconcilePlan {
     ) -> Result<Self, SysError> {
         let mut roots = config.package_keys("main/system")?;
         let preferences = config.provider_preferences("main/system")?;
+        if no_prune {
+            roots.extend(installed.iter().map(|package| package.key.clone()));
+            roots.sort();
+            roots.dedup();
+        }
         let locks = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
