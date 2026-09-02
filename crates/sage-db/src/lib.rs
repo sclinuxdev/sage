@@ -264,10 +264,16 @@ impl SageDatabase {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.provides, &txn, symbol)?.unwrap_or_default())
     }
-    /// Pins a system interface such as `virtual/libc` to one package instance.
-    pub fn set_system_provider(&self, interface: &str, key: &PackageKey) -> Result<(), DbError> {
+    /// Replaces every persisted system-provider binding in one transaction.
+    pub fn replace_system_providers(
+        &self,
+        bindings: &BTreeMap<String, PackageKey>,
+    ) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
-        self.system.put(&mut txn, interface, &key.canonical_id())?;
+        self.system.clear(&mut txn)?;
+        for (interface, key) in bindings {
+            self.system.put(&mut txn, interface, &key.canonical_id())?;
+        }
         txn.commit()?;
         Ok(())
     }

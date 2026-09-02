@@ -2,15 +2,6 @@ name: Torture Lab
 
 on:
   workflow_dispatch:
-    inputs:
-      seed:
-        description: Reproducible random seed
-        required: true
-        default: "1517166630"
-      operations:
-        description: Random state-machine operations
-        required: true
-        default: "1000"
   schedule:
     - cron: "17 3 * * *"
 
@@ -26,9 +17,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run long model sequence
-        env:
-          TORTURE_SEED: ${{ inputs.seed || '1517166630' }}
-          TORTURE_OPERATIONS: ${{ inputs.operations || '1000' }}
-        run: >-
-          cargo run -p sage-tests --bin sage-torture -- random
-          --seed "$TORTURE_SEED" --operations "$TORTURE_OPERATIONS"
+        run: cargo run -p sage-tests --bin sage-torture -- random --seed 1517166630 --operations 1000

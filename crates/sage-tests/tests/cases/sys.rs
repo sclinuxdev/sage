@@ -326,6 +326,17 @@ mod sys_tests {
     }
 
     #[test]
+    fn reconciliation_rejects_multiple_bindings_for_one_interface() {
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release("old-app", "1-1", &["virtual/libc < 2-1"], &[]));
+        universe.insert(release("new-app", "1-1", &["virtual/libc >= 2-1"], &[]));
+        universe.insert(release("old-libc", "1-1", &[], &["virtual/libc"]));
+        universe.insert(release("new-libc", "2-1", &[], &["virtual/libc"]));
+        let config = provider_config("new-libc", &["old-app", "new-app"]);
+        assert!(ReconcilePlan::compute(&config, &[], &universe, false).is_err());
+    }
+
+    #[test]
     fn alternatives_choose_priority_and_publish_atomically() {
         let root = tempfile::tempdir().unwrap();
         let candidates = [

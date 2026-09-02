@@ -1132,8 +1132,6 @@ fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result
 async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
-    let desired: Vec<_> = config.packages.iter().cloned().collect();
-    apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
     let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = if dry_run {
@@ -1143,6 +1141,8 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     };
     let plan =
         sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
+    let desired: Vec<_> = config.packages.iter().cloned().collect();
+    apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
     let names: Vec<_> = plan
         .remove
         .into_iter()
@@ -1151,20 +1151,13 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     if !names.is_empty() {
         remove_packages(root, &names, Some("main/system"), false, dry_run)?;
     }
-    let database = if dry_run {
-        None
-    } else {
-        Some(sage_db::SageDatabase::open(&db_path)?)
-    };
-    for (interface, key) in plan.provider_bindings {
-        if dry_run {
+    if dry_run {
+        for (interface, key) in &plan.provider_bindings {
             println!("Would bind virtual/{interface} to {key}");
-        } else {
-            database
-                .as_ref()
-                .expect("non-dry rebuild opens the database")
-                .set_system_provider(&interface, &key)?;
         }
+    } else {
+        sage_db::SageDatabase::open(&db_path)?
+            .replace_system_providers(&plan.provider_bindings)?;
     }
     render_services(root, &config, dry_run)?;
     if !dry_run {
