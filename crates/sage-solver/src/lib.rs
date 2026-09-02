@@ -105,9 +105,10 @@ impl<'a> SageSolver<'a> {
     ///
     /// Provider bindings are recovered from PubGrub's selected private proxy
     /// releases before those implementation-only packages are removed from the
-    /// public solution. A symbol that resolves to different concrete packages
-    /// cannot be represented by the single system-provider binding and is
-    /// rejected instead of choosing one by map order.
+    /// public solution. Concrete-name fallback proxies are excluded because
+    /// they are not persisted system interfaces. A configured virtual symbol
+    /// that resolves to different concrete packages cannot be represented by
+    /// one binding and is rejected instead of choosing one by map order.
     pub fn resolve_with_provider_bindings(
         &self,
         requested: &[PackageKey],
@@ -213,8 +214,9 @@ impl<'a> SageSolver<'a> {
                             concrete.len()
                         )));
                     };
-                    provider_choices
-                        .push((provider_symbol(&requirement.name).into(), concrete.clone()));
+                    if !requirement.name.starts_with("virtual/provider/") {
+                        provider_choices.push((requirement.name, concrete.clone()));
+                    }
                 }
                 Ok((
                     selected
