@@ -158,6 +158,106 @@ fn archive_attack_matrix_is_fail_closed() {
 }
 
 #[test]
+fn payload_validation_precedes_all_filesystem_writes() {
+    use sha2::Digest as _;
+
+    let first = b"first";
+    let expected_second = b"right";
+    let actual_second = b"wrong";
+    let first_hash = hex::encode(sha2::Sha256::digest(first));
+    let second_hash = hex::encode(sha2::Sha256::digest(expected_second));
+    let (_archive_root, archive) = raw_archive_entries(
+        &format!(
+            "usr/first\t0644\t{}\t{first_hash}\nusr/second\t0644\t{}\t{second_hash}\n",
+            first.len(),
+            expected_second.len()
+        ),
+        &[
+            ("data/usr/first", tar::EntryType::Regular, first, None),
+            (
+                "data/usr/second",
+                tar::EntryType::Regular,
+                actual_second,
+                None,
+            ),
+        ],
+    );
+    let inspection = sage_archive::inspect_package(&archive).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        sage_archive::extract_package(&archive, root.path(), &inspection.files),
+        Err(sage_archive::ArchiveError::ChecksumMismatch { .. })
+    ));
+    assert!(!root.path().join("usr/first").exists());
+    assert!(!root.path().join("usr/second").exists());
+
+    let parent = b"parent";
+    let child = b"child";
+    let parent_hash = hex::encode(sha2::Sha256::digest(parent));
+    let child_hash = hex::encode(sha2::Sha256::digest(child));
+    let (_archive_root, archive) = raw_archive_entries(
+        &format!(
+            "opt/app\t0644\t{}\t{parent_hash}\nopt/app/bin/tool\t0644\t{}\t{child_hash}\n",
+            parent.len(),
+            child.len()
+        ),
+        &[
+            ("data/opt/app", tar::EntryType::Regular, parent, None),
+            (
+                "data/opt/app/bin/tool",
+                tar::EntryType::Regular,
+                child,
+                None,
+            ),
+        ],
+    );
+    let inspection = sage_archive::inspect_package(&archive).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
+    assert!(!root.path().join("opt/app").exists());
+    assert!(!root.path().join("opt/app/bin/tool").exists());
+}
+
+#[tokio::test]
+async fn malformed_package_preflight_does_not_leave_a_recovery_journal() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    let malformed = lab
+        .add_package(sage_tests::PackageSpec::new(
+            "system", "raw", 1, "usr/hard", "payload",
+        ))
+        .unwrap();
+    lab.add_package(sage_tests::PackageSpec::new(
+        "system",
+        "healthy",
+        1,
+        "usr/lib/torture/healthy",
+        "healthy",
+    ))
+    .unwrap();
+    write_raw_archive(
+        &malformed,
+        &format!("usr/hard\t0644\t0\t{}\n", "0".repeat(64)),
+        &[(
+            "data/usr/hard",
+            tar::EntryType::Link,
+            b"",
+            Some("data/usr/source"),
+        )],
+    );
+    lab.publish().unwrap();
+
+    assert!(lab.install("raw", "system").await.is_err());
+    {
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert!(database.pending_journals().unwrap().is_empty());
+        assert!(database.packages().unwrap().is_empty());
+    }
+    assert!(!lab.root().join("usr/hard").exists());
+    lab.install("healthy", "system").await.unwrap();
+    lab.audit().unwrap();
+}
+
+#[test]
 fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
     use sha2::Digest as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -835,10 +935,26 @@ fn raw_archive(
     payload: &[u8],
     link: Option<&str>,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
-    use std::fs::File;
+    raw_archive_entries(index, &[(payload_path, entry_type, payload, link)])
+}
+
+fn raw_archive_entries(
+    index: &str,
+    entries: &[(&str, tar::EntryType, &[u8], Option<&str>)],
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let package = directory.path().join("raw.pkg.tar.zst");
-    let encoder = zstd::Encoder::new(File::create(&package).unwrap(), 1).unwrap();
+    write_raw_archive(&package, index, entries);
+    (directory, package)
+}
+
+fn write_raw_archive(
+    package: &std::path::Path,
+    index: &str,
+    entries: &[(&str, tar::EntryType, &[u8], Option<&str>)],
+) {
+    use std::fs::File;
+    let encoder = zstd::Encoder::new(File::create(package).unwrap(), 1).unwrap();
     let mut builder = tar::Builder::new(encoder);
     append_raw_entry(
         &mut builder,
@@ -862,9 +978,10 @@ license="MIT"
         index.as_bytes(),
         None,
     );
-    append_raw_entry(&mut builder, payload_path, entry_type, payload, link);
+    for (path, entry_type, payload, link) in entries {
+        append_raw_entry(&mut builder, path, *entry_type, payload, *link);
+    }
     builder.into_inner().unwrap().finish().unwrap();
-    (directory, package)
 }
 
 fn append_raw_entry<W: std::io::Write>(

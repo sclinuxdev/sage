@@ -576,6 +576,7 @@ async fn preflight_packages(
                 architecture
             );
         }
+        sage_archive::validate_package_payload(&archive, &inspection.files)?;
         let prefix = source
             .target_root
             .strip_prefix("/")

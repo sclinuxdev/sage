@@ -47,6 +47,14 @@
 16. **Provider bindings guessed from concrete solution order.** Reconciliation
     now records the concrete dependency of PubGrub's selected virtual proxy, so
     an unrelated explicit provider root cannot replace the actual binding.
+17. **Malformed archives reached durable install journals.** Installation now
+    validates the complete payload before recording recovery state, so a bad
+    package cannot block every later mutating command.
+18. **Regular payload preflight trusted size without content.** The no-write
+    archive scan now streams and hashes every regular entry before publication.
+19. **Indexed payload paths allowed non-directory ancestors.** Preflight rejects
+    a file or symlink path that would need to become a directory for another
+    indexed entry.
 
 Each item has a deterministic regression in `crates/sage-tests`.
 

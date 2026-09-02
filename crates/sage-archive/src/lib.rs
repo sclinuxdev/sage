@@ -421,7 +421,7 @@ fn extract_package_internal(
     previous_hashes: &BTreeMap<String, String>,
     fault: Option<FaultPoint>,
 ) -> Result<ExtractionReport, ArchiveError> {
-    validate_payload(package, index)?;
+    validate_package_payload(package, index)?;
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
@@ -507,10 +507,16 @@ fn extract_package_internal(
     Ok(report)
 }
 
-/// Scans every payload header before the first write. This keeps unsupported
-/// hard links, duplicate aliases, and malformed late entries from leaving a
-/// partially published package merely because they followed valid files.
-fn validate_payload(package: &Path, index: &[FileRecord]) -> Result<(), ArchiveError> {
+/// Validates every payload entry without writing to the target filesystem.
+///
+/// The scan rejects unsupported types, duplicate and ancestor-colliding paths,
+/// missing index entries, unsafe links, and content mismatches. Package-manager
+/// preflight calls this before creating a recovery journal, while extraction
+/// repeats it immediately before publication to keep direct callers atomic.
+pub fn validate_package_payload(
+    package: impl AsRef<Path>,
+    index: &[FileRecord],
+) -> Result<(), ArchiveError> {
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
@@ -520,11 +526,25 @@ fn validate_payload(package: &Path, index: &[FileRecord]) -> Result<(), ArchiveE
             "files.idx contains duplicate canonical paths".into(),
         ));
     }
-    let decoder = zstd::Decoder::new(File::open(package)?)?;
+    for path in expected.keys() {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if expected.contains_key(ancestor) {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "indexed payload {} has non-directory ancestor {}",
+                    path.display(),
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    let decoder = zstd::Decoder::new(File::open(package.as_ref())?)?;
     let mut archive = tar::Archive::new(decoder);
     let mut seen = BTreeSet::new();
     for entry in archive.entries()? {
-        let entry = entry?;
+        let mut entry = entry?;
         let path = clean_archive_path(&entry.path()?)?;
         if path.starts_with(".METADATA") {
             if entry.header().entry_type().is_file() {
@@ -572,6 +592,7 @@ fn validate_payload(package: &Path, index: &[FileRecord]) -> Result<(), ArchiveE
                     relative.display()
                 )));
             }
+            verify_reader(relative, record, &mut entry)?;
         } else {
             return Err(ArchiveError::UnsafePath(format!(
                 "unsupported entry {}",
