@@ -166,7 +166,13 @@ impl ElfScanner {
             if !bytes.starts_with(b"\x7fELF") {
                 continue;
             }
-            let goblin::Object::Elf(elf) = goblin::Object::parse(&bytes)? else {
+            let object = goblin::Object::parse(&bytes).map_err(|error| {
+                BuildError::InvalidSpec(format!(
+                    "ELF parse failed for {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            let goblin::Object::Elf(elf) = object else {
                 continue;
             };
             if let Some(soname) = elf.soname {
@@ -206,7 +212,13 @@ impl ElfScanner {
             if !bytes.starts_with(b"\x7fELF") {
                 continue;
             }
-            let goblin::Object::Elf(elf) = goblin::Object::parse(&bytes)? else {
+            let object = goblin::Object::parse(&bytes).map_err(|error| {
+                BuildError::InvalidSpec(format!(
+                    "ELF parse failed for {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            let goblin::Object::Elf(elf) = object else {
                 continue;
             };
             let relative = entry

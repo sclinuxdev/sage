@@ -1453,6 +1453,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
@@ -1532,6 +1533,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "walkdir",
  "zstd",
 ]
 
@@ -1583,6 +1585,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "walkdir",
  "zstd",
 ]
 

@@ -33,6 +33,11 @@
 2. **零文件冲突与无交叉污染**: 被子包认领的文件自动从主包文件池中剔除，确保生成的多个 `*.pkg.tar.zst` 之间**文件集合严格互斥**。
 3. **独立 ELF 符号扫描**: 每个子包独立运行 `ElfScanner`，例如主包工具自动生成对 `libs` 子包导出的 `so:libfoo.so` 的依赖。
 
+归档文件名使用稳定的包坐标，不包含 ABI slot：
+`<name>-<version>-<release>-<arch>.pkg.tar.zst`。slot 只保存在
+`.METADATA/manifest.toml` 和仓库索引中，因此不同 slot 的同名产物必须输出到
+不同目录，避免文件名碰撞。
+
 ---
 
 ## 2. 完整实战配方示例 (`libarchive` 多包拆分)
@@ -126,6 +131,9 @@ files = [
 ### 3.2 `[[subpackages]]` (独立拆分子包)
 - `name`: 子包名称（如 `foo-libs`, `foo-dev`, `foo-doc`）。
 - `description`: 子包专属描述（可选，默认继承主包）。
+- `channel`: 子包通道覆盖（可选，默认继承主包）。运行时库可因此落在
+  `system` 通道，而编译器本体保留在版本化 slot 中。
+- `slot`: 子包 ABI slot 覆盖（可选，默认继承主包）。
 - `dependencies`: 子包专属依赖（如 `foo-dev` 依赖 `foo-libs`）。
 - `provides`: 子包显式提供的额外虚拟符号。
 - `[subpackages.payload]`:

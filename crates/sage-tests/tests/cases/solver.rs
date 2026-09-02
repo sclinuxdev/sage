@@ -102,6 +102,26 @@ mod solver_tests {
     }
 
     #[test]
+    fn locked_virtual_provider_version_wins_over_newest() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release("main/system", "app", "1-1", &["virtual/libc"]));
+        let mut seed = release("main/system", "glibc", "2.44-0", &[]);
+        seed.provides.push("virtual/libc".into());
+        universe.insert(seed);
+        let mut repository = release("main/system", "glibc", "2.44-5", &[]);
+        repository.provides.push("virtual/libc".into());
+        universe.insert(repository);
+        let key = PackageKey::new("main/system", "glibc", "0");
+        let solution = SageSolver::with_locked(
+            &universe,
+            [(key.clone(), "2.44-0".parse().unwrap())],
+        )
+        .resolve(&[PackageKey::new("main/system", "app", "0")])
+        .unwrap();
+        assert_eq!(solution[&key], "2.44-0".parse().unwrap());
+    }
+
+    #[test]
     fn root_dependency_constraints_apply_to_build_environments() {
         let mut universe = PackageUniverse::default();
         universe.insert(release("main/system", "cmake", "3.20-1", &[]));
@@ -114,6 +134,33 @@ mod solver_tests {
             solution[&PackageKey::new("main/system", "cmake", "0")],
             "3.20-1".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn short_subchannel_dependencies_inherit_repository_root() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(sage_core::Package::from_release(
+            PackageKey::new("main/gcc16", "gcc", "16"),
+            "16.2.0-1".parse().unwrap(),
+            vec![],
+            vec![],
+        ));
+        let dependency = "gcc16/gcc:16".parse().unwrap();
+        let solution = SageSolver::new(&universe)
+            .resolve_dependencies("main/system", &[dependency])
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/gcc16", "gcc", "16")));
+    }
+
+    #[test]
+    fn canonical_cross_channel_dependencies_are_not_double_prefixed() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release("main/system", "gmp", "6.3.0-1", &[]));
+        let dependency = "main/system/gmp".parse().unwrap();
+        let solution = SageSolver::new(&universe)
+            .resolve_dependencies("main/gcc16", &[dependency])
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/system", "gmp", "0")));
     }
 
     #[test]

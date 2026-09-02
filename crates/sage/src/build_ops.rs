@@ -11,7 +11,9 @@ pub async fn mass_rebuild(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| recipe_root.join(".sage-packages"));
     prepare_source_pool(&pool, dry_run)?;
-    execute_source_layers(root, &layers, &pool, jobs, dry_run).await
+    reset_failure_report(&pool, dry_run)?;
+    let mut blocked_symbols = std::collections::BTreeSet::new();
+    execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await
 }
 pub async fn bootstrap_sources(
     root: &Path,
@@ -26,6 +28,8 @@ pub async fn bootstrap_sources(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| base.join(".sage-bootstrap"));
     prepare_source_pool(&pool, dry_run)?;
+    reset_failure_report(&pool, dry_run)?;
+    let mut blocked_symbols = std::collections::BTreeSet::new();
     for stage in plan.stages {
         println!("Bootstrap stage {}", stage.name);
         let mut units = Vec::new();
@@ -41,7 +45,7 @@ pub async fn bootstrap_sources(
         }
         let units = source_build_units(root, units)?;
         let layers = sage_build::BuildGraph::layers(units)?;
-        execute_source_layers(root, &layers, &pool, jobs, dry_run).await?;
+        execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await?;
     }
     Ok(())
 }
@@ -67,24 +71,31 @@ fn source_build_units(
 }
 
 fn prepare_source_pool(pool: &Path, dry_run: bool) -> Result<()> {
-    if pool.exists()
-        && std::fs::read_dir(pool)?.any(|entry| {
-            entry.ok().is_some_and(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
-            })
-        })
-    {
-        bail!(
-            "source build output must not contain existing packages: {}",
-            pool.display()
-        );
-    }
+    // A bootstrap output pool may contain explicitly preserved seed archives.
+    // New artifacts are published atomically by the layer executor and replace
+    // the matching seed filename when a package is rebuilt.
     if !dry_run {
         std::fs::create_dir_all(pool)?;
     }
+    Ok(())
+}
+
+fn reset_failure_report(pool: &Path, dry_run: bool) -> Result<()> {
+    if !dry_run {
+        let report = pool.join("build-failures.log");
+        if report.exists() {
+            std::fs::remove_file(report)?;
+        }
+    }
+    Ok(())
+}
+
+fn record_failure(report: &Path, message: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(report)?;
+    std::io::Write::write_all(&mut file, format!("{message}\n").as_bytes())?;
     Ok(())
 }
 
@@ -94,6 +105,7 @@ async fn execute_source_layers(
     pool: &Path,
     requested_jobs: usize,
     dry_run: bool,
+    blocked_symbols: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     if dry_run {
         for (index, layer) in layers.iter().enumerate() {
@@ -111,6 +123,7 @@ async fn execute_source_layers(
     }
     let config =
         sage_build::BuildConfig::load(under_root(root, Path::new("/etc/sage/build.toml")))?;
+    let failure_report = pool.join("build-failures.log");
     for (layer_index, layer) in layers.iter().enumerate() {
         let concurrency = if requested_jobs == 0 {
             config.jobs.min(layer.len()).max(1)
@@ -125,13 +138,29 @@ async fn execute_source_layers(
                 .tempdir_in(pool)?;
             let mut tasks = tokio::task::JoinSet::new();
             for (index, unit) in chunk.iter().enumerate() {
+                if unit
+                    .consumed_symbol_ids()
+                    .iter()
+                    .any(|symbol| blocked_symbols.contains(symbol))
+                {
+                    let message = format!(
+                        "{}: blocked by a failed dependency; not scheduled",
+                        unit.name
+                    );
+                    println!("Skip {message}");
+                    record_failure(&failure_report, &message)?;
+                    blocked_symbols.extend(unit.produced_symbol_ids());
+                    continue;
+                }
                 let root = root.to_path_buf();
                 let recipe = unit.recipe.clone();
+                let unit_name = unit.name.clone();
+                let produced_symbols = unit.produced_symbol_ids();
                 let output = outputs.path().join(format!("{index:04}"));
                 let pool = pool.to_path_buf();
                 std::fs::create_dir(&output)?;
                 tasks.spawn(async move {
-                    build_recipe(
+                    let result = build_recipe(
                         &root,
                         &recipe,
                         &[],
@@ -144,32 +173,167 @@ async fn execute_source_layers(
                         },
                     )
                     .await
-                    .map(|_| output)
+                    .map(|_| output);
+                    (unit_name, produced_symbols, result)
                 });
             }
             let mut completed = Vec::new();
             while let Some(result) = tasks.join_next().await {
-                completed.push(result??);
-            }
-            completed.sort();
-            for directory in completed {
-                let mut artifacts: Vec<_> = std::fs::read_dir(directory)?
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .map(|entry| entry.path())
-                    .filter(|path| {
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
-                    })
-                    .collect();
-                artifacts.sort();
-                for artifact in artifacts {
-                    let target = pool.join(artifact.file_name().unwrap());
-                    std::fs::rename(&artifact, &target)?;
-                    println!("Published {}", target.display());
+                match result {
+                    Ok((unit_name, produced_symbols, Ok(output))) => {
+                        completed.push((unit_name, produced_symbols, output));
+                    }
+                    Ok((unit_name, produced_symbols, Err(error))) => {
+                        let message = format!("{unit_name}: {error:#}");
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                        blocked_symbols.extend(produced_symbols);
+                    }
+                    Err(error) => {
+                        let message = format!("build task panicked or was cancelled: {error}");
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                    }
                 }
             }
+            completed.sort_by(|left, right| left.2.cmp(&right.2));
+            for (unit_name, produced_symbols, directory) in completed {
+                let artifacts = match std::fs::read_dir(&directory) {
+                    Ok(entries) => {
+                        let mut artifacts: Vec<_> = entries
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .map(|entry| entry.path())
+                            .filter(|path| {
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+                            })
+                            .collect();
+                        artifacts.sort();
+                        artifacts
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "{unit_name}: failed to read build output {}: {error}",
+                            directory.display()
+                        );
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                        blocked_symbols.extend(produced_symbols);
+                        continue;
+                    }
+                };
+                let mut publish_failed = false;
+                for artifact in artifacts {
+                    let inspection = match sage_archive::inspect_package(&artifact) {
+                        Ok(inspection) => inspection,
+                        Err(error) => {
+                            let message = format!(
+                                "{unit_name}: failed to inspect {}: {error}",
+                                artifact.display()
+                            );
+                            eprintln!("Build failed: {message}");
+                            record_failure(&failure_report, &message)?;
+                            publish_failed = true;
+                            continue;
+                        }
+                    };
+                    let Some(file_name) = artifact.file_name() else {
+                        let message = format!(
+                            "{unit_name}: build output has no filename: {}",
+                            artifact.display()
+                        );
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                        publish_failed = true;
+                        continue;
+                    };
+                    let target = pool
+                        .join(".slots")
+                        .join(&inspection.manifest.channel)
+                        .join(&inspection.manifest.name)
+                        .join(&inspection.manifest.slot)
+                        .join(file_name);
+                    if let Some(parent) = target.parent() {
+                        if let Err(error) = std::fs::create_dir_all(parent) {
+                            let message = format!(
+                                "{unit_name}: failed to create package destination {}: {error}",
+                                parent.display()
+                            );
+                            eprintln!("Build failed: {message}");
+                            record_failure(&failure_report, &message)?;
+                            publish_failed = true;
+                            continue;
+                        }
+                    }
+                    if let Err(error) = std::fs::rename(&artifact, &target) {
+                        let message = format!(
+                            "{unit_name}: failed to publish {}: {error}",
+                            artifact.display()
+                        );
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                        publish_failed = true;
+                        continue;
+                    }
+                    if let Err(error) = remove_superseded_pool_artifacts(
+                        pool,
+                        &target,
+                        &inspection.manifest,
+                    ) {
+                        let message = format!(
+                            "{unit_name}: failed to retire superseded bootstrap seed: {error}"
+                        );
+                        eprintln!("Build failed: {message}");
+                        record_failure(&failure_report, &message)?;
+                        publish_failed = true;
+                        continue;
+                    }
+                    println!("Published {}", target.display());
+                }
+                if publish_failed {
+                    blocked_symbols.extend(produced_symbols);
+                }
+            }
+        }
+    }
+    if failure_report.exists() {
+        bail!(
+            "source build failed; review {}",
+            failure_report.display()
+        );
+    }
+    Ok(())
+}
+
+/// Keeps exactly one local release for each package identity. A seed remains
+/// available until its replacement has been renamed into the pool, then all
+/// older flat or slotted copies of that channel/name/Slot are retired.
+fn remove_superseded_pool_artifacts(
+    pool: &Path,
+    replacement: &Path,
+    manifest: &sage_archive::PackageManifest,
+) -> Result<()> {
+    let replacement = replacement.canonicalize()?;
+    for entry in walkdir::WalkDir::new(pool).follow_links(false) {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type().is_file()
+            || !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".pkg.tar.zst"))
+            || path.canonicalize()? == replacement
+        {
+            continue;
+        }
+        let candidate = sage_archive::inspect_package(path)?;
+        if candidate.manifest.channel == manifest.channel
+            && candidate.manifest.name == manifest.name
+            && candidate.manifest.slot == manifest.slot
+        {
+            std::fs::remove_file(path)?;
         }
     }
     Ok(())
@@ -227,6 +391,37 @@ async fn build_recipe(
         .with_context(|| format!("failed to load {}", build_config_path.display()))?;
     if let Some(jobs) = invocation.jobs_override {
         config.jobs = jobs.max(1);
+    }
+    if let Some(linker) = &recipe.build.linker {
+        config.linker.clone_from(linker);
+    }
+    if let Some(compiler) = &recipe.build.compiler {
+        match sage_build::tool_family(compiler).as_str() {
+            "clang" => {
+                config.cc = "clang".into();
+                config.cxx = "clang++".into();
+            }
+            "gcc" => {
+                config.cc = "gcc".into();
+                config.cxx = "g++".into();
+            }
+            _ => unreachable!("recipe compiler was validated during load"),
+        }
+    }
+    if let Some(flags) = &recipe.build.cflags {
+        config.cflags.clone_from(flags);
+    }
+    if let Some(flags) = &recipe.build.cxxflags {
+        config.cxxflags.clone_from(flags);
+    }
+    if let Some(flags) = &recipe.build.cppflags {
+        config.cppflags.clone_from(flags);
+    }
+    if let Some(flags) = &recipe.build.ldflags {
+        config.ldflags.clone_from(flags);
+    }
+    if let Some(flags) = &recipe.build.rustflags {
+        config.rustflags.clone_from(flags);
     }
     let cross = config.cross_target(&recipe.build.target)?.cloned();
     if let Some(target) = &cross {
@@ -388,19 +583,33 @@ async fn build_recipe(
     };
     let distfiles = source.join(".distfiles");
     std::fs::create_dir(&distfiles)?;
-    let engine = sage_repo::DownloadEngine::new(workspace.path().join("cache"))?;
+    // Source inputs are content-addressed independently of the installed
+    // package database. A failed build can therefore resume without fetching
+    // the same verified tarballs again, while stale bytes still fail the hash
+    // gate and are atomically replaced by DownloadEngine.
+    let source_cache = under_root(root, Path::new("/var/cache/sage/sources"));
+    std::fs::create_dir_all(&source_cache)?;
+    let engine = sage_repo::DownloadEngine::new(&source_cache)?;
     for (index, input) in recipe.source_inputs().enumerate() {
         let staged = distfiles.join(sage_build::source_archive_name(index));
         match input.kind {
             sage_build::SourceKind::Archive => {
+                let cached = source_cache.join(&input.sha256);
                 engine
-                    .download_url(&input.url, &staged, &input.sha256)
+                    .download_url(&input.url, &cached, &input.sha256)
                     .await?;
+                if std::fs::hard_link(&cached, &staged).is_err() {
+                    std::fs::copy(&cached, &staged)?;
+                }
             }
             sage_build::SourceKind::File => {
+                let cached = source_cache.join(&input.sha256);
                 engine
-                    .download_url(&input.url, &staged, &input.sha256)
+                    .download_url(&input.url, &cached, &input.sha256)
                     .await?;
+                if std::fs::hard_link(&cached, &staged).is_err() {
+                    std::fs::copy(&cached, &staged)?;
+                }
             }
             sage_build::SourceKind::Git => {
                 let git = config.git.clone();
@@ -437,24 +646,32 @@ async fn build_recipe(
     };
     sage_build::stage_declarative_install(&destdir, &source, &recipe)?;
     sage_build::validate_kernel_module_slot(&destdir, &recipe.package.slot)?;
-    if recipe.uses_private_channel() {
-        let report = sage_build::ElfScanner::rewrite_private_runpaths(
-            &destdir,
-            &recipe.build.private_library_dirs,
-            &config.patchelf,
-        )?;
-        tracing::info!(
-            files = report.rewritten.len(),
-            directories = report.library_dirs.len(),
-            "rewrote private-channel ELF RUNPATHs"
-        );
-    }
     let areas = sage_build::PayloadCarver::carve_packages(&destdir, &recipe)?;
     let output_dir = invocation
         .output_dir
         .as_deref()
         .unwrap_or_else(|| recipe_path.parent().unwrap_or(Path::new(".")));
     for area in areas {
+        let subpackage = recipe
+            .subpackages
+            .iter()
+            .find(|subpackage| subpackage.name == area.name);
+        let package_channel = subpackage
+            .and_then(|package| package.channel.as_deref())
+            .unwrap_or(&recipe.package.channel);
+        if package_channel != "system" && !package_channel.ends_with("/system") {
+            let report = sage_build::ElfScanner::rewrite_private_runpaths(
+                &area.path().join("data"),
+                &recipe.build.private_library_dirs,
+                &config.patchelf,
+            )?;
+            tracing::info!(
+                package = area.name,
+                files = report.rewritten.len(),
+                directories = report.library_dirs.len(),
+                "rewrote private-channel ELF RUNPATHs"
+            );
+        }
         package_staging(
             &recipe,
             &area,
@@ -515,26 +732,56 @@ async fn prepare_package_tree(
     std::fs::create_dir(&tree)?;
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
-    let mut owned = std::collections::BTreeSet::new();
+    let mut owned: std::collections::BTreeMap<
+        PathBuf,
+        (sage_core::PackageKey, sage_core::Version),
+    > = std::collections::BTreeMap::new();
     for (key, version) in solution {
         let source = available
             .releases
             .get(&(key.clone(), version.clone()))
             .with_context(|| format!("index record disappeared for build dependency {key}"))?;
         let archive = obtain_release_archive(&engine, &package_cache, source).await?;
-        let inspection = sage_archive::inspect_package(&archive)?;
-        if let Some(path) = inspection
+        let inspection = sage_archive::inspect_package(&archive).with_context(|| {
+            format!(
+                "failed to inspect build dependency archive {} for {} {}",
+                archive.display(),
+                key,
+                version
+            )
+        })?;
+        if let Some((path, owner)) = inspection
             .files
             .iter()
-            .map(|record| &record.path)
-            .find(|path| !owned.insert((*path).clone()))
+            .map(|record| record.path.clone())
+            .filter(|path| !is_shared_build_metadata(path))
+            .find_map(|path| {
+                if let Some(owner) = owned.get(&path) {
+                    Some((path, owner.clone()))
+                } else {
+                    owned.insert(path, (key.clone(), version.clone()));
+                    None
+                }
+            })
         {
-            bail!("build dependency file conflict at {}", path.display());
+            bail!(
+                "build dependency file conflict at {} between {} and {}",
+                path.display(),
+                key,
+                owner.0
+            );
         }
         sage_archive::extract_package(&archive, &tree, &inspection.files)?;
         println!("{} dependency {} {}", tree_name, key, version);
     }
     Ok(Some(tree))
+}
+
+/// Info directory indexes are intentionally shared and regenerated by the
+/// GNU documentation tools. They must not make otherwise independent build
+/// dependency packages look like a payload collision.
+fn is_shared_build_metadata(path: &Path) -> bool {
+    path == Path::new("usr/share/info/dir")
 }
 
 async fn obtain_release_archive(
@@ -667,16 +914,34 @@ fn package_staging(
     let metadata = area.path().join(".METADATA");
     std::fs::create_dir(&metadata)?;
     stage_declarative_metadata(recipe_dir, &metadata, &area.name, &recipe.package.name)?;
-    stage_alternatives(recipe, &metadata, &area.name)?;
-    stage_sysusers(recipe, &metadata, &area.name)?;
-    std::fs::write(
-        metadata.join("files.idx"),
-        sage_archive::format_file_index(&records),
-    )?;
     let subpackage = recipe
         .subpackages
         .iter()
         .find(|subpackage| subpackage.name == area.name);
+    let package_channel = subpackage
+        .and_then(|package| package.channel.as_deref())
+        .unwrap_or(&recipe.package.channel);
+    let package_slot = subpackage
+        .and_then(|package| package.slot.as_deref())
+        .unwrap_or(&recipe.package.slot);
+    stage_alternatives(
+        recipe,
+        &metadata,
+        &area.name,
+        package_channel,
+        package_slot,
+    )?;
+    stage_sysusers(
+        recipe,
+        &metadata,
+        &area.name,
+        package_channel,
+        package_slot,
+    )?;
+    std::fs::write(
+        metadata.join("files.idx"),
+        sage_archive::format_file_index(&records),
+    )?;
     let mut dependency_strings = area.dependencies.clone();
     dependency_strings.extend(elf.dependencies);
     dependency_strings.sort();
@@ -692,12 +957,12 @@ fn package_staging(
     let manifest = sage_archive::PackageManifest {
         schema_version: sage_core::SCHEMA_VERSION,
         name: area.name.clone(),
-        slot: recipe.package.slot.clone(),
+        slot: package_slot.into(),
         version: recipe.package.version.clone(),
         release: recipe.package.release,
         epoch: recipe.package.epoch,
         arch: recipe.package.arch.clone(),
-        channel: recipe.package.channel.clone(),
+        channel: package_channel.into(),
         description: subpackage
             .and_then(|package| package.description.clone())
             .unwrap_or_else(|| recipe.package.description.clone()),
@@ -721,13 +986,18 @@ fn package_staging(
         toml::to_string_pretty(&manifest)?,
     )?;
     let output = output_dir.join(format!(
-        "{}-{}-{}-{}-{}.pkg.tar.zst",
+        "{}-{}-{}-{}.pkg.tar.zst",
         area.name,
-        recipe.package.slot,
         recipe.package.version,
         recipe.package.release,
         recipe.package.arch
     ));
+    if output.exists() {
+        bail!(
+            "package archive filename collision at {}; slot is metadata, so outputs with identical name/version/release/arch must use separate directories",
+            output.display()
+        );
+    }
     sage_archive::create_package(area.path(), &output, 15)?;
     println!("Created {}", output.display());
     Ok(())
@@ -737,6 +1007,8 @@ fn stage_alternatives(
     recipe: &sage_build::RecipeSpec,
     metadata: &Path,
     output_package: &str,
+    package_channel: &str,
+    package_slot: &str,
 ) -> Result<()> {
     let alternatives: Vec<_> = recipe
         .alternatives
@@ -757,9 +1029,9 @@ fn stage_alternatives(
     let document = sage_sys::AlternativesDocument {
         schema_version: sage_core::SCHEMA_VERSION,
         package: sage_core::PackageKey::new(
-            &recipe.package.channel,
+            package_channel,
             output_package,
-            &recipe.package.slot,
+            package_slot,
         ),
         alternatives,
     };
@@ -774,6 +1046,8 @@ pub fn stage_sysusers(
     recipe: &sage_build::RecipeSpec,
     metadata: &Path,
     output_package: &str,
+    package_channel: &str,
+    package_slot: &str,
 ) -> Result<()> {
     let accounts: Vec<_> = recipe
         .sysusers
@@ -797,9 +1071,9 @@ pub fn stage_sysusers(
     let document = sage_sys::SysusersDocument {
         schema_version: sage_core::SCHEMA_VERSION,
         package: sage_core::PackageKey::new(
-            &recipe.package.channel,
+            package_channel,
             output_package,
-            &recipe.package.slot,
+            package_slot,
         ),
         accounts,
     };

@@ -21,7 +21,7 @@ mod build_tests {
         fs::create_dir(&build).unwrap();
         fs::write(
             build.join(".sage-tool-usage"),
-            "cc\t/usr/bin/gcc\ncc\t/usr/bin/gcc\nlinker\t/usr/bin/ld.lld\n",
+            "cc\t/usr/bin/gcc\tgcc (Sage test) 1.0\ncc\t/usr/bin/gcc\tgcc (Sage test) 1.0\nlinker\t/usr/bin/ld.lld\tLLD 18.1\n",
         )
         .unwrap();
         let config = BuildConfig {
@@ -34,6 +34,7 @@ mod build_tests {
             cxx: "g++".into(),
             linker: "ld.lld".into(),
             rustc: "rustc".into(),
+            gcc_toolchain: None,
             patchelf: "patchelf".into(),
             cflags: "-O2".into(),
             cxxflags: "-O3".into(),
@@ -47,6 +48,9 @@ mod build_tests {
             compiler_cache: String::new(),
             ccache_dir: PathBuf::new(),
             sandbox_dependencies: vec![],
+            sandbox_host_tools: vec![],
+            sandbox_host_libraries: vec![],
+            sandbox_host_preload: vec![],
             build: String::new(),
             targets: BTreeMap::new(),
         };
@@ -636,7 +640,14 @@ shell="/usr/bin/nologin"
         let root = directory.path().join("dest");
         fs::create_dir(&root).unwrap();
         fs::create_dir_all(root.join(".METADATA")).unwrap();
-        sage::stage_sysusers(&recipe, &root.join(".METADATA"), "daemon").unwrap();
+        sage::stage_sysusers(
+            &recipe,
+            &root.join(".METADATA"),
+            "daemon",
+            "system",
+            "0",
+        )
+        .unwrap();
         assert_eq!(
             sage_sys::SysusersDocument::parse(
                 &fs::read(root.join(".METADATA/sysusers.toml")).unwrap(),
@@ -710,6 +721,8 @@ shell="/usr/bin/nologin"
                     name: "x-libs".into(),
                     description: None,
                     license: None,
+                    channel: None,
+                    slot: None,
                     dependencies: vec![],
                     provides: vec![],
                     payload: PayloadSpec {
@@ -721,6 +734,8 @@ shell="/usr/bin/nologin"
                     name: "x-dev".into(),
                     description: None,
                     license: None,
+                    channel: None,
+                    slot: None,
                     dependencies: vec![],
                     provides: vec![],
                     payload: PayloadSpec {

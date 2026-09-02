@@ -233,12 +233,13 @@ impl SageProvider {
                     if !dependency_range(&requirement).contains(version) {
                         continue;
                     }
-                    let preference = if preferred_providers.get(provider_name) == Some(key) {
-                        3
-                    } else if locked.contains_key(key) {
-                        2
-                    } else {
-                        1
+                    let preferred = preferred_providers.get(provider_name) == Some(key);
+                    let exact_lock = locked.get(key) == Some(version);
+                    let preference = match (preferred, exact_lock) {
+                        (true, true) => 4,
+                        (true, false) => 3,
+                        (false, true) => 2,
+                        (false, false) => 1,
                     };
                     let proxy_version =
                         Version::new(preference, format!("{provider_index}.{version_index}"), 0);
@@ -403,19 +404,22 @@ fn dependency_key(
 ///
 /// Recipe metadata intentionally uses short channel names such as `system` or
 /// `gcc16`. Once a repository index is loaded, those names become
-/// `main/system` and `main/gcc16`. Keeping this conversion at the solver seam
-/// lets recipe graphs stay readable while preserving exact cross-root channel
-/// references when a dependency already contains `/`.
+/// `main/system` and `main/gcc16`. The dependency parser passes the channel
+/// portion of `gcc16/gcc` as `gcc16`, so both short and `subchannel/name`
+/// declarations must inherit the repository root from the parent package.
 fn dependency_channel(parent: &PackageKey, requested: Option<&str>) -> String {
     let Some(requested) = requested else {
         return parent.channel.clone();
     };
-    if requested.contains('/') {
-        return requested.into();
-    }
     parent.channel.rsplit_once('/').map_or_else(
         || requested.into(),
-        |(root, _)| format!("{root}/{requested}"),
+        |(root, _)| {
+            if requested == root || requested.starts_with(&format!("{root}/")) {
+                requested.into()
+            } else {
+                format!("{root}/{requested}")
+            }
+        },
     )
 }
 fn is_virtual(dependency: &Dependency) -> bool {

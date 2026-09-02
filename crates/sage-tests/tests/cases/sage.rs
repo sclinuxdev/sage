@@ -260,7 +260,11 @@ target_root="/"
             .map(|entry| entry.path())
             .find(|path| path.to_string_lossy().ends_with(".pkg.tar.zst"))
             .unwrap();
-        let destination = pool.join(archive.file_name().unwrap());
+        let destination = pool
+            .join(".slots")
+            .join(slot)
+            .join(archive.file_name().unwrap());
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::copy(archive, &destination).unwrap();
         destination
     }
@@ -282,8 +286,13 @@ target_root="/"
         std::fs::copy(pool.join("index.mdb"), index).unwrap();
         let cache = root.join("var/cache/sage/packages");
         std::fs::create_dir_all(&cache).unwrap();
-        for entry in std::fs::read_dir(pool).unwrap().map(Result::unwrap) {
-            let path = entry.path();
+        for entry in walkdir::WalkDir::new(pool)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.into_path();
             if path.to_string_lossy().ends_with(".pkg.tar.zst") {
                 let digest = hex::encode(Sha256::digest(std::fs::read(&path).unwrap()));
                 std::fs::copy(path, cache.join(digest)).unwrap();
@@ -367,7 +376,17 @@ target_root="/"
             },
         )
         .await;
-        assert_ne!(app1.file_name(), app2_slot.file_name());
+        assert_eq!(app1.file_name(), app2_slot.file_name());
+        assert_ne!(
+            sage_archive::inspect_package(&app1)
+                .unwrap()
+                .manifest
+                .slot,
+            sage_archive::inspect_package(&app2_slot)
+                .unwrap()
+                .manifest
+                .slot
+        );
         assert_eq!(
             sage_archive::inspect_package(&app2_slot)
                 .unwrap()

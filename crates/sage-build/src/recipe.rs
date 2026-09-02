@@ -70,6 +70,27 @@ pub struct RecipeBuild {
     /// Extra private-library directories, relative to the installed channel root.
     #[serde(default)]
     pub private_library_dirs: Vec<PathBuf>,
+    /// Optional linker override for recipes with toolchain-specific link constraints.
+    #[serde(default)]
+    pub linker: Option<String>,
+    /// Optional compiler family override for recipes that must self-host with GCC.
+    #[serde(default)]
+    pub compiler: Option<String>,
+    /// Optional C compiler flags for recipes with a documented optimization policy.
+    #[serde(default)]
+    pub cflags: Option<String>,
+    /// Optional C++ compiler flags for recipes with a documented optimization policy.
+    #[serde(default)]
+    pub cxxflags: Option<String>,
+    /// Optional preprocessor flags for a recipe-specific toolchain boundary.
+    #[serde(default)]
+    pub cppflags: Option<String>,
+    /// Optional linker flags for a recipe-specific toolchain boundary.
+    #[serde(default)]
+    pub ldflags: Option<String>,
+    /// Optional Rust flags for a recipe-specific toolchain boundary.
+    #[serde(default)]
+    pub rustflags: Option<String>,
     /// Optional target triple. An empty value means a native build.
     #[serde(default)]
     pub target: String,
@@ -111,6 +132,12 @@ pub struct SubpackageSpec {
     pub name: String,
     pub description: Option<String>,
     pub license: Option<String>,
+    /// Optional channel override for this output package.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Optional ABI slot override for this output package.
+    #[serde(default)]
+    pub slot: Option<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
@@ -272,9 +299,12 @@ impl BuildUnit {
                 .iter()
                 .map(|package| {
                     sage_core::PackageKey::new(
-                        &recipe.package.channel,
+                        package
+                            .channel
+                            .as_deref()
+                            .unwrap_or(&recipe.package.channel),
                         &package.name,
-                        &recipe.package.slot,
+                        package.slot.as_deref().unwrap_or(&recipe.package.slot),
                     )
                 }),
         );
@@ -335,6 +365,26 @@ impl BuildUnit {
         }
         Ok(())
     }
+
+    /// Returns stable identifiers for symbols this unit consumes.  The
+    /// scheduler uses these identifiers to block only dependents of a failed
+    /// build while allowing unrelated units in later layers to proceed.
+    pub fn consumed_symbol_ids(&self) -> BTreeSet<String> {
+        self.consumes.iter().map(symbol_id).collect()
+    }
+
+    /// Returns stable identifiers for every package/provide symbol emitted by
+    /// this unit.  A blocked unit propagates the block to its own dependents.
+    pub fn produced_symbol_ids(&self) -> BTreeSet<String> {
+        self.produces.iter().map(symbol_id).collect()
+    }
+}
+
+fn symbol_id(symbol: &BuildSymbol) -> String {
+    match symbol {
+        BuildSymbol::Package(key) => format!("package:{key}"),
+        BuildSymbol::Provided(name) => format!("provided:{name}"),
+    }
 }
 
 fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildSymbol {
@@ -394,7 +444,7 @@ impl BuildGraph {
     }
 
     /// Applies Kahn's algorithm and returns maximal deterministic parallel layers.
-    pub fn layers(units: Vec<BuildUnit>) -> Result<Vec<Vec<BuildUnit>>, BuildError> {
+    pub fn layers(mut units: Vec<BuildUnit>) -> Result<Vec<Vec<BuildUnit>>, BuildError> {
         let mut package_owners = BTreeMap::new();
         for unit in &units {
             for package in &unit.packages {
@@ -411,6 +461,27 @@ impl BuildGraph {
             for symbol in &unit.produces {
                 producers.entry(symbol.clone()).or_default().push(index);
             }
+        }
+        // A dependency may name a compatibility alias rather than a
+        // concrete output package (for example `zlib-libs` is provided by
+        // the zlib recipe).  Resolve that fallback before constructing the
+        // graph so layer ordering and failure propagation match the package
+        // solver's package-or-provides semantics.
+        for unit in &mut units {
+            let mut resolved = BTreeSet::new();
+            for symbol in &unit.consumes {
+                if let BuildSymbol::Package(key) = symbol {
+                    if !producers.contains_key(symbol) {
+                        let provider = BuildSymbol::Provided(key.name.clone());
+                        if producers.contains_key(&provider) {
+                            resolved.insert(provider);
+                            continue;
+                        }
+                    }
+                }
+                resolved.insert(symbol.clone());
+            }
+            unit.consumes = resolved;
         }
         let mut outgoing = vec![BTreeSet::new(); units.len()];
         let mut indegree = vec![0usize; units.len()];
@@ -559,6 +630,17 @@ impl RecipeSpec {
             }
         }
         recipe.install.validate()?;
+        if let Some(linker) = &recipe.build.linker {
+            validate_tool_name(linker)?;
+        }
+        if let Some(compiler) = &recipe.build.compiler {
+            validate_tool_name(compiler)?;
+            if !matches!(tool_family(compiler).as_str(), "clang" | "gcc") {
+                return Err(BuildError::InvalidSpec(
+                    "recipe compiler must be clang or gcc".into(),
+                ));
+            }
+        }
         if recipe.features.keys().any(|name| !valid_feature_name(name)) {
             return Err(BuildError::InvalidSpec(
                 "feature names must use lowercase ASCII letters, digits, '_' or '-'".into(),
@@ -590,6 +672,23 @@ impl RecipeSpec {
             ));
         }
         for subpackage in &recipe.subpackages {
+            if subpackage.channel.as_deref().is_some_and(str::is_empty) {
+                return Err(BuildError::InvalidSpec(
+                    "subpackage channel must not be empty".into(),
+                ));
+            }
+            if subpackage.slot.as_deref().is_some_and(|slot| {
+                slot.is_empty()
+                    || !slot.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                    })
+            }) {
+                return Err(BuildError::InvalidSpec(
+                    "subpackage slot must contain only ASCII letters, digits, '.', '_', '+', or '-'"
+                        .into(),
+                ));
+            }
             if let Some(license) = &subpackage.license {
                 sage_core::validate_spdx_expression(license)
                     .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;

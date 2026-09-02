@@ -12,6 +12,9 @@ pub struct BuildConfig {
     pub cxx: String,
     pub linker: String,
     pub rustc: String,
+    /// Optional GCC installation used by Clang for crt/libgcc discovery.
+    #[serde(default)]
+    pub gcc_toolchain: Option<PathBuf>,
     #[serde(default = "default_patchelf")]
     pub patchelf: PathBuf,
     #[serde(default)]
@@ -39,6 +42,18 @@ pub struct BuildConfig {
     /// into the ephemeral toolchain and never registered as host state.
     #[serde(default)]
     pub sandbox_dependencies: Vec<String>,
+    /// Host-provided build utilities exposed only under the private sandbox
+    /// build directory when the target sysroot does not provide them.
+    #[serde(default)]
+    pub sandbox_host_tools: Vec<PathBuf>,
+    /// Shared libraries needed by `sandbox_host_tools`, also exposed only
+    /// under the private sandbox build directory.
+    #[serde(default)]
+    pub sandbox_host_libraries: Vec<PathBuf>,
+    /// Host libraries that must be loaded before target libraries with the
+    /// same SONAME (for example, a host-only OpenSSL ABI used by rsync).
+    #[serde(default)]
+    pub sandbox_host_preload: Vec<PathBuf>,
     /// Native machine triple used as the GNU build/host default.
     #[serde(default)]
     pub build: String,
@@ -97,6 +112,19 @@ impl BuildConfig {
         for target in config.targets.values() {
             for tool in [&target.cc, &target.cxx, &target.ar, &target.strip] {
                 validate_tool_name(tool)?;
+            }
+        }
+        for path in config
+            .sandbox_host_tools
+            .iter()
+            .chain(config.sandbox_host_libraries.iter())
+            .chain(config.sandbox_host_preload.iter())
+        {
+            if !path.is_absolute() || path.file_name().is_none() || !path.is_file() {
+                return Err(BuildError::InvalidSpec(format!(
+                    "sandbox host path must be an existing absolute file: {}",
+                    path.display()
+                )));
             }
         }
         Ok(config)
@@ -221,7 +249,7 @@ pub fn compose_runner(
     }
     expanded_variables.extend(variables.clone());
     let mut script = String::from(
-        "#!/usr/bin/bash\nset -euo pipefail\ntrap 'printf >&2 \"sage-build: line %s failed\\n\" \"$LINENO\"' ERR\n",
+        "#!/usr/bin/bash\nset -euo pipefail\nulimit -s unlimited 2>/dev/null || true\ntrap 'printf >&2 \"sage-build: line %s failed\\n\" \"$LINENO\"' ERR\n",
     );
     for (name, value) in env {
         validate_shell_name(&name)?;
@@ -377,10 +405,24 @@ impl<'a> SandboxRunner<'a> {
         if allow_network {
             command.arg("--share-net");
         }
-        command
-            .args(["--ro-bind"])
-            .arg(&self.config.sysroot)
-            .arg("/");
+        // Start with a writable tmpfs root. Binding the complete host sysroot
+        // read-only first leaves no place for bwrap to create /source when the
+        // host root is itself read-only (common in containers). Only the
+        // system directories needed by ordinary programs are imported from the
+        // configured sysroot; build state remains confined to explicit binds.
+        command.args(["--tmpfs", "/"]);
+        for directory in ["bin", "etc", "lib", "lib64", "opt", "sbin", "sys", "usr", "var"] {
+            let source = self.config.sysroot.join(directory);
+            if source.exists() {
+                command
+                    .args(["--ro-bind"])
+                    .arg(source)
+                    .arg(format!("/{directory}"));
+            }
+        }
+        for mountpoint in ["source", "build", "dest", "run"] {
+            command.args(["--dir", &format!("/{mountpoint}")]);
+        }
         command.args(["--bind"]).arg(&paths.source).arg("/source");
         // Overlay immutable inputs after the writable source bind. An archive may
         // populate the source tree, but it cannot replace later distfiles, the
@@ -396,6 +438,40 @@ impl<'a> SandboxRunner<'a> {
                 .arg("/source/.patches");
         }
         command.args(["--bind"]).arg(&paths.build).arg("/build");
+        let host_tools: Vec<_> = self
+            .config
+            .sandbox_host_tools
+            .iter()
+            .filter(|tool| {
+                tool.is_file()
+                    && tool
+                        .file_name()
+                        .map(|name| !self.config.sysroot.join("usr/bin").join(name).exists())
+                        .unwrap_or(false)
+            })
+            .collect();
+        if !host_tools.is_empty() {
+            command.args(["--dir", "/build/.sage-host-tools"]);
+            for tool in host_tools {
+                let name = tool.file_name().expect("validated host tool filename");
+                command
+                    .args(["--ro-bind"])
+                    .arg(tool)
+                    .arg(PathBuf::from("/build/.sage-host-tools").join(name));
+            }
+        }
+        if !self.config.sandbox_host_libraries.is_empty() {
+            command.args(["--dir", "/build/.sage-host-libs"]);
+            for library in &self.config.sandbox_host_libraries {
+                let name = library
+                    .file_name()
+                    .expect("validated host library filename");
+                command
+                    .args(["--ro-bind"])
+                    .arg(library)
+                    .arg(PathBuf::from("/build/.sage-host-libs").join(name));
+            }
+        }
         command.args(["--bind"]).arg(&paths.destdir).arg("/dest");
         command
             .args(["--ro-bind"])
@@ -406,10 +482,6 @@ impl<'a> SandboxRunner<'a> {
         ]);
         if let Some(toolchain) = &paths.toolchain {
             command.args(["--ro-bind"]).arg(toolchain).arg("/toolchain");
-            command
-                .args(["--ro-bind"])
-                .arg(toolchain.join("usr"))
-                .arg("/usr");
         }
         if let Some(target_sysroot) = &paths.target_sysroot {
             command
@@ -465,6 +537,13 @@ impl<'a> SandboxRunner<'a> {
             false,
             true,
         )?;
+        for (name, role, tool) in [
+            ("gcc", "cc", &self.config.cc),
+            ("g++", "cxx", &self.config.cxx),
+            ("c++", "cxx", &self.config.cxx),
+        ] {
+            self.write_tool_wrapper(&directory.join(name), role, tool, true, false)?;
+        }
         for (name, role, tool, driver, rustc) in [
             (&self.config.cc, "cc", &self.config.cc, true, false),
             (&self.config.cxx, "cxx", &self.config.cxx, true, false),
@@ -485,17 +564,98 @@ impl<'a> SandboxRunner<'a> {
         rustc: bool,
     ) -> Result<(), BuildError> {
         validate_tool_name(tool)?;
-        let search_path = "/usr/bin";
+        // Build dependencies from every channel are extracted into one
+        // ephemeral tree.  Channel/slot identity belongs to package metadata;
+        // embedding a particular channel or GCC release here would make the
+        // sandbox depend on today's bootstrap graph.
+        let search_path = "/toolchain/usr/bin:/usr/bin";
+        let (gcc_toolchain_setup, gcc_toolchain_arg) = self
+            .config
+            .gcc_toolchain
+            .as_ref()
+            .filter(|_| compiler_driver && tool_family(tool) == "clang")
+            .map(|path| {
+                let configured = path.to_string_lossy();
+                let fallback = if path.starts_with("/toolchain") {
+                    "if [ ! -d \"$gcc_toolchain/lib/gcc\" ] && [ ! -d \"$gcc_toolchain/lib64/gcc\" ]; then gcc_toolchain=/usr; fi\n"
+                } else {
+                    ""
+                };
+                (
+                    format!(
+                        "gcc_toolchain={}\n{fallback}",
+                        shell_quote(&configured)
+                    ),
+                    " --gcc-toolchain=\"$gcc_toolchain\"",
+                )
+            })
+            .unwrap_or_else(|| (String::new(), ""));
+        let gcc_prefix = if compiler_driver && tool_family(tool) == "gcc" {
+            " -B/build/.sage-tools"
+        } else {
+            ""
+        };
+        // Clang's GCC-toolchain discovery can suppress the normal host
+        // include search path.  Keep the target's libc headers visible even
+        // for nested configure/make sub-builds that overwrite CXXFLAGS.  The
+        // path must be appended after the C++ directories so include_next in
+        // libstdc++ headers can reach libc's headers.
+        let clang_system_include = if compiler_driver && tool_family(tool) == "clang" {
+            " -idirafter /toolchain/usr/include -idirafter /usr/include"
+        } else {
+            ""
+        };
+        let driver_linker = if compiler_driver
+            && matches!(tool_family(tool).as_str(), "clang" | "gcc")
+            // GCC rejects `-fuse-ld=ld`; its default driver linker is GNU ld.
+            // Keeping the argument absent here still selects GNU ld while
+            // allowing explicit mold/lld selections to be enforced.
+            && !(tool_family(tool) == "gcc" && self.config.linker == "ld")
+        {
+            shell_quote(&format!("-fuse-ld={}", self.config.linker))
+        } else {
+            String::new()
+        };
         let mut script = format!(
-            "#!/usr/bin/bash\nset -euo pipefail\nresolved=$(PATH={} command -v -- {})\nprintf '%s\\t%s\\n' {} \"$resolved\" >> /build/.sage-tool-usage\n",
+            "#!/usr/bin/bash\nset -euo pipefail\nresolved=$(PATH={} command -v -- {})\nversion=$(\"$resolved\" --version 2>/dev/null | sed -n '1p')\n[ -n \"$version\" ] || {{ echo \"sage-build: failed to read $resolved version\" >&2; exit 1; }}\nprintf '%s\\t%s\\t%s\\n' {} \"$resolved\" \"$version\" >> /build/.sage-tool-usage\n",
             shell_quote(search_path),
             shell_quote(tool),
             shell_quote(role),
         );
         if compiler_driver {
-            script.push_str("exec \"$resolved\" -B/build/.sage-tools \"$@\"\n");
+            script.push_str("args=(\"$@\")\n");
+            if tool_family(tool) == "clang" {
+                // CPATH-family variables are searched before Clang's normal
+                // system directories.  That breaks libstdc++'s include_next
+                // when a nested build supplies its own -I directory.
+                script.push_str("unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH\n");
+                script.push_str(&gcc_toolchain_setup);
+                // Nested build systems sometimes inject their own linker
+                // choice.  The Sage build configuration is authoritative.
+                script.push_str(
+                    "args=()\nfor arg in \"$@\"; do\n    case \"$arg\" in\n        -fuse-ld=*) ;;\n        *) args+=(\"$arg\") ;;\n    esac\ndone\n",
+                );
+                // These options are wrapper policy rather than package
+                // source flags.  Do not let -Werror turn a compile-only
+                // probe into a false failure because a linker/toolchain
+                // option is not consumed by that invocation.
+                script.push_str("args+=(\"-Wno-unused-command-line-argument\")\n");
+                script.push_str(&format!(
+                    "compile_only=0\nfor arg in \"${{args[@]}}\"; do\n    case \"$arg\" in\n        -c|-S|-E|-fsyntax-only) compile_only=1 ;;\n    esac\ndone\nif [ \"$compile_only\" -eq 0 ]; then args+=({driver_linker}); fi\n",
+                ));
+            } else if tool_family(tool) == "gcc" {
+                script.push_str(&format!(
+                    "compile_only=0\nfor arg in \"${{args[@]}}\"; do\n    case \"$arg\" in\n        -c|-S|-E|-fsyntax-only) compile_only=1 ;;\n    esac\ndone\nif [ \"$compile_only\" -eq 0 ]; then args+=({driver_linker}); fi\n",
+                ));
+            }
+            script.push_str(&format!(
+                "exec \"$resolved\"{}{}{} \"${{args[@]}}\"\n",
+                gcc_toolchain_arg, gcc_prefix, clang_system_include
+            ));
         } else if rustc {
-            script.push_str("exec \"$resolved\" -C linker=/build/.sage-tools/ld \"$@\"\n");
+            // Let Rust link through the configured Clang driver so its final
+            // links use the same mold policy as C/C++ packages.
+            script.push_str("exec \"$resolved\" -C linker=/build/.sage-tools/cc \"$@\"\n");
         } else {
             script.push_str("exec \"$resolved\" \"$@\"\n");
         }
@@ -508,12 +668,29 @@ impl<'a> SandboxRunner<'a> {
         &self,
         paths: &SandboxPaths,
     ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
-        let log = fs::read_to_string(paths.build.join(".sage-tool-usage"))?;
+        let usage_path = paths.build.join(".sage-tool-usage");
+        let log = fs::read_to_string(&usage_path).map_err(|error| {
+            BuildError::InvalidSpec(format!(
+                "failed to read managed build-tool usage {}: {error}",
+                usage_path.display()
+            ))
+        })?;
         let mut observed = BTreeMap::new();
         for line in log.lines() {
-            let Some((role, executable)) = line.split_once('\t') else {
+            let mut fields = line.splitn(3, '\t');
+            let Some(role) = fields.next() else {
                 return Err(BuildError::InvalidSpec(
                     "malformed managed build-tool observation".into(),
+                ));
+            };
+            let Some(executable) = fields.next() else {
+                return Err(BuildError::InvalidSpec(
+                    "malformed managed build-tool observation".into(),
+                ));
+            };
+            let Some(version) = fields.next() else {
+                return Err(BuildError::InvalidSpec(
+                    "managed build-tool observation has no version".into(),
                 ));
             };
             if !matches!(role, "cc" | "cxx" | "linker" | "rustc") || executable.is_empty() {
@@ -521,30 +698,23 @@ impl<'a> SandboxRunner<'a> {
                     "unknown managed build-tool observation".into(),
                 ));
             }
+            if version.is_empty() {
+                return Err(BuildError::InvalidSpec(
+                    "managed build-tool observation has an empty version".into(),
+                ));
+            }
             observed
                 .entry(role.to_string())
-                .or_insert_with(|| executable.to_string());
+                .or_insert_with(|| (executable.to_string(), version.to_string()));
         }
         observed
             .into_iter()
-            .map(|(role, executable)| {
+            .map(|(role, (executable, version))| {
                 let host_path = self.host_tool_path(paths, &executable)?;
-                let output = Command::new(&host_path).arg("--version").output()?;
-                if !output.status.success() {
+                if !host_path.exists() {
                     return Err(BuildError::InvalidSpec(format!(
-                        "failed to probe observed build tool {executable}"
-                    )));
-                }
-                let version_output = String::from_utf8_lossy(&output.stdout);
-                let version = version_output
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                if version.is_empty() {
-                    return Err(BuildError::InvalidSpec(format!(
-                        "observed build tool {executable} returned no version"
+                        "observed build tool {executable} is missing at {}",
+                        host_path.display()
                     )));
                 }
                 let parameters = match role.as_str() {
@@ -600,7 +770,14 @@ impl<'a> SandboxRunner<'a> {
         if let (Some(toolchain), Ok(relative)) =
             (&paths.toolchain, sandbox_path.strip_prefix("/usr"))
         {
-            return Ok(toolchain.join("usr").join(relative));
+            let toolchain_path = toolchain.join("usr").join(relative);
+            if toolchain_path.exists() {
+                return Ok(toolchain_path);
+            }
+            return Ok(self
+                .config
+                .sysroot
+                .join(sandbox_path.strip_prefix("/").unwrap()));
         }
         if sandbox_path.is_absolute() {
             return Ok(self
@@ -613,7 +790,11 @@ impl<'a> SandboxRunner<'a> {
 
     fn environment(&self, paths: &SandboxPaths) -> BTreeMap<String, String> {
         let toolchain = paths.toolchain.is_some();
-        let path = "/build/.sage-tools:/usr/bin";
+        let path = if self.config.sandbox_host_tools.is_empty() {
+            "/build/.sage-tools:/toolchain/usr/bin:/usr/bin"
+        } else {
+            "/build/.sage-tools:/build/.sage-host-tools:/toolchain/usr/bin:/usr/bin"
+        };
         let mut environment = BTreeMap::from([
             ("LC_ALL".into(), "C".into()),
             ("TZ".into(), "UTC".into()),
@@ -623,13 +804,20 @@ impl<'a> SandboxRunner<'a> {
             ("BUILD_DIR".into(), "/build".into()),
             ("DESTDIR".into(), "/dest".into()),
             ("JOBS".into(), self.config.jobs.to_string()),
+            ("TAR_OPTIONS".into(), "--no-same-owner".into()),
             (
                 "SOURCE_DATE_EPOCH".into(),
                 self.config.source_date_epoch.to_string(),
             ),
             ("CC".into(), "/build/.sage-tools/cc".into()),
             ("CXX".into(), "/build/.sage-tools/cxx".into()),
+            ("HOSTCC".into(), "/build/.sage-tools/cc".into()),
+            ("HOSTCXX".into(), "/build/.sage-tools/cxx".into()),
             ("LD".into(), "/build/.sage-tools/ld".into()),
+            ("AR".into(), "ar".into()),
+            ("RANLIB".into(), "ranlib".into()),
+            ("NM".into(), "nm".into()),
+            ("STRIP".into(), "strip".into()),
             ("RUSTC".into(), "/build/.sage-tools/rustc".into()),
             ("CFLAGS".into(), self.config.cflags.clone()),
             ("CXXFLAGS".into(), self.config.cxxflags.clone()),
@@ -641,13 +829,59 @@ impl<'a> SandboxRunner<'a> {
             environment.extend([
                 (
                     "PKG_CONFIG_PATH".into(),
-                    "/usr/lib/pkgconfig:/usr/share/pkgconfig".into(),
+                    "/toolchain/usr/lib/pkgconfig:/toolchain/usr/share/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig".into(),
                 ),
-                ("CMAKE_PREFIX_PATH".into(), "/usr".into()),
-                ("ACLOCAL_PATH".into(), "/usr/share/aclocal".into()),
-                ("PYTHONPATH".into(), "/usr/lib/python/site-packages".into()),
-                ("LD_LIBRARY_PATH".into(), "/usr/lib:/usr/lib64".into()),
+                (
+                    "CMAKE_PREFIX_PATH".into(),
+                    "/toolchain/usr:/usr".into(),
+                ),
+                (
+                    "ACLOCAL_PATH".into(),
+                    "/toolchain/usr/share/aclocal:/usr/share/aclocal".into(),
+                ),
+                (
+                    "PYTHONPATH".into(),
+                    "/toolchain/usr/lib/python/site-packages:/usr/lib/python/site-packages".into(),
+                ),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    "/toolchain/usr/lib:/toolchain/usr/lib64:/usr/lib:/usr/lib64".into(),
+                ),
+                (
+                    "LIBRARY_PATH".into(),
+                    "/toolchain/usr/lib:/toolchain/usr/lib64:/usr/lib:/usr/lib64".into(),
+                ),
             ]);
+        }
+        if !self.config.sandbox_host_libraries.is_empty() {
+            let current = environment
+                .get("LD_LIBRARY_PATH")
+                .cloned()
+                .unwrap_or_default();
+            environment.insert(
+                "LD_LIBRARY_PATH".into(),
+                if current.is_empty() {
+                    "/build/.sage-host-libs".into()
+                } else {
+                    format!("/build/.sage-host-libs:{current}")
+                },
+            );
+        }
+        if !self.config.sandbox_host_preload.is_empty() {
+            let preload = self
+                .config
+                .sandbox_host_preload
+                .iter()
+                .map(|library| {
+                    let name = library
+                        .file_name()
+                        .expect("validated host preload filename");
+                    PathBuf::from("/build/.sage-host-libs").join(name)
+                })
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":");
+            environment.insert("LD_PRELOAD".into(), preload);
         }
         if paths.target_sysroot.is_some() {
             environment.extend([

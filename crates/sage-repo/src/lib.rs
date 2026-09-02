@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use heed::types::{Bytes, Str};
 use heed::{Env, EnvFlags, EnvOpenOptions};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, RANGE};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,10 +12,13 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
 const CHUNKS: u64 = 4;
+const MAX_REQUEST_ATTEMPTS: usize = 4;
+const RETRY_BACKOFF_MS: u64 = 250;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Repository transfer, verification, and index failures.
@@ -149,10 +152,11 @@ pub fn build_index(
     signing_key: &Path,
 ) -> Result<IndexArtifacts, RepoError> {
     std::fs::create_dir_all(output_dir)?;
-    let mut package_files: Vec<_> = std::fs::read_dir(pool)?
-        .collect::<Result<Vec<_>, _>>()?
+    let mut package_files: Vec<_> = walkdir::WalkDir::new(pool)
+        .follow_links(false)
         .into_iter()
-        .map(|entry| entry.path())
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.into_path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -176,7 +180,11 @@ pub fn build_index(
         }
         releases.entry(key).or_default().push(IndexedRelease {
             package: inspection.manifest,
-            archive: path.file_name().unwrap().to_string_lossy().into_owned(),
+            archive: path
+                .strip_prefix(pool)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .into_owned(),
             sha256: hash_file(path)?,
         });
     }
@@ -278,6 +286,9 @@ impl DownloadEngine {
     pub fn new(cache_dir: impl Into<PathBuf>) -> Result<Self, RepoError> {
         let client = Client::builder()
             .user_agent(concat!("sage/", env!("CARGO_PKG_VERSION")))
+            .http1_only()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(300))
             .build()?;
         Ok(Self {
             client,
@@ -335,10 +346,7 @@ impl DownloadEngine {
             tokio::fs::create_dir_all(parent).await?;
         }
         // HEAD is an optimization only; mirrors that reject it still work through GET.
-        let head = self
-            .client
-            .head(url)
-            .send()
+        let head = send_with_retries(&self.client, Method::HEAD, url, None)
             .await
             .ok()
             .filter(|response| response.status().is_success());
@@ -358,11 +366,7 @@ impl DownloadEngine {
             self.download_ranges(url, &temporary, length.unwrap())
                 .await?;
         } else {
-            stream_response(
-                self.client.get(url).send().await?.error_for_status()?,
-                &temporary,
-            )
-            .await?;
+            download_response_with_retries(&self.client, url, None, &temporary, None).await?;
         }
         verify_hash(&temporary, sha256).await?;
         tokio::fs::rename(&temporary, destination).await?;
@@ -390,18 +394,15 @@ impl DownloadEngine {
             let client = self.client.clone();
             let url = url.to_owned();
             tasks.spawn(async move {
-                let response = client
-                    .get(url)
-                    .header(RANGE, format!("bytes={start}-{end}"))
-                    .send()
-                    .await?;
-                if response.status() != StatusCode::PARTIAL_CONTENT {
-                    return Err(RepoError::InvalidConfig(
-                        "server ignored a range request".into(),
-                    ));
-                }
-                stream_response(response, &part).await?;
-                Ok::<_, RepoError>(())
+                let range = format!("bytes={start}-{end}");
+                download_response_with_retries(
+                    &client,
+                    &url,
+                    Some(&range),
+                    &part,
+                    Some(StatusCode::PARTIAL_CONTENT),
+                )
+                .await
             });
         }
         let _cleanup = TempFiles::new(parts.clone());
@@ -475,6 +476,45 @@ impl DownloadEngine {
     }
 }
 
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+async fn send_with_retries(
+    client: &Client,
+    method: Method,
+    url: &str,
+    range: Option<&str>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    for attempt in 0..MAX_REQUEST_ATTEMPTS {
+        let mut request = client.request(method.clone(), url);
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
+        }
+        match request.send().await {
+            Ok(response)
+                if retryable_status(response.status()) && attempt + 1 < MAX_REQUEST_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(
+                    RETRY_BACKOFF_MS * 2u64.pow(attempt as u32),
+                ))
+                .await;
+            }
+            Ok(response) => return Ok(response),
+            Err(_error) if attempt + 1 < MAX_REQUEST_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(
+                    RETRY_BACKOFF_MS * 2u64.pow(attempt as u32),
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("request retry loop must return on its final attempt")
+}
+
 async fn stream_response(mut response: reqwest::Response, path: &Path) -> Result<(), RepoError> {
     let mut output = tokio::fs::File::create(path).await?;
     while let Some(chunk) = response.chunk().await? {
@@ -482,6 +522,54 @@ async fn stream_response(mut response: reqwest::Response, path: &Path) -> Result
     }
     output.sync_all().await?;
     Ok(())
+}
+
+/// Downloads a response body with retries that cover both response setup and
+/// streaming. A successful HTTP response can still fail while reading its
+/// body, especially through slow mirrors or proxy connections, so retrying
+/// only `send()` is insufficient. Each attempt writes to the same temporary
+/// path and removes a partial body before the next attempt.
+async fn download_response_with_retries(
+    client: &Client,
+    url: &str,
+    range: Option<&str>,
+    path: &Path,
+    expected_status: Option<StatusCode>,
+) -> Result<(), RepoError> {
+    for attempt in 0..MAX_REQUEST_ATTEMPTS {
+        let response = match send_with_retries(client, Method::GET, url, range).await {
+            Ok(response) => response,
+            Err(_error) if attempt + 1 < MAX_REQUEST_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(
+                    RETRY_BACKOFF_MS * 2u64.pow(attempt as u32),
+                ))
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(expected_status) = expected_status {
+            if response.status() != expected_status {
+                return Err(RepoError::InvalidConfig(
+                    "server ignored a range request".into(),
+                ));
+            }
+        } else if !response.status().is_success() {
+            return Err(response.error_for_status().unwrap_err().into());
+        }
+        match stream_response(response, path).await {
+            Ok(()) => return Ok(()),
+            Err(_error) if attempt + 1 < MAX_REQUEST_ATTEMPTS => {
+                let _ = tokio::fs::remove_file(path).await;
+                tokio::time::sleep(Duration::from_millis(
+                    RETRY_BACKOFF_MS * 2u64.pow(attempt as u32),
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("response retry loop must return on its final attempt")
 }
 
 async fn verify_hash(path: &Path, expected: &str) -> Result<(), RepoError> {

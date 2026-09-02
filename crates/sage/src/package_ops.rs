@@ -141,13 +141,26 @@ pub fn load_available_with_pool(
             }
             let alias = subchannel.alias.as_deref().unwrap_or(sub_name);
             let canonical = format!("{channel_name}/{alias}");
+            // Register configured names even before their remote index has
+            // been synchronized. This is required during a staged bootstrap,
+            // where the local output pool is the authoritative source and
+            // intentionally starts without an LMDB index.
+            aliases.insert(alias.into(), canonical.clone());
+            aliases.insert(canonical.clone(), canonical.clone());
+            target_roots.insert(canonical.clone(), subchannel.target_root.clone());
+            // Source builds with an explicit pool form a closed bootstrap
+            // universe.  Falling back to a synchronized channel here can mix
+            // old-format or newer binary releases into an otherwise local,
+            // reproducible self-hosting graph.  Configured aliases are still
+            // registered above so local package identities canonicalize in
+            // exactly the same way as normal repository packages.
+            if local_pool.is_some() {
+                continue;
+            }
             let index_path = cache.join(&channel_name).join(alias).join("index.mdb");
             if !index_path.exists() {
                 continue;
             }
-            aliases.insert(alias.into(), canonical.clone());
-            aliases.insert(canonical.clone(), canonical.clone());
-            target_roots.insert(canonical.clone(), subchannel.target_root.clone());
             let url = sage_repo::subchannel_url(&channel, sub_name, subchannel);
             for release in sage_repo::RepositoryIndex::open(&index_path)?.all_releases()? {
                 if architecture.is_some_and(|wanted| {
@@ -171,10 +184,11 @@ pub fn load_available_with_pool(
         }
     }
     if let Some(pool) = local_pool.filter(|pool| pool.exists()) {
-        let mut packages: Vec<_> = std::fs::read_dir(pool)?
-            .collect::<Result<Vec<_>, _>>()?
+        let mut packages: Vec<_> = walkdir::WalkDir::new(pool)
+            .follow_links(false)
             .into_iter()
-            .map(|entry| entry.path())
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.into_path())
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
@@ -183,7 +197,8 @@ pub fn load_available_with_pool(
             .collect();
         packages.sort();
         for path in packages {
-            let inspection = sage_archive::inspect_package(&path)?;
+            let inspection = sage_archive::inspect_package(&path)
+                .with_context(|| format!("failed to inspect local package {}", path.display()))?;
             if architecture.is_some_and(|wanted| {
                 inspection.manifest.arch != wanted
                     && inspection.manifest.arch != "any"
@@ -195,12 +210,12 @@ pub fn load_available_with_pool(
                 .get(&inspection.manifest.channel)
                 .cloned()
                 .unwrap_or_else(|| {
-                    if inspection.manifest.channel.contains('/') {
-                        inspection.manifest.channel.clone()
-                    } else {
-                        format!("main/{}", inspection.manifest.channel)
-                    }
-                });
+                if inspection.manifest.channel.contains('/') {
+                    inspection.manifest.channel.clone()
+                } else {
+                    format!("main/{}", inspection.manifest.channel)
+                }
+            });
             aliases
                 .entry(inspection.manifest.channel.clone())
                 .or_insert_with(|| canonical.clone());
@@ -215,7 +230,11 @@ pub fn load_available_with_pool(
                 ReleaseSource {
                     release: sage_repo::IndexedRelease {
                         package: inspection.manifest,
-                        archive: path.file_name().unwrap().to_string_lossy().into_owned(),
+                        archive: path
+                            .strip_prefix(pool)
+                            .unwrap_or(path.as_path())
+                            .to_string_lossy()
+                            .into_owned(),
                         sha256: String::new(),
                     },
                     location: ReleaseLocation::Local(path),
@@ -233,6 +252,7 @@ pub fn load_available_with_pool(
         aliases,
     })
 }
+
 fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
     let selected = selected.unwrap_or("system");
     available
@@ -1183,7 +1203,7 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
             }
         }
         QueryAction::Owner { path } => {
-            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let relative = path.strip_prefix(root).unwrap_or(path.as_path());
             let relative = relative.strip_prefix("/").unwrap_or(relative);
             for owner in sage_db::read_owners(&db_path, &relative.to_string_lossy())? {
                 println!("{owner}");
