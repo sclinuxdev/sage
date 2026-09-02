@@ -1282,6 +1282,10 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     };
     let plan =
         sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
+    let init_provider = plan
+        .provider_bindings
+        .get("init")
+        .context("system providers must select an init implementation")?;
     let current = installed
         .iter()
         .map(|package| (package.key.clone(), package.version.clone()))
@@ -1321,10 +1325,6 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         sage_db::SageDatabase::open(&db_path)?
             .replace_system_providers(&plan.provider_bindings)?;
     }
-    let init_provider = plan
-        .provider_bindings
-        .get("init")
-        .context("system providers must select an init implementation")?;
     render_services(root, &config, &init_provider.name, dry_run)?;
     if !dry_run {
         let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
@@ -1600,5 +1600,32 @@ mod package_ops_tests {
         )
         .unwrap();
         assert_eq!(state.provider, "loom");
+    }
+
+    #[tokio::test]
+    async fn missing_init_does_not_clear_provider_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
+        std::fs::write(
+            root.path().join("etc/sage/system.toml"),
+            "schema_version=1\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("etc/sage/channels.toml"),
+            "schema_version=1\n[channels]\n",
+        )
+        .unwrap();
+        let key = sage_core::PackageKey::new("main/system", "loom", "0");
+        {
+            let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+            database
+                .replace_system_providers(&BTreeMap::from([("init".into(), key.clone())]))
+                .unwrap();
+        }
+
+        rebuild_system(root.path(), false, false).await.unwrap_err();
+        let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+        assert_eq!(database.system_provider("init").unwrap(), Some(key));
     }
 }
