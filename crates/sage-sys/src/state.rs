@@ -74,78 +74,12 @@ impl ReconcilePlan {
         no_prune: bool,
     ) -> Result<Self, SysError> {
         let preferences = config.provider_preferences("main/system")?;
-        let installed_by_key = installed
-            .iter()
-            .map(|package| (package.key.clone(), package))
-            .collect::<BTreeMap<_, _>>();
-        let mut retained_keys = installed
+        let retained = installed
             .iter()
             .filter(|package| no_prune || package.key.channel != "main/system")
-            .map(|package| package.key.clone())
-            .collect::<BTreeSet<_>>();
-        // A retained cross-channel root keeps its installed dependency graph even
-        // when repository pruning has removed one of the exact releases.
-        let mut pending = retained_keys.clone();
-        while let Some(key) = pending.pop_first() {
-            let package = installed_by_key
-                .get(&key)
-                .expect("retained package came from installed state");
-            for dependency in &package.dependencies {
-                let preferred = preferences.get(&dependency.name);
-                let virtual_dependency = dependency.name.starts_with("virtual/")
-                    || dependency.name.starts_with("so:");
-                if virtual_dependency && preferred.is_none() {
-                    continue;
-                }
-                if virtual_dependency
-                    && preferred.is_some()
-                    && !installed.iter().any(|candidate| {
-                        preferred == Some(&candidate.key)
-                            && installed_satisfies(
-                                &package.key,
-                                dependency,
-                                candidate,
-                                universe,
-                            )
-                    })
-                {
-                    continue;
-                }
-                let candidates = installed
-                    .iter()
-                    .filter(|candidate| {
-                        installed_satisfies(&package.key, dependency, candidate, universe)
-                    })
-                    .collect::<Vec<_>>();
-                let direct = candidates
-                    .iter()
-                    .find(|candidate| !virtual_dependency && candidate.key.name == dependency.name)
-                    .copied();
-                let preferred = preferred.and_then(|preferred| {
-                    candidates
-                        .iter()
-                        .find(|candidate| candidate.key == *preferred)
-                        .copied()
-                });
-                let candidate = direct.or(preferred).or_else(|| {
-                    let [candidate] = candidates.as_slice() else {
-                        return None;
-                    };
-                    Some(*candidate)
-                });
-                if let Some(candidate) = candidate {
-                    if retained_keys.insert(candidate.key.clone()) {
-                        pending.insert(candidate.key.clone());
-                    }
-                }
-            }
-        }
-        let retained = retained_keys
-            .iter()
-            .map(|key| installed_by_key[key])
             .collect::<Vec<_>>();
-        // Reconstruct every installed release as a candidate, but exact-pin only
-        // the unambiguous retained closure above so PubGrub can backtrack providers.
+        // Reconstruct every installed release as a locked candidate. Only packages
+        // retained by policy become exact roots; PubGrub owns dependency movement.
         let retained_universe = (!retained.is_empty()).then(|| {
             let mut universe = universe.clone();
             for package in installed {
@@ -237,60 +171,6 @@ impl ReconcilePlan {
             services: config.services.clone(),
         })
     }
-}
-
-fn installed_satisfies(
-    parent: &sage_core::PackageKey,
-    dependency: &sage_core::Dependency,
-    candidate: &sage_db::InstalledPackage,
-    universe: &sage_solver::PackageUniverse,
-) -> bool {
-    let virtual_dependency =
-        dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:");
-    let channel = if virtual_dependency {
-        parent
-            .channel
-            .rsplit_once('/')
-            .map_or_else(|| "system".into(), |(root, _)| format!("{root}/system"))
-    } else if let Some(requested) = dependency.channel.as_deref() {
-        parent.channel.rsplit_once('/').map_or_else(
-            || requested.into(),
-            |(root, _)| {
-                if requested == root || requested.starts_with(&format!("{root}/")) {
-                    requested.into()
-                } else {
-                    format!("{root}/{requested}")
-                }
-            },
-        )
-    } else {
-        parent.channel.clone()
-    };
-    let direct = !virtual_dependency && candidate.key.name == dependency.name;
-    if !virtual_dependency
-        && !direct
-        && universe
-            .versions(&sage_core::PackageKey::new(
-                channel.clone(),
-                &dependency.name,
-                dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT),
-            ))
-            .next()
-            .is_some()
-    {
-        return false;
-    }
-    let identity_matches = direct || candidate.provides.contains(&dependency.name);
-    let slot_matches = dependency.slot.as_deref().map_or_else(
-        || virtual_dependency || !direct || candidate.key.slot == sage_core::DEFAULT_SLOT,
-        |slot| candidate.key.slot == slot,
-    );
-    candidate.key.channel == channel
-        && identity_matches
-        && slot_matches
-        && dependency
-            .op
-            .matches(&candidate.version, dependency.version.as_ref())
 }
 
 /// One candidate for a declarative alternatives link.

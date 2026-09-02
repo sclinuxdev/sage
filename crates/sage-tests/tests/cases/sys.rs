@@ -326,13 +326,48 @@ mod sys_tests {
         ));
         let retained = ReconcilePlan::compute(
             &empty,
-            &[runtime.clone(), installed_lib],
+            &[runtime.clone(), installed_lib.clone()],
             &current_universe,
             false,
         )
         .unwrap();
         assert!(retained.install.is_empty());
         assert!(retained.remove.is_empty());
+
+        let mut compatible_runtime = runtime.clone();
+        compatible_runtime.dependencies = vec!["main/system/libc >= 1.0-1".parse().unwrap()];
+        let mut compatible_universe = sage_solver::PackageUniverse::default();
+        compatible_universe.insert(sage_core::Package::from_release(
+            compatible_runtime.key.clone(),
+            compatible_runtime.version.clone(),
+            compatible_runtime.dependencies.clone(),
+            vec![],
+        ));
+        compatible_universe.insert(sage_core::Package::from_release(
+            installed_lib.key.clone(),
+            "2.0-1".parse().unwrap(),
+            vec![],
+            vec![],
+        ));
+        compatible_universe.insert(release(
+            "new-consumer",
+            "1.0-1",
+            &["libc >= 2.0-1"],
+            &[],
+        ));
+        let mut compatible_config = empty.clone();
+        compatible_config.packages.insert("new-consumer".into());
+        let retained = ReconcilePlan::compute(
+            &compatible_config,
+            &[compatible_runtime, installed_lib],
+            &compatible_universe,
+            false,
+        )
+        .unwrap();
+        assert!(retained
+            .install
+            .iter()
+            .any(|(key, version)| key.name == "libc" && *version == "2.0-1".parse().unwrap()));
 
         let mut virtual_root = runtime.clone();
         virtual_root.dependencies = vec!["virtual/libc".parse().unwrap()];
