@@ -113,6 +113,7 @@ impl ChannelsConfig {
 
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
+        && !matches!(value, "." | "..")
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))

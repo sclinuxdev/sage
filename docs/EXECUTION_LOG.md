@@ -14,14 +14,14 @@ omitted; every build, test, lint, benchmark, and integration gate is recorded.
 | `cargo check --all-targets` | passed |
 | `cargo check -p sage --no-default-features` | passed without Torture Lab APIs |
 | `cargo clippy --all-targets -- -D warnings` | passed with zero warnings |
-| `cargo test --all-targets` | passed: 65 existing tests, 16 Torture Lab tests, 1 benchmark ignored |
+| `cargo test --all-targets` | passed: 66 existing tests, 16 Torture Lab tests, 1 benchmark ignored |
 | `cargo run -p sage-tests --bin sage-torture -- quick` | passed; 17 recorded real package operations |
-| production Rust physical-line count | 9,721 lines; informational, not a release gate |
+| production Rust physical-line count | 9,861 lines; informational, not a release gate |
 | fixed-seed 24-step state-machine test | passed with seed `0x5a6e2026` |
 | expanded 200-step state-machine | passed with seed `1517166630`; 329 recorded steps |
 | nightly-scale 1,000-step state-machine | passed with seed `1517166630`; 1,667 recorded steps |
-| focused provider-backtracking test | passed |
-| focused channel-path traversal test | passed |
+| focused provider-backtracking and exact proxy-binding tests | passed |
+| focused channel-path traversal test | passed, including dot-only channel, subchannel and alias values |
 | focused local Git-daemon readiness test | passed without timing sleeps |
 | focused multi-process and abrupt-termination tests | passed |
 | Linux Torture Lab binary | 16 passed, 1 benchmark ignored in Debian sid as uid 1000 |

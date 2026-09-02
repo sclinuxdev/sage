@@ -78,9 +78,9 @@ impl ReconcilePlan {
         let locks = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
-        let solution = sage_solver::SageSolver::with_locked(universe, locks)
+        let (solution, selected_providers) = sage_solver::SageSolver::with_locked(universe, locks)
             .prefer_providers(preferences.clone())
-            .resolve(&roots)?;
+            .resolve_with_provider_bindings(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
@@ -99,18 +99,10 @@ impl ReconcilePlan {
                 .cloned()
                 .collect()
         };
-        // Preferences only rank concrete providers. The binding must describe
-        // what PubGrub actually selected after conflict backtracking, otherwise
-        // LMDB can claim that an uninstalled provider owns an interface.
         let provider_bindings = preferences
             .into_keys()
             .filter_map(|symbol| {
-                let selected = solution.iter().find_map(|(key, version)| {
-                    universe
-                        .release(key, version)
-                        .is_some_and(|package| package.provides.contains(&symbol))
-                        .then(|| key.clone())
-                })?;
+                let selected = selected_providers.get(&symbol)?.clone();
                 Some((
                     symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
                     selected,

@@ -48,6 +48,18 @@ priority=1
 signing_key="/etc/sage/key"
 "#,
             r#"schema_version=1
+[channels.".."]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+"#,
+            r#"schema_version=1
+[channels."."]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+"#,
+            r#"schema_version=1
 [channels.main]
 url="https://example.invalid"
 priority=1
@@ -60,6 +72,44 @@ priority=1
 signing_key="/etc/sage/key"
 [channels.main.subchannels.system]
 alias="../outside"
+scope="system"
+target_root="/"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels.system]
+alias=".."
+scope="system"
+target_root="/"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels.system]
+alias="."
+scope="system"
+target_root="/"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels.".."]
+scope="system"
+target_root="/"
+"#,
+            r#"schema_version=1
+[channels.main]
+url="https://example.invalid"
+priority=1
+signing_key="/etc/sage/key"
+[channels.main.subchannels."."]
 scope="system"
 target_root="/"
 "#,

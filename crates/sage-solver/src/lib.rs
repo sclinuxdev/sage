@@ -98,6 +98,37 @@ impl<'a> SageSolver<'a> {
             .map(|key| (key, VersionRange::full()))
             .collect();
         self.resolve_root(dependencies)
+            .map(|(solution, _)| solution)
+    }
+
+    /// Resolves roots and returns the concrete package selected by each virtual proxy.
+    ///
+    /// Provider bindings are recovered from PubGrub's selected private proxy
+    /// releases before those implementation-only packages are removed from the
+    /// public solution. A symbol that resolves to different concrete packages
+    /// cannot be represented by the single system-provider binding and is
+    /// rejected instead of choosing one by map order.
+    pub fn resolve_with_provider_bindings(
+        &self,
+        requested: &[PackageKey],
+    ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
+        let dependencies = requested
+            .iter()
+            .cloned()
+            .map(|key| (key, VersionRange::full()))
+            .collect();
+        let (solution, choices) = self.resolve_root(dependencies)?;
+        let mut bindings = BTreeMap::new();
+        for (symbol, key) in choices {
+            if let Some(previous) = bindings.insert(symbol.clone(), key.clone()) {
+                if previous != key {
+                    return Err(SolverError::Internal(format!(
+                        "virtual symbol {symbol} selected both {previous} and {key}"
+                    )));
+                }
+            }
+        }
+        Ok((solution, bindings))
     }
     /// Resolves arbitrary root constraints in one pass. Source builds use this
     /// for explicit and rclass-provided build dependencies without installing
@@ -124,8 +155,12 @@ impl<'a> SageSolver<'a> {
                 .or_insert(range);
         }
         self.resolve_root_with(&root, &root_version, dependencies)
+            .map(|(solution, _)| solution)
     }
-    fn resolve_root(&self, dependencies: DependencyMap) -> Result<Solution, SolverError> {
+    fn resolve_root(
+        &self,
+        dependencies: DependencyMap,
+    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
         let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
         let root_version = Version::new(0, "0", 0);
         self.resolve_root_with(&root, &root_version, dependencies)
@@ -135,7 +170,7 @@ impl<'a> SageSolver<'a> {
         root: &PackageKey,
         root_version: &Version,
         dependencies: DependencyMap,
-    ) -> Result<Solution, SolverError> {
+    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
         let provider = SageProvider::build(
             self.universe,
             &self.locked,
@@ -145,10 +180,43 @@ impl<'a> SageSolver<'a> {
             dependencies,
         )?;
         match resolve(&provider, root.clone(), root_version.clone()) {
-            Ok(selected) => Ok(selected
-                .into_iter()
-                .filter(|(key, _)| key != root && key.channel != "__sage")
-                .collect()),
+            Ok(selected) => {
+                let mut provider_choices = Vec::new();
+                for (key, version) in &selected {
+                    let Some((_, _, requirement)) = virtual_requirement(key) else {
+                        continue;
+                    };
+                    let dependencies = provider
+                        .releases
+                        .get(key)
+                        .and_then(|versions| versions.get(version))
+                        .ok_or_else(|| {
+                            SolverError::Internal(format!(
+                                "selected virtual proxy {key} {version} has no release"
+                            ))
+                        })?;
+                    let concrete = dependencies
+                        .keys()
+                        .filter(|candidate| candidate.channel != "__sage")
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let [concrete] = concrete.as_slice() else {
+                        return Err(SolverError::Internal(format!(
+                            "selected virtual proxy {key} {version} has {} concrete providers",
+                            concrete.len()
+                        )));
+                    };
+                    provider_choices
+                        .push((provider_symbol(&requirement.name).into(), concrete.clone()));
+                }
+                Ok((
+                    selected
+                        .into_iter()
+                        .filter(|(key, _)| key != root && key.channel != "__sage")
+                        .collect(),
+                    provider_choices,
+                ))
+            }
             Err(PubGrubError::NoSolution(mut tree)) => {
                 tree.collapse_no_versions();
                 Err(SolverError::NoSolution(DefaultStringReporter::report(

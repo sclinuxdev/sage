@@ -41,6 +41,12 @@
     new claimant; cyclic swaps fail before the journal is created.
 14. **Bounded lock waits busy-spun.** Contended retries now sleep for at most
     10 ms or the remaining deadline, avoiding a full CPU core during waits.
+15. **Dot-only channel identifiers escaped cache scopes.** Channel, subchannel
+    and alias validation now rejects `.` and `..` before they reach URL or path
+    construction.
+16. **Provider bindings guessed from concrete solution order.** Reconciliation
+    now records the concrete dependency of PubGrub's selected virtual proxy, so
+    an unrelated explicit provider root cannot replace the actual binding.
 
 Each item has a deterministic regression in `crates/sage-tests`.
 
