@@ -29,6 +29,11 @@ mod db_tests {
         assert_eq!(db.package(&rg.key).unwrap(), Some(rg.clone()));
         assert_eq!(db.owners("usr/bin/rg").unwrap(), vec![rg.key.clone()]);
         assert_eq!(db.providers("cmd:ripgrep").unwrap(), vec![rg.key.clone()]);
+        db.replace_system_providers(&BTreeMap::from([("tool".into(), rg.key.clone())]))
+            .unwrap();
+        assert_eq!(db.system_provider("tool").unwrap(), Some(rg.key.clone()));
+        db.replace_system_providers(&BTreeMap::new()).unwrap();
+        assert!(db.system_provider("tool").unwrap().is_none());
         assert_eq!(db.remove(&rg.key).unwrap(), Some(rg));
         assert!(db.owners("usr/bin/rg").unwrap().is_empty());
     }
@@ -103,16 +108,4 @@ mod db_tests {
         assert!(matches!(record.validate(), Err(DbError::InvalidJournal(_))));
     }
 
-    #[test]
-    fn provider_bindings_are_replaced_as_a_complete_set() {
-        let root = tempfile::tempdir().unwrap();
-        let database = SageDatabase::open(root.path()).unwrap();
-        let key = sage_core::PackageKey::new("main/system", "musl", "0");
-        database
-            .replace_system_providers(&BTreeMap::from([("libc".into(), key.clone())]))
-            .unwrap();
-        assert_eq!(database.system_provider("libc").unwrap(), Some(key));
-        database.replace_system_providers(&BTreeMap::new()).unwrap();
-        assert!(database.system_provider("libc").unwrap().is_none());
-    }
 }

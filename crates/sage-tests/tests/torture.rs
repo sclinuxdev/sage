@@ -272,7 +272,7 @@ fn equal_content_cross_package_claims_are_rejected() {
 async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
     for (name, path, content) in [
-        ("z-owner", "usr/lib/torture/handoff", "old-owner"),
+        ("z-owner", "etc/torture-handoff.conf", "old-owner"),
         ("a-claimant", "usr/lib/torture/claimant-old", "old-claimant"),
     ] {
         lab.add("system", name, 1, path, content).unwrap();
@@ -280,10 +280,11 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     lab.publish().unwrap();
     lab.install("z-owner", "system").await.unwrap();
     lab.install("a-claimant", "system").await.unwrap();
+    std::fs::write(lab.root().join("etc/torture-handoff.conf"), b"user-edit").unwrap();
 
     for (name, path, content) in [
         ("z-owner", "usr/lib/torture/owner-new", "new-owner"),
-        ("a-claimant", "usr/lib/torture/handoff", "new-claimant"),
+        ("a-claimant", "etc/torture-handoff.conf", "new-claimant"),
     ] {
         lab.add("system", name, 2, path, content).unwrap();
     }
@@ -300,15 +301,19 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     })
     .await
     .unwrap();
-    let state = lab.audit().unwrap();
+    let state = lab.snapshot().unwrap();
     assert_eq!(state.packages["main/system:a-claimant:0"], "2-1");
     assert_eq!(state.packages["main/system:z-owner:0"], "2-1");
     assert_eq!(
-        std::fs::read(lab.root().join("usr/lib/torture/handoff")).unwrap(),
+        std::fs::read(lab.root().join("etc/torture-handoff.conf")).unwrap(),
+        b"user-edit"
+    );
+    assert_eq!(
+        std::fs::read(lab.root().join("etc/torture-handoff.conf.sage-new")).unwrap(),
         b"new-claimant"
     );
     assert_eq!(
-        sage_db::read_owners(&lab.root().join("var/lib/sage"), "usr/lib/torture/handoff").unwrap(),
+        sage_db::read_owners(&lab.root().join("var/lib/sage"), "etc/torture-handoff.conf").unwrap(),
         [sage_core::PackageKey::new("main/system", "a-claimant", "0")]
     );
 

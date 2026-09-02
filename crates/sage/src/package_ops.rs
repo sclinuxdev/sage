@@ -686,6 +686,18 @@ async fn resume_install(
     };
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
+    let previous_config = previous_packages
+        .values()
+        .flat_map(|package| {
+            package.config_hashes.iter().filter_map(|(relative, hash)| {
+                package
+                    .files
+                    .iter()
+                    .find(|path| Path::new(path).ends_with(relative))
+                    .map(|path| (path.clone(), hash.clone()))
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut modified = Vec::new();
     if journal.stage == "packages" {
     for (key, version) in &changes {
@@ -726,10 +738,18 @@ async fn resume_install(
             }
         }
         let previous_package = previous_packages.get(key).cloned();
-        let previous = previous_package
+        let mut previous = previous_package
             .as_ref()
             .map(|package| package.config_hashes.clone())
             .unwrap_or_default();
+        for record in inspection.files.iter().filter(|record| record.path.starts_with("etc")) {
+            let physical = prefix.join(&record.path).to_string_lossy().into_owned();
+            if let Some(hash) = previous_config.get(&physical) {
+                previous
+                    .entry(record.path.to_string_lossy().into_owned())
+                    .or_insert_with(|| hash.clone());
+            }
+        }
         let report = sage_archive::extract_package_with_config(
             &archive,
             &target,
