@@ -323,12 +323,26 @@ async fn dependency_removal_uses_solver_provider_semantics() {
 #[tokio::test]
 async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
-    for (name, path, content) in [
-        ("z-owner", "etc/torture-handoff.conf", "old-owner"),
-        ("a-claimant", "usr/lib/torture/claimant-old", "old-claimant"),
-    ] {
-        lab.add("system", name, 1, path, content).unwrap();
-    }
+    let mut owner = sage_tests::PackageSpec::new(
+        "system",
+        "z-owner",
+        1,
+        "etc/torture-handoff.conf",
+        "old-owner",
+    );
+    owner.files.insert(
+        "a/etc/torture-handoff.conf".into(),
+        b"nested-owner".to_vec(),
+    );
+    lab.add_package(owner).unwrap();
+    lab.add(
+        "system",
+        "a-claimant",
+        1,
+        "usr/lib/torture/claimant-old",
+        "old-claimant",
+    )
+    .unwrap();
     lab.publish().unwrap();
     lab.install("z-owner", "system").await.unwrap();
     lab.install("a-claimant", "system").await.unwrap();

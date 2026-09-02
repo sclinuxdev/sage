@@ -753,11 +753,7 @@ async fn resume_install(
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let mut previous_config = BTreeMap::new();
     for package in previous_packages.values() {
-        for (relative, hash) in &package.config_hashes {
-            if let Some(path) = package.files.iter().find(|path| Path::new(path).ends_with(relative)) {
-                previous_config.insert(path.clone(), hash.clone());
-            }
-        }
+        previous_config.extend(package.config_hashes.clone());
     }
     let mut modified = Vec::new();
     let mut removed_paths = Vec::new();
@@ -803,14 +799,15 @@ async fn resume_install(
             }
         }
         let previous_package = previous_packages.get(key).cloned();
-        let mut previous = previous_package
-            .as_ref()
-            .map(|package| package.config_hashes.clone())
-            .unwrap_or_default();
+        let mut previous = BTreeMap::new();
         for record in inspection.files.iter().filter(|record| record.path.starts_with("etc")) {
             let physical = prefix.join(&record.path).to_string_lossy().into_owned();
-            if let Some(hash) = previous_config.get(&physical) {
-                previous.entry(record.path.to_string_lossy().into_owned()).or_insert(hash.clone());
+            let hash = previous_package
+                .as_ref()
+                .and_then(|package| package.config_hashes.get(&physical))
+                .or_else(|| previous_config.get(&physical));
+            if let Some(hash) = hash {
+                previous.insert(record.path.to_string_lossy().into_owned(), hash.clone());
             }
         }
         let report = sage_archive::extract_package_with_config(
@@ -846,8 +843,9 @@ async fn resume_install(
             .iter()
             .filter(|record| record.path.starts_with("etc"))
             .map(|record| {
+                let physical = prefix.join(&record.path).to_string_lossy().into_owned();
                 (
-                    record.path.to_string_lossy().into_owned(),
+                    physical,
                     record.sha256.clone(),
                 )
             })
@@ -1214,10 +1212,7 @@ fn should_preserve_config(
     physical: &str,
     hashes: &BTreeMap<String, String>,
 ) -> Result<bool> {
-    let Some((_, expected)) = hashes
-        .iter()
-        .find(|(relative, _)| Path::new(physical).ends_with(relative))
-    else {
+    let Some(expected) = hashes.get(physical) else {
         return Ok(false);
     };
     if !path.exists() {
