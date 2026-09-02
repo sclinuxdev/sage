@@ -128,6 +128,9 @@ impl<'a> SageSolver<'a> {
         let (solution, choices) = self.resolve_root(dependencies)?;
         let mut bindings = BTreeMap::new();
         for (symbol, key) in choices {
+            if !self.preferred_providers.contains_key(&symbol) {
+                continue;
+            }
             if let Some(previous) = bindings.insert(symbol.clone(), key.clone()) {
                 if previous != key {
                     return Err(SolverError::Internal(format!(

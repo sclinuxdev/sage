@@ -220,6 +220,42 @@ mod solver_tests {
     }
 
     #[test]
+    fn unconfigured_virtuals_do_not_create_system_bindings() {
+        let mut universe = PackageUniverse::default();
+        universe.insert(release(
+            "main/system",
+            "old-app",
+            "1-1",
+            &["virtual/libc < 2-1"],
+        ));
+        universe.insert(release(
+            "main/system",
+            "new-app",
+            "1-1",
+            &["virtual/libc >= 2-1"],
+        ));
+        let mut old_provider = release("main/system", "old-libc", "1-1", &[]);
+        old_provider.provides.push("virtual/libc".into());
+        universe.insert(old_provider);
+        let mut new_provider = release("main/system", "new-libc", "2-1", &[]);
+        new_provider.provides.push("virtual/libc".into());
+        universe.insert(new_provider);
+
+        let (solution, bindings) = SageSolver::new(&universe)
+            .resolve_with_provider_bindings(
+                &[
+                    PackageKey::new("main/system", "old-app", "0"),
+                    PackageKey::new("main/system", "new-app", "0"),
+                ],
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert!(solution.contains_key(&PackageKey::new("main/system", "old-libc", "0")));
+        assert!(solution.contains_key(&PackageKey::new("main/system", "new-libc", "0")));
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
     fn package_conflict_participates_in_version_backtracking() {
         let mut universe = PackageUniverse::default();
         universe.insert(release("main/system", "app", "1-1", &[]));
