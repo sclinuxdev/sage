@@ -351,20 +351,17 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
 
     let mut hierarchy = sage_tests::TortureLab::new().unwrap();
     for (name, path) in [
-        ("ancestor-owner", "usr/lib/torture/app"),
-        ("descendant-claimant", "usr/lib/torture/claimant-v1"),
+        ("z-node", "usr/lib/torture/app"),
+        ("a-node", "usr/lib/torture/claimant-v1"),
     ] {
         hierarchy.add("system", name, 1, path, "v1").unwrap();
     }
     hierarchy.publish().unwrap();
-    hierarchy.install("ancestor-owner", "system").await.unwrap();
-    hierarchy
-        .install("descendant-claimant", "system")
-        .await
-        .unwrap();
+    hierarchy.install("z-node", "system").await.unwrap();
+    hierarchy.install("a-node", "system").await.unwrap();
     for (name, path) in [
-        ("ancestor-owner", "usr/lib/torture/owner-v2"),
-        ("descendant-claimant", "usr/lib/torture/app/bin/tool"),
+        ("z-node", "usr/lib/torture/owner-v2"),
+        ("a-node", "usr/lib/torture/app/bin/tool"),
     ] {
         hierarchy.add("system", name, 2, path, "v2").unwrap();
     }
@@ -375,7 +372,7 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
         dry_run: false,
         root: hierarchy.root().into(),
         command: sage::Commands::Upgrade {
-            packages: vec!["ancestor-owner".into(), "descendant-claimant".into()],
+            packages: vec!["z-node".into(), "a-node".into()],
             channel: Some("system".into()),
             sync: false,
         },
