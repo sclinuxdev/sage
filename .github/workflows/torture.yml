@@ -11,10 +11,6 @@ on:
         description: Random state-machine operations
         required: true
         default: "1000"
-      packages:
-        description: Database benchmark package count
-        required: true
-        default: "10000"
   schedule:
     - cron: "17 3 * * *"
 
@@ -22,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  random-state-machine:
+  release-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -36,17 +32,3 @@ jobs:
         run: >-
           cargo run -p sage-tests --bin sage-torture -- random
           --seed "$TORTURE_SEED" --operations "$TORTURE_OPERATIONS"
-
-  benchmark:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Record database and package-path benchmarks
-        env:
-          TORTURE_PACKAGES: ${{ inputs.packages || '10000' }}
-        run: >-
-          cargo run --release -p sage-tests --bin sage-torture -- bench
-          --packages "$TORTURE_PACKAGES"

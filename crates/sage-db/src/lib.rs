@@ -28,17 +28,6 @@ pub enum DbError {
     },
     #[error("operation journal '{0}' failed its integrity check")]
     InvalidJournal(String),
-    #[cfg(feature = "torture")]
-    #[error("injected database fault at {0:?}")]
-    InjectedFault(DbFault),
-}
-
-/// Explicit write-transaction boundaries used only by reliability tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(feature = "torture")]
-pub enum DbFault {
-    BeforeWrite,
-    BeforeCommit,
 }
 /// Complete installed state required for removal and reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,25 +176,6 @@ impl SageDatabase {
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
         self.install_in_txn(&mut txn, package, allow_shared)?;
-        txn.commit()?;
-        Ok(())
-    }
-    /// Executes the normal install transaction with an optional test fault.
-    #[cfg(feature = "torture")]
-    pub fn install_with_fault(
-        &self,
-        package: &InstalledPackage,
-        allow_shared: bool,
-        fault: Option<DbFault>,
-    ) -> Result<(), DbError> {
-        let mut txn = self.env.write_txn()?;
-        if fault == Some(DbFault::BeforeWrite) {
-            return Err(DbError::InjectedFault(DbFault::BeforeWrite));
-        }
-        self.install_in_txn(&mut txn, package, allow_shared)?;
-        if fault == Some(DbFault::BeforeCommit) {
-            return Err(DbError::InjectedFault(DbFault::BeforeCommit));
-        }
         txn.commit()?;
         Ok(())
     }
@@ -388,34 +358,6 @@ pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> 
         .map(decode)
         .transpose()?
         .unwrap_or_default())
-}
-/// Reads the complete ownership table for consistency verification.
-pub fn read_ownerships(path: &Path) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let mut options = EnvOpenOptions::new();
-    options.max_dbs(8);
-    // SAFETY: this environment is strictly read-only and keeps LMDB locking enabled.
-    unsafe {
-        options.flags(EnvFlags::READ_ONLY);
-    }
-    let env = unsafe { options.open(path)? };
-    let txn = env.read_txn()?;
-    let files: Database<Str, Bytes> = env.open_database(&txn, Some("files"))?.ok_or_else(|| {
-        DbError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing files table",
-        ))
-    })?;
-    let ownerships = files
-        .iter(&txn)?
-        .map(|item| {
-            let (path, bytes) = item?;
-            Ok((path.to_owned(), decode(bytes)?))
-        })
-        .collect();
-    ownerships
 }
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DbError> {
     Ok(bincode::serialize(value)?)

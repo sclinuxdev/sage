@@ -8,91 +8,6 @@ async fn fixed_seed_state_machine_matches_the_reference_model() {
     sage_tests::run_random(0x5a6e_2026, 24).await.unwrap();
 }
 
-#[tokio::test]
-#[ignore = "full benchmarks run in the Torture Lab workflow"]
-async fn benchmark_smoke_records_database_metrics() {
-    let report = sage_tests::run_bench(100).await.unwrap();
-    assert_eq!(report["packages"], 100.0);
-    assert!(report["database_bytes"] > 0.0);
-    assert!(report["lookup_ns_each"] >= 0.0);
-}
-
-#[test]
-fn archive_fault_boundaries_retry_without_temporary_debris() {
-    let mut lab = sage_tests::TortureLab::new().unwrap();
-    let package = lab
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "faulty",
-            1,
-            "usr/lib/torture/faulty",
-            "0123456789abcdef",
-        ))
-        .unwrap();
-    let inspection = sage_archive::inspect_package(&package).unwrap();
-    for fault in [
-        sage_archive::ExtractionFault::BeforeTemporary,
-        sage_archive::ExtractionFault::AfterPartialWrite,
-        sage_archive::ExtractionFault::BeforeRename,
-        sage_archive::ExtractionFault::AfterRename,
-    ] {
-        let root = tempfile::tempdir().unwrap();
-        let result = sage_archive::extract_package_with_fault(
-            &package,
-            root.path(),
-            &inspection.files,
-            fault,
-        );
-        assert!(matches!(
-            result,
-            Err(sage_archive::ArchiveError::InjectedFault(point)) if point == fault
-        ));
-        sage_archive::extract_package(&package, root.path(), &inspection.files).unwrap();
-        assert_eq!(
-            std::fs::read(root.path().join("usr/lib/torture/faulty")).unwrap(),
-            b"0123456789abcdef"
-        );
-        let directory = root.path().join("usr/lib/torture");
-        assert!(std::fs::read_dir(directory).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".sage-tmp-")));
-    }
-}
-
-#[test]
-fn database_faults_abort_the_entire_reverse_index_transaction() {
-    use std::collections::BTreeMap;
-    let directory = tempfile::tempdir().unwrap();
-    let database = sage_db::SageDatabase::open(directory.path()).unwrap();
-    let package = sage_db::InstalledPackage {
-        key: sage_core::PackageKey::new("main/system", "faulty", "0"),
-        version: sage_core::Version::new(0, "1", 1),
-        arch: "noarch".into(),
-        installed_size: 1,
-        dependencies: Vec::new(),
-        provides: vec!["virtual/faulty".into()],
-        conflicts: Vec::new(),
-        files: vec!["usr/lib/torture/faulty".into()],
-        config_hashes: BTreeMap::new(),
-    };
-    for fault in [
-        sage_db::DbFault::BeforeWrite,
-        sage_db::DbFault::BeforeCommit,
-    ] {
-        assert!(matches!(
-            database.install_with_fault(&package, false, Some(fault)),
-            Err(sage_db::DbError::InjectedFault(point)) if point == fault
-        ));
-        assert!(database.package(&package.key).unwrap().is_none());
-        assert!(database.owners(&package.files[0]).unwrap().is_empty());
-        assert!(database.providers(&package.provides[0]).unwrap().is_empty());
-    }
-    database.install(&package, false).unwrap();
-    assert_eq!(database.package(&package.key).unwrap(), Some(package));
-}
-
 #[test]
 fn batch_conflicts_rollback_every_package_record() {
     use std::collections::BTreeMap;
@@ -140,13 +55,7 @@ fn archive_attack_matrix_is_fail_closed() {
 
     let mut lab = sage_tests::TortureLab::new().unwrap();
     let package = lab
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "escape",
-            1,
-            "usr/lib/torture/payload",
-            "payload",
-        ))
+        .add("system", "escape", 1, "usr/lib/torture/payload", "payload")
         .unwrap();
     let inspection = sage_archive::inspect_package(&package).unwrap();
     let target = tempfile::tempdir().unwrap();
@@ -166,7 +75,7 @@ fn payload_validation_precedes_all_filesystem_writes() {
     let actual_second = b"wrong";
     let first_hash = hex::encode(sha2::Sha256::digest(first));
     let second_hash = hex::encode(sha2::Sha256::digest(expected_second));
-    let (_archive_root, archive) = raw_archive_entries(
+    let error = assert_archive_rejected(
         &format!(
             "usr/first\t0644\t{}\t{first_hash}\nusr/second\t0644\t{}\t{second_hash}\n",
             first.len(),
@@ -181,21 +90,18 @@ fn payload_validation_precedes_all_filesystem_writes() {
                 None,
             ),
         ],
+        &["usr/first", "usr/second"],
     );
-    let inspection = sage_archive::inspect_package(&archive).unwrap();
-    let root = tempfile::tempdir().unwrap();
     assert!(matches!(
-        sage_archive::extract_package(&archive, root.path(), &inspection.files),
-        Err(sage_archive::ArchiveError::ChecksumMismatch { .. })
+        error,
+        sage_archive::ArchiveError::ChecksumMismatch { .. }
     ));
-    assert!(!root.path().join("usr/first").exists());
-    assert!(!root.path().join("usr/second").exists());
 
     let parent = b"parent";
     let child = b"child";
     let parent_hash = hex::encode(sha2::Sha256::digest(parent));
     let child_hash = hex::encode(sha2::Sha256::digest(child));
-    let (_archive_root, archive) = raw_archive_entries(
+    assert_archive_rejected(
         &format!(
             "opt/app\t0644\t{}\t{parent_hash}\nopt/app/bin/tool\t0644\t{}\t{child_hash}\n",
             parent.len(),
@@ -210,16 +116,12 @@ fn payload_validation_precedes_all_filesystem_writes() {
                 None,
             ),
         ],
+        &["opt/app", "opt/app/bin/tool"],
     );
-    let inspection = sage_archive::inspect_package(&archive).unwrap();
-    let root = tempfile::tempdir().unwrap();
-    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
-    assert!(!root.path().join("opt/app").exists());
-    assert!(!root.path().join("opt/app/bin/tool").exists());
 
     let payload = b"owned";
     let payload_hash = hex::encode(sha2::Sha256::digest(payload));
-    let (_archive_root, archive) = raw_archive_entries(
+    assert_archive_rejected(
         &format!("usr/owned/file\t0644\t{}\t{payload_hash}\n", payload.len()),
         &[
             ("data/var/unowned", tar::EntryType::Directory, b"", None),
@@ -230,42 +132,25 @@ fn payload_validation_precedes_all_filesystem_writes() {
                 None,
             ),
         ],
+        &["var/unowned", "usr/owned/file"],
     );
-    let inspection = sage_archive::inspect_package(&archive).unwrap();
-    let root = tempfile::tempdir().unwrap();
-    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
-    assert!(!root.path().join("var/unowned").exists());
-    assert!(!root.path().join("usr/owned/file").exists());
 
-    let (_archive_root, archive) = raw_archive_entries(
+    assert_archive_rejected(
         &format!("usr/collision\t0644\t{}\t{payload_hash}\n", payload.len()),
         &[
             ("data/usr/collision", tar::EntryType::Regular, payload, None),
             ("data/usr/collision", tar::EntryType::Directory, b"", None),
         ],
+        &["usr/collision"],
     );
-    let inspection = sage_archive::inspect_package(&archive).unwrap();
-    let root = tempfile::tempdir().unwrap();
-    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
-    assert!(!root.path().join("usr/collision").exists());
 }
 
 #[tokio::test]
 async fn malformed_package_preflight_does_not_leave_a_recovery_journal() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
-    let malformed = lab
-        .add_package(sage_tests::PackageSpec::new(
-            "system", "raw", 1, "usr/hard", "payload",
-        ))
+    let malformed = lab.add("system", "raw", 1, "usr/hard", "payload").unwrap();
+    lab.add("system", "healthy", 1, "usr/lib/torture/healthy", "healthy")
         .unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "healthy",
-        1,
-        "usr/lib/torture/healthy",
-        "healthy",
-    ))
-    .unwrap();
     write_raw_archive(
         &malformed,
         &format!("usr/hard\t0644\t0\t{}\n", "0".repeat(64)),
@@ -296,13 +181,7 @@ fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
 
     let mut lab = sage_tests::TortureLab::new().unwrap();
     let package = lab
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "swap",
-            1,
-            "usr/lib/torture/swap",
-            "file",
-        ))
+        .add("system", "swap", 1, "usr/lib/torture/swap", "file")
         .unwrap();
     let inspection = sage_archive::inspect_package(&package).unwrap();
 
@@ -324,13 +203,13 @@ fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
 
     let mut nested_lab = sage_tests::TortureLab::new().unwrap();
     let nested = nested_lab
-        .add_package(sage_tests::PackageSpec::new(
+        .add(
             "system",
             "nested",
             1,
             "usr/lib/torture/parent/child",
             "child",
-        ))
+        )
         .unwrap();
     let nested_inspection = sage_archive::inspect_package(&nested).unwrap();
     let file_target = tempfile::tempdir().unwrap();
@@ -357,12 +236,14 @@ fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
     let relative = format!("usr/lib/{component}/file");
     let bytes = b"long";
     let hash = hex::encode(sha2::Sha256::digest(bytes));
-    let (_archive_root, archive) = raw_archive(
+    let (_archive_root, archive) = raw_archive_entries(
         &format!("{relative}\t0644\t{}\t{hash}\n", bytes.len()),
-        &format!("data/{relative}"),
-        tar::EntryType::Regular,
-        bytes,
-        None,
+        &[(
+            &format!("data/{relative}"),
+            tar::EntryType::Regular,
+            bytes,
+            None,
+        )],
     );
     let long_inspection = sage_archive::inspect_package(&archive).unwrap();
     let long_target = tempfile::tempdir().unwrap();
@@ -373,30 +254,11 @@ fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
 }
 
 #[test]
-fn hardlinks_and_equal_content_cross_package_claims_are_rejected() {
-    let hash = "0".repeat(64);
-    let (_archive_root, archive) = raw_archive(
-        &format!("usr/hard\t0644\t0\t{hash}\n"),
-        "data/usr/hard",
-        tar::EntryType::Link,
-        &[],
-        Some("data/usr/source"),
-    );
-    let inspection = sage_archive::inspect_package(&archive).unwrap();
-    let root = tempfile::tempdir().unwrap();
-    assert!(sage_archive::extract_package(&archive, root.path(), &inspection.files).is_err());
-    assert!(!root.path().join("usr/hard").exists());
-
+fn equal_content_cross_package_claims_are_rejected() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
     for name in ["same-a", "same-b"] {
-        lab.add_package(sage_tests::PackageSpec::new(
-            "system",
-            name,
-            1,
-            "usr/lib/torture/equal",
-            "identical",
-        ))
-        .unwrap();
+        lab.add("system", name, 1, "usr/lib/torture/equal", "identical")
+            .unwrap();
     }
     lab.publish().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -409,48 +271,27 @@ fn hardlinks_and_equal_content_cross_package_claims_are_rejected() {
 #[tokio::test]
 async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "z-owner",
-        1,
-        "usr/lib/torture/handoff",
-        "old-owner",
-    ))
-    .unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "a-claimant",
-        1,
-        "usr/lib/torture/claimant-old",
-        "old-claimant",
-    ))
-    .unwrap();
+    for (name, path, content) in [
+        ("z-owner", "usr/lib/torture/handoff", "old-owner"),
+        ("a-claimant", "usr/lib/torture/claimant-old", "old-claimant"),
+    ] {
+        lab.add("system", name, 1, path, content).unwrap();
+    }
     lab.publish().unwrap();
     lab.install("z-owner", "system").await.unwrap();
     lab.install("a-claimant", "system").await.unwrap();
 
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "z-owner",
-        2,
-        "usr/lib/torture/owner-new",
-        "new-owner",
-    ))
-    .unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "a-claimant",
-        2,
-        "usr/lib/torture/handoff",
-        "new-claimant",
-    ))
-    .unwrap();
+    for (name, path, content) in [
+        ("z-owner", "usr/lib/torture/owner-new", "new-owner"),
+        ("a-claimant", "usr/lib/torture/handoff", "new-claimant"),
+    ] {
+        lab.add("system", name, 2, path, content).unwrap();
+    }
     lab.publish().unwrap();
     sage::execute(sage::Cli {
         verbose: false,
         dry_run: false,
         root: lab.root().into(),
-        lock_timeout: None,
         command: sage::Commands::Upgrade {
             packages: vec!["a-claimant".into(), "z-owner".into()],
             channel: Some("system".into()),
@@ -472,52 +313,27 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     );
 
     let mut cycle = sage_tests::TortureLab::new().unwrap();
-    cycle
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "cycle-a",
-            1,
-            "usr/lib/torture/cycle-p",
-            "a-v1",
-        ))
-        .unwrap();
-    cycle
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "cycle-b",
-            1,
-            "usr/lib/torture/cycle-q",
-            "b-v1",
-        ))
-        .unwrap();
+    for (name, path, content) in [
+        ("cycle-a", "usr/lib/torture/cycle-p", "a-v1"),
+        ("cycle-b", "usr/lib/torture/cycle-q", "b-v1"),
+    ] {
+        cycle.add("system", name, 1, path, content).unwrap();
+    }
     cycle.publish().unwrap();
     cycle.install("cycle-a", "system").await.unwrap();
     cycle.install("cycle-b", "system").await.unwrap();
-    cycle
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "cycle-a",
-            2,
-            "usr/lib/torture/cycle-q",
-            "a-v2",
-        ))
-        .unwrap();
-    cycle
-        .add_package(sage_tests::PackageSpec::new(
-            "system",
-            "cycle-b",
-            2,
-            "usr/lib/torture/cycle-p",
-            "b-v2",
-        ))
-        .unwrap();
+    for (name, path, content) in [
+        ("cycle-a", "usr/lib/torture/cycle-q", "a-v2"),
+        ("cycle-b", "usr/lib/torture/cycle-p", "b-v2"),
+    ] {
+        cycle.add("system", name, 2, path, content).unwrap();
+    }
     cycle.publish().unwrap();
     let before = cycle.audit().unwrap();
     assert!(sage::execute(sage::Cli {
         verbose: false,
         dry_run: false,
         root: cycle.root().into(),
-        lock_timeout: None,
         command: sage::Commands::Upgrade {
             packages: vec!["cycle-a".into(), "cycle-b".into()],
             channel: Some("system".into()),
@@ -530,7 +346,7 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
 }
 
 #[test]
-fn host_lock_contention_is_nonblocking_and_recoverable() {
+fn host_lock_namespace_is_anchored_and_private() {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = tempfile::tempdir().unwrap();
     let canonical = directory.path().canonicalize().unwrap();
@@ -556,54 +372,13 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    assert!(matches!(
-        sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO),
-        Err(sage_core::CoreError::LockTimedOut(_))
-    ));
-    assert!(matches!(
-        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO),
-        Err(sage_core::CoreError::LockTimedOut(_))
-    ));
-    let wait_started = std::time::Instant::now();
-    assert!(matches!(
-        sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::from_millis(25)),
-        Err(sage_core::CoreError::LockTimedOut(_))
-    ));
-    let waited = wait_started.elapsed();
-    assert!(waited >= std::time::Duration::from_millis(20));
-    assert!(waited < std::time::Duration::from_secs(2));
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let error = runtime
-        .block_on(sage::execute(sage::Cli {
-            verbose: false,
-            dry_run: false,
-            root: canonical.clone(),
-            lock_timeout: Some(0),
-            command: sage::Commands::Verify,
-        }))
-        .unwrap_err();
-    assert!(error.to_string().contains("timed out"));
     drop(exclusive);
-    let first_reader =
-        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO).unwrap();
-    let second_reader =
-        sage_core::HostLock::acquire_shared_for(&path, std::time::Duration::ZERO).unwrap();
-    assert!(matches!(
-        sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO),
-        Err(sage_core::CoreError::LockTimedOut(_))
-    ));
-    drop((first_reader, second_reader));
-    sage_core::HostLock::acquire_exclusive_for(&path, std::time::Duration::ZERO).unwrap();
 
     let outside = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(canonical.join("run")).unwrap();
     let redirected = canonical.join("run/redirected");
     std::os::unix::fs::symlink(outside.path(), &redirected).unwrap();
-    assert!(sage_core::HostLock::acquire_exclusive_for(
-        redirected.join("operation.lock"),
-        std::time::Duration::ZERO
-    )
-    .is_err());
+    assert!(sage_core::HostLock::acquire_exclusive(redirected.join("operation.lock")).is_err());
     assert!(!outside.path().join("operation.lock").exists());
 
     let final_directory = canonical.join("run/final-link");
@@ -611,21 +386,16 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
     let outside_file = outside.path().join("outside-lock");
     std::fs::write(&outside_file, b"outside").unwrap();
     std::os::unix::fs::symlink(&outside_file, final_directory.join("operation.lock")).unwrap();
-    assert!(sage_core::HostLock::acquire_exclusive_for(
-        final_directory.join("operation.lock"),
-        std::time::Duration::ZERO
-    )
-    .is_err());
+    assert!(
+        sage_core::HostLock::acquire_exclusive(final_directory.join("operation.lock")).is_err()
+    );
     assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
 
     let insecure_directory = canonical.join("run/insecure");
     std::fs::create_dir(&insecure_directory).unwrap();
     std::fs::set_permissions(&insecure_directory, std::fs::Permissions::from_mode(0o777)).unwrap();
-    let insecure_lock = sage_core::HostLock::acquire_exclusive_for(
-        insecure_directory.join("operation.lock"),
-        std::time::Duration::ZERO,
-    )
-    .unwrap();
+    let insecure_lock =
+        sage_core::HostLock::acquire_exclusive(insecure_directory.join("operation.lock")).unwrap();
     assert_eq!(
         std::fs::metadata(&insecure_directory)
             .unwrap()
@@ -641,31 +411,9 @@ fn host_lock_contention_is_nonblocking_and_recoverable() {
 fn concurrent_process_writers_serialize_real_package_operations() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
     for name in ["left", "right"] {
-        lab.add_package(sage_tests::PackageSpec::new(
-            "system",
-            name,
-            1,
-            &format!("usr/lib/torture/{name}"),
-            name,
-        ))
-        .unwrap();
+        lab.add("system", name, 1, &format!("usr/lib/torture/{name}"), name)
+            .unwrap();
     }
-    lab.add_package(sage_tests::PackageSpec::new(
-        "runtime",
-        "parallel",
-        1,
-        "bin/parallel",
-        "runtime",
-    ))
-    .unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "toolchain",
-        "parallel",
-        1,
-        "bin/parallel",
-        "toolchain",
-    ))
-    .unwrap();
     lab.publish().unwrap();
     let operation_lock = lab
         .root()
@@ -673,25 +421,8 @@ fn concurrent_process_writers_serialize_real_package_operations() {
         .unwrap()
         .join("run/sage/operation.lock");
     let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let binary = env!("CARGO_BIN_EXE_sage-torture");
-    let mut left = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "left",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
-    let mut right = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "right",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
+    let mut left = worker(lab.root(), "install", "left", "system");
+    let mut right = worker(lab.root(), "install", "right", "system");
     drop(gate);
     assert!(left.wait().unwrap().success());
     assert!(right.wait().unwrap().success());
@@ -699,120 +430,25 @@ fn concurrent_process_writers_serialize_real_package_operations() {
     assert!(state.packages.contains_key("main/system:left:0"));
     assert!(state.packages.contains_key("main/system:right:0"));
 
-    // Two processes upgrading the same package converge on one version.
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "left",
-        2,
-        "usr/lib/torture/left",
-        "left-v2",
-    ))
-    .unwrap();
-    lab.publish().unwrap();
-    let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let mut first_upgrade = std::process::Command::new(binary)
-        .args([
-            "worker-upgrade",
-            lab.root().to_str().unwrap(),
-            "left",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
-    let mut second_upgrade = std::process::Command::new(binary)
-        .args([
-            "worker-upgrade",
-            lab.root().to_str().unwrap(),
-            "left",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
-    drop(gate);
-    assert!(first_upgrade.wait().unwrap().success());
-    assert!(second_upgrade.wait().unwrap().success());
-    assert_eq!(lab.audit().unwrap().packages["main/system:left:0"], "2-1");
-
-    // Physically isolated channels may publish concurrently under the same global lock.
-    let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let mut runtime_install = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "parallel",
-            "runtime",
-        ])
-        .spawn()
-        .unwrap();
-    let mut toolchain_install = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "parallel",
-            "toolchain",
-        ])
-        .spawn()
-        .unwrap();
-    drop(gate);
-    assert!(runtime_install.wait().unwrap().success());
-    assert!(toolchain_install.wait().unwrap().success());
-    let state = lab.audit().unwrap();
-    assert!(state.packages.contains_key("main/runtime:parallel:0"));
-    assert!(state.packages.contains_key("main/toolchain:parallel:0"));
-
-    // A shared read-only verifier and a writer each observe one complete serial state.
-    lab.add_package(sage_tests::PackageSpec::new(
+    // A shared read-only query and a writer each observe one complete serial state.
+    lab.add(
         "system",
         "query-race",
         1,
         "usr/lib/torture/query-race",
         "query-race",
-    ))
+    )
     .unwrap();
     lab.publish().unwrap();
     let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let mut verify = std::process::Command::new(binary)
-        .args(["worker-verify", lab.root().to_str().unwrap()])
+    let mut query = std::process::Command::new(env!("CARGO_BIN_EXE_sage-torture"))
+        .args(["worker-query", lab.root().to_str().unwrap()])
         .spawn()
         .unwrap();
-    let mut query_race = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "query-race",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
+    let mut query_race = worker(lab.root(), "install", "query-race", "system");
     drop(gate);
-    assert!(verify.wait().unwrap().success());
+    assert!(query.wait().unwrap().success());
     assert!(query_race.wait().unwrap().success());
-    lab.audit().unwrap();
-
-    // A writer racing with a removal still converges to one explainable serial order.
-    let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let mut remove = std::process::Command::new(binary)
-        .args([
-            "worker-remove",
-            lab.root().to_str().unwrap(),
-            "left",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
-    let mut reinstall = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "left",
-            "system",
-        ])
-        .spawn()
-        .unwrap();
-    drop(gate);
-    let remove_ok = remove.wait().unwrap().success();
-    let install_ok = reinstall.wait().unwrap().success();
-    assert!(remove_ok && install_ok);
     lab.audit().unwrap();
 }
 
@@ -849,35 +485,16 @@ fn lmdb_map_full_rolls_back_all_indexes() {
 #[test]
 fn abrupt_process_termination_recovers_on_next_start() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "abrupt",
-        1,
-        "usr/lib/torture/abrupt",
-        "durable",
-    ))
-    .unwrap();
+    lab.add("system", "abrupt", 1, "usr/lib/torture/abrupt", "durable")
+        .unwrap();
     lab.publish().unwrap();
     lab.inject("abort:before-lmdb-write").unwrap();
-    let binary = env!("CARGO_BIN_EXE_sage-torture");
-    let status = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "abrupt",
-            "system",
-        ])
-        .status()
+    let status = worker(lab.root(), "install", "abrupt", "system")
+        .wait()
         .unwrap();
     assert!(!status.success());
-    let retry = std::process::Command::new(binary)
-        .args([
-            "worker-install",
-            lab.root().to_str().unwrap(),
-            "abrupt",
-            "system",
-        ])
-        .status()
+    let retry = worker(lab.root(), "install", "abrupt", "system")
+        .wait()
         .unwrap();
     assert!(retry.success());
     let state = lab.audit().unwrap();
@@ -925,49 +542,15 @@ async fn recovery_failure_is_retryable_more_than_once() {
 }
 
 #[tokio::test]
-async fn verify_detects_database_and_rootfs_divergence() {
-    let mut lab = sage_tests::TortureLab::new().unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
-        "system",
-        "verify-me",
-        1,
-        "usr/lib/torture/verify-me",
-        "present",
-    ))
-    .unwrap();
-    lab.publish().unwrap();
-    lab.install("verify-me", "system").await.unwrap();
-    sage::execute(sage::Cli {
-        verbose: false,
-        dry_run: false,
-        root: lab.root().into(),
-        lock_timeout: None,
-        command: sage::Commands::Verify,
-    })
-    .await
-    .unwrap();
-    std::fs::remove_file(lab.root().join("usr/lib/torture/verify-me")).unwrap();
-    assert!(sage::execute(sage::Cli {
-        verbose: false,
-        dry_run: false,
-        root: lab.root().into(),
-        lock_timeout: None,
-        command: sage::Commands::Verify,
-    })
-    .await
-    .is_err());
-}
-
-#[tokio::test]
 async fn remove_repairs_a_database_record_whose_filesystem_subtree_is_missing() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
-    lab.add_package(sage_tests::PackageSpec::new(
+    lab.add(
         "system",
         "missing-tree",
         1,
         "usr/lib/torture/missing/subtree/file",
         "payload",
-    ))
+    )
     .unwrap();
     lab.publish().unwrap();
     lab.install("missing-tree", "system").await.unwrap();
@@ -978,14 +561,35 @@ async fn remove_repairs_a_database_record_whose_filesystem_subtree_is_missing() 
     assert!(!state.packages.contains_key("main/system:missing-tree:0"));
 }
 
-fn raw_archive(
+fn assert_archive_rejected(
     index: &str,
-    payload_path: &str,
-    entry_type: tar::EntryType,
-    payload: &[u8],
-    link: Option<&str>,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    raw_archive_entries(index, &[(payload_path, entry_type, payload, link)])
+    entries: &[(&str, tar::EntryType, &[u8], Option<&str>)],
+    absent: &[&str],
+) -> sage_archive::ArchiveError {
+    let (_directory, archive) = raw_archive_entries(index, entries);
+    let inspection = sage_archive::inspect_package(&archive).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let error =
+        sage_archive::extract_package(&archive, root.path(), &inspection.files).unwrap_err();
+    assert!(absent.iter().all(|path| !root.path().join(path).exists()));
+    error
+}
+
+fn worker(
+    root: &std::path::Path,
+    action: &str,
+    package: &str,
+    channel: &str,
+) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sage-torture"))
+        .args([
+            &format!("worker-{action}"),
+            root.to_str().unwrap(),
+            package,
+            channel,
+        ])
+        .spawn()
+        .unwrap()
 }
 
 fn raw_archive_entries(

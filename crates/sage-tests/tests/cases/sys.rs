@@ -5,6 +5,28 @@ mod sys_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
+    fn release(name: &str, version: &str, dependencies: &[&str], provides: &[&str]) -> sage_core::Package {
+        sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", name, "0"),
+            version.parse().unwrap(),
+            dependencies.iter().map(|value| value.parse().unwrap()).collect(),
+            provides.iter().map(|value| (*value).into()).collect(),
+        )
+    }
+
+    fn provider_config(provider: &str, packages: &[&str]) -> SystemConfig {
+        SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: BTreeMap::from([("libc".into(), provider.into())]),
+            packages: packages.iter().map(|value| (*value).into()).collect(),
+            services: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn administrator_trigger_overrides_vendor_definition() {
         let root = tempfile::tempdir().unwrap();
@@ -250,19 +272,9 @@ mod sys_tests {
     #[test]
     fn reconciliation_switches_and_prunes_virtual_provider() {
         let mut universe = sage_solver::PackageUniverse::default();
-        universe.insert(sage_core::Package::from_release(
-            sage_core::PackageKey::new("main/system", "app", "0"),
-            "1-1".parse().unwrap(),
-            vec!["virtual/libc".parse().unwrap()],
-            vec![],
-        ));
+        universe.insert(release("app", "1-1", &["virtual/libc"], &[]));
         for name in ["glibc", "musl"] {
-            universe.insert(sage_core::Package::from_release(
-                sage_core::PackageKey::new("main/system", name, "0"),
-                "1-1".parse().unwrap(),
-                vec![],
-                vec!["virtual/libc".into()],
-            ));
+            universe.insert(release(name, "1-1", &[], &["virtual/libc"]));
         }
         let glibc = sage_db::InstalledPackage {
             key: sage_core::PackageKey::new("main/system", "glibc", "0"),
@@ -275,16 +287,7 @@ mod sys_tests {
             files: vec![],
             config_hashes: BTreeMap::new(),
         };
-        let config = SystemConfig {
-            schema_version: 1,
-            system: SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: BTreeMap::from([("libc".into(), "musl".into())]),
-            packages: BTreeSet::from(["app".into()]),
-            services: BTreeSet::new(),
-        };
+        let config = provider_config("musl", &["app"]);
         let plan = ReconcilePlan::compute(&config, &[glibc], &universe, false).unwrap();
         assert!(plan
             .install
@@ -296,32 +299,13 @@ mod sys_tests {
     #[test]
     fn reconciliation_backtracks_from_conflicting_provider_preference() {
         let mut universe = sage_solver::PackageUniverse::default();
-        let mut app = sage_core::Package::from_release(
-            sage_core::PackageKey::new("main/system", "app", "0"),
-            "1-1".parse().unwrap(),
-            vec!["virtual/libc".parse().unwrap()],
-            vec![],
-        );
+        let mut app = release("app", "1-1", &["virtual/libc"], &[]);
         app.conflicts.push("musl".into());
         universe.insert(app);
         for name in ["glibc", "musl"] {
-            universe.insert(sage_core::Package::from_release(
-                sage_core::PackageKey::new("main/system", name, "0"),
-                "1-1".parse().unwrap(),
-                vec![],
-                vec!["virtual/libc".into()],
-            ));
+            universe.insert(release(name, "1-1", &[], &["virtual/libc"]));
         }
-        let config = SystemConfig {
-            schema_version: 1,
-            system: SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: BTreeMap::from([("libc".into(), "musl".into())]),
-            packages: BTreeSet::from(["app".into()]),
-            services: BTreeSet::new(),
-        };
+        let config = provider_config("musl", &["app"]);
 
         let plan = ReconcilePlan::compute(&config, &[], &universe, false).unwrap();
         assert!(plan.install.iter().any(|(key, _)| key.name == "glibc"));
@@ -332,34 +316,10 @@ mod sys_tests {
     #[test]
     fn reconciliation_binds_the_provider_selected_by_the_virtual_proxy() {
         let mut universe = sage_solver::PackageUniverse::default();
-        universe.insert(sage_core::Package::from_release(
-            sage_core::PackageKey::new("main/system", "app", "0"),
-            "1-1".parse().unwrap(),
-            vec!["virtual/libc >= 2-1".parse().unwrap()],
-            vec![],
-        ));
-        universe.insert(sage_core::Package::from_release(
-            sage_core::PackageKey::new("main/system", "a-explicit", "0"),
-            "1-1".parse().unwrap(),
-            vec![],
-            vec!["virtual/libc".into()],
-        ));
-        universe.insert(sage_core::Package::from_release(
-            sage_core::PackageKey::new("main/system", "z-selected", "0"),
-            "2-1".parse().unwrap(),
-            vec![],
-            vec!["virtual/libc".into()],
-        ));
-        let config = SystemConfig {
-            schema_version: 1,
-            system: SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: BTreeMap::from([("libc".into(), "a-explicit".into())]),
-            packages: BTreeSet::from(["app".into(), "a-explicit".into()]),
-            services: BTreeSet::new(),
-        };
+        universe.insert(release("app", "1-1", &["virtual/libc >= 2-1"], &[]));
+        universe.insert(release("a-explicit", "1-1", &[], &["virtual/libc"]));
+        universe.insert(release("z-selected", "2-1", &[], &["virtual/libc"]));
+        let config = provider_config("a-explicit", &["app", "a-explicit"]);
 
         let plan = ReconcilePlan::compute(&config, &[], &universe, false).unwrap();
         assert_eq!(plan.provider_bindings["libc"].name, "z-selected");

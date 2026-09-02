@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 description = "Streaming tar.zst packaging and openat path traversal safe unpacking for Sage"
 
-[features]
-torture = []
-
 [dependencies]
 sage-core = { workspace = true }
 tar = { workspace = true }

@@ -24,9 +24,6 @@ pub struct Cli {
     /// Target filesystem sysroot prefix.
     #[arg(long, global = true, default_value = "/")]
     pub root: PathBuf,
-    /// Bound the operation-lock wait; omission preserves blocking behavior.
-    #[arg(long, global = true)]
-    pub lock_timeout: Option<u64>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -66,8 +63,6 @@ pub enum Commands {
         #[arg(long)]
         no_prune: bool,
     },
-    /// Verify package records, ownership indexes, and managed path existence.
-    Verify,
     /// Manage software channels and repository indexes.
     Repo {
         #[command(subcommand)]
@@ -161,22 +156,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Commands::Channel {
             action: ChannelAction::List
         } | Commands::Query { .. }
-            | Commands::Verify
     );
     let lock_root = std::fs::canonicalize(&cli.root)
         .with_context(|| format!("cannot resolve target root {}", cli.root.display()))?;
     let lock_path = under_root(&lock_root, Path::new("/run/sage/operation.lock"));
-    let _lock = match (cli.dry_run || read_only, cli.lock_timeout) {
-        (true, Some(seconds)) => sage_core::HostLock::acquire_shared_for(
-            lock_path,
-            std::time::Duration::from_secs(seconds),
-        )?,
-        (false, Some(seconds)) => sage_core::HostLock::acquire_exclusive_for(
-            lock_path,
-            std::time::Duration::from_secs(seconds),
-        )?,
-        (true, None) => sage_core::HostLock::acquire_shared(lock_path)?,
-        (false, None) => sage_core::HostLock::acquire_exclusive(lock_path)?,
+    let _lock = if cli.dry_run || read_only {
+        sage_core::HostLock::acquire_shared(lock_path)?
+    } else {
+        sage_core::HostLock::acquire_exclusive(lock_path)?
     };
     if !cli.dry_run && !read_only {
         settle_journals(&cli.root).await?;
@@ -216,7 +203,6 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Commands::Rebuild { no_prune } => {
             rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
         }
-        Commands::Verify => verify_state(&cli.root)?,
         Commands::Repo { action } => match action {
             RepoAction::Index { dir, sign_key } => {
                 let key = sign_key.context("repo index requires --sign-key")?;

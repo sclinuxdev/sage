@@ -40,88 +40,27 @@ mod repo_tests {
 
     #[test]
     fn channel_paths_and_identifiers_cannot_escape_the_target_root() {
+        let document = |channel: &str,
+                        subchannel: &str,
+                        alias: Option<&str>,
+                        signing_key: &str,
+                        target_root: &str| {
+            let alias = alias.map_or(String::new(), |value| format!("alias=\"{value}\"\n"));
+            format!(
+                "schema_version=1\n[channels.\"{channel}\"]\nurl=\"https://example.invalid\"\npriority=1\nsigning_key=\"{signing_key}\"\n[channels.\"{channel}\".subchannels.\"{subchannel}\"]\n{alias}scope=\"system\"\ntarget_root=\"{target_root}\"\n"
+            )
+        };
         for document in [
-            r#"schema_version=1
-[channels."../outside"]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-"#,
-            r#"schema_version=1
-[channels.".."]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-"#,
-            r#"schema_version=1
-[channels."."]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/../outside"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels.system]
-alias="../outside"
-scope="system"
-target_root="/"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels.system]
-alias=".."
-scope="system"
-target_root="/"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels.system]
-alias="."
-scope="system"
-target_root="/"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels.".."]
-scope="system"
-target_root="/"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels."."]
-scope="system"
-target_root="/"
-"#,
-            r#"schema_version=1
-[channels.main]
-url="https://example.invalid"
-priority=1
-signing_key="/etc/sage/key"
-[channels.main.subchannels.system]
-scope="system"
-target_root="/../outside"
-"#,
+            document("../outside", "system", None, "/etc/sage/key", "/"),
+            document("..", "system", None, "/etc/sage/key", "/"),
+            document(".", "system", None, "/etc/sage/key", "/"),
+            document("main", "system", None, "/etc/sage/../outside", "/"),
+            document("main", "system", Some("../outside"), "/etc/sage/key", "/"),
+            document("main", "system", Some(".."), "/etc/sage/key", "/"),
+            document("main", "system", Some("."), "/etc/sage/key", "/"),
+            document("main", "..", None, "/etc/sage/key", "/"),
+            document("main", ".", None, "/etc/sage/key", "/"),
+            document("main", "system", None, "/etc/sage/key", "/../outside"),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("channels.toml");

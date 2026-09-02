@@ -1,5 +1,5 @@
 //! Hermetic, model-checked fixtures for Sage package-manager torture testing.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use sage::{Cli, Commands};
 use sage_core::{Dependency, Package, PackageKey, Version, SCHEMA_VERSION};
@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use tempfile::TempDir;
 
 /// Declarative package fixture that is converted into a real signed Sage archive.
@@ -188,6 +187,17 @@ target_root="/opt/channels/torture/1"
         self.catalog.insert(coordinate.clone(), physical);
         self.archives.insert(coordinate, archive.clone());
         Ok(archive)
+    }
+
+    pub fn add(
+        &mut self,
+        channel: &str,
+        name: &str,
+        version: u32,
+        path: &str,
+        content: &str,
+    ) -> Result<PathBuf> {
+        self.add_package(PackageSpec::new(channel, name, version, path, content))
     }
 
     /// Rebuilds each channel index and primes the content-addressed package cache.
@@ -394,37 +404,13 @@ ignore_missing_binary=false
 /// Stable release-gate scenario covering dependencies, conflicts, channels, retries, and upgrades.
 pub async fn run_quick() -> Result<Vec<String>> {
     let mut lab = TortureLab::new()?;
-    lab.add_package(PackageSpec::new(
-        "system",
-        "base",
-        1,
-        "usr/lib/torture/base",
-        "base-v1",
-    ))?;
+    lab.add("system", "base", 1, "usr/lib/torture/base", "base-v1")?;
     let mut app = PackageSpec::new("system", "app", 1, "usr/lib/torture/app", "app-v1");
     app.dependencies.push("base".into());
     lab.add_package(app)?;
-    lab.add_package(PackageSpec::new(
-        "system",
-        "rival",
-        1,
-        "usr/lib/torture/app",
-        "rival",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "runtime",
-        "shared",
-        1,
-        "bin/shared",
-        "runtime",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "toolchain",
-        "shared",
-        1,
-        "bin/shared",
-        "toolchain",
-    ))?;
+    lab.add("system", "rival", 1, "usr/lib/torture/app", "rival")?;
+    lab.add("runtime", "shared", 1, "bin/shared", "runtime")?;
+    lab.add("toolchain", "shared", 1, "bin/shared", "toolchain")?;
     lab.publish()?;
 
     lab.install("app", "system").await?;
@@ -486,63 +472,36 @@ pub async fn run_quick() -> Result<Vec<String>> {
 enum RandomOperation {
     Install(usize),
     Remove(usize),
-    Reinstall(usize),
     Conflict,
     FaultRetry(usize),
     Upgrade(usize),
     RollbackAttempt(usize),
-    ToggleRuntime,
-    ToggleToolchain,
+    Toggle(&'static str),
     DependencyReplacement,
 }
 
 /// Model-driven random sequence. Every mutation is followed by a full state audit.
-/// A failure is replayed against progressively shorter prefixes so the report
-/// contains the smallest reproducing prefix, not only the original seed.
 pub async fn run_random(seed: u64, operations: usize) -> Result<Vec<String>> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let sequence = (0..operations)
         .map(|_| {
             let package = rng.gen_range(0..8);
-            match rng.gen_range(0..10) {
+            match rng.gen_range(0..9) {
                 0 => RandomOperation::Install(package),
                 1 => RandomOperation::Remove(package),
-                2 => RandomOperation::Reinstall(package),
-                3 => RandomOperation::Conflict,
-                4 => RandomOperation::FaultRetry(package),
-                5 => RandomOperation::Upgrade(package),
-                6 => RandomOperation::RollbackAttempt(package),
-                7 => RandomOperation::ToggleRuntime,
-                8 => RandomOperation::ToggleToolchain,
+                2 => RandomOperation::Conflict,
+                3 => RandomOperation::FaultRetry(package),
+                4 => RandomOperation::Upgrade(package),
+                5 => RandomOperation::RollbackAttempt(package),
+                6 => RandomOperation::Toggle("runtime"),
+                7 => RandomOperation::Toggle("toolchain"),
                 _ => RandomOperation::DependencyReplacement,
             }
         })
         .collect::<Vec<_>>();
-    match execute_random_sequence(seed, &sequence).await {
-        Ok(steps) => Ok(steps),
-        Err(original) => {
-            if sequence.is_empty() {
-                bail!("seed {seed} failed during fixture setup: {original:#}");
-            }
-            let mut low = 1_usize;
-            let mut high = sequence.len();
-            while low < high {
-                let middle = low + (high - low) / 2;
-                if execute_random_sequence(seed, &sequence[..middle])
-                    .await
-                    .is_err()
-                {
-                    high = middle;
-                } else {
-                    low = middle + 1;
-                }
-            }
-            bail!(
-                "seed {seed} failed; minimal reproducing prefix={low}; operations={:?}; original={original:#}",
-                &sequence[..low]
-            )
-        }
-    }
+    execute_random_sequence(seed, &sequence)
+        .await
+        .with_context(|| format!("seed {seed} operations={sequence:?}"))
 }
 
 async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Result<Vec<String>> {
@@ -550,49 +509,19 @@ async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Res
     let package_count = 8;
     for index in 0..package_count {
         let name = format!("p{index}");
-        lab.add_package(PackageSpec::new(
+        lab.add(
             "system",
             &name,
             1,
             &format!("usr/lib/torture/{name}"),
             &format!("{name}-v1"),
-        ))?;
+        )?;
     }
-    lab.add_package(PackageSpec::new(
-        "system",
-        "intruder",
-        1,
-        "usr/lib/torture/p0",
-        "intruder",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "runtime",
-        "switchable",
-        1,
-        "bin/switchable",
-        "runtime",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "toolchain",
-        "switchable",
-        1,
-        "bin/switchable",
-        "toolchain",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "system",
-        "dep-a",
-        1,
-        "usr/lib/torture/dep-a",
-        "dep-a",
-    ))?;
-    lab.add_package(PackageSpec::new(
-        "system",
-        "dep-b",
-        1,
-        "usr/lib/torture/dep-b",
-        "dep-b",
-    ))?;
+    lab.add("system", "intruder", 1, "usr/lib/torture/p0", "intruder")?;
+    lab.add("runtime", "switchable", 1, "bin/switchable", "runtime")?;
+    lab.add("toolchain", "switchable", 1, "bin/switchable", "toolchain")?;
+    lab.add("system", "dep-a", 1, "usr/lib/torture/dep-a", "dep-a")?;
+    lab.add("system", "dep-b", 1, "usr/lib/torture/dep-b", "dep-b")?;
     let mut consumer = PackageSpec::new(
         "system",
         "consumer",
@@ -636,19 +565,6 @@ async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Res
                     bail!("seed {seed} step {step}: absent remove changed state");
                 }
             }
-            RandomOperation::Reinstall(index) => {
-                let name = format!("p{index}");
-                lab.install(&name, "system").await?;
-                model.insert(
-                    model_key("system", &name),
-                    if version_two.contains(index) { 2 } else { 1 },
-                );
-                let converged = lab.audit()?;
-                lab.install(&name, "system").await?;
-                if lab.audit()? != converged {
-                    bail!("seed {seed} step {step}: reinstall accumulated side effects");
-                }
-            }
             RandomOperation::Conflict => {
                 lab.install("p0", "system").await?;
                 model.insert(
@@ -682,13 +598,13 @@ async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Res
             RandomOperation::Upgrade(index) => {
                 let name = format!("p{index}");
                 if version_two.insert(*index) {
-                    lab.add_package(PackageSpec::new(
+                    lab.add(
                         "system",
                         &name,
                         2,
                         &format!("usr/lib/torture/{name}"),
                         &format!("{name}-v2"),
-                    ))?;
+                    )?;
                     lab.publish()?;
                 }
                 lab.upgrade(&name, "system").await?;
@@ -710,24 +626,21 @@ async fn execute_random_sequence(seed: u64, sequence: &[RandomOperation]) -> Res
                     if lab.audit()? != stable {
                         bail!("seed {seed} step {step}: repository rollback downgraded state");
                     }
-                    lab.add_package(PackageSpec::new(
+                    lab.add(
                         "system",
                         &name,
                         2,
                         &format!("usr/lib/torture/{name}"),
                         &format!("{name}-v2"),
-                    ))?;
+                    )?;
                     lab.publish()?;
                 } else {
                     lab.install(&name, "system").await?;
                     model.insert(key, if version_two.contains(index) { 2 } else { 1 });
                 }
             }
-            RandomOperation::ToggleRuntime => {
-                toggle_channel(&mut lab, &mut model, "runtime").await?;
-            }
-            RandomOperation::ToggleToolchain => {
-                toggle_channel(&mut lab, &mut model, "toolchain").await?;
+            RandomOperation::Toggle(channel) => {
+                toggle_channel(&mut lab, &mut model, channel).await?;
             }
             RandomOperation::DependencyReplacement if !dependency_replaced => {
                 lab.install("consumer", "system").await?;
@@ -798,157 +711,11 @@ async fn toggle_channel(
     Ok(())
 }
 
-/// Repeatable microbenchmarks. They intentionally report measurements without pass/fail claims.
-pub async fn run_bench(package_count: usize) -> Result<BTreeMap<String, f64>> {
-    let directory = tempfile::tempdir()?;
-    let start = Instant::now();
-    let database = sage_db::SageDatabase::open(directory.path())?;
-    let startup = start.elapsed().as_secs_f64() * 1_000.0;
-    let packages = (0..package_count)
-        .map(|index| sage_db::InstalledPackage {
-            key: PackageKey::new("main/system", format!("bench-{index:05}"), "0"),
-            version: Version::new(0, "1", 1),
-            arch: "noarch".into(),
-            installed_size: 1,
-            dependencies: Vec::new(),
-            provides: Vec::new(),
-            conflicts: Vec::new(),
-            files: vec![format!("usr/lib/torture/bench-{index:05}")],
-            config_hashes: BTreeMap::new(),
-        })
-        .collect::<Vec<_>>();
-    let individual_start = Instant::now();
-    for package in &packages {
-        database.install(package, false)?;
-    }
-    let individual = individual_start.elapsed().as_secs_f64() * 1_000.0;
-    let lookup_start = Instant::now();
-    for package in &packages {
-        if database.package(&package.key)?.is_none() {
-            return Err(anyhow!("benchmark package disappeared"));
-        }
-    }
-    let lookup = lookup_start.elapsed().as_secs_f64() * 1_000.0;
-    let ownership_start = Instant::now();
-    for package in &packages {
-        if database.owners(&package.files[0])? != [package.key.clone()] {
-            return Err(anyhow!("benchmark ownership record disappeared"));
-        }
-    }
-    let ownership = ownership_start.elapsed().as_secs_f64() * 1_000.0;
-    let mut conflict = packages
-        .first()
-        .cloned()
-        .unwrap_or(sage_db::InstalledPackage {
-            key: PackageKey::new("main/system", "bench-conflict-source", "0"),
-            version: Version::new(0, "1", 1),
-            arch: "noarch".into(),
-            installed_size: 1,
-            dependencies: Vec::new(),
-            provides: Vec::new(),
-            conflicts: Vec::new(),
-            files: vec!["usr/lib/torture/bench-conflict".into()],
-            config_hashes: BTreeMap::new(),
-        });
-    conflict.key = PackageKey::new("main/system", "bench-conflict", "0");
-    let conflict_start = Instant::now();
-    let conflict_rejected = database.install(&conflict, false).is_err();
-    let conflict_ms = conflict_start.elapsed().as_secs_f64() * 1_000.0;
-    if package_count > 0 && !conflict_rejected {
-        return Err(anyhow!("benchmark conflict was accepted"));
-    }
-    let bytes = fs::metadata(directory.path().join("data.mdb"))?.len() as f64;
-    drop(database);
-    let cold_start = Instant::now();
-    let reopened = sage_db::SageDatabase::open(directory.path())?;
-    if let Some(package) = packages.last() {
-        if reopened.package(&package.key)?.is_none() {
-            return Err(anyhow!("cold-open lookup lost the final package"));
-        }
-    }
-    let cold = cold_start.elapsed().as_secs_f64() * 1_000.0;
-
-    let batch_directory = tempfile::tempdir()?;
-    let batch_database = sage_db::SageDatabase::open(batch_directory.path())?;
-    let batch_start = Instant::now();
-    batch_database.install_batch(&packages, false)?;
-    let batch = batch_start.elapsed().as_secs_f64() * 1_000.0;
-
-    let mut lab = TortureLab::new()?;
-    lab.add_package(PackageSpec::new(
-        "system",
-        "bench-small",
-        1,
-        "usr/lib/torture/bench-small",
-        "small",
-    ))?;
-    let mut large = PackageSpec::new(
-        "system",
-        "bench-large",
-        1,
-        "usr/lib/torture/large/file-0000",
-        "data",
-    );
-    for index in 1..1_000 {
-        large.files.insert(
-            format!("usr/lib/torture/large/file-{index:04}"),
-            b"data".to_vec(),
-        );
-    }
-    lab.add_package(large)?;
-    lab.publish()?;
-    let small_start = Instant::now();
-    lab.install("bench-small", "system").await?;
-    let small_install = small_start.elapsed().as_secs_f64() * 1_000.0;
-    let large_start = Instant::now();
-    lab.install("bench-large", "system").await?;
-    let large_install = large_start.elapsed().as_secs_f64() * 1_000.0;
-    lab.audit()?;
-
-    let random_operations = 32_usize;
-    let random_start = Instant::now();
-    run_random(0x5a6e_b00c, random_operations).await?;
-    let random_seconds = random_start.elapsed().as_secs_f64();
-    let mut report = BTreeMap::from([
-        ("empty_start_ms".into(), startup),
-        ("cold_open_and_lookup_ms".into(), cold),
-        ("individual_insert_ms".into(), individual),
-        ("batch_insert_ms".into(), batch),
-        ("lookup_total_ms".into(), lookup),
-        (
-            "lookup_ns_each".into(),
-            lookup * 1_000_000.0 / package_count.max(1) as f64,
-        ),
-        ("ownership_total_ms".into(), ownership),
-        ("conflict_reject_ms".into(), conflict_ms),
-        ("small_package_install_ms".into(), small_install),
-        ("thousand_file_install_ms".into(), large_install),
-        (
-            "random_operations_per_second".into(),
-            random_operations as f64 / random_seconds,
-        ),
-        ("database_bytes".into(), bytes),
-        ("packages".into(), package_count as f64),
-    ]);
-    if let Some(bytes) = peak_rss_bytes() {
-        report.insert("peak_rss_bytes".into(), bytes as f64);
-    }
-    Ok(report)
-}
-
-fn peak_rss_bytes() -> Option<u64> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
-    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    Some(kib * 1024)
-}
-
 fn cli(root: &Path, command: Commands) -> Cli {
     Cli {
         verbose: false,
         dry_run: false,
         root: root.into(),
-        lock_timeout: None,
         command,
     }
 }

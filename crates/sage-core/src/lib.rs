@@ -47,8 +47,6 @@ pub enum CoreError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("timed out waiting for host lock at {0}")]
-    LockTimedOut(PathBuf),
     #[error("invalid version string '{0}'")]
     InvalidVersion(String),
     #[error("invalid package key string '{0}'")]
@@ -594,11 +592,6 @@ pub struct HostLock {
     path: PathBuf,
 }
 
-enum TryLockError {
-    Busy,
-    Fatal(CoreError),
-}
-
 impl HostLock {
     pub fn acquire_shared(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::acquire(path, false)
@@ -606,19 +599,6 @@ impl HostLock {
     pub fn acquire_exclusive(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         Self::acquire(path, true)
     }
-    pub fn acquire_shared_for(
-        path: impl AsRef<Path>,
-        timeout: std::time::Duration,
-    ) -> Result<Self, CoreError> {
-        Self::acquire_for(path, false, timeout)
-    }
-    pub fn acquire_exclusive_for(
-        path: impl AsRef<Path>,
-        timeout: std::time::Duration,
-    ) -> Result<Self, CoreError> {
-        Self::acquire_for(path, true, timeout)
-    }
-
     fn acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
         let path = path.as_ref().to_path_buf();
         let file = open_lock_file(&path)?;
@@ -632,47 +612,6 @@ impl HostLock {
             source,
         })?;
         Ok(Self { file, path })
-    }
-
-    fn try_acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, TryLockError> {
-        let path = path.as_ref().to_path_buf();
-        let file = open_lock_file(&path).map_err(TryLockError::Fatal)?;
-        let result = if exclusive {
-            fs2::FileExt::try_lock_exclusive(&file)
-        } else {
-            fs2::FileExt::try_lock_shared(&file)
-        };
-        match result {
-            Ok(()) => Ok(Self { file, path }),
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(TryLockError::Busy)
-            }
-            Err(source) => Err(TryLockError::Fatal(CoreError::LockFailed { path, source })),
-        }
-    }
-
-    fn acquire_for(
-        path: impl AsRef<Path>,
-        exclusive: bool,
-        timeout: std::time::Duration,
-    ) -> Result<Self, CoreError> {
-        let path = path.as_ref().to_path_buf();
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                CoreError::InvalidMetadata("operation lock timeout is out of range".into())
-            })?;
-        loop {
-            match Self::try_acquire(&path, exclusive) {
-                Ok(lock) => return Ok(lock),
-                Err(TryLockError::Busy) if std::time::Instant::now() < deadline => {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
-                }
-                Err(TryLockError::Busy) => return Err(CoreError::LockTimedOut(path)),
-                Err(TryLockError::Fatal(error)) => return Err(error),
-            }
-        }
     }
 
     pub fn path(&self) -> &Path {
