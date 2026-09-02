@@ -648,6 +648,7 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
         .count();
     let mut normal_index = 0_usize;
     for component in parent.components() {
+        validate_lock_ancestor(&current, path)?;
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => {
@@ -682,9 +683,6 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
         .map_err(errno_io)?;
         // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
         let next = unsafe { OwnedFd::from_raw_fd(next) };
-        if normal_index + 1 == normal_components {
-            validate_lock_ancestor(&next, path)?;
-        }
         if normal_index == normal_components {
             harden_lock_directory(&next, path)?;
         }
@@ -712,7 +710,9 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
 
 fn validate_lock_ancestor(directory: &OwnedFd, path: &Path) -> Result<(), CoreError> {
     let metadata = fstat(directory.as_raw_fd()).map_err(errno_io)?;
-    if metadata.st_uid != geteuid().as_raw() || metadata.st_mode & 0o022 != 0 {
+    let trusted_owner = metadata.st_uid == 0 || metadata.st_uid == geteuid().as_raw();
+    let unsafe_writable = metadata.st_mode & 0o022 != 0 && metadata.st_mode & 0o1000 == 0;
+    if !trusted_owner || unsafe_writable {
         return Err(CoreError::InvalidMetadata(format!(
             "operation lock parent is not trusted: {}",
             path.parent()

@@ -498,6 +498,14 @@ fn host_lock_namespace_is_anchored_and_private() {
     assert!(
         sage_core::HostLock::acquire_exclusive(unsafe_run.join("sage/operation.lock")).is_err()
     );
+
+    let unsafe_tree = unsafe_root.path().join("shared");
+    std::fs::create_dir(&unsafe_tree).unwrap();
+    std::fs::set_permissions(&unsafe_tree, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(sage_core::HostLock::acquire_exclusive(
+        unsafe_tree.join("root/run/sage/operation.lock")
+    )
+    .is_err());
 }
 
 #[test]
