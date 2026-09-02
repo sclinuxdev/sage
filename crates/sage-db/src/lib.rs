@@ -40,7 +40,7 @@ pub struct InstalledPackage {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub files: Vec<String>,
-    /// Original package hashes for three-way configuration upgrades.
+    /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
