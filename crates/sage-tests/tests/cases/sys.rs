@@ -311,13 +311,40 @@ mod sys_tests {
         ));
         let retained = ReconcilePlan::compute(
             &empty,
-            &[runtime, installed_lib],
+            &[runtime.clone(), installed_lib],
             &current_universe,
             false,
         )
         .unwrap();
         assert!(retained.install.is_empty());
         assert!(retained.remove.is_empty());
+
+        let mut virtual_root = runtime.clone();
+        virtual_root.dependencies = vec!["virtual/libc".parse().unwrap()];
+        let mut glibc = old.clone();
+        glibc.key = sage_core::PackageKey::new("main/system", "glibc", "0");
+        glibc.provides = vec!["virtual/libc".into()];
+        let mut musl = glibc.clone();
+        musl.key = sage_core::PackageKey::new("main/system", "musl", "0");
+        let mut provider_universe = sage_solver::PackageUniverse::default();
+        for package in [&virtual_root, &glibc, &musl] {
+            provider_universe.insert(sage_core::Package::from_release(
+                package.key.clone(),
+                package.version.clone(),
+                package.dependencies.clone(),
+                package.provides.clone(),
+            ));
+        }
+        let mut provider_config = empty.clone();
+        provider_config.providers.insert("libc".into(), "musl".into());
+        let retained = ReconcilePlan::compute(
+            &provider_config,
+            &[virtual_root, glibc.clone(), musl],
+            &provider_universe,
+            false,
+        )
+        .unwrap();
+        assert_eq!(retained.remove, vec![glibc.key]);
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
         universe.insert(old_release);

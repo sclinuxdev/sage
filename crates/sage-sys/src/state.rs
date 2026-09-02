@@ -73,6 +73,7 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
+        let preferences = config.provider_preferences("main/system")?;
         let installed_by_key = installed
             .iter()
             .map(|package| (package.key.clone(), package))
@@ -90,9 +91,16 @@ impl ReconcilePlan {
                 .get(&key)
                 .expect("retained package came from installed state");
             for dependency in &package.dependencies {
-                for candidate in installed
+                let preferred = preferences.get(&dependency.name);
+                if let Some(candidate) = installed
                     .iter()
                     .filter(|candidate| installed_satisfies(&package.key, dependency, candidate))
+                    .min_by_key(|candidate| {
+                        let direct = !dependency.name.starts_with("virtual/")
+                            && !dependency.name.starts_with("so:")
+                            && candidate.key.name == dependency.name;
+                        (!direct, preferred != Some(&candidate.key), candidate.key.clone())
+                    })
                 {
                     if retained_keys.insert(candidate.key.clone()) {
                         pending.insert(candidate.key.clone());
@@ -122,7 +130,6 @@ impl ReconcilePlan {
         });
         let universe = retained_universe.as_ref().unwrap_or(universe);
         let mut roots = config.package_keys("main/system")?;
-        let preferences = config.provider_preferences("main/system")?;
         if !retained.is_empty() {
             roots.extend(retained.iter().map(|package| package.key.clone()));
             roots.sort();
@@ -224,10 +231,10 @@ fn installed_satisfies(
     } else {
         parent.channel.clone()
     };
-    let identity_matches = candidate.key.name == dependency.name
-        || candidate.provides.contains(&dependency.name);
+    let direct = !virtual_dependency && candidate.key.name == dependency.name;
+    let identity_matches = direct || candidate.provides.contains(&dependency.name);
     let slot_matches = dependency.slot.as_deref().map_or_else(
-        || virtual_dependency || candidate.key.slot == sage_core::DEFAULT_SLOT,
+        || virtual_dependency || !direct || candidate.key.slot == sage_core::DEFAULT_SLOT,
         |slot| candidate.key.slot == slot,
     );
     candidate.key.channel == channel
