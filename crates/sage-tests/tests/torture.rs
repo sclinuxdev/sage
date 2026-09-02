@@ -153,6 +153,8 @@ async fn malformed_package_preflight_does_not_leave_a_recovery_journal() {
         .unwrap();
     lab.add("system", "blocked", 1, "usr/lib/torture/blocked", "blocked")
         .unwrap();
+    lab.add("system", "linked", 1, "opt/app-link/file", "linked")
+        .unwrap();
     write_raw_archive(
         &malformed,
         &format!("usr/hard\t0644\t0\t{}\n", "0".repeat(64)),
@@ -180,6 +182,16 @@ async fn malformed_package_preflight_does_not_leave_a_recovery_journal() {
         assert!(database.packages().unwrap().is_empty());
     }
     assert!(lab.root().join("usr/lib/torture/blocked").is_dir());
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(lab.root().join("opt")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), lab.root().join("opt/app-link")).unwrap();
+    assert!(lab.install("linked", "system").await.is_err());
+    {
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert!(database.pending_journals().unwrap().is_empty());
+        assert!(database.packages().unwrap().is_empty());
+    }
+    assert!(!outside.path().join("file").exists());
     lab.install("healthy", "system").await.unwrap();
     lab.audit().unwrap();
 }

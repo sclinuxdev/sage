@@ -622,16 +622,27 @@ async fn preflight_packages(
         }
     }
     for (path, claimant) in &planned {
-        match std::fs::symlink_metadata(under_root(root, Path::new(path))) {
-            Ok(metadata) if metadata.is_dir() => {
-                bail!("file conflict for {path}: destination is a directory")
+        let components = Path::new(path)
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut destination = root.to_path_buf();
+        for (index, component) in components.iter().enumerate() {
+            destination.push(component);
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
+                    bail!("file hierarchy conflict for {path}: an ancestor is not a directory")
+                }
+                Ok(metadata) if index + 1 == components.len() && metadata.is_dir() => {
+                    bail!("file conflict for {path}: destination is a directory")
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-                bail!("file hierarchy conflict for {path}: an ancestor is not a directory")
-            }
-            Err(error) => return Err(error.into()),
         }
         for ancestor in Path::new(path).ancestors().skip(1) {
             if ancestor.as_os_str().is_empty() {
