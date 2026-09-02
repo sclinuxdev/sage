@@ -43,6 +43,12 @@ pub struct InstalledPackage {
     /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
+/// Exact declarative rebuild tail replayed after package publication recovers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildContinuation {
+    pub provider_bindings: BTreeMap<String, PackageKey>,
+    pub system_config: Vec<u8>,
+}
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -56,6 +62,7 @@ pub enum JournalAction {
         removed_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
         removal_trigger_documents: Vec<Vec<u8>>,
+        rebuild: Option<RebuildContinuation>,
     },
     Remove {
         packages: Vec<InstalledPackage>,

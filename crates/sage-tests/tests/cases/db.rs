@@ -83,6 +83,7 @@ mod db_tests {
                 removed_paths: vec![],
                 previous_alternative_documents: vec![],
                 removal_trigger_documents: vec![],
+                rebuild: None,
             },
         );
         SageDatabase::open(dir.path())
@@ -105,6 +106,7 @@ mod db_tests {
             removed_paths: vec![],
             previous_alternative_documents: vec![],
             removal_trigger_documents: vec![],
+            rebuild: None,
         };
         let mut record = JournalRecord::new("op-1".into(), "packages", action.clone());
         record.stage = "triggers".into();

@@ -362,6 +362,7 @@ async fn apply_packages(
             &config.system.architecture,
             &changes,
             &[],
+            None,
         )
         .await?;
     }
@@ -427,6 +428,7 @@ async fn publish_packages(
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
     retired: &[sage_db::InstalledPackage],
+    rebuild: Option<sage_db::RebuildContinuation>,
 ) -> Result<()> {
     let changes =
         preflight_packages(root, database, available, architecture, changes, retired).await?;
@@ -457,6 +459,7 @@ async fn publish_packages(
                 Path::new("usr/share/sage/alternatives"),
             )?,
             removal_trigger_documents: trigger_documents(root)?,
+            rebuild,
         },
     );
     database.write_journal(&journal)?;
@@ -741,12 +744,13 @@ async fn resume_install(
     journal: &mut sage_db::JournalRecord,
 ) -> Result<()> {
     journal.validate()?;
-    let (architecture, changes, previous_packages, retired_packages) = match &journal.action {
+    let (architecture, changes, previous_packages, retired_packages, rebuild) = match &journal.action {
         sage_db::JournalAction::Install {
             architecture,
             changes,
             previous_packages,
             retired_packages,
+            rebuild,
             ..
         } => (
             architecture.clone(),
@@ -757,6 +761,7 @@ async fn resume_install(
                 .map(|package| (package.key.clone(), package))
                 .collect::<BTreeMap<_, _>>(),
             retired_packages.clone(),
+            rebuild.clone(),
         ),
         _ => bail!("install recovery received a removal journal"),
     };
@@ -978,9 +983,54 @@ async fn resume_install(
         root,
         sage_sys::TriggerEvent::PostChange,
     )?;
-    journal.advance("complete");
+    journal.advance(if rebuild.is_some() {
+        "rebuild-bindings"
+    } else {
+        "complete"
+    });
     database.write_journal(journal)?;
     crash_point(root, "trigger-complete")?;
+    }
+    if journal.stage == "rebuild-bindings" {
+        let continuation = rebuild
+            .as_ref()
+            .context("rebuild journal is missing its continuation")?;
+        database.replace_system_providers(&continuation.provider_bindings)?;
+        journal.advance("rebuild-services");
+        database.write_journal(journal)?;
+        crash_point(root, "rebuild-bindings")?;
+    }
+    if journal.stage == "rebuild-services" {
+        let continuation = rebuild
+            .as_ref()
+            .context("rebuild journal is missing its continuation")?;
+        let config: sage_sys::SystemConfig =
+            toml::from_str(std::str::from_utf8(&continuation.system_config)?)?;
+        let init_provider = continuation
+            .provider_bindings
+            .get("init")
+            .context("rebuild journal has no resolved init provider")?;
+        let state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
+        let previous = state_path
+            .exists()
+            .then(|| sage_sys::RenderedServicesState::load(&state_path))
+            .transpose()?;
+        render_services(root, &config, &init_provider.name, false, previous.as_ref())?;
+        journal.advance("rebuild-triggers");
+        database.write_journal(journal)?;
+        crash_point(root, "rebuild-services")?;
+    }
+    if journal.stage == "rebuild-triggers" {
+        let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+        sage_sys::TriggerEngine::execute_triggers_for(
+            &triggers,
+            &[PathBuf::from("etc/sage/system.toml")],
+            root,
+            sage_sys::TriggerEvent::Rebuild,
+        )?;
+        journal.advance("complete");
+        database.write_journal(journal)?;
+        crash_point(root, "rebuild-triggers")?;
     }
     database.finish_journal(&journal.op_id)?;
     Ok(())
@@ -1296,6 +1346,7 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     let init_provider = plan
         .provider_bindings
         .get("init")
+        .cloned()
         .context("system providers must select an init implementation")?;
     let rendered_state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
     let previous_services = rendered_state_path
@@ -1321,43 +1372,34 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     for package in &retired {
         println!("Remove {} {}", package.key, package.version);
     }
-    if !dry_run && (!changes.is_empty() || !retired.is_empty()) {
-        let database = sage_db::SageDatabase::open(&db_path)?;
-        publish_packages(
-            root,
-            &database,
-            &available,
-            &config.system.architecture,
-            &changes,
-            &retired,
-        )
-        .await?;
-    }
     if dry_run {
         for (interface, key) in &plan.provider_bindings {
             println!("Would bind virtual/{interface} to {key}");
         }
-    } else {
-        sage_db::SageDatabase::open(&db_path)?
-            .replace_system_providers(&plan.provider_bindings)?;
-    }
-    render_services(
-        root,
-        &config,
-        &init_provider.name,
-        dry_run,
-        previous_services.as_ref(),
-    )?;
-    if !dry_run {
-        let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
-        sage_sys::TriggerEngine::execute_triggers_for(
-            &triggers,
-            &[PathBuf::from("etc/sage/system.toml")],
+        render_services(
             root,
-            sage_sys::TriggerEvent::Rebuild,
+            &config,
+            &init_provider.name,
+            true,
+            previous_services.as_ref(),
         )?;
+        return Ok(());
     }
-    Ok(())
+    let continuation = sage_db::RebuildContinuation {
+        provider_bindings: plan.provider_bindings,
+        system_config: toml::to_string(&config)?.into_bytes(),
+    };
+    let database = sage_db::SageDatabase::open(&db_path)?;
+    publish_packages(
+        root,
+        &database,
+        &available,
+        &config.system.architecture,
+        &changes,
+        &retired,
+        Some(continuation),
+    )
+    .await
 }
 fn render_services(
     root: &Path,
@@ -1584,6 +1626,21 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
 mod package_ops_tests {
     use super::*;
 
+    fn system_config(provider: Option<&str>) -> sage_sys::SystemConfig {
+        sage_sys::SystemConfig {
+            schema_version: 1,
+            system: sage_sys::SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers: provider
+                .map(|provider| BTreeMap::from([("init".into(), provider.into())]))
+                .unwrap_or_default(),
+            packages: BTreeSet::new(),
+            services: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn service_rendering_uses_the_resolved_init_provider() {
         let root = tempfile::tempdir().unwrap();
@@ -1591,16 +1648,7 @@ mod package_ops_tests {
         std::fs::create_dir_all(&rclass).unwrap();
         let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n";
         std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
-        let config = sage_sys::SystemConfig {
-            schema_version: 1,
-            system: sage_sys::SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: BTreeMap::from([("init".into(), "systemd".into())]),
-            packages: BTreeSet::new(),
-            services: BTreeSet::new(),
-        };
+        let config = system_config(Some("systemd"));
 
         render_services(root.path(), &config, "loom", false, None).unwrap();
         let state = sage_sys::RenderedServicesState::load(
@@ -1633,16 +1681,7 @@ mod package_ops_tests {
     #[test]
     fn dry_run_does_not_load_a_planned_init_renderer() {
         let root = tempfile::tempdir().unwrap();
-        let config = sage_sys::SystemConfig {
-            schema_version: 1,
-            system: sage_sys::SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: BTreeMap::new(),
-            packages: BTreeSet::new(),
-            services: BTreeSet::new(),
-        };
+        let config = system_config(None);
         render_services(root.path(), &config, "not-installed", true, None).unwrap();
     }
 
@@ -1671,5 +1710,57 @@ mod package_ops_tests {
         rebuild_system(root.path(), false, false).await.unwrap_err();
         let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
         assert_eq!(database.system_provider("init").unwrap(), Some(key));
+    }
+
+    #[tokio::test]
+    async fn journal_recovery_completes_the_rebuild_tail() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
+        std::fs::write(
+            root.path().join("etc/sage/channels.toml"),
+            "schema_version=1\n[channels]\n",
+        )
+        .unwrap();
+        let rclass = root.path().join("usr/share/sage/rclass");
+        std::fs::create_dir_all(&rclass).unwrap();
+        std::fs::write(
+            rclass.join("init-loom.toml"),
+            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n",
+        )
+        .unwrap();
+        let key = sage_core::PackageKey::new("main/system", "loom", "0");
+        let config = system_config(Some("loom"));
+        {
+            let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+            let journal = sage_db::JournalRecord::new(
+                "rebuild-tail".into(),
+                "rebuild-bindings",
+                sage_db::JournalAction::Install {
+                    architecture: "amd64".into(),
+                    changes: vec![],
+                    previous_packages: vec![],
+                    retired_packages: vec![],
+                    modified_paths: vec![],
+                    removed_paths: vec![],
+                    previous_alternative_documents: vec![],
+                    removal_trigger_documents: vec![],
+                    rebuild: Some(sage_db::RebuildContinuation {
+                        provider_bindings: BTreeMap::from([("init".into(), key.clone())]),
+                        system_config: toml::to_string(&config).unwrap().into_bytes(),
+                    }),
+                },
+            );
+            database.write_journal(&journal).unwrap();
+        }
+
+        settle_journals(root.path()).await.unwrap();
+        let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+        assert_eq!(database.system_provider("init").unwrap(), Some(key));
+        assert!(database.pending_journals().unwrap().is_empty());
+        let state = sage_sys::RenderedServicesState::load(
+            root.path().join("var/lib/sage/rendered-services.toml"),
+        )
+        .unwrap();
+        assert_eq!(state.provider, "loom");
     }
 }
