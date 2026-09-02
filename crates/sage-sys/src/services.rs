@@ -46,6 +46,7 @@ pub struct ServiceDocument {
 pub struct RenderedServicesState {
     pub schema_version: u32,
     pub provider: String,
+    pub generator: TemplateServiceGenerator,
     pub services: Vec<ServiceSpec>,
     #[serde(default)]
     pub enabled: BTreeSet<String>,
@@ -267,7 +268,7 @@ struct InitRclass {
 }
 
 /// Generic target/template pair loaded from an `init-*.toml` rclass.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateServiceGenerator {
     #[serde(rename = "target_path")]
