@@ -25,7 +25,7 @@ pub enum SolverError {
 /// Solver releases use the canonical package record without a conversion layer.
 pub type PackageRelease = Package;
 /// Compact package universe assembled from mmap-backed repository point queries.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PackageUniverse {
     releases: BTreeMap<PackageKey, BTreeMap<Version, PackageRelease>>,
     providers: HashMap<String, Vec<PackageKey>>,

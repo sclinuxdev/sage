@@ -78,8 +78,11 @@ mod db_tests {
                 architecture: "amd64".into(),
                 changes: vec![],
                 previous_packages: vec![],
+                retired_packages: vec![],
                 modified_paths: vec![],
+                removed_paths: vec![],
                 previous_alternative_documents: vec![],
+                removal_trigger_documents: vec![],
             },
         );
         SageDatabase::open(dir.path())
@@ -97,8 +100,11 @@ mod db_tests {
             architecture: "amd64".into(),
             changes: vec![],
             previous_packages: vec![],
+            retired_packages: vec![],
             modified_paths: vec![],
+            removed_paths: vec![],
             previous_alternative_documents: vec![],
+            removal_trigger_documents: vec![],
         };
         let mut record = JournalRecord::new("op-1".into(), "packages", action.clone());
         record.stage = "triggers".into();

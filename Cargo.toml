@@ -11,6 +11,7 @@ members = [
     "crates/sage-build",
     "crates/sage-repo",
 ]
+default-members = ["crates/sage"]
 
 [workspace.package]
 version = "0.4.0"

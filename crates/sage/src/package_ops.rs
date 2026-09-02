@@ -361,6 +361,7 @@ async fn apply_packages(
             &available,
             &config.system.architecture,
             &changes,
+            &[],
         )
         .await?;
     }
@@ -425,29 +426,37 @@ async fn publish_packages(
     available: &AvailablePackages,
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
+    retired: &[sage_db::InstalledPackage],
 ) -> Result<()> {
-    let changes = preflight_packages(root, database, available, architecture, changes).await?;
+    let changes =
+        preflight_packages(root, database, available, architecture, changes, retired).await?;
     let op_id = operation_id("install")?;
     // Recovery must not consult records that installation may already have replaced.
-    let previous_packages = changes
+    let mut previous_packages = retired
         .iter()
-        .map(|(key, _)| database.package(key))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        .cloned()
+        .map(|package| (package.key.clone(), package))
+        .collect::<BTreeMap<_, _>>();
+    for (key, _) in &changes {
+        if let Some(package) = database.package(key)? {
+            previous_packages.insert(key.clone(), package);
+        }
+    }
     let mut journal = sage_db::JournalRecord::new(
         op_id,
         "packages",
         sage_db::JournalAction::Install {
             architecture: architecture.into(),
             changes: changes.clone(),
-            previous_packages,
+            previous_packages: previous_packages.into_values().collect(),
+            retired_packages: retired.to_vec(),
             modified_paths: Vec::new(),
+            removed_paths: Vec::new(),
             previous_alternative_documents: read_documents(
                 root,
                 Path::new("usr/share/sage/alternatives"),
             )?,
+            removal_trigger_documents: trigger_documents(root)?,
         },
     );
     database.write_journal(&journal)?;
@@ -543,11 +552,15 @@ async fn preflight_packages(
     available: &AvailablePackages,
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
+    retired: &[sage_db::InstalledPackage],
 ) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
-    let mut final_paths = BTreeMap::<sage_core::PackageKey, BTreeSet<String>>::new();
+    let mut final_paths = retired
+        .iter()
+        .map(|package| (package.key.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
     for (key, version) in changes {
         let source = available
             .releases
@@ -621,8 +634,7 @@ async fn preflight_packages(
             }
             if successors
                 .get_mut(&owner)
-                .expect("planned owner has a successor set")
-                .insert(claimant.clone())
+                .is_some_and(|targets| targets.insert(claimant.clone()))
             {
                 *indegree
                     .get_mut(claimant)
@@ -667,11 +679,12 @@ async fn resume_install(
     journal: &mut sage_db::JournalRecord,
 ) -> Result<()> {
     journal.validate()?;
-    let (architecture, changes, previous_packages) = match &journal.action {
+    let (architecture, changes, previous_packages, retired_packages) = match &journal.action {
         sage_db::JournalAction::Install {
             architecture,
             changes,
             previous_packages,
+            retired_packages,
             ..
         } => (
             architecture.clone(),
@@ -681,6 +694,7 @@ async fn resume_install(
                 .cloned()
                 .map(|package| (package.key.clone(), package))
                 .collect::<BTreeMap<_, _>>(),
+            retired_packages.clone(),
         ),
         _ => bail!("install recovery received a removal journal"),
     };
@@ -695,7 +709,11 @@ async fn resume_install(
         }
     }
     let mut modified = Vec::new();
+    let mut removed_paths = Vec::new();
     if journal.stage == "packages" {
+    for package in &retired_packages {
+        database.remove(&package.key)?;
+    }
     for (key, version) in &changes {
         let source = available
             .releases
@@ -818,11 +836,29 @@ async fn resume_install(
             eprintln!("Configuration update requires review: {}", path.display());
         }
     }
-    if let sage_db::JournalAction::Install { modified_paths, .. } = &mut journal.action {
+    for package in &retired_packages {
+        for relative in &package.files {
+            if database.owners(relative)?.is_empty() {
+                let path = under_root(root, Path::new(relative));
+                if !should_preserve_config(&path, relative, &package.config_hashes)? {
+                    remove_file_beneath(root, &path)?;
+                    modified.push(PathBuf::from(relative));
+                    removed_paths.push(relative.clone());
+                }
+            }
+        }
+    }
+    if let sage_db::JournalAction::Install {
+        modified_paths,
+        removed_paths: journal_removed,
+        ..
+    } = &mut journal.action
+    {
         *modified_paths = modified
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
+        *journal_removed = removed_paths;
     }
     journal.advance("alternatives");
     database.write_journal(journal)?;
@@ -854,6 +890,26 @@ async fn resume_install(
     crash_point(root, "alternatives")?;
     }
     if journal.stage == "triggers" {
+    let (removal_triggers, removed_paths) = match &journal.action {
+        sage_db::JournalAction::Install {
+            removal_trigger_documents,
+            removed_paths,
+            ..
+        } => (
+            removal_trigger_documents
+                .iter()
+                .map(|bytes| sage_sys::TriggerSpec::parse(bytes))
+                .collect::<Result<Vec<_>, _>>()?,
+            removed_paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        ),
+        _ => unreachable!(),
+    };
+    sage_sys::TriggerEngine::execute_triggers_for(
+        &removal_triggers,
+        &removed_paths,
+        root,
+        sage_sys::TriggerEvent::PostRemove,
+    )?;
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
     crash_point(root, "triggers")?;
     sage_sys::TriggerEngine::execute_triggers_for(
@@ -1172,13 +1228,21 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         .map(|package| (package.key.clone(), package.version.clone()))
         .collect::<BTreeMap<_, _>>();
     let changes = installation_order(&available, plan.install.iter().cloned().collect())?;
+    let retired = installed
+        .iter()
+        .filter(|package| plan.remove.contains(&package.key))
+        .cloned()
+        .collect::<Vec<_>>();
     for (key, version) in &changes {
         println!(
             "{} {key} {version}",
             if current.contains_key(key) { "Upgrade" } else { "Install" }
         );
     }
-    if !dry_run && !changes.is_empty() {
+    for package in &retired {
+        println!("Remove {} {}", package.key, package.version);
+    }
+    if !dry_run && (!changes.is_empty() || !retired.is_empty()) {
         let database = sage_db::SageDatabase::open(&db_path)?;
         publish_packages(
             root,
@@ -1186,16 +1250,9 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
             &available,
             &config.system.architecture,
             &changes,
+            &retired,
         )
         .await?;
-    }
-    let names: Vec<_> = plan
-        .remove
-        .into_iter()
-        .map(|key| format!("{}:{}", key.name, key.slot))
-        .collect();
-    if !names.is_empty() {
-        remove_packages(root, &names, Some("main/system"), false, dry_run)?;
     }
     if dry_run {
         for (interface, key) in &plan.provider_bindings {

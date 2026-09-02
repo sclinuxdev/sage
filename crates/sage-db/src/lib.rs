@@ -51,8 +51,11 @@ pub enum JournalAction {
         changes: Vec<(PackageKey, Version)>,
         /// Pre-upgrade records retained until obsolete paths are removed.
         previous_packages: Vec<InstalledPackage>,
+        retired_packages: Vec<InstalledPackage>,
         modified_paths: Vec<String>,
+        removed_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
+        removal_trigger_documents: Vec<Vec<u8>>,
     },
     Remove {
         packages: Vec<InstalledPackage>,

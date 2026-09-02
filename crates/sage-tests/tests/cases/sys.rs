@@ -268,6 +268,9 @@ mod sys_tests {
             plan.remove,
             vec![sage_core::PackageKey::new("main/system", "old", "0")]
         );
+        let retained = ReconcilePlan::compute(&config, std::slice::from_ref(&old), &universe, true)
+            .unwrap();
+        assert!(retained.remove.is_empty());
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
         universe.insert(old_release);
