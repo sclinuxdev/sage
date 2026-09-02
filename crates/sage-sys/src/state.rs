@@ -73,9 +73,13 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
-        let retained_universe = no_prune.then(|| {
+        let retained = installed
+            .iter()
+            .filter(|package| no_prune || package.key.channel != "main/system")
+            .collect::<Vec<_>>();
+        let retained_universe = (!retained.is_empty()).then(|| {
             let mut universe = universe.clone();
-            for package in installed {
+            for package in &retained {
                 if universe.release(&package.key, &package.version).is_none() {
                     let mut release = sage_core::Package::from_release(
                         package.key.clone(),
@@ -92,8 +96,8 @@ impl ReconcilePlan {
         let universe = retained_universe.as_ref().unwrap_or(universe);
         let mut roots = config.package_keys("main/system")?;
         let preferences = config.provider_preferences("main/system")?;
-        if no_prune {
-            roots.extend(installed.iter().map(|package| package.key.clone()));
+        if !retained.is_empty() {
+            roots.extend(retained.iter().map(|package| package.key.clone()));
             roots.sort();
             roots.dedup();
         }
