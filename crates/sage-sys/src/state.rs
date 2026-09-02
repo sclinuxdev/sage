@@ -116,18 +116,7 @@ impl ReconcilePlan {
                 .prefer_providers(preferences.clone())
                 .resolve_with_provider_bindings(roots, &exact)
         };
-        let (mut solution, mut selected_providers) = resolve(&roots)?;
-        let missing = preferences
-            .iter()
-            .filter(|(symbol, _)| !selected_providers.contains_key(*symbol))
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            roots.extend(missing);
-            roots.sort();
-            roots.dedup();
-            (solution, selected_providers) = resolve(&roots)?;
-        }
+        let (solution, selected_providers) = resolve(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))

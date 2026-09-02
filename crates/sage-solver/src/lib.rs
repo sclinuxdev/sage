@@ -114,7 +114,7 @@ impl<'a> SageSolver<'a> {
         requested: &[PackageKey],
         exact: &BTreeMap<PackageKey, Version>,
     ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
-        let dependencies = requested
+        let mut dependencies: DependencyMap = requested
             .iter()
             .cloned()
             .map(|key| {
@@ -125,7 +125,30 @@ impl<'a> SageSolver<'a> {
                 (key, range)
             })
             .collect();
-        let (solution, choices) = self.resolve_root(dependencies)?;
+        let (mut solution, mut choices) = self.resolve_root(dependencies.clone())?;
+        let missing = self
+            .preferred_providers
+            .iter()
+            .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| choice == *symbol))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            for (symbol, preferred) in missing {
+                dependencies.insert(
+                    virtual_key(
+                        &preferred.channel,
+                        &Dependency {
+                            name: symbol.clone(),
+                            slot: None,
+                            channel: None,
+                            op: ConstraintOp::Any,
+                            version: None,
+                        },
+                    ),
+                    VersionRange::full(),
+                );
+            }
+            (solution, choices) = self.resolve_root(dependencies)?;
+        }
         let mut bindings = BTreeMap::new();
         for (symbol, key) in choices {
             if !self.preferred_providers.contains_key(&symbol) {

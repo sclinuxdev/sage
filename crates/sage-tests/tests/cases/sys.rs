@@ -488,6 +488,18 @@ mod sys_tests {
         assert!(plan.install.iter().any(|(key, _)| key.name == "glibc"));
         assert!(!plan.install.iter().any(|(key, _)| key.name == "musl"));
         assert_eq!(plan.provider_bindings["libc"].name, "glibc");
+
+        let mut universe = sage_solver::PackageUniverse::default();
+        let mut guard = release("guard", "1-1", &[], &[]);
+        guard.conflicts.push("systemd".into());
+        universe.insert(guard);
+        for name in ["systemd", "loom"] {
+            universe.insert(release(name, "1-1", &[], &["virtual/init"]));
+        }
+        let mut config = provider_config("systemd", &["guard"]);
+        config.providers = BTreeMap::from([("init".into(), "systemd".into())]);
+        let plan = ReconcilePlan::compute(&config, &[], &universe, false).unwrap();
+        assert_eq!(plan.provider_bindings["init"].name, "loom");
     }
 
     #[test]
