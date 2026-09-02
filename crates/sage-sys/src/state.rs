@@ -73,9 +73,36 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
-        let retained = installed
+        let installed_by_key = installed
+            .iter()
+            .map(|package| (package.key.clone(), package))
+            .collect::<BTreeMap<_, _>>();
+        let mut retained_keys = installed
             .iter()
             .filter(|package| no_prune || package.key.channel != "main/system")
+            .map(|package| package.key.clone())
+            .collect::<BTreeSet<_>>();
+        // A retained cross-channel root keeps its installed dependency graph even
+        // when repository pruning has removed one of the exact releases.
+        let mut pending = retained_keys.clone();
+        while let Some(key) = pending.pop_first() {
+            let package = installed_by_key
+                .get(&key)
+                .expect("retained package came from installed state");
+            for dependency in &package.dependencies {
+                for candidate in installed
+                    .iter()
+                    .filter(|candidate| installed_satisfies(&package.key, dependency, candidate))
+                {
+                    if retained_keys.insert(candidate.key.clone()) {
+                        pending.insert(candidate.key.clone());
+                    }
+                }
+            }
+        }
+        let retained = retained_keys
+            .iter()
+            .map(|key| installed_by_key[key])
             .collect::<Vec<_>>();
         let retained_universe = (!retained.is_empty()).then(|| {
             let mut universe = universe.clone();
@@ -169,6 +196,46 @@ impl ReconcilePlan {
             services: config.services.clone(),
         })
     }
+}
+
+fn installed_satisfies(
+    parent: &sage_core::PackageKey,
+    dependency: &sage_core::Dependency,
+    candidate: &sage_db::InstalledPackage,
+) -> bool {
+    let virtual_dependency =
+        dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:");
+    let channel = if virtual_dependency {
+        parent
+            .channel
+            .rsplit_once('/')
+            .map_or_else(|| "system".into(), |(root, _)| format!("{root}/system"))
+    } else if let Some(requested) = dependency.channel.as_deref() {
+        parent.channel.rsplit_once('/').map_or_else(
+            || requested.into(),
+            |(root, _)| {
+                if requested == root || requested.starts_with(&format!("{root}/")) {
+                    requested.into()
+                } else {
+                    format!("{root}/{requested}")
+                }
+            },
+        )
+    } else {
+        parent.channel.clone()
+    };
+    let identity_matches = candidate.key.name == dependency.name
+        || candidate.provides.contains(&dependency.name);
+    let slot_matches = dependency.slot.as_deref().map_or_else(
+        || virtual_dependency || candidate.key.slot == sage_core::DEFAULT_SLOT,
+        |slot| candidate.key.slot == slot,
+    );
+    candidate.key.channel == channel
+        && identity_matches
+        && slot_matches
+        && dependency
+            .op
+            .matches(&candidate.version, dependency.version.as_ref())
 }
 
 /// One candidate for a declarative alternatives link.

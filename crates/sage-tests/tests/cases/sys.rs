@@ -276,8 +276,42 @@ mod sys_tests {
         runtime.dependencies = vec!["main/system/lib".parse().unwrap()];
         let mut empty = config.clone();
         empty.packages.clear();
-        let retained = ReconcilePlan::compute(&empty, &[runtime], &universe, false).unwrap();
+        let retained =
+            ReconcilePlan::compute(&empty, &[runtime.clone()], &universe, false).unwrap();
         assert!(retained.install.iter().any(|(key, _)| key.name == "lib"));
+        let installed_lib = sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "lib", "0"),
+            version: "1.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 0,
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        };
+        let mut current_universe = sage_solver::PackageUniverse::default();
+        current_universe.insert(sage_core::Package::from_release(
+            runtime.key.clone(),
+            runtime.version.clone(),
+            runtime.dependencies.clone(),
+            vec![],
+        ));
+        current_universe.insert(sage_core::Package::from_release(
+            installed_lib.key.clone(),
+            "2.0-1".parse().unwrap(),
+            vec![],
+            vec![],
+        ));
+        let retained = ReconcilePlan::compute(
+            &empty,
+            &[runtime, installed_lib],
+            &current_universe,
+            false,
+        )
+        .unwrap();
+        assert!(retained.install.is_empty());
+        assert!(retained.remove.is_empty());
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
         universe.insert(old_release);
