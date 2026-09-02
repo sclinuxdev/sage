@@ -240,6 +240,12 @@ mod sys_tests {
             vec![],
             vec![],
         ));
+        universe.insert(sage_core::Package::from_release(
+            sage_core::PackageKey::new("main/system", "libc", "0"),
+            "1.0-1".parse().unwrap(),
+            vec![],
+            vec![],
+        ));
         let old = sage_db::InstalledPackage {
             key: sage_core::PackageKey::new("main/system", "old", "0"),
             version: "1.0-1".parse().unwrap(),
@@ -272,15 +278,15 @@ mod sys_tests {
             .unwrap();
         assert!(retained.remove.is_empty());
         let mut runtime = old.clone();
-        runtime.key = sage_core::PackageKey::new("main/runtime", "runtime", "0");
-        runtime.dependencies = vec!["main/system/lib".parse().unwrap()];
+        runtime.key = sage_core::PackageKey::new("main/runtime", "foo", "0");
+        runtime.dependencies = vec!["main/system/libc".parse().unwrap()];
         let mut empty = config.clone();
         empty.packages.clear();
         let retained =
             ReconcilePlan::compute(&empty, &[runtime.clone()], &universe, false).unwrap();
-        assert!(retained.install.iter().any(|(key, _)| key.name == "lib"));
+        assert!(retained.install.iter().any(|(key, _)| key.name == "libc"));
         let installed_lib = sage_db::InstalledPackage {
-            key: sage_core::PackageKey::new("main/system", "lib", "0"),
+            key: sage_core::PackageKey::new("main/system", "libc", "0"),
             version: "1.0-1".parse().unwrap(),
             arch: "amd64".into(),
             installed_size: 0,
