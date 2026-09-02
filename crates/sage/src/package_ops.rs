@@ -686,18 +686,14 @@ async fn resume_install(
     };
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
-    let previous_config = previous_packages
-        .values()
-        .flat_map(|package| {
-            package.config_hashes.iter().filter_map(|(relative, hash)| {
-                package
-                    .files
-                    .iter()
-                    .find(|path| Path::new(path).ends_with(relative))
-                    .map(|path| (path.clone(), hash.clone()))
-            })
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut previous_config = BTreeMap::new();
+    for package in previous_packages.values() {
+        for (relative, hash) in &package.config_hashes {
+            if let Some(path) = package.files.iter().find(|path| Path::new(path).ends_with(relative)) {
+                previous_config.insert(path.clone(), hash.clone());
+            }
+        }
+    }
     let mut modified = Vec::new();
     if journal.stage == "packages" {
     for (key, version) in &changes {
@@ -745,9 +741,7 @@ async fn resume_install(
         for record in inspection.files.iter().filter(|record| record.path.starts_with("etc")) {
             let physical = prefix.join(&record.path).to_string_lossy().into_owned();
             if let Some(hash) = previous_config.get(&physical) {
-                previous
-                    .entry(record.path.to_string_lossy().into_owned())
-                    .or_insert_with(|| hash.clone());
+                previous.entry(record.path.to_string_lossy().into_owned()).or_insert(hash.clone());
             }
         }
         let report = sage_archive::extract_package_with_config(
@@ -1161,8 +1155,28 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     };
     let plan =
         sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
-    let desired: Vec<_> = config.packages.iter().cloned().collect();
-    apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
+    let current = installed
+        .iter()
+        .map(|package| (package.key.clone(), package.version.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let changes = installation_order(&available, plan.install.iter().cloned().collect())?;
+    for (key, version) in &changes {
+        println!(
+            "{} {key} {version}",
+            if current.contains_key(key) { "Upgrade" } else { "Install" }
+        );
+    }
+    if !dry_run && !changes.is_empty() {
+        let database = sage_db::SageDatabase::open(&db_path)?;
+        publish_packages(
+            root,
+            &database,
+            &available,
+            &config.system.architecture,
+            &changes,
+        )
+        .await?;
+    }
     let names: Vec<_> = plan
         .remove
         .into_iter()

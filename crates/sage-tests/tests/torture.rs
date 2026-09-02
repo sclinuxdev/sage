@@ -394,7 +394,12 @@ fn host_lock_namespace_is_anchored_and_private() {
     assert!(
         sage_core::HostLock::acquire_exclusive(final_directory.join("operation.lock")).is_err()
     );
-    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+
+    let hard_directory = canonical.join("run/final-hardlink");
+    std::fs::create_dir_all(&hard_directory).unwrap();
+    std::fs::hard_link(&outside_file, hard_directory.join("operation.lock")).unwrap();
+    assert!(sage_core::HostLock::acquire_exclusive(hard_directory.join("operation.lock")).is_err());
 
     let insecure_directory = canonical.join("run/insecure");
     std::fs::create_dir(&insecure_directory).unwrap();

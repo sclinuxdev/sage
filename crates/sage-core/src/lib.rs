@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -696,9 +696,10 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
     .map_err(errno_io)?;
     // SAFETY: `openat` returned a fresh descriptor transferred exactly once.
     let file = unsafe { File::from_raw_fd(raw) };
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != geteuid().as_raw() || metadata.nlink() != 1 {
         return Err(CoreError::InvalidMetadata(format!(
-            "operation lock is not a regular file: {}",
+            "operation lock is not a private regular file: {}",
             path.display()
         )));
     }
