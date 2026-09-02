@@ -285,6 +285,21 @@ mod sys_tests {
         let retained =
             ReconcilePlan::compute(&empty, &[runtime.clone()], &universe, false).unwrap();
         assert!(retained.install.iter().any(|(key, _)| key.name == "libc"));
+        let mut concrete_root = runtime.clone();
+        concrete_root.dependencies = vec!["main/system/lib".parse().unwrap()];
+        let mut alias = old.clone();
+        alias.key = sage_core::PackageKey::new("main/system", "alias", "0");
+        alias.provides = vec!["lib".into()];
+        alias.conflicts = vec!["lib".into()];
+        let retained = ReconcilePlan::compute(
+            &empty,
+            &[concrete_root, alias.clone()],
+            &universe,
+            false,
+        )
+        .unwrap();
+        assert!(retained.install.iter().any(|(key, _)| key.name == "lib"));
+        assert_eq!(retained.remove, vec![alias.key]);
         let installed_lib = sage_db::InstalledPackage {
             key: sage_core::PackageKey::new("main/system", "libc", "0"),
             version: "1.0-1".parse().unwrap(),

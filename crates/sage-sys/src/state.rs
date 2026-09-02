@@ -98,14 +98,21 @@ impl ReconcilePlan {
                     && preferred.is_some()
                     && !installed.iter().any(|candidate| {
                         preferred == Some(&candidate.key)
-                            && installed_satisfies(&package.key, dependency, candidate)
+                            && installed_satisfies(
+                                &package.key,
+                                dependency,
+                                candidate,
+                                universe,
+                            )
                     })
                 {
                     continue;
                 }
                 if let Some(candidate) = installed
                     .iter()
-                    .filter(|candidate| installed_satisfies(&package.key, dependency, candidate))
+                    .filter(|candidate| {
+                        installed_satisfies(&package.key, dependency, candidate, universe)
+                    })
                     .min_by_key(|candidate| {
                         let direct = !virtual_dependency && candidate.key.name == dependency.name;
                         (!direct, preferred != Some(&candidate.key), candidate.key.clone())
@@ -218,6 +225,7 @@ fn installed_satisfies(
     parent: &sage_core::PackageKey,
     dependency: &sage_core::Dependency,
     candidate: &sage_db::InstalledPackage,
+    universe: &sage_solver::PackageUniverse,
 ) -> bool {
     let virtual_dependency =
         dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:");
@@ -241,6 +249,19 @@ fn installed_satisfies(
         parent.channel.clone()
     };
     let direct = !virtual_dependency && candidate.key.name == dependency.name;
+    if !virtual_dependency
+        && !direct
+        && universe
+            .versions(&sage_core::PackageKey::new(
+                channel.clone(),
+                &dependency.name,
+                dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT),
+            ))
+            .next()
+            .is_some()
+    {
+        return false;
+    }
     let identity_matches = direct || candidate.provides.contains(&dependency.name);
     let slot_matches = dependency.slot.as_deref().map_or_else(
         || virtual_dependency || !direct || candidate.key.slot == sage_core::DEFAULT_SLOT,
