@@ -444,12 +444,10 @@ async fn publish_packages(
             changes,
             previous_packages,
             modified_paths: Vec::new(),
-            removed_paths: Vec::new(),
             previous_alternative_documents: read_documents(
                 root,
                 Path::new("usr/share/sage/alternatives"),
             )?,
-            removal_trigger_documents: trigger_documents(root)?,
         },
     );
     database.write_journal(&journal)?;
@@ -753,7 +751,6 @@ async fn resume_install(
         previous_config.extend(package.config_hashes.clone());
     }
     let mut modified = Vec::new();
-    let mut removed_paths = Vec::new();
     if journal.stage == "packages" {
     for (key, version) in &changes {
         let source = available
@@ -871,7 +868,6 @@ async fn resume_install(
                     if !should_preserve_config(&path, obsolete, &previous_package.config_hashes)? {
                         remove_file_beneath(root, &path)?;
                         modified.push(PathBuf::from(obsolete));
-                        removed_paths.push(obsolete.clone());
                     }
                 }
             }
@@ -882,7 +878,6 @@ async fn resume_install(
     }
     if let sage_db::JournalAction::Install {
         modified_paths,
-        removed_paths: journal_removed,
         ..
     } = &mut journal.action
     {
@@ -890,7 +885,6 @@ async fn resume_install(
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        *journal_removed = removed_paths;
     }
     journal.advance("alternatives");
     database.write_journal(journal)?;
@@ -922,26 +916,6 @@ async fn resume_install(
     crash_point(root, "alternatives")?;
     }
     if journal.stage == "triggers" {
-    let (removal_triggers, removed_paths) = match &journal.action {
-        sage_db::JournalAction::Install {
-            removal_trigger_documents,
-            removed_paths,
-            ..
-        } => (
-            removal_trigger_documents
-                .iter()
-                .map(|bytes| sage_sys::TriggerSpec::parse(bytes))
-                .collect::<Result<Vec<_>, _>>()?,
-            removed_paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
-        ),
-        _ => unreachable!(),
-    };
-    sage_sys::TriggerEngine::execute_triggers_for(
-        &removal_triggers,
-        &removed_paths,
-        root,
-        sage_sys::TriggerEvent::PostRemove,
-    )?;
     let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
     crash_point(root, "triggers")?;
     sage_sys::TriggerEngine::execute_triggers_for(
