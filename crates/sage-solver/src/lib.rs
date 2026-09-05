@@ -403,6 +403,19 @@ impl SageProvider {
             for target in targets {
                 if let Some(versions) = releases.get_mut(&target) {
                     for (version, dependencies) in versions {
+                        // The key-level index may include a symbol supplied only
+                        // by another release, including reconstructed installed
+                        // metadata. Mark only releases that actually provide it.
+                        if is_virtual(&conflict)
+                            && !universe.release(&target, version).is_some_and(|release| {
+                                release
+                                    .provides
+                                    .iter()
+                                    .any(|symbol| symbol == &conflict.name)
+                            })
+                        {
+                            continue;
+                        }
                         if dependency_range(&conflict).contains(version) {
                             dependencies
                                 .insert(marker.clone(), VersionRange::singleton(zero.clone()));

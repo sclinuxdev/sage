@@ -483,8 +483,41 @@ mod sys_tests {
             .insert("requires-new-provider".into());
         assert!(ReconcilePlan::compute(
             &changed_provider_config,
-            &[virtual_consumer, stale_provider],
+            &[virtual_consumer, stale_provider.clone()],
             &changed_provider_universe,
+            false,
+        )
+        .is_err());
+
+        // Virtual conflicts must also use exact release metadata: the retained
+        // provider can upgrade to v2, which no longer advertises the symbol.
+        let mut guard = release("guard", "1.0-1", &[], &[]);
+        guard.conflicts.push("virtual/runtime-api".into());
+        changed_provider_universe.insert(guard.clone());
+        let mut conflict_config = empty.clone();
+        conflict_config.packages.insert("guard".into());
+        conflict_config.packages.insert("provider".into());
+        let plan = ReconcilePlan::compute(
+            &conflict_config,
+            std::slice::from_ref(&stale_provider),
+            &changed_provider_universe,
+            false,
+        )
+        .unwrap();
+        assert!(plan.install.contains(&(
+            stale_provider.key.clone(),
+            "2.0-1".parse().unwrap(),
+        )));
+        let guard_coordinate = guard.coordinate();
+        assert!(plan.install.contains(&(guard_coordinate.key, guard_coordinate.version)));
+
+        // Without the non-providing release, the real conflict still rejects v1.
+        let mut conflict_universe = sage_solver::PackageUniverse::default();
+        conflict_universe.insert(guard);
+        assert!(ReconcilePlan::compute(
+            &conflict_config,
+            &[stale_provider],
+            &conflict_universe,
             false,
         )
         .is_err());
