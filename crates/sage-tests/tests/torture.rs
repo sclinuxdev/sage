@@ -841,6 +841,43 @@ async fn remove_repairs_a_database_record_whose_filesystem_subtree_is_missing() 
     assert!(!state.packages.contains_key("main/system:missing-tree:0"));
 }
 
+#[tokio::test]
+async fn audit_rejects_orphaned_reverse_ownership_rows() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    lab.add("system", "owned", 1, "usr/lib/torture/owned", "payload")
+        .unwrap();
+    lab.publish().unwrap();
+    lab.install("owned", "system").await.unwrap();
+
+    let db_path = lab.root().join("var/lib/sage");
+    let mut options = heed::EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: the test owns this isolated environment and has dropped every
+    // previous handle before opening it for deliberate corruption.
+    let environment = unsafe { options.open(&db_path).unwrap() };
+    let mut transaction = environment.write_txn().unwrap();
+    let files: heed::Database<heed::types::Str, heed::types::Bytes> = environment
+        .open_database(&transaction, Some("files"))
+        .unwrap()
+        .unwrap();
+    let nonexistent = vec![sage_core::PackageKey::new(
+        "main/system",
+        "nonexistent",
+        "0",
+    )];
+    files
+        .put(
+            &mut transaction,
+            "usr/lib/torture/orphaned-index-row",
+            &bincode::serialize(&nonexistent).unwrap(),
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(environment);
+
+    assert!(lab.audit().is_err());
+}
+
 fn assert_archive_rejected(
     index: &str,
     entries: &[(&str, tar::EntryType, &[u8], Option<&str>)],

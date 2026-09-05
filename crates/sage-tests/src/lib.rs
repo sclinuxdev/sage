@@ -311,13 +311,13 @@ ignore_missing_binary=false
 
     pub fn snapshot(&self) -> Result<StateSnapshot> {
         let db_path = self.root().join("var/lib/sage");
-        let installed = sage_db::read_packages(&db_path)?;
+        let database = sage_db::SageDatabase::open(&db_path)?;
+        let installed = database.packages()?;
         let packages = installed
             .iter()
             .map(|package| (package.key.canonical_id(), package.version.to_string()))
             .collect();
         let mut files = BTreeMap::new();
-        let mut owners = BTreeMap::new();
         for package in &installed {
             for relative in &package.files {
                 let target = self.root().join(relative);
@@ -332,15 +332,20 @@ ignore_missing_binary=false
                     fs::read(&target)?
                 };
                 files.insert(relative.clone(), content);
-                owners.insert(
-                    relative.clone(),
-                    sage_db::read_owners(&db_path, relative)?
-                        .into_iter()
-                        .map(|owner| owner.canonical_id())
-                        .collect(),
-                );
             }
         }
+        let owners = database
+            .file_owners()?
+            .into_iter()
+            .map(|(path, keys)| {
+                let mut owners = keys
+                    .into_iter()
+                    .map(|owner| owner.canonical_id())
+                    .collect::<Vec<_>>();
+                owners.sort();
+                (path, owners)
+            })
+            .collect();
         Ok(StateSnapshot {
             packages,
             files,
@@ -353,6 +358,7 @@ ignore_missing_binary=false
         let snapshot = self.snapshot()?;
         let installed = sage_db::read_packages(&self.root().join("var/lib/sage"))?;
         let mut expected = BTreeMap::new();
+        let mut expected_owners = BTreeMap::<String, Vec<String>>::new();
         for package in installed {
             let payload = self
                 .catalog
@@ -360,14 +366,20 @@ ignore_missing_binary=false
                 .with_context(|| format!("model lacks {} {}", package.key, package.version))?;
             expected.extend(payload.clone());
             for path in &package.files {
-                let owners = snapshot
-                    .owners
-                    .get(path)
-                    .with_context(|| format!("ownership index lacks {path}"))?;
-                if owners != &[package.key.canonical_id()] {
-                    bail!("unexpected owners for {path}: {owners:?}");
-                }
+                expected_owners
+                    .entry(path.clone())
+                    .or_default()
+                    .push(package.key.canonical_id());
             }
+        }
+        for owners in expected_owners.values_mut() {
+            owners.sort();
+        }
+        if snapshot.owners != expected_owners {
+            bail!(
+                "package/ownership divergence\nexpected={expected_owners:?}\nactual={:?}",
+                snapshot.owners
+            );
         }
         if snapshot.files != expected {
             bail!(

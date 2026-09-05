@@ -270,6 +270,19 @@ impl SageDatabase {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.files, &txn, path)?.unwrap_or_default())
     }
+    /// Returns the complete reverse file-ownership index in LMDB key order.
+    pub fn file_owners(&self) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
+        let txn = self.env.read_txn()?;
+        let owners = self
+            .files
+            .iter(&txn)?
+            .map(|entry| {
+                let (path, bytes) = entry?;
+                Ok((path.into(), decode(bytes)?))
+            })
+            .collect();
+        owners
+    }
     pub fn providers(&self, symbol: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.provides, &txn, symbol)?.unwrap_or_default())
