@@ -393,6 +393,7 @@ impl TemplateServiceGenerator {
         services: &[ServiceSpec],
         sysroot: &Path,
     ) -> Result<(), SysError> {
+        self.validate_service_set(services, sysroot)?;
         let Some(directory) = &self.managed_directory else {
             for service in services {
                 self.render_service_unvalidated(service, sysroot)?;
@@ -473,6 +474,50 @@ impl TemplateServiceGenerator {
         }
         if had_previous {
             fs::remove_dir_all(backup)?;
+        }
+        Ok(())
+    }
+
+    /// Validates a complete provider generation without writing files or
+    /// executing provider commands. Package publication uses this pass before
+    /// it creates a recovery journal, so an invalid target, template, or
+    /// service type cannot strand a transaction after the package database has
+    /// changed.
+    pub fn validate_service_set(
+        &self,
+        services: &[ServiceSpec],
+        sysroot: &Path,
+    ) -> Result<(), SysError> {
+        let managed_directory = self
+            .managed_directory
+            .as_deref()
+            .map(|directory| target_path(sysroot, Path::new(directory)))
+            .transpose()?;
+        for service in services {
+            service.validate()?;
+            self.validate_service_type(service)?;
+            let variables = self.service_variables(service, sysroot)?;
+            expand_template(&self.template, &variables)?;
+            let target = self.rendered_path(service, sysroot)?;
+            if let Some(directory) = &managed_directory {
+                if target.parent() != Some(directory.as_path()) {
+                    return Err(SysError::Invalid(format!(
+                        "service {} renders outside managed directory {}",
+                        service.name,
+                        directory.display()
+                    )));
+                }
+            }
+            self.validate_compile_command(&variables, sysroot)?;
+            for (kind, command) in [
+                ("validate", self.validate_command.as_deref()),
+                ("enable", self.enable_command.as_deref()),
+                ("disable", self.disable_command.as_deref()),
+            ] {
+                if let Some(command) = command {
+                    self.validate_command_path(kind, command, &variables, sysroot)?;
+                }
+            }
         }
         Ok(())
     }
@@ -558,6 +603,55 @@ impl TemplateServiceGenerator {
                 service.service_type, service.name
             )))
         }
+    }
+
+    fn validate_compile_command(
+        &self,
+        variables: &BTreeMap<String, String>,
+        sysroot: &Path,
+    ) -> Result<(), SysError> {
+        let Some((program, arguments)) = self.compile_command.split_first() else {
+            return Ok(());
+        };
+        let mut variables = variables.clone();
+        variables.insert(
+            "INPUT".into(),
+            sysroot
+                .join("var/lib/sage/.sage-preflight-input")
+                .display()
+                .to_string(),
+        );
+        variables.insert(
+            "OUTPUT".into(),
+            sysroot
+                .join("var/lib/sage/.sage-preflight-output")
+                .display()
+                .to_string(),
+        );
+        let program = expand_template(program, &variables)?;
+        target_path(sysroot, Path::new(&program))?;
+        for argument in arguments {
+            expand_template(argument, &variables)?;
+        }
+        Ok(())
+    }
+
+    fn validate_command_path(
+        &self,
+        kind: &str,
+        command: &str,
+        variables: &BTreeMap<String, String>,
+        sysroot: &Path,
+    ) -> Result<(), SysError> {
+        let command = expand_template(command, variables)?;
+        let program = command
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| SysError::Invalid(format!("empty {kind} command")))?;
+        target_path(sysroot, Path::new(program)).map_err(|error| {
+            SysError::Invalid(format!("invalid {kind} command program: {error}"))
+        })?;
+        Ok(())
     }
 
     fn service_variables(

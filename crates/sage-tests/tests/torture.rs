@@ -403,13 +403,19 @@ async fn provider_changes_fail_before_mutating_the_working_system() {
     lab.install("loom", "system").await.unwrap();
     let before = lab.snapshot().unwrap();
     let config = config
-        .replace("packages=[\"systemd\",\"loom\"]", "packages=[\"loom:1\"]")
-        .replace("services=[\"daemon\"]", "services=[]")
+        .replace(
+            "packages=[\"systemd\",\"loom\"]",
+            "packages=[\"systemd\",\"loom:1\"]",
+        )
         .replace("init=\"systemd\"", "init=\"loom:1\"");
     std::fs::write(&config_path, &config).unwrap();
+    let unsafe_renderer = "schema_version=1\n[service_generator]\ntarget_path=\"../../etc/${service.name}\"\nmode=420\ntemplate=\"\"\n";
+    let unsupported_renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\nsupported_types=[\"forking\"]\n";
     for (index, (renderer, valid)) in [
         (None, false),
         (Some("invalid TOML ["), false),
+        (Some(unsafe_renderer), false),
+        (Some(unsupported_renderer), false),
         (Some(renderer), true),
     ]
     .into_iter()
@@ -446,7 +452,7 @@ async fn provider_changes_fail_before_mutating_the_working_system() {
                 state.provider,
                 sage_core::PackageKey::new("main/system", "loom", "1")
             );
-            assert!(!native_path.exists());
+            assert!(native_path.is_file());
             let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
             assert_eq!(
                 database.system_provider("init").unwrap(),

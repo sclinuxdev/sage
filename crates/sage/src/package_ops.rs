@@ -63,6 +63,33 @@ fn read_documents(root: &Path, relative: &Path) -> Result<Vec<Vec<u8>>> {
         .map(|entry| std::fs::read(entry.path()).map_err(Into::into))
         .collect()
 }
+fn service_declaration_path(name: &str) -> String {
+    Path::new("usr/share/sage/services")
+        .join(format!("{name}.toml"))
+        .to_string_lossy()
+        .into_owned()
+}
+fn read_service_declarations(
+    root: &Path,
+) -> Result<BTreeMap<String, sage_sys::ServiceSpec>> {
+    let directory = under_root(root, Path::new("/usr/share/sage/services"));
+    if !directory.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut entries = std::fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries
+        .into_iter()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("toml"))
+        .map(|entry| {
+            let relative = Path::new("usr/share/sage/services")
+                .join(entry.file_name())
+                .to_string_lossy()
+                .into_owned();
+            Ok((relative, sage_sys::ServiceSpec::load(entry.path())?))
+        })
+        .collect()
+}
 fn alternatives_from_documents(documents: &[Vec<u8>]) -> Result<Vec<sage_sys::Alternative>> {
     let mut alternatives = Vec::new();
     for document in documents {
@@ -541,7 +568,7 @@ impl PackageDeclarations {
         let mut paths = self
             .services
             .iter()
-            .map(|(name, _)| format!("usr/share/sage/services/{name}.toml"))
+            .map(|(name, _)| service_declaration_path(name))
             .collect::<Vec<_>>();
         if let Some((name, _)) = &self.trigger {
             paths.push(format!("usr/share/sage/triggers/{name}.toml"));
@@ -572,7 +599,13 @@ async fn preflight_packages(
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
     let renderer_path = init_provider
         .map(|provider| format!("usr/share/sage/rclass/init-{}.toml", provider.name));
-    let mut renderer_checked = false;
+    let mut planned_renderer = None;
+    let mut planned_services = if renderer_path.is_some() {
+        Some(read_service_declarations(root)?)
+    } else {
+        None
+    };
+    let mut replacement_services = BTreeMap::new();
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
     let mut final_paths = retired
         .iter()
@@ -611,6 +644,7 @@ async fn preflight_packages(
             .target_root
             .strip_prefix("/")
             .unwrap_or(&source.target_root);
+        let declarations = PackageDeclarations::parse(&inspection, key)?;
         if let Some(path) = &renderer_path {
             if let Some(record) = inspection
                 .files
@@ -618,9 +652,17 @@ async fn preflight_packages(
                 .find(|record| prefix.join(&record.path) == Path::new(path))
             {
                 let bytes = sage_archive::read_payload_file(&archive, &record.path)?;
-                sage_sys::TemplateServiceGenerator::parse(&bytes)
+                let generator = sage_sys::TemplateServiceGenerator::parse(&bytes)
                     .with_context(|| format!("invalid planned init renderer {path}"))?;
-                renderer_checked = true;
+                planned_renderer = Some(generator);
+            }
+        }
+        if renderer_path.is_some() {
+            for (name, bytes) in &declarations.services {
+                let service = sage_sys::ServiceSpec::parse(bytes).with_context(|| {
+                    format!("invalid planned service declaration {name} in {key}")
+                })?;
+                replacement_services.insert(service_declaration_path(name), service);
             }
         }
         let mut ownership: Vec<_> = inspection
@@ -628,7 +670,7 @@ async fn preflight_packages(
             .iter()
             .map(|record| prefix.join(&record.path).to_string_lossy().into_owned())
             .collect();
-        ownership.extend(PackageDeclarations::parse(&inspection, key)?.ownership_paths(key));
+        ownership.extend(declarations.ownership_paths(key));
         for path in &ownership {
             if let Some(owner) = planned.insert(path.clone(), key.clone()) {
                 if owner != *key {
@@ -650,20 +692,49 @@ async fn preflight_packages(
                 .insert(package.key.clone());
         }
     }
-    if let Some(path) = renderer_path.filter(|_| !renderer_checked) {
+    if let Some(services) = planned_services.as_mut() {
+        // Keep declarations whose current owners survive the transaction, then
+        // overlay service files carried by replacement archives. This mirrors
+        // publication order without touching the live service directory.
+        services.retain(|path, _| {
+            installed_paths.get(path).is_none_or(|owners| {
+                owners.is_empty()
+                    || owners.iter().any(|owner| {
+                        final_paths
+                            .get(owner)
+                            .is_none_or(|paths| paths.contains(path))
+                    })
+            })
+        });
+        services.extend(replacement_services);
+    }
+    if let Some(path) = renderer_path {
         // A live renderer cannot satisfy the plan if every current owner will
         // release it. This includes same-name upgrades that omit the old file.
-        if installed_paths.get(&path).is_some_and(|owners| {
-            owners.iter().all(|owner| {
-                final_paths
-                    .get(owner)
-                    .is_some_and(|paths| !paths.contains(&path))
+        if planned_renderer.is_none()
+            && installed_paths.get(&path).is_some_and(|owners| {
+                owners.iter().all(|owner| {
+                    final_paths
+                        .get(owner)
+                        .is_some_and(|paths| !paths.contains(&path))
+                })
             })
-        }) {
+        {
             bail!("planned init renderer {path} is removed by this transaction");
         }
-        sage_sys::TemplateServiceGenerator::from_rclass(&under_root(root, Path::new(&path)))
-            .with_context(|| format!("invalid planned init renderer {path}"))?;
+        let generator = match planned_renderer {
+            Some(generator) => generator,
+            None => sage_sys::TemplateServiceGenerator::from_rclass(
+                &under_root(root, Path::new(&path)),
+            )
+            .with_context(|| format!("invalid planned init renderer {path}"))?,
+        };
+        if let Some(services) = planned_services {
+            let services = services.into_values().collect::<Vec<_>>();
+            generator
+                .validate_service_set(&services, root)
+                .with_context(|| format!("invalid planned init renderer {path}"))?;
+        }
     }
     for (path, claimant) in &planned {
         let components = Path::new(path)
