@@ -673,9 +673,7 @@ async fn preflight_packages(
         ownership.extend(declarations.ownership_paths(key));
         for path in &ownership {
             if let Some(owner) = planned.insert(path.clone(), key.clone()) {
-                if owner != *key {
-                    bail!("transaction packages {owner} and {key} both own {path}");
-                }
+                bail!("transaction packages {owner} and {key} both own {path}");
             }
         }
         final_paths.insert(key.clone(), ownership.into_iter().collect());

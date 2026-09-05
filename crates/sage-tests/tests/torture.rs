@@ -196,6 +196,34 @@ async fn malformed_package_preflight_does_not_leave_a_recovery_journal() {
     lab.audit().unwrap();
 }
 
+#[tokio::test]
+async fn declaration_payload_collision_is_rejected_before_publication() {
+    use sha2::{Digest, Sha256};
+
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    let path = "usr/share/sage/services/foo.toml";
+    let payload = b"verified payload";
+    let package = lab.add("system", "raw", 1, path, "payload").unwrap();
+    write_raw_archive(
+        &package,
+        &format!("{path}\t0644\t{}\t{:x}\n", payload.len(), Sha256::digest(payload)),
+        &[
+            (".METADATA/service.toml", tar::EntryType::Regular,
+             b"schema_version=1\n[service]\nname=\"foo\"\ndescription=\"Foo\"\ncommand=[\"/usr/bin/foo\"]\nuser=\"root\"\ngroup=\"root\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n", None),
+            ("data/usr/share/sage/services/foo.toml", tar::EntryType::Regular, payload, None),
+        ],
+    );
+    lab.publish().unwrap();
+
+    let error = lab.install("raw", "system").await.unwrap_err();
+    assert!(format!("{error:#}").contains("both own"));
+    assert!(!lab.root().join(path).exists());
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    assert!(database.packages().unwrap().is_empty());
+    assert!(database.file_owners().unwrap().is_empty());
+}
+
 #[test]
 fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
     use sha2::Digest as _;
