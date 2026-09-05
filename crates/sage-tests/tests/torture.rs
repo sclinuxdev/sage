@@ -333,12 +333,16 @@ async fn dependency_removal_uses_solver_provider_semantics() {
 }
 
 #[tokio::test]
-async fn removal_preserves_the_bound_provider_with_an_installed_alternative() {
+async fn provider_changes_fail_before_mutating_the_working_system() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
+    let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\n";
     for name in ["systemd", "loom"] {
         let mut provider = sage_tests::PackageSpec::new(
-            "system", name, 1, &format!("usr/share/sage/rclass/init-{name}.toml"),
-            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\n",
+            "system",
+            name,
+            1,
+            &format!("usr/share/sage/rclass/init-{name}.toml"),
+            renderer,
         );
         provider.provides.push("virtual/init".into());
         if name == "systemd" {
@@ -394,6 +398,75 @@ async fn removal_preserves_the_bound_provider_with_an_installed_alternative() {
     }
     // An unused provider can still be removed without switching the binding.
     lab.remove("loom", "system").await.unwrap();
+
+    // Its old same-name template must not mask a missing file in the new slot.
+    lab.install("loom", "system").await.unwrap();
+    let before = lab.snapshot().unwrap();
+    let config = config
+        .replace("packages=[\"systemd\",\"loom\"]", "packages=[\"loom:1\"]")
+        .replace("services=[\"daemon\"]", "services=[]")
+        .replace("init=\"systemd\"", "init=\"loom:1\"");
+    std::fs::write(&config_path, &config).unwrap();
+    for (index, (renderer, valid)) in [
+        (None, false),
+        (Some("invalid TOML ["), false),
+        (Some(renderer), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut provider = sage_tests::PackageSpec::new(
+            "system",
+            "loom",
+            index as u32 + 2,
+            "usr/lib/torture/loom",
+            "new provider",
+        );
+        provider.slot = "1".into();
+        provider.provides.push("virtual/init".into());
+        if let Some(renderer) = renderer {
+            provider.files.insert(
+                "usr/share/sage/rclass/init-loom.toml".into(),
+                renderer.as_bytes().to_vec(),
+            );
+        }
+        lab.add_package(provider).unwrap();
+        lab.publish().unwrap();
+        let result = sage::execute(sage::Cli {
+            verbose: false,
+            dry_run: false,
+            root: lab.root().into(),
+            command: sage::Commands::Rebuild { no_prune: false },
+        })
+        .await;
+        if valid {
+            result.unwrap();
+            let state = sage_sys::RenderedServicesState::load(&state_path).unwrap();
+            assert_eq!(
+                state.provider,
+                sage_core::PackageKey::new("main/system", "loom", "1")
+            );
+            assert!(!native_path.exists());
+            let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+            assert_eq!(
+                database.system_provider("init").unwrap(),
+                Some(state.provider)
+            );
+            assert!(database.pending_journals().unwrap().is_empty());
+            continue;
+        }
+        assert!(result.is_err());
+        assert_eq!(lab.snapshot().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        assert_eq!(std::fs::read(&native_path).unwrap(), native);
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert_eq!(
+            database.system_provider("init").unwrap(),
+            Some(sage_core::PackageKey::new("main/system", "systemd", "0"))
+        );
+        assert!(database.pending_journals().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

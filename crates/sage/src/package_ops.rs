@@ -430,8 +430,18 @@ async fn publish_packages(
     retired: &[sage_db::InstalledPackage],
     rebuild: Option<sage_db::RebuildContinuation>,
 ) -> Result<()> {
-    let changes =
-        preflight_packages(root, database, available, architecture, changes, retired).await?;
+    let changes = preflight_packages(
+        root,
+        database,
+        available,
+        architecture,
+        changes,
+        retired,
+        rebuild
+            .as_ref()
+            .and_then(|continuation| continuation.provider_bindings.get("init")),
+    )
+    .await?;
     let op_id = operation_id("install")?;
     // Recovery must not consult records that installation may already have replaced.
     let mut previous_packages = retired
@@ -556,9 +566,13 @@ async fn preflight_packages(
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
     retired: &[sage_db::InstalledPackage],
+    init_provider: Option<&sage_core::PackageKey>,
 ) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
+    let renderer_path = init_provider
+        .map(|provider| format!("usr/share/sage/rclass/init-{}.toml", provider.name));
+    let mut renderer_checked = false;
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
     let mut final_paths = retired
         .iter()
@@ -597,6 +611,18 @@ async fn preflight_packages(
             .target_root
             .strip_prefix("/")
             .unwrap_or(&source.target_root);
+        if let Some(path) = &renderer_path {
+            if let Some(record) = inspection
+                .files
+                .iter()
+                .find(|record| prefix.join(&record.path) == Path::new(path))
+            {
+                let bytes = sage_archive::read_payload_file(&archive, &record.path)?;
+                sage_sys::TemplateServiceGenerator::parse(&bytes)
+                    .with_context(|| format!("invalid planned init renderer {path}"))?;
+                renderer_checked = true;
+            }
+        }
         let mut ownership: Vec<_> = inspection
             .files
             .iter()
@@ -623,6 +649,21 @@ async fn preflight_packages(
                 .or_default()
                 .insert(package.key.clone());
         }
+    }
+    if let Some(path) = renderer_path.filter(|_| !renderer_checked) {
+        // A live renderer cannot satisfy the plan if every current owner will
+        // release it. This includes same-name upgrades that omit the old file.
+        if installed_paths.get(&path).is_some_and(|owners| {
+            owners.iter().all(|owner| {
+                final_paths
+                    .get(owner)
+                    .is_some_and(|paths| !paths.contains(&path))
+            })
+        }) {
+            bail!("planned init renderer {path} is removed by this transaction");
+        }
+        sage_sys::TemplateServiceGenerator::from_rclass(&under_root(root, Path::new(&path)))
+            .with_context(|| format!("invalid planned init renderer {path}"))?;
     }
     for (path, claimant) in &planned {
         let components = Path::new(path)

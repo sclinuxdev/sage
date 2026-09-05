@@ -305,7 +305,15 @@ pub struct TemplateServiceGenerator {
 
 impl TemplateServiceGenerator {
     pub fn from_rclass(path: &Path) -> Result<Self, SysError> {
-        let class: InitRclass = toml::from_str(&fs::read_to_string(path)?)?;
+        Self::parse(&fs::read(path)?)
+    }
+
+    /// Parses a renderer before package publication; rejects invalid UTF-8,
+    /// malformed TOML, missing renderer fields, and unsupported schema versions.
+    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| SysError::Invalid(format!("init rclass is not UTF-8: {error}")))?;
+        let class: InitRclass = toml::from_str(text)?;
         validate_schema(class.schema_version)?;
         Ok(class.service_generator)
     }

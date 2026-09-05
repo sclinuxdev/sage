@@ -42,6 +42,33 @@ pub type PackageManifest = sage_core::Package;
 /// Build-tool provenance shared with package manifests.
 pub use sage_core::ManagedBuildTool;
 
+/// Reads one regular file from a payload already checked by `validate_package_payload`.
+/// Missing entries and non-regular files are rejected; no payload is published.
+pub fn read_payload_file(package: &Path, relative: &Path) -> Result<Vec<u8>, ArchiveError> {
+    let wanted = Path::new("data").join(relative);
+    let decoder = zstd::Decoder::new(File::open(package)?)?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if clean_archive_path(&entry.path()?)? != wanted {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "expected a regular payload file: {}",
+                relative.display()
+            )));
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    Err(ArchiveError::InvalidMetadata(format!(
+        "missing payload file: {}",
+        relative.display()
+    )))
+}
+
 /// One integrity record from `.METADATA/files.idx`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
