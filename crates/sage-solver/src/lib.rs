@@ -338,7 +338,16 @@ impl SageProvider {
                     continue;
                 }
                 for (version_index, version) in universe.versions(key).enumerate() {
-                    if !dependency_range(&requirement).contains(version) {
+                    // The symbol index identifies package keys, not releases. A
+                    // newer release may stop providing the symbol, so each proxy
+                    // candidate must be checked against its exact metadata.
+                    let provides_symbol = universe.release(key, version).is_some_and(|release| {
+                        release
+                            .provides
+                            .iter()
+                            .any(|symbol| symbol == provider_name)
+                    });
+                    if !provides_symbol || !dependency_range(&requirement).contains(version) {
                         continue;
                     }
                     let preferred = preferred_providers.get(provider_name) == Some(key);

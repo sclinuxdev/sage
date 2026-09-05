@@ -449,6 +449,46 @@ mod sys_tests {
         .unwrap();
         assert_eq!(retained.install, vec![(musl.key, musl.version)]);
         assert_eq!(retained.remove, vec![glibc.key]);
+
+        // Reconstructing an installed provider release adds its key to the
+        // symbol index. A repository release under that key which dropped the
+        // symbol must not satisfy the virtual dependency.
+        let mut stale_provider = old.clone();
+        stale_provider.key = sage_core::PackageKey::new("main/system", "provider", "0");
+        stale_provider.provides = vec!["virtual/runtime-api".into()];
+        let mut virtual_consumer = runtime.clone();
+        virtual_consumer.dependencies = vec!["virtual/runtime-api".parse().unwrap()];
+        let mut changed_provider_universe = sage_solver::PackageUniverse::default();
+        changed_provider_universe.insert(sage_core::Package::from_release(
+            virtual_consumer.key.clone(),
+            virtual_consumer.version.clone(),
+            virtual_consumer.dependencies.clone(),
+            vec![],
+        ));
+        changed_provider_universe.insert(release(
+            "provider",
+            "2.0-1",
+            &[],
+            &[],
+        ));
+        changed_provider_universe.insert(release(
+            "requires-new-provider",
+            "1.0-1",
+            &["provider >= 2.0-1"],
+            &[],
+        ));
+        let mut changed_provider_config = empty.clone();
+        changed_provider_config
+            .packages
+            .insert("requires-new-provider".into());
+        assert!(ReconcilePlan::compute(
+            &changed_provider_config,
+            &[virtual_consumer, stale_provider],
+            &changed_provider_universe,
+            false,
+        )
+        .is_err());
+
         let mut old_release = release("old", "1.0-1", &[], &[]);
         old_release.conflicts.push("app".into());
         universe.insert(old_release);
