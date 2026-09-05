@@ -20,6 +20,8 @@ pub struct PackageSpec {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub files: BTreeMap<String, Vec<u8>>,
+    /// Payload paths that should be archived with executable permissions.
+    pub executables: BTreeSet<String>,
 }
 
 impl PackageSpec {
@@ -33,6 +35,7 @@ impl PackageSpec {
             provides: Vec::new(),
             conflicts: Vec::new(),
             files: BTreeMap::from([(path.into(), content.as_bytes().to_vec())]),
+            executables: BTreeSet::new(),
         }
     }
 
@@ -125,6 +128,10 @@ target_root="/opt/channels/torture/1"
             let target = data.join(relative);
             fs::create_dir_all(target.parent().context("fixture path has no parent")?)?;
             fs::write(target, content)?;
+            if spec.executables.contains(relative) {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(data.join(relative), fs::Permissions::from_mode(0o755))?;
+            }
         }
         let records = sage_archive::build_file_index(&data)?;
         fs::write(

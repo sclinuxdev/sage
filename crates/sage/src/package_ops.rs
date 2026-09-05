@@ -1003,6 +1003,7 @@ async fn resume_install(
                     if !should_preserve_config(&path, obsolete, &previous_package.config_hashes)? {
                         remove_file_beneath(root, &path)?;
                         modified.push(PathBuf::from(obsolete));
+                        removed_paths.push(obsolete.clone());
                     }
                 }
             }

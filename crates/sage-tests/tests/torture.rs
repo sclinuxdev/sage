@@ -1007,3 +1007,45 @@ fn append_raw_entry<W: std::io::Write>(
     header.set_cksum();
     builder.append_data(&mut header, path, payload).unwrap();
 }
+
+#[tokio::test]
+async fn obsolete_upgrade_paths_run_the_old_removal_trigger() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    let mut tool = sage_tests::PackageSpec::new(
+        "system",
+        "record",
+        1,
+        "usr/bin/record",
+        "#!/bin/sh\nprintf removed > \"$1\"\n",
+    );
+    tool.executables.insert("usr/bin/record".into());
+    lab.add_package(tool).unwrap();
+    let mut package =
+        sage_tests::PackageSpec::new("system", "old-path", 1, "usr/lib/torture/obsolete", "old");
+    package.files.insert("usr/share/sage/triggers/obsolete.toml".into(),
+        b"schema_version=1\nname=\"obsolete\"\ndescription=\"Record removal\"\non_paths=[\"usr/lib/torture/obsolete\"]\nexec=[\"/usr/bin/record\",\"${sysroot}/removal-log\"]\npriority=1\nevents=[\"post-remove\"]\n".to_vec());
+    lab.add_package(package).unwrap();
+    lab.publish().unwrap();
+    lab.install("record", "system").await.unwrap();
+    lab.install("old-path", "system").await.unwrap();
+    assert!(!lab.root().join("removal-log").exists());
+    lab.add(
+        "system",
+        "old-path",
+        2,
+        "usr/lib/torture/replacement",
+        "new",
+    )
+    .unwrap();
+    lab.publish().unwrap();
+    lab.inject("triggers").unwrap();
+    assert!(lab.upgrade("old-path", "system").await.is_err());
+    lab.upgrade("old-path", "system").await.unwrap();
+    assert_eq!(
+        std::fs::read(lab.root().join("removal-log")).unwrap(),
+        b"removed"
+    );
+    assert!(!lab.root().join("usr/lib/torture/obsolete").exists());
+    lab.snapshot().unwrap();
+}
+
