@@ -13,8 +13,8 @@
    - 压缩归档采用 `tar` + `zstd-rs` 流式处理。
    - CLI 前端完全基于 `clap` (derive) 与 `indicatif`，**当前阶段不引入 TUI**。
    - 沙箱隔离直接调用系统的 `bwrap` (Bubblewrap) 与 `fakeroot`。
-2. **绝对零硬编码与完全可扩展性 (Zero-Hardcoded & Purely Data-Driven)**：
-   - **严禁在 Rust 源码中硬编码任何可扩展业务逻辑**。
+2. **沿用明确的数据边界**：
+   - 新增行为只实现当前需求；仅在确实需要用户配置或已有多个使用场景时扩展配置，不为“完全可扩展”新增配置或模板层。
    - 触发器（ldconfig, ca-certificates 等）全量由 `triggers/*.toml` 声明。
    - Init 服务转换由 `rclass/init-*.toml` 模板引擎驱动。
    - 编译器/工具链由 `rclass/*.toml` 驱动。
