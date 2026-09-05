@@ -115,7 +115,7 @@ async fn settle_journals(root: &Path) -> Result<()> {
             sage_db::JournalAction::Install { architecture, .. } => {
                 let architecture = architecture.clone();
                 let available = load_available_with_pool(root, Some(&architecture), None)?;
-                resume_install(root, &database, &available, &mut journal).await?;
+                resume_install(root, &database, &available, &mut journal, false).await?;
             }
             sage_db::JournalAction::Remove { .. } => {
                 resume_remove(root, &database, &mut journal)?;
@@ -451,7 +451,7 @@ async fn publish_packages(
         },
     );
     database.write_journal(&journal)?;
-    resume_install(root, database, available, &mut journal).await
+    resume_install(root, database, available, &mut journal, true).await
 }
 
 struct PackageDeclarations {
@@ -725,6 +725,7 @@ async fn resume_install(
     database: &sage_db::SageDatabase,
     available: &AvailablePackages,
     journal: &mut sage_db::JournalRecord,
+    prevalidated: bool,
 ) -> Result<()> {
     journal.validate()?;
     let (architecture, changes, previous_packages) = match &journal.action {
@@ -801,12 +802,11 @@ async fn resume_install(
                 previous.insert(record.path.to_string_lossy().into_owned(), hash.clone());
             }
         }
-        let report = sage_archive::extract_package_with_config(
-            &archive,
-            &target,
-            &inspection.files,
-            &previous,
-        )?;
+        let report = if prevalidated {
+            sage_archive::extract_prevalidated_package(&archive, &target, &inspection.files, &previous)?
+        } else {
+            sage_archive::extract_package_with_config(&archive, &target, &inspection.files, &previous)?
+        };
         crash_point(root, "extraction")?;
         for (name, bytes) in declarations.services {
             write_atomic_under_root(

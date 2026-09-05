@@ -349,16 +349,20 @@ pub fn extract_package_with_config(
     index: &[FileRecord],
     previous_hashes: &BTreeMap<String, String>,
 ) -> Result<ExtractionReport, ArchiveError> {
-    extract_package_internal(package.as_ref(), sysroot.as_ref(), index, previous_hashes)
+    validate_package_payload(package.as_ref(), index)?;
+    extract_prevalidated_package(package.as_ref(), sysroot.as_ref(), index, previous_hashes)
 }
 
-fn extract_package_internal(
+/// Publishes a payload after the caller validated the same archive and index.
+/// Per-file hashes and dirfd-relative writes remain enforced during extraction.
+/// Callers recovering an earlier transaction must use `extract_package_with_config`
+/// to validate the current archive before any publication.
+pub fn extract_prevalidated_package(
     package: &Path,
     sysroot: &Path,
     index: &[FileRecord],
     previous_hashes: &BTreeMap<String, String>,
 ) -> Result<ExtractionReport, ArchiveError> {
-    validate_package_payload(package, index)?;
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
@@ -448,8 +452,8 @@ fn extract_package_internal(
 ///
 /// The scan rejects unsupported types, duplicate and ancestor-colliding paths,
 /// missing index entries, unsafe links, and content mismatches. Package-manager
-/// preflight calls this before creating a recovery journal, while extraction
-/// repeats it immediately before publication to keep direct callers atomic.
+/// preflight calls this before creating a recovery journal. Direct extraction
+/// and journal recovery also validate their current archive before publication.
 pub fn validate_package_payload(
     package: impl AsRef<Path>,
     index: &[FileRecord],
