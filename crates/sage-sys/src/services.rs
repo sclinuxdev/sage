@@ -45,7 +45,8 @@ pub struct ServiceDocument {
 #[serde(deny_unknown_fields)]
 pub struct RenderedServicesState {
     pub schema_version: u32,
-    pub provider: String,
+    /// Full identity distinguishes same-name providers across slots and channels.
+    pub provider: sage_core::PackageKey,
     pub generator: TemplateServiceGenerator,
     pub services: Vec<ServiceSpec>,
     #[serde(default)]
@@ -56,7 +57,7 @@ impl RenderedServicesState {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
         let state: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(state.schema_version)?;
-        if !valid_declaration_name(&state.provider) {
+        if !valid_declaration_name(&state.provider.name) {
             return Err(SysError::Invalid("invalid rendered-service provider".into()));
         }
         let mut names = BTreeSet::new();

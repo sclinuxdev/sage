@@ -1015,7 +1015,7 @@ async fn resume_install(
             .exists()
             .then(|| sage_sys::RenderedServicesState::load(&state_path))
             .transpose()?;
-        render_services(root, &config, &init_provider.name, false, previous.as_ref())?;
+        render_services(root, &config, init_provider, false, previous.as_ref())?;
         journal.advance("rebuild-triggers");
         database.write_journal(journal)?;
         crash_point(root, "rebuild-services")?;
@@ -1346,7 +1346,6 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     let init_provider = plan
         .provider_bindings
         .get("init")
-        .cloned()
         .context("system providers must select an init implementation")?;
     let rendered_state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
     let previous_services = rendered_state_path
@@ -1379,7 +1378,7 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
         render_services(
             root,
             &config,
-            &init_provider.name,
+            init_provider,
             true,
             previous_services.as_ref(),
         )?;
@@ -1404,13 +1403,13 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
 fn render_services(
     root: &Path,
     config: &sage_sys::SystemConfig,
-    provider: &str,
+    provider: &sage_core::PackageKey,
     dry_run: bool,
     previous: Option<&sage_sys::RenderedServicesState>,
 ) -> Result<()> {
     let rclass = under_root(
         root,
-        &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
+        &Path::new("/usr/share/sage/rclass").join(format!("init-{}.toml", provider.name)),
     );
     let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
     let mut installed = Vec::new();
@@ -1438,7 +1437,7 @@ fn render_services(
     if dry_run {
         if let Some(previous) = previous {
             for service in &previous.services {
-                let provider_changed = previous.provider != provider;
+                let provider_changed = previous.provider != *provider;
                 let removed = !installed
                     .iter()
                     .any(|candidate| candidate.name == service.name);
@@ -1466,7 +1465,7 @@ fn render_services(
     let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
     if let Some(previous) = previous {
         for service in &previous.services {
-            let provider_changed = previous.provider != provider;
+            let provider_changed = previous.provider != *provider;
             let removed = !installed
                 .iter()
                 .any(|candidate| candidate.name == service.name);
@@ -1488,8 +1487,8 @@ fn render_services(
     }
     let state = sage_sys::RenderedServicesState {
         schema_version: sage_core::SCHEMA_VERSION,
-        provider: provider.into(),
-        generator: generator.clone(),
+        provider: provider.clone(),
+        generator,
         services: installed,
         enabled: config.services.clone(),
     };
@@ -1649,40 +1648,32 @@ mod package_ops_tests {
         let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n";
         std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
         let config = system_config(Some("systemd"));
+        let loom = sage_core::PackageKey::new("main/system", "loom", "0");
+        let systemd = sage_core::PackageKey::new("main/system", "systemd", "0");
 
-        render_services(root.path(), &config, "loom", false, None).unwrap();
+        render_services(root.path(), &config, &loom, false, None).unwrap();
         let state = sage_sys::RenderedServicesState::load(
             root.path().join("var/lib/sage/rendered-services.toml"),
         )
         .unwrap();
-        assert_eq!(state.provider, "loom");
+        assert_eq!(state.provider, loom);
 
         std::fs::write(rclass.join("init-systemd.toml"), renderer).unwrap();
         std::fs::remove_file(rclass.join("init-loom.toml")).unwrap();
+        render_services(root.path(), &config, &systemd, false, Some(&state)).unwrap();
         let state = sage_sys::RenderedServicesState::load(
             root.path().join("var/lib/sage/rendered-services.toml"),
         )
         .unwrap();
-        render_services(
-            root.path(),
-            &config,
-            "systemd",
-            false,
-            Some(&state),
-        )
-        .unwrap();
-        let state = sage_sys::RenderedServicesState::load(
-            root.path().join("var/lib/sage/rendered-services.toml"),
-        )
-        .unwrap();
-        assert_eq!(state.provider, "systemd");
+        assert_eq!(state.provider, systemd);
     }
 
     #[test]
     fn dry_run_does_not_load_a_planned_init_renderer() {
         let root = tempfile::tempdir().unwrap();
         let config = system_config(None);
-        render_services(root.path(), &config, "not-installed", true, None).unwrap();
+        let provider = sage_core::PackageKey::new("main/system", "not-installed", "0");
+        render_services(root.path(), &config, &provider, true, None).unwrap();
     }
 
     #[tokio::test]
@@ -1713,7 +1704,7 @@ mod package_ops_tests {
     }
 
     #[tokio::test]
-    async fn journal_recovery_completes_the_rebuild_tail() {
+    async fn journal_recovery_reconciles_an_init_slot_switch() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
         std::fs::write(
@@ -1723,15 +1714,58 @@ mod package_ops_tests {
         .unwrap();
         let rclass = root.path().join("usr/share/sage/rclass");
         std::fs::create_dir_all(&rclass).unwrap();
+        let renderer = r#"schema_version=1
+[service_generator]
+target_path="/etc/loom-0/${service.name}"
+mode=420
+template="${service.name}"
+enable_command="/service-action enable ${SYSROOT}/etc/loom-0/enabled"
+disable_command="/service-action disable ${SYSROOT}/etc/loom-0/enabled"
+"#;
+        std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
+        let action = root.path().join("service-action");
         std::fs::write(
-            rclass.join("init-loom.toml"),
-            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n",
+            &action,
+            "#!/bin/sh\ncase \"$1\" in\nenable) : > \"$2\";;\ndisable) /bin/rm -f \"$2\";;\nesac\n",
         )
         .unwrap();
-        let key = sage_core::PackageKey::new("main/system", "loom", "0");
-        let config = system_config(Some("loom"));
+        std::fs::set_permissions(&action, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let services = root.path().join("usr/share/sage/services");
+        std::fs::create_dir_all(&services).unwrap();
+        std::fs::write(
+            services.join("daemon.toml"),
+            r#"schema_version=1
+[service]
+name="daemon"
+description="Daemon"
+command=["/usr/bin/daemon"]
+user="daemon"
+group="daemon"
+working_dir="/"
+restart="on-failure"
+type="simple"
+"#,
+        )
+        .unwrap();
+        let old_key = sage_core::PackageKey::new("main/system", "loom", "0");
+        let key = sage_core::PackageKey::new("main/system", "loom", "1");
+        let mut config = system_config(Some("loom:1"));
+        config.services.insert("daemon".into());
+        render_services(root.path(), &config, &old_key, false, None).unwrap();
+        assert!(root.path().join("etc/loom-0/daemon").is_file());
+        assert!(root.path().join("etc/loom-0/enabled").is_file());
+        // Simulate publication replacing the same-name rclass before recovery.
+        std::fs::write(
+            rclass.join("init-loom.toml"),
+            renderer.replace("loom-0", "loom-1"),
+        )
+        .unwrap();
         {
             let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+            database
+                .replace_system_providers(&BTreeMap::from([("init".into(), old_key)]))
+                .unwrap();
             let journal = sage_db::JournalRecord::new(
                 "rebuild-tail".into(),
                 "rebuild-bindings",
@@ -1754,13 +1788,20 @@ mod package_ops_tests {
         }
 
         settle_journals(root.path()).await.unwrap();
+        assert!(!root.path().join("etc/loom-0/daemon").exists());
+        assert!(!root.path().join("etc/loom-0/enabled").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("etc/loom-1/daemon")).unwrap(),
+            "daemon"
+        );
+        assert!(root.path().join("etc/loom-1/enabled").is_file());
         let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
-        assert_eq!(database.system_provider("init").unwrap(), Some(key));
+        assert_eq!(database.system_provider("init").unwrap(), Some(key.clone()));
         assert!(database.pending_journals().unwrap().is_empty());
         let state = sage_sys::RenderedServicesState::load(
             root.path().join("var/lib/sage/rendered-services.toml"),
         )
         .unwrap();
-        assert_eq!(state.provider, "loom");
+        assert_eq!(state.provider, key);
     }
 }
