@@ -45,9 +45,7 @@ pub struct ServiceDocument {
 #[serde(deny_unknown_fields)]
 pub struct RenderedServicesState {
     pub schema_version: u32,
-    /// Full identity distinguishes same-name providers across slots and channels.
-    pub provider: sage_core::PackageKey,
-    pub generator: TemplateServiceGenerator,
+    pub provider: String,
     pub services: Vec<ServiceSpec>,
     #[serde(default)]
     pub enabled: BTreeSet<String>,
@@ -57,7 +55,7 @@ impl RenderedServicesState {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
         let state: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(state.schema_version)?;
-        if !valid_declaration_name(&state.provider.name) {
+        if !valid_declaration_name(&state.provider) {
             return Err(SysError::Invalid("invalid rendered-service provider".into()));
         }
         let mut names = BTreeSet::new();
@@ -269,7 +267,7 @@ struct InitRclass {
 }
 
 /// Generic target/template pair loaded from an `init-*.toml` rclass.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateServiceGenerator {
     #[serde(rename = "target_path")]
@@ -305,15 +303,7 @@ pub struct TemplateServiceGenerator {
 
 impl TemplateServiceGenerator {
     pub fn from_rclass(path: &Path) -> Result<Self, SysError> {
-        Self::parse(&fs::read(path)?)
-    }
-
-    /// Parses a renderer before package publication; rejects invalid UTF-8,
-    /// malformed TOML, missing renderer fields, and unsupported schema versions.
-    pub fn parse(bytes: &[u8]) -> Result<Self, SysError> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| SysError::Invalid(format!("init rclass is not UTF-8: {error}")))?;
-        let class: InitRclass = toml::from_str(text)?;
+        let class: InitRclass = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(class.schema_version)?;
         Ok(class.service_generator)
     }
@@ -393,7 +383,6 @@ impl TemplateServiceGenerator {
         services: &[ServiceSpec],
         sysroot: &Path,
     ) -> Result<(), SysError> {
-        self.validate_service_set(services, sysroot)?;
         let Some(directory) = &self.managed_directory else {
             for service in services {
                 self.render_service_unvalidated(service, sysroot)?;
@@ -478,86 +467,6 @@ impl TemplateServiceGenerator {
         Ok(())
     }
 
-    /// Validates a complete provider generation without writing files or
-    /// executing provider commands. Package publication uses this pass before
-    /// it creates a recovery journal, so an invalid target, template, or
-    /// service type cannot strand a transaction after the package database has
-    /// changed.
-    pub fn validate_service_set(
-        &self,
-        services: &[ServiceSpec],
-        sysroot: &Path,
-    ) -> Result<(), SysError> {
-        let managed_directory = self
-            .managed_directory
-            .as_deref()
-            .map(|directory| target_path(sysroot, Path::new(directory)))
-            .transpose()?;
-        for service in services {
-            service.validate()?;
-            self.validate_service_type(service)?;
-            let variables = self.service_variables(service, sysroot)?;
-            expand_template(&self.template, &variables)?;
-            let target = self.rendered_path(service, sysroot)?;
-            if let Some(directory) = &managed_directory {
-                if target.parent() != Some(directory.as_path()) {
-                    return Err(SysError::Invalid(format!(
-                        "service {} renders outside managed directory {}",
-                        service.name,
-                        directory.display()
-                    )));
-                }
-            }
-            self.validate_compile_command(&variables, sysroot)?;
-            for (kind, command) in [
-                ("validate", self.validate_command.as_deref()),
-                ("enable", self.enable_command.as_deref()),
-                ("disable", self.disable_command.as_deref()),
-            ] {
-                if let Some(command) = command {
-                    self.validate_command_path(kind, command, &variables, sysroot)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns the normalized provider programs needed by this generation.
-    /// Template and path errors are returned without executing any command.
-    pub fn required_programs(
-        &self,
-        services: &[ServiceSpec],
-        enabled: &BTreeSet<String>,
-        sysroot: &Path,
-    ) -> Result<BTreeSet<PathBuf>, SysError> {
-        let mut programs = BTreeSet::new();
-        for service in services {
-            let variables = self.service_variables(service, sysroot)?;
-            if let Some(program) = self.validate_compile_command(&variables, sysroot)? {
-                programs.insert(program);
-            }
-            for (kind, command) in [
-                ("validate", self.validate_command.as_deref()),
-                ("enable", self.enable_command.as_deref().filter(|_| enabled.contains(&service.name))),
-                // Persisted generations must remain removable, including disabled services.
-                ("disable", self.disable_command.as_deref()),
-            ] {
-                if let Some(command) = command {
-                    programs.insert(self.validate_command_path(kind, command, &variables, sysroot)?);
-                }
-            }
-        }
-        Ok(programs)
-    }
-
-    /// Returns the old generation's cleanup program without executing it.
-    /// Invalid templates and paths are returned as errors.
-    pub fn disable_program(&self, service: &ServiceSpec, sysroot: &Path) -> Result<Option<PathBuf>, SysError> {
-        self.disable_command.as_deref().map(|command| {
-            self.validate_command_path("disable", command, &self.service_variables(service, sysroot)?, sysroot)
-        }).transpose()
-    }
-
     /// Runs the provider's whole-tree validator after all definitions exist.
     pub fn validate_rendered_services(
         &self,
@@ -639,54 +548,6 @@ impl TemplateServiceGenerator {
                 service.service_type, service.name
             )))
         }
-    }
-
-    fn validate_compile_command(
-        &self,
-        variables: &BTreeMap<String, String>,
-        sysroot: &Path,
-    ) -> Result<Option<PathBuf>, SysError> {
-        let Some((program, arguments)) = self.compile_command.split_first() else {
-            return Ok(None);
-        };
-        let mut variables = variables.clone();
-        variables.insert(
-            "INPUT".into(),
-            sysroot
-                .join("var/lib/sage/.sage-preflight-input")
-                .display()
-                .to_string(),
-        );
-        variables.insert(
-            "OUTPUT".into(),
-            sysroot
-                .join("var/lib/sage/.sage-preflight-output")
-                .display()
-                .to_string(),
-        );
-        let program = expand_template(program, &variables)?;
-        let program = target_path(sysroot, Path::new(&program))?;
-        for argument in arguments {
-            expand_template(argument, &variables)?;
-        }
-        Ok(Some(program))
-    }
-
-    fn validate_command_path(
-        &self,
-        kind: &str,
-        command: &str,
-        variables: &BTreeMap<String, String>,
-        sysroot: &Path,
-    ) -> Result<PathBuf, SysError> {
-        let command = expand_template(command, variables)?;
-        let program = command
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| SysError::Invalid(format!("empty {kind} command")))?;
-        target_path(sysroot, Path::new(program)).map_err(|error| {
-            SysError::Invalid(format!("invalid {kind} command program: {error}"))
-        })
     }
 
     fn service_variables(

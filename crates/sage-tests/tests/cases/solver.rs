@@ -1,7 +1,6 @@
 mod solver_tests {
     use sage_core::PackageKey;
     use sage_solver::*;
-    use std::collections::BTreeMap;
 
     fn release(channel: &str, name: &str, version: &str, dependencies: &[&str]) -> PackageRelease {
         sage_core::Package::from_release(
@@ -191,68 +190,6 @@ mod solver_tests {
             .unwrap();
         assert!(solution.contains_key(&PackageKey::new("main/system", "glibc", "0")));
         assert!(!solution.contains_key(&PackageKey::new("main/system", "musl", "0")));
-    }
-
-    #[test]
-    fn concrete_provider_fallbacks_do_not_create_system_bindings() {
-        let mut universe = PackageUniverse::default();
-        universe.insert(release("main/system", "old-app", "1-1", &["lib < 2-1"]));
-        universe.insert(release("main/system", "new-app", "1-1", &["lib >= 2-1"]));
-        let mut old_provider = release("main/system", "old-lib", "1-1", &[]);
-        old_provider.provides.push("lib".into());
-        universe.insert(old_provider);
-        let mut new_provider = release("main/system", "new-lib", "2-1", &[]);
-        new_provider.provides.push("lib".into());
-        universe.insert(new_provider);
-
-        let (solution, bindings) = SageSolver::new(&universe)
-            .resolve_with_provider_bindings(
-                &[
-                    PackageKey::new("main/system", "old-app", "0"),
-                    PackageKey::new("main/system", "new-app", "0"),
-                ],
-                &BTreeMap::new(),
-            )
-            .unwrap();
-        assert!(solution.contains_key(&PackageKey::new("main/system", "old-lib", "0")));
-        assert!(solution.contains_key(&PackageKey::new("main/system", "new-lib", "0")));
-        assert!(bindings.is_empty());
-    }
-
-    #[test]
-    fn unconfigured_virtuals_do_not_create_system_bindings() {
-        let mut universe = PackageUniverse::default();
-        universe.insert(release(
-            "main/system",
-            "old-app",
-            "1-1",
-            &["virtual/libc < 2-1"],
-        ));
-        universe.insert(release(
-            "main/system",
-            "new-app",
-            "1-1",
-            &["virtual/libc >= 2-1"],
-        ));
-        let mut old_provider = release("main/system", "old-libc", "1-1", &[]);
-        old_provider.provides.push("virtual/libc".into());
-        universe.insert(old_provider);
-        let mut new_provider = release("main/system", "new-libc", "2-1", &[]);
-        new_provider.provides.push("virtual/libc".into());
-        universe.insert(new_provider);
-
-        let (solution, bindings) = SageSolver::new(&universe)
-            .resolve_with_provider_bindings(
-                &[
-                    PackageKey::new("main/system", "old-app", "0"),
-                    PackageKey::new("main/system", "new-app", "0"),
-                ],
-                &BTreeMap::new(),
-            )
-            .unwrap();
-        assert!(solution.contains_key(&PackageKey::new("main/system", "old-libc", "0")));
-        assert!(solution.contains_key(&PackageKey::new("main/system", "new-libc", "0")));
-        assert!(bindings.is_empty());
     }
 
     #[test]

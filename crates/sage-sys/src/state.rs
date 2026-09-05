@@ -73,53 +73,17 @@ impl ReconcilePlan {
         universe: &sage_solver::PackageUniverse,
         no_prune: bool,
     ) -> Result<Self, SysError> {
-        let preferences = config.provider_preferences("main/system")?;
-        let retained = installed
-            .iter()
-            .filter(|package| no_prune || package.key.channel != "main/system")
-            .collect::<Vec<_>>();
-        // Reconstruct every installed release as a locked candidate. Only packages
-        // retained by policy become exact roots; PubGrub owns dependency movement.
-        let missing_installed = installed
-            .iter()
-            .any(|package| universe.release(&package.key, &package.version).is_none());
-        let retained_universe = missing_installed.then(|| {
-            let mut universe = universe.clone();
-            for package in installed {
-                if universe.release(&package.key, &package.version).is_none() {
-                    let mut release = sage_core::Package::from_release(
-                        package.key.clone(),
-                        package.version.clone(),
-                        package.dependencies.clone(),
-                        package.provides.clone(),
-                    );
-                    release.conflicts.clone_from(&package.conflicts);
-                    universe.insert(release);
-                }
-            }
-            universe
-        });
-        let universe = retained_universe.as_ref().unwrap_or(universe);
         let mut roots = config.package_keys("main/system")?;
-        if !retained.is_empty() {
-            roots.extend(retained.iter().map(|package| package.key.clone()));
-            roots.sort();
-            roots.dedup();
-        }
+        let preferences = config.provider_preferences("main/system")?;
+        roots.extend(preferences.values().cloned());
+        roots.sort();
+        roots.dedup();
         let locks = installed
             .iter()
-            .map(|package| (package.key.clone(), package.version.clone()))
-            .collect::<Vec<_>>();
-        let exact = retained
-            .iter()
-            .map(|package| (package.key.clone(), package.version.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let resolve = |roots: &[sage_core::PackageKey]| {
-            sage_solver::SageSolver::with_locked(universe, locks.clone())
-                .prefer_providers(preferences.clone())
-                .resolve_with_provider_bindings(roots, &exact)
-        };
-        let (solution, selected_providers) = resolve(&roots)?;
+            .map(|package| (package.key.clone(), package.version.clone()));
+        let solution = sage_solver::SageSolver::with_locked(universe, locks)
+            .prefer_providers(preferences.clone())
+            .resolve(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
@@ -139,23 +103,9 @@ impl ReconcilePlan {
                 .collect()
         };
         let provider_bindings = preferences
-            .iter()
-            .map(|(symbol, preferred)| {
-                let selected = selected_providers.get(symbol).unwrap_or(preferred);
-                let release = solution
-                    .get(selected)
-                    .and_then(|version| universe.release(selected, version));
-                if !release.is_some_and(|package| package.provides.contains(symbol)) {
-                    return Err(SysError::Invalid(format!(
-                        "configured provider {selected} does not provide {symbol}"
-                    )));
-                }
-                Ok((
-                    symbol.strip_prefix("virtual/").unwrap_or(symbol).into(),
-                    selected.clone(),
-                ))
-            })
-            .collect::<Result<_, _>>()?;
+            .into_iter()
+            .map(|(symbol, key)| (symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(), key))
+            .collect();
         Ok(Self {
             install,
             remove,

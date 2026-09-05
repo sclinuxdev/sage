@@ -43,12 +43,6 @@ pub struct InstalledPackage {
     /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
-/// Exact declarative rebuild tail replayed after package publication recovers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebuildContinuation {
-    pub provider_bindings: BTreeMap<String, PackageKey>,
-    pub system_config: Vec<u8>,
-}
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -57,12 +51,10 @@ pub enum JournalAction {
         changes: Vec<(PackageKey, Version)>,
         /// Pre-upgrade records retained until obsolete paths are removed.
         previous_packages: Vec<InstalledPackage>,
-        retired_packages: Vec<InstalledPackage>,
         modified_paths: Vec<String>,
         removed_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
         removal_trigger_documents: Vec<Vec<u8>>,
-        rebuild: Option<RebuildContinuation>,
     },
     Remove {
         packages: Vec<InstalledPackage>,
@@ -271,6 +263,7 @@ impl SageDatabase {
         Ok(get_owned(&self.files, &txn, path)?.unwrap_or_default())
     }
     /// Returns the complete reverse file-ownership index in LMDB key order.
+    #[cfg(feature = "torture")]
     pub fn file_owners(&self) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
         let txn = self.env.read_txn()?;
         let owners = self
@@ -287,16 +280,10 @@ impl SageDatabase {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.provides, &txn, symbol)?.unwrap_or_default())
     }
-    /// Replaces every persisted system-provider binding in one transaction.
-    pub fn replace_system_providers(
-        &self,
-        bindings: &BTreeMap<String, PackageKey>,
-    ) -> Result<(), DbError> {
+    /// Pins a system interface such as `virtual/libc` to one package instance.
+    pub fn set_system_provider(&self, interface: &str, key: &PackageKey) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
-        self.system.clear(&mut txn)?;
-        for (interface, key) in bindings {
-            self.system.put(&mut txn, interface, &key.canonical_id())?;
-        }
+        self.system.put(&mut txn, interface, &key.canonical_id())?;
         txn.commit()?;
         Ok(())
     }
@@ -362,33 +349,6 @@ pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
         records.push(decode(bytes)?);
     }
     Ok(records)
-}
-/// Reads resolved system bindings without creating or writing the environment.
-/// Returns an empty map for an absent environment, or an error for invalid state.
-pub fn read_system_providers(path: &Path) -> Result<BTreeMap<String, PackageKey>, DbError> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let mut options = EnvOpenOptions::new();
-    options.max_dbs(8);
-    // SAFETY: this environment performs no writes and retains LMDB locking.
-    unsafe {
-        options.flags(EnvFlags::READ_ONLY);
-    }
-    let env = unsafe { options.open(path)? };
-    let txn = env.read_txn()?;
-    let system: Database<Str, Str> = env.open_database(&txn, Some("system"))?.ok_or_else(|| {
-        DbError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing system table",
-        ))
-    })?;
-    let mut bindings = BTreeMap::new();
-    for entry in system.iter(&txn)? {
-        let (interface, key) = entry?;
-        bindings.insert(interface.into(), key.parse()?);
-    }
-    Ok(bindings)
 }
 /// Reads one file-owner list without opening a write transaction.
 pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {

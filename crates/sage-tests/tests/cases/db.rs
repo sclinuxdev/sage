@@ -29,11 +29,6 @@ mod db_tests {
         assert_eq!(db.package(&rg.key).unwrap(), Some(rg.clone()));
         assert_eq!(db.owners("usr/bin/rg").unwrap(), vec![rg.key.clone()]);
         assert_eq!(db.providers("cmd:ripgrep").unwrap(), vec![rg.key.clone()]);
-        db.replace_system_providers(&BTreeMap::from([("tool".into(), rg.key.clone())]))
-            .unwrap();
-        assert_eq!(db.system_provider("tool").unwrap(), Some(rg.key.clone()));
-        db.replace_system_providers(&BTreeMap::new()).unwrap();
-        assert!(db.system_provider("tool").unwrap().is_none());
         assert_eq!(db.remove(&rg.key).unwrap(), Some(rg));
         assert!(db.owners("usr/bin/rg").unwrap().is_empty());
     }
@@ -78,12 +73,10 @@ mod db_tests {
                 architecture: "amd64".into(),
                 changes: vec![],
                 previous_packages: vec![],
-                retired_packages: vec![],
                 modified_paths: vec![],
                 removed_paths: vec![],
                 previous_alternative_documents: vec![],
                 removal_trigger_documents: vec![],
-                rebuild: None,
             },
         );
         SageDatabase::open(dir.path())
@@ -101,12 +94,10 @@ mod db_tests {
             architecture: "amd64".into(),
             changes: vec![],
             previous_packages: vec![],
-            retired_packages: vec![],
             modified_paths: vec![],
             removed_paths: vec![],
             previous_alternative_documents: vec![],
             removal_trigger_documents: vec![],
-            rebuild: None,
         };
         let mut record = JournalRecord::new("op-1".into(), "packages", action.clone());
         record.stage = "triggers".into();

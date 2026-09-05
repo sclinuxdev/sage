@@ -63,33 +63,6 @@ fn read_documents(root: &Path, relative: &Path) -> Result<Vec<Vec<u8>>> {
         .map(|entry| std::fs::read(entry.path()).map_err(Into::into))
         .collect()
 }
-fn service_declaration_path(name: &str) -> String {
-    Path::new("usr/share/sage/services")
-        .join(format!("{name}.toml"))
-        .to_string_lossy()
-        .into_owned()
-}
-fn read_service_declarations(
-    root: &Path,
-) -> Result<BTreeMap<String, sage_sys::ServiceSpec>> {
-    let directory = under_root(root, Path::new("/usr/share/sage/services"));
-    if !directory.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let mut entries = std::fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    entries
-        .into_iter()
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("toml"))
-        .map(|entry| {
-            let relative = Path::new("usr/share/sage/services")
-                .join(entry.file_name())
-                .to_string_lossy()
-                .into_owned();
-            Ok((relative, sage_sys::ServiceSpec::load(entry.path())?))
-        })
-        .collect()
-}
 fn alternatives_from_documents(documents: &[Vec<u8>]) -> Result<Vec<sage_sys::Alternative>> {
     let mut alternatives = Vec::new();
     for document in documents {
@@ -388,8 +361,6 @@ async fn apply_packages(
             &available,
             &config.system.architecture,
             &changes,
-            &[],
-            None,
         )
         .await?;
     }
@@ -454,39 +425,24 @@ async fn publish_packages(
     available: &AvailablePackages,
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
-    retired: &[sage_db::InstalledPackage],
-    rebuild: Option<sage_db::RebuildContinuation>,
 ) -> Result<()> {
-    let changes = preflight_packages(
-        root,
-        database,
-        available,
-        architecture,
-        changes,
-        retired,
-        rebuild.as_ref(),
-    )
-    .await?;
+    let changes = preflight_packages(root, database, available, architecture, changes).await?;
     let op_id = operation_id("install")?;
     // Recovery must not consult records that installation may already have replaced.
-    let mut previous_packages = retired
+    let previous_packages = changes
         .iter()
-        .cloned()
-        .map(|package| (package.key.clone(), package))
-        .collect::<BTreeMap<_, _>>();
-    for (key, _) in &changes {
-        if let Some(package) = database.package(key)? {
-            previous_packages.insert(key.clone(), package);
-        }
-    }
+        .map(|(key, _)| database.package(key))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let mut journal = sage_db::JournalRecord::new(
         op_id,
-        if rebuild.is_some() { "rebuild-cleanup" } else { "packages" },
+        "packages",
         sage_db::JournalAction::Install {
             architecture: architecture.into(),
-            changes: changes.clone(),
-            previous_packages: previous_packages.into_values().collect(),
-            retired_packages: retired.to_vec(),
+            changes,
+            previous_packages,
             modified_paths: Vec::new(),
             removed_paths: Vec::new(),
             previous_alternative_documents: read_documents(
@@ -494,7 +450,6 @@ async fn publish_packages(
                 Path::new("usr/share/sage/alternatives"),
             )?,
             removal_trigger_documents: trigger_documents(root)?,
-            rebuild,
         },
     );
     database.write_journal(&journal)?;
@@ -566,7 +521,7 @@ impl PackageDeclarations {
         let mut paths = self
             .services
             .iter()
-            .map(|(name, _)| service_declaration_path(name))
+            .map(|(name, _)| format!("usr/share/sage/services/{name}.toml"))
             .collect::<Vec<_>>();
         if let Some((name, _)) = &self.trigger {
             paths.push(format!("usr/share/sage/triggers/{name}.toml"));
@@ -590,26 +545,11 @@ async fn preflight_packages(
     available: &AvailablePackages,
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
-    retired: &[sage_db::InstalledPackage],
-    rebuild: Option<&sage_db::RebuildContinuation>,
 ) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
-    let renderer_path = rebuild.and_then(|continuation| continuation.provider_bindings.get("init"))
-        .map(|provider| format!("usr/share/sage/rclass/init-{}.toml", provider.name));
-    let mut planned_renderer = None;
-    let mut planned_services = if renderer_path.is_some() {
-        Some(read_service_declarations(root)?)
-    } else {
-        None
-    };
-    let mut replacement_services = BTreeMap::new();
-    let mut payloads = BTreeMap::new();
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
-    let mut final_paths = retired
-        .iter()
-        .map(|package| (package.key.clone(), BTreeSet::new()))
-        .collect::<BTreeMap<_, _>>();
+    let mut final_paths = BTreeMap::<sage_core::PackageKey, BTreeSet<String>>::new();
     for (key, version) in changes {
         let source = available
             .releases
@@ -644,38 +584,6 @@ async fn preflight_packages(
             .strip_prefix("/")
             .unwrap_or(&source.target_root);
         let declarations = PackageDeclarations::parse(&inspection, key)?;
-        if renderer_path.is_some() {
-        for record in &inspection.files {
-            let physical = prefix.join(&record.path);
-            if physical.parent() == Some(Path::new("usr/share/sage/services"))
-                && physical.extension().is_some_and(|extension| extension == "toml")
-            {
-                let bytes = sage_archive::read_payload_file(&archive, &record.path)?;
-                replacement_services.insert(physical.to_string_lossy().into_owned(), sage_sys::ServiceSpec::parse(&bytes)?);
-            }
-            payloads.insert(physical, (archive.clone(), record.path.clone(), record.mode));
-        }
-        }
-        if let Some(path) = &renderer_path {
-            if let Some(record) = inspection
-                .files
-                .iter()
-                .find(|record| prefix.join(&record.path) == Path::new(path))
-            {
-                let bytes = sage_archive::read_payload_file(&archive, &record.path)?;
-                let generator = sage_sys::TemplateServiceGenerator::parse(&bytes)
-                    .with_context(|| format!("invalid planned init renderer {path}"))?;
-                planned_renderer = Some(generator);
-            }
-        }
-        if renderer_path.is_some() {
-            for (name, bytes) in &declarations.services {
-                let service = sage_sys::ServiceSpec::parse(bytes).with_context(|| {
-                    format!("invalid planned service declaration {name} in {key}")
-                })?;
-                replacement_services.insert(service_declaration_path(name), service);
-            }
-        }
         let mut ownership: Vec<_> = inspection
             .files
             .iter()
@@ -699,68 +607,6 @@ async fn preflight_packages(
                 .entry(path)
                 .or_default()
                 .insert(package.key.clone());
-        }
-    }
-    if let Some(services) = planned_services.as_mut() {
-        // Keep declarations whose current owners survive the transaction, then
-        // overlay service files carried by replacement archives. This mirrors
-        // publication order without touching the live service directory.
-        services.retain(|path, _| {
-            installed_paths.get(path).is_none_or(|owners| {
-                owners.is_empty()
-                    || owners.iter().any(|owner| {
-                        final_paths
-                            .get(owner)
-                            .is_none_or(|paths| paths.contains(path))
-                    })
-            })
-        });
-        services.extend(replacement_services);
-    }
-    if let Some(path) = renderer_path {
-        // A live renderer cannot satisfy the plan if every current owner will
-        // release it. This includes same-name upgrades that omit the old file.
-        if planned_renderer.is_none()
-            && installed_paths.get(&path).is_some_and(|owners| {
-                owners.iter().all(|owner| {
-                    final_paths
-                        .get(owner)
-                        .is_some_and(|paths| !paths.contains(&path))
-                })
-            })
-        {
-            bail!("planned init renderer {path} is removed by this transaction");
-        }
-        let generator = match planned_renderer {
-            Some(generator) => generator,
-            None => sage_sys::TemplateServiceGenerator::from_rclass(
-                &under_root(root, Path::new(&path)),
-            )
-            .with_context(|| format!("invalid planned init renderer {path}"))?,
-        };
-        if let Some(services) = planned_services {
-            let services = services.into_values().collect::<Vec<_>>();
-            let config: sage_sys::SystemConfig = toml::from_str(std::str::from_utf8(&rebuild.expect("renderer requires rebuild").system_config)?)?;
-            for name in &config.services {
-                if !services.iter().any(|service| &service.name == name) {
-                    bail!("enabled service '{name}' has no planned declaration");
-                }
-            }
-            generator
-                .validate_service_set(&services, root)
-                .with_context(|| format!("invalid planned init renderer {path}"))?;
-            let mut removed = installed_paths.iter().filter(|(path, owners)| {
-                !planned.contains_key(*path) && owners.iter().all(|owner| {
-                    final_paths.get(owner).is_some_and(|paths| !paths.contains(*path))
-                })
-            }).map(|(path, _)| PathBuf::from(path)).collect::<BTreeSet<_>>();
-            // Generated declarations replace any live payload at their path with
-            // non-executable data, so the old file cannot satisfy a program lookup.
-            removed.extend(planned.keys().filter(|path| !payloads.contains_key(Path::new(path)))
-                .map(PathBuf::from));
-            for program in generator.required_programs(&services, &config.services, root)? {
-                validate_planned_program(root, &program, &payloads, &removed)?;
-            }
         }
     }
     for (path, claimant) in &planned {
@@ -874,76 +720,8 @@ async fn preflight_packages(
     if ordered.len() != changes.len() {
         bail!("cyclic file ownership handoff in package transaction");
     }
-    if rebuild.is_some() {
-        let path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
-        if path.exists() {
-            let previous = sage_sys::RenderedServicesState::load(&path)?;
-            for service in &previous.services {
-                if let Some(program) = previous.generator.disable_program(service, root)? {
-                    validate_planned_program(root, &program, &BTreeMap::new(), &BTreeSet::new())?;
-                }
-            }
-        }
-    }
     Ok(ordered)
 }
-/// Checks a program against the final payload/retained-file overlay without
-/// publishing it. Resolve every symlink component in that same overlay so a
-/// retained link cannot conceal a removed target or escape the target root.
-fn validate_planned_program(
-    root: &Path,
-    program: &Path,
-    payloads: &BTreeMap<PathBuf, (PathBuf, PathBuf, u32)>,
-    removed: &BTreeSet<PathBuf>,
-) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mut pending = program.strip_prefix(root)?.components()
-        .map(|component| PathBuf::from(component.as_os_str()))
-        .collect::<std::collections::VecDeque<_>>();
-    let mut relative = PathBuf::new();
-    let mut links = BTreeSet::new();
-    while let Some(component) = pending.pop_front() {
-        if component == Path::new(".") { continue; }
-        if component == Path::new("..") {
-            if !relative.pop() { bail!("program escapes sysroot: {}", program.display()); }
-            continue;
-        }
-        relative.push(component);
-        if removed.contains(&relative) {
-            bail!("planned program {} uses removed path {}", program.display(), relative.display());
-        }
-        let (link, regular, mode) = if let Some((archive, path, mode)) = payloads.get(&relative) {
-            (sage_archive::payload_link_target(archive, path)?, true, *mode)
-        } else if !pending.is_empty() && payloads.keys().any(|path| path.starts_with(&relative)) {
-            // Payload ancestors are created by extraction, even on a fresh root.
-            (None, false, 0)
-        } else {
-            let path = root.join(&relative);
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("missing planned program {}", program.display()))?;
-            (metadata.is_symlink().then(|| std::fs::read_link(&path)).transpose()?,
-             metadata.is_file(), metadata.permissions().mode())
-        };
-        if let Some(link) = link {
-            if link.is_absolute() || !links.insert(relative.clone()) {
-                bail!("unsafe program symlink {}", relative.display());
-            }
-            relative.pop();
-            for component in link.components().rev() {
-                pending.push_front(PathBuf::from(component.as_os_str()));
-            }
-        } else if pending.is_empty() {
-            if !regular || mode & 0o111 == 0 {
-                bail!("planned program is not executable: {}", program.display());
-            }
-            return Ok(());
-        } else if regular {
-            bail!("program ancestor is not a directory: {}", relative.display());
-        }
-    }
-    bail!("planned program is not a regular file: {}", program.display())
-}
-
 async fn resume_install(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -951,13 +729,11 @@ async fn resume_install(
     journal: &mut sage_db::JournalRecord,
 ) -> Result<()> {
     journal.validate()?;
-    let (architecture, changes, previous_packages, retired_packages, rebuild) = match &journal.action {
+    let (architecture, changes, previous_packages) = match &journal.action {
         sage_db::JournalAction::Install {
             architecture,
             changes,
             previous_packages,
-            retired_packages,
-            rebuild,
             ..
         } => (
             architecture.clone(),
@@ -967,8 +743,6 @@ async fn resume_install(
                 .cloned()
                 .map(|package| (package.key.clone(), package))
                 .collect::<BTreeMap<_, _>>(),
-            retired_packages.clone(),
-            rebuild.clone(),
         ),
         _ => bail!("install recovery received a removal journal"),
     };
@@ -980,33 +754,7 @@ async fn resume_install(
     }
     let mut modified = Vec::new();
     let mut removed_paths = Vec::new();
-    if journal.stage == "rebuild-cleanup" {
-        // Disable the previous generation while all of its programs and libraries
-        // still exist. Persist the emptied state before entering package publication;
-        // recovery must never rerun an old command after its package is retired.
-        // Any changed package may supply a runtime dependency of these programs.
-        if !changes.is_empty() || !retired_packages.is_empty() {
-            let relative = Path::new("var/lib/sage/rendered-services.toml");
-            let path = under_root(root, relative);
-            if path.exists() {
-                let mut previous = sage_sys::RenderedServicesState::load(&path)?;
-                for service in &previous.services {
-                    previous.generator.disable_service(service, root)?;
-                    previous.generator.remove_service(service, root)?;
-                }
-                previous.services.clear();
-                previous.enabled.clear();
-                write_atomic_under_root(root, relative, toml::to_string_pretty(&previous)?.as_bytes())?;
-            }
-        }
-        crash_point(root, "rebuild-cleanup")?;
-        journal.advance("packages");
-        database.write_journal(journal)?;
-    }
     if journal.stage == "packages" {
-    for package in &retired_packages {
-        database.remove(&package.key)?;
-    }
     for (key, version) in &changes {
         let source = available
             .releases
@@ -1132,18 +880,6 @@ async fn resume_install(
             eprintln!("Configuration update requires review: {}", path.display());
         }
     }
-    for package in &retired_packages {
-        for relative in &package.files {
-            if database.owners(relative)?.is_empty() {
-                let path = under_root(root, Path::new(relative));
-                if !should_preserve_config(&path, relative, &package.config_hashes)? {
-                    remove_file_beneath(root, &path)?;
-                    modified.push(PathBuf::from(relative));
-                    removed_paths.push(relative.clone());
-                }
-            }
-        }
-    }
     if let sage_db::JournalAction::Install {
         modified_paths,
         removed_paths: journal_removed,
@@ -1214,54 +950,9 @@ async fn resume_install(
         root,
         sage_sys::TriggerEvent::PostChange,
     )?;
-    journal.advance(if rebuild.is_some() {
-        "rebuild-bindings"
-    } else {
-        "complete"
-    });
+    journal.advance("complete");
     database.write_journal(journal)?;
     crash_point(root, "trigger-complete")?;
-    }
-    if journal.stage == "rebuild-bindings" {
-        let continuation = rebuild
-            .as_ref()
-            .context("rebuild journal is missing its continuation")?;
-        database.replace_system_providers(&continuation.provider_bindings)?;
-        journal.advance("rebuild-services");
-        database.write_journal(journal)?;
-        crash_point(root, "rebuild-bindings")?;
-    }
-    if journal.stage == "rebuild-services" {
-        let continuation = rebuild
-            .as_ref()
-            .context("rebuild journal is missing its continuation")?;
-        let config: sage_sys::SystemConfig =
-            toml::from_str(std::str::from_utf8(&continuation.system_config)?)?;
-        let init_provider = continuation
-            .provider_bindings
-            .get("init")
-            .context("rebuild journal has no resolved init provider")?;
-        let state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
-        let previous = state_path
-            .exists()
-            .then(|| sage_sys::RenderedServicesState::load(&state_path))
-            .transpose()?;
-        render_services(root, &config, init_provider, false, previous.as_ref())?;
-        journal.advance("rebuild-triggers");
-        database.write_journal(journal)?;
-        crash_point(root, "rebuild-services")?;
-    }
-    if journal.stage == "rebuild-triggers" {
-        let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
-        sage_sys::TriggerEngine::execute_triggers_for(
-            &triggers,
-            &[PathBuf::from("etc/sage/system.toml")],
-            root,
-            sage_sys::TriggerEvent::Rebuild,
-        )?;
-        journal.advance("complete");
-        database.write_journal(journal)?;
-        crash_point(root, "rebuild-triggers")?;
     }
     database.finish_journal(&journal.op_id)?;
     Ok(())
@@ -1325,15 +1016,6 @@ fn remove_packages(
         .collect();
     if selected.len() != names.len() {
         bail!("one or more requested packages are not installed in {canonical}");
-    }
-    // A replacement candidate does not switch a persisted binding. Rebuild owns
-    // that transition, including native-service reconciliation and recovery.
-    for (interface, provider) in sage_db::read_system_providers(&db_path)? {
-        if requested.contains(&provider) {
-            bail!(
-                "cannot remove bound provider {provider} for virtual/{interface}; switch providers with rebuild first"
-            );
-        }
     }
     for dependent in &installed {
         if selected.iter().any(|removed| {
@@ -1570,6 +1252,11 @@ fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result
 async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
+    let mut desired: Vec<_> = config.packages.iter().cloned().collect();
+    desired.extend(config.providers.values().cloned());
+    desired.sort();
+    desired.dedup();
+    apply_packages(root, &desired, Some("system"), false, false, dry_run).await?;
     let available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = if dry_run {
@@ -1579,74 +1266,51 @@ async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()
     };
     let plan =
         sage_sys::ReconcilePlan::compute(&config, &installed, &available.universe, no_prune)?;
-    let init_provider = plan
-        .provider_bindings
+    let names: Vec<_> = plan
+        .remove
+        .into_iter()
+        .map(|key| format!("{}:{}", key.name, key.slot))
+        .collect();
+    if !names.is_empty() {
+        remove_packages(root, &names, Some("main/system"), false, dry_run)?;
+    }
+    let database = if dry_run {
+        None
+    } else {
+        Some(sage_db::SageDatabase::open(&db_path)?)
+    };
+    for (interface, key) in plan.provider_bindings {
+        if dry_run {
+            println!("Would bind virtual/{interface} to {key}");
+        } else {
+            database
+                .as_ref()
+                .expect("non-dry rebuild opens the database")
+                .set_system_provider(&interface, &key)?;
+        }
+    }
+    render_services(root, &config, dry_run)?;
+    if !dry_run {
+        let triggers = sage_sys::TriggerEngine::load_triggers(root)?;
+        sage_sys::TriggerEngine::execute_triggers_for(
+            &triggers,
+            &[PathBuf::from("etc/sage/system.toml")],
+            root,
+            sage_sys::TriggerEvent::Rebuild,
+        )?;
+    }
+    Ok(())
+}
+fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) -> Result<()> {
+    let provider = config
+        .providers
         .get("init")
         .context("system providers must select an init implementation")?;
-    let rendered_state_path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
-    let previous_services = rendered_state_path
-        .exists()
-        .then(|| sage_sys::RenderedServicesState::load(&rendered_state_path))
-        .transpose()?;
-    let current = installed
-        .iter()
-        .map(|package| (package.key.clone(), package.version.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let changes = installation_order(&available, plan.install.iter().cloned().collect())?;
-    let retired = installed
-        .iter()
-        .filter(|package| plan.remove.contains(&package.key))
-        .cloned()
-        .collect::<Vec<_>>();
-    for (key, version) in &changes {
-        println!(
-            "{} {key} {version}",
-            if current.contains_key(key) { "Upgrade" } else { "Install" }
-        );
-    }
-    for package in &retired {
-        println!("Remove {} {}", package.key, package.version);
-    }
-    if dry_run {
-        for (interface, key) in &plan.provider_bindings {
-            println!("Would bind virtual/{interface} to {key}");
-        }
-        render_services(
-            root,
-            &config,
-            init_provider,
-            true,
-            previous_services.as_ref(),
-        )?;
-        return Ok(());
-    }
-    let continuation = sage_db::RebuildContinuation {
-        provider_bindings: plan.provider_bindings,
-        system_config: toml::to_string(&config)?.into_bytes(),
-    };
-    let database = sage_db::SageDatabase::open(&db_path)?;
-    publish_packages(
-        root,
-        &database,
-        &available,
-        &config.system.architecture,
-        &changes,
-        &retired,
-        Some(continuation),
-    )
-    .await
-}
-fn render_services(
-    root: &Path,
-    config: &sage_sys::SystemConfig,
-    provider: &sage_core::PackageKey,
-    dry_run: bool,
-    previous: Option<&sage_sys::RenderedServicesState>,
-) -> Result<()> {
     let rclass = under_root(
         root,
-        &Path::new("/usr/share/sage/rclass").join(format!("init-{}.toml", provider.name)),
+        &Path::new("/usr/share/sage/rclass").join(format!("init-{provider}.toml")),
     );
+    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
     let service_dir = under_root(root, Path::new("/usr/share/sage/services"));
     let mut installed = Vec::new();
     if service_dir.exists() {
@@ -1670,8 +1334,14 @@ fn render_services(
         bail!("enabled service '{service}' has no installed declaration");
     }
     let state_relative = Path::new("var/lib/sage/rendered-services.toml");
+    let state_path = under_root(root, state_relative);
+    let previous = if state_path.exists() {
+        Some(sage_sys::RenderedServicesState::load(&state_path)?)
+    } else {
+        None
+    };
     if dry_run {
-        if let Some(previous) = previous {
+        if let Some(previous) = &previous {
             for service in &previous.services {
                 let provider_changed = previous.provider != *provider;
                 let removed = !installed
@@ -1698,8 +1368,14 @@ fn render_services(
         }
         return Ok(());
     }
-    let generator = sage_sys::TemplateServiceGenerator::from_rclass(&rclass)?;
-    if let Some(previous) = previous {
+    if let Some(previous) = &previous {
+        let previous_rclass = under_root(
+            root,
+            &Path::new("/usr/share/sage/rclass")
+                .join(format!("init-{}.toml", previous.provider)),
+        );
+        let previous_generator =
+            sage_sys::TemplateServiceGenerator::from_rclass(&previous_rclass)?;
         for service in &previous.services {
             let provider_changed = previous.provider != *provider;
             let removed = !installed
@@ -1708,10 +1384,10 @@ fn render_services(
             let disabled = previous.enabled.contains(&service.name)
                 && !config.services.contains(&service.name);
             if provider_changed || removed || disabled {
-                previous.generator.disable_service(service, root)?;
+                previous_generator.disable_service(service, root)?;
             }
             if provider_changed || removed {
-                previous.generator.remove_service(service, root)?;
+                previous_generator.remove_service(service, root)?;
             }
         }
     }
@@ -1724,7 +1400,6 @@ fn render_services(
     let state = sage_sys::RenderedServicesState {
         schema_version: sage_core::SCHEMA_VERSION,
         provider: provider.clone(),
-        generator,
         services: installed,
         enabled: config.services.clone(),
     };
@@ -1855,225 +1530,4 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod package_ops_tests {
-    use super::*;
-
-    #[test]
-    fn planned_program_links_resolve_in_the_final_filesystem() {
-        use std::os::unix::{fs::symlink, fs::PermissionsExt as _};
-        let root = tempfile::tempdir().unwrap();
-        let stage = tempfile::tempdir().unwrap();
-        let data = stage.path().join("data");
-        std::fs::create_dir_all(data.join("usr/bin")).unwrap();
-        std::fs::create_dir_all(stage.path().join(".METADATA")).unwrap();
-        std::fs::write(data.join("usr/bin/real"), b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(data.join("usr/bin/real"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        symlink("real", data.join("usr/bin/ctl")).unwrap();
-        std::fs::write(stage.path().join(".METADATA/manifest.toml"),
-            "schema_version=1\nname=\"program\"\nversion=\"1\"\nrelease=1\narch=\"noarch\"\nchannel=\"system\"\ndescription=\"Program\"\nlicense=\"MIT\"\n").unwrap();
-        let records = sage_archive::build_file_index(&data).unwrap();
-        std::fs::write(stage.path().join(".METADATA/files.idx"), sage_archive::format_file_index(&records)).unwrap();
-        let archive = stage.path().join("program.pkg.tar.zst");
-        sage_archive::create_package(stage.path(), &archive, 1).unwrap();
-        sage_archive::validate_package_payload(&archive, &records).unwrap();
-        let mut payloads = records.into_iter().map(|record| {
-            (record.path.clone(), (archive.clone(), record.path, record.mode))
-        }).collect::<BTreeMap<_, _>>();
-        let program = root.path().join("usr/bin/ctl");
-        validate_planned_program(root.path(), &program, &payloads, &BTreeSet::new()).unwrap();
-        payloads.remove(Path::new("usr/bin/real"));
-        let removed = BTreeSet::from([PathBuf::from("usr/bin/real")]);
-        assert!(validate_planned_program(root.path(), &program, &payloads, &removed).is_err());
-        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
-        symlink("real", &program).unwrap();
-        std::fs::copy(data.join("usr/bin/real"), root.path().join("usr/bin/real")).unwrap();
-        validate_planned_program(root.path(), &program, &BTreeMap::new(), &BTreeSet::new()).unwrap();
-        assert!(validate_planned_program(root.path(), &program, &BTreeMap::new(), &removed).is_err());
-        std::fs::remove_file(&program).unwrap();
-        symlink(data.join("usr/bin/real"), &program).unwrap();
-        assert!(validate_planned_program(root.path(), &program, &BTreeMap::new(), &BTreeSet::new()).is_err());
-    }
-
-    fn system_config(provider: Option<&str>) -> sage_sys::SystemConfig {
-        sage_sys::SystemConfig {
-            schema_version: 1,
-            system: sage_sys::SystemMetadata {
-                architecture: "amd64".into(),
-                profile: "default".into(),
-            },
-            providers: provider
-                .map(|provider| BTreeMap::from([("init".into(), provider.into())]))
-                .unwrap_or_default(),
-            packages: BTreeSet::new(),
-            services: BTreeSet::new(),
-        }
-    }
-
-    #[test]
-    fn service_rendering_uses_the_resolved_init_provider() {
-        let root = tempfile::tempdir().unwrap();
-        let rclass = root.path().join("usr/share/sage/rclass");
-        std::fs::create_dir_all(&rclass).unwrap();
-        let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/loom/${service.name}\"\nmode=420\ntemplate=\"\"\n";
-        std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
-        let config = system_config(Some("systemd"));
-        let loom = sage_core::PackageKey::new("main/system", "loom", "0");
-        let systemd = sage_core::PackageKey::new("main/system", "systemd", "0");
-
-        render_services(root.path(), &config, &loom, false, None).unwrap();
-        let state = sage_sys::RenderedServicesState::load(
-            root.path().join("var/lib/sage/rendered-services.toml"),
-        )
-        .unwrap();
-        assert_eq!(state.provider, loom);
-
-        std::fs::write(rclass.join("init-systemd.toml"), renderer).unwrap();
-        std::fs::remove_file(rclass.join("init-loom.toml")).unwrap();
-        render_services(root.path(), &config, &systemd, false, Some(&state)).unwrap();
-        let state = sage_sys::RenderedServicesState::load(
-            root.path().join("var/lib/sage/rendered-services.toml"),
-        )
-        .unwrap();
-        assert_eq!(state.provider, systemd);
-    }
-
-    #[test]
-    fn dry_run_does_not_load_a_planned_init_renderer() {
-        let root = tempfile::tempdir().unwrap();
-        let config = system_config(None);
-        let provider = sage_core::PackageKey::new("main/system", "not-installed", "0");
-        render_services(root.path(), &config, &provider, true, None).unwrap();
-    }
-
-    #[tokio::test]
-    async fn missing_init_does_not_clear_provider_bindings() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
-        std::fs::write(
-            root.path().join("etc/sage/system.toml"),
-            "schema_version=1\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.path().join("etc/sage/channels.toml"),
-            "schema_version=1\n[channels]\n",
-        )
-        .unwrap();
-        let key = sage_core::PackageKey::new("main/system", "loom", "0");
-        {
-            let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
-            database
-                .replace_system_providers(&BTreeMap::from([("init".into(), key.clone())]))
-                .unwrap();
-        }
-
-        rebuild_system(root.path(), false, false).await.unwrap_err();
-        let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
-        assert_eq!(database.system_provider("init").unwrap(), Some(key));
-    }
-
-    #[tokio::test]
-    async fn journal_recovery_reconciles_an_init_slot_switch() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("etc/sage")).unwrap();
-        std::fs::write(
-            root.path().join("etc/sage/channels.toml"),
-            "schema_version=1\n[channels]\n",
-        )
-        .unwrap();
-        let rclass = root.path().join("usr/share/sage/rclass");
-        std::fs::create_dir_all(&rclass).unwrap();
-        let renderer = r#"schema_version=1
-[service_generator]
-target_path="/etc/loom-0/${service.name}"
-mode=420
-template="${service.name}"
-enable_command="/service-action enable ${SYSROOT}/etc/loom-0/enabled"
-disable_command="/service-action disable ${SYSROOT}/etc/loom-0/enabled"
-"#;
-        std::fs::write(rclass.join("init-loom.toml"), renderer).unwrap();
-        let action = root.path().join("service-action");
-        std::fs::write(
-            &action,
-            "#!/bin/sh\ncase \"$1\" in\nenable) : > \"$2\";;\ndisable) /bin/rm -f \"$2\";;\nesac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&action, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let services = root.path().join("usr/share/sage/services");
-        std::fs::create_dir_all(&services).unwrap();
-        std::fs::write(
-            services.join("daemon.toml"),
-            r#"schema_version=1
-[service]
-name="daemon"
-description="Daemon"
-command=["/usr/bin/daemon"]
-user="daemon"
-group="daemon"
-working_dir="/"
-restart="on-failure"
-type="simple"
-"#,
-        )
-        .unwrap();
-        let old_key = sage_core::PackageKey::new("main/system", "loom", "0");
-        let key = sage_core::PackageKey::new("main/system", "loom", "1");
-        let mut config = system_config(Some("loom:1"));
-        config.services.insert("daemon".into());
-        render_services(root.path(), &config, &old_key, false, None).unwrap();
-        assert!(root.path().join("etc/loom-0/daemon").is_file());
-        assert!(root.path().join("etc/loom-0/enabled").is_file());
-        // Simulate publication replacing the same-name rclass before recovery.
-        std::fs::write(
-            rclass.join("init-loom.toml"),
-            renderer.replace("loom-0", "loom-1"),
-        )
-        .unwrap();
-        {
-            let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
-            database
-                .replace_system_providers(&BTreeMap::from([("init".into(), old_key)]))
-                .unwrap();
-            let journal = sage_db::JournalRecord::new(
-                "rebuild-tail".into(),
-                "rebuild-bindings",
-                sage_db::JournalAction::Install {
-                    architecture: "amd64".into(),
-                    changes: vec![],
-                    previous_packages: vec![],
-                    retired_packages: vec![],
-                    modified_paths: vec![],
-                    removed_paths: vec![],
-                    previous_alternative_documents: vec![],
-                    removal_trigger_documents: vec![],
-                    rebuild: Some(sage_db::RebuildContinuation {
-                        provider_bindings: BTreeMap::from([("init".into(), key.clone())]),
-                        system_config: toml::to_string(&config).unwrap().into_bytes(),
-                    }),
-                },
-            );
-            database.write_journal(&journal).unwrap();
-        }
-
-        settle_journals(root.path()).await.unwrap();
-        assert!(!root.path().join("etc/loom-0/daemon").exists());
-        assert!(!root.path().join("etc/loom-0/enabled").exists());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("etc/loom-1/daemon")).unwrap(),
-            "daemon"
-        );
-        assert!(root.path().join("etc/loom-1/enabled").is_file());
-        let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
-        assert_eq!(database.system_provider("init").unwrap(), Some(key.clone()));
-        assert!(database.pending_journals().unwrap().is_empty());
-        let state = sage_sys::RenderedServicesState::load(
-            root.path().join("var/lib/sage/rendered-services.toml"),
-        )
-        .unwrap();
-        assert_eq!(state.provider, key);
-    }
 }

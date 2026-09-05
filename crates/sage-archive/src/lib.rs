@@ -42,63 +42,6 @@ pub type PackageManifest = sage_core::Package;
 /// Build-tool provenance shared with package manifests.
 pub use sage_core::ManagedBuildTool;
 
-/// Reads one regular file from a payload already checked by `validate_package_payload`.
-/// Missing entries and non-regular files are rejected; no payload is published.
-pub fn read_payload_file(package: &Path, relative: &Path) -> Result<Vec<u8>, ArchiveError> {
-    let wanted = Path::new("data").join(relative);
-    let decoder = zstd::Decoder::new(File::open(package)?)?;
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if clean_archive_path(&entry.path()?)? != wanted {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            return Err(ArchiveError::InvalidMetadata(format!(
-                "expected a regular payload file: {}",
-                relative.display()
-            )));
-        }
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
-        return Ok(bytes);
-    }
-    Err(ArchiveError::InvalidMetadata(format!(
-        "missing payload file: {}",
-        relative.display()
-    )))
-}
-
-/// Reads the link target of a verified payload entry, or `None` for a regular file.
-/// Missing entries and other entry types are errors. Callers must validate the
-/// complete payload first; this lookup does not publish files.
-pub fn payload_link_target(
-    package: &Path,
-    relative: &Path,
-) -> Result<Option<PathBuf>, ArchiveError> {
-    let wanted = Path::new("data").join(relative);
-    let mut archive = tar::Archive::new(zstd::Decoder::new(File::open(package)?)?);
-    for entry in archive.entries()? {
-        let entry = entry?;
-        if clean_archive_path(&entry.path()?)? == wanted {
-            if entry.header().entry_type().is_file() {
-                return Ok(None);
-            }
-            if entry.header().entry_type().is_symlink() {
-                return entry
-                    .link_name()?
-                    .map(|path| Some(path.into_owned()))
-                    .ok_or_else(|| ArchiveError::InvalidMetadata("symlink has no target".into()));
-            }
-            break;
-        }
-    }
-    Err(ArchiveError::InvalidMetadata(format!(
-        "missing regular file or symlink: {}",
-        relative.display()
-    )))
-}
-
 /// One integrity record from `.METADATA/files.idx`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
