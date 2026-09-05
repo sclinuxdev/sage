@@ -1072,11 +1072,7 @@ fn remove_packages(
     dry_run: bool,
 ) -> Result<()> {
     let db_path = under_root(root, Path::new("/var/lib/sage"));
-    let installed = if dry_run {
-        sage_db::read_packages(&db_path)?
-    } else {
-        sage_db::SageDatabase::open(&db_path)?.packages()?
-    };
+    let installed = sage_db::read_packages(&db_path)?;
     let canonical = channel.map_or_else(
         || "main/system".into(),
         |value| {
@@ -1098,6 +1094,15 @@ fn remove_packages(
         .collect();
     if selected.len() != names.len() {
         bail!("one or more requested packages are not installed in {canonical}");
+    }
+    // A replacement candidate does not switch a persisted binding. Rebuild owns
+    // that transition, including native-service reconciliation and recovery.
+    for (interface, provider) in sage_db::read_system_providers(&db_path)? {
+        if requested.contains(&provider) {
+            bail!(
+                "cannot remove bound provider {provider} for virtual/{interface}; switch providers with rebuild first"
+            );
+        }
     }
     for dependent in &installed {
         if selected.iter().any(|removed| {

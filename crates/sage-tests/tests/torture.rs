@@ -333,6 +333,70 @@ async fn dependency_removal_uses_solver_provider_semantics() {
 }
 
 #[tokio::test]
+async fn removal_preserves_the_bound_provider_with_an_installed_alternative() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    for name in ["systemd", "loom"] {
+        let mut provider = sage_tests::PackageSpec::new(
+            "system", name, 1, &format!("usr/share/sage/rclass/init-{name}.toml"),
+            "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\n",
+        );
+        provider.provides.push("virtual/init".into());
+        if name == "systemd" {
+            provider.files.insert(
+                "usr/share/sage/services/daemon.toml".into(),
+                b"schema_version=1\n[service]\nname=\"daemon\"\ndescription=\"Daemon\"\ncommand=[\"/usr/bin/daemon\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n".to_vec(),
+            );
+        }
+        lab.add_package(provider).unwrap();
+    }
+    lab.publish().unwrap();
+    lab.install("systemd", "system").await.unwrap();
+    lab.install("loom", "system").await.unwrap();
+    let config_path = lab.root().join("etc/sage/system.toml");
+    let config = "schema_version=1\npackages=[\"systemd\",\"loom\"]\nservices=[\"daemon\"]\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n[providers]\ninit=\"systemd\"\n";
+    std::fs::write(&config_path, config).unwrap();
+    sage::execute(sage::Cli {
+        verbose: false,
+        dry_run: false,
+        root: lab.root().into(),
+        command: sage::Commands::Rebuild { no_prune: false },
+    })
+    .await
+    .unwrap();
+    let before = lab.snapshot().unwrap();
+    let state_path = lab.root().join("var/lib/sage/rendered-services.toml");
+    let state = std::fs::read(&state_path).unwrap();
+    let native_path = lab.root().join("etc/native/daemon");
+    let native = std::fs::read(&native_path).unwrap();
+    for dry_run in [false, true] {
+        let error = sage::execute(sage::Cli {
+            verbose: false,
+            dry_run,
+            root: lab.root().into(),
+            command: sage::Commands::Remove {
+                packages: vec!["systemd".into()],
+                channel: None,
+            },
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("bound provider"), "{error:#}");
+        assert_eq!(lab.snapshot().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), config);
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        assert_eq!(std::fs::read(&native_path).unwrap(), native);
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert_eq!(
+            database.system_provider("init").unwrap(),
+            Some(sage_core::PackageKey::new("main/system", "systemd", "0"))
+        );
+        assert!(database.pending_journals().unwrap().is_empty());
+    }
+    // An unused provider can still be removed without switching the binding.
+    lab.remove("loom", "system").await.unwrap();
+}
+
+#[tokio::test]
 async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     let mut lab = sage_tests::TortureLab::new().unwrap();
     let mut owner = sage_tests::PackageSpec::new(

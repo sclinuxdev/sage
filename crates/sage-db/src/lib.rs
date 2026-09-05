@@ -350,6 +350,33 @@ pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
     }
     Ok(records)
 }
+/// Reads resolved system bindings without creating or writing the environment.
+/// Returns an empty map for an absent environment, or an error for invalid state.
+pub fn read_system_providers(path: &Path) -> Result<BTreeMap<String, PackageKey>, DbError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: this environment performs no writes and retains LMDB locking.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let system: Database<Str, Str> = env.open_database(&txn, Some("system"))?.ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing system table",
+        ))
+    })?;
+    let mut bindings = BTreeMap::new();
+    for entry in system.iter(&txn)? {
+        let (interface, key) = entry?;
+        bindings.insert(interface.into(), key.parse()?);
+    }
+    Ok(bindings)
+}
 /// Reads one file-owner list without opening a write transaction.
 pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {
     if !path.exists() {
