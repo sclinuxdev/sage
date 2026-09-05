@@ -277,6 +277,16 @@ mod sys_tests {
         let retained = ReconcilePlan::compute(&config, std::slice::from_ref(&old), &universe, true)
             .unwrap();
         assert!(retained.remove.is_empty());
+        let mut installed_app = old.clone();
+        installed_app.key = sage_core::PackageKey::new("main/system", "app", "0");
+        installed_app.version = "2.0-1".parse().unwrap();
+        installed_app.dependencies.clear();
+        let mut stale_universe = sage_solver::PackageUniverse::default();
+        stale_universe.insert(release("app", "1.0-1", &[], &[]));
+        let retained = ReconcilePlan::compute(&config, &[installed_app], &stale_universe, false)
+            .unwrap();
+        assert!(retained.install.is_empty());
+        assert!(retained.remove.is_empty());
         let mut runtime = old.clone();
         runtime.key = sage_core::PackageKey::new("main/runtime", "foo", "0");
         runtime.dependencies = vec!["main/system/libc".parse().unwrap()];

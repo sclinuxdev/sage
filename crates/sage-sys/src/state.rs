@@ -80,7 +80,10 @@ impl ReconcilePlan {
             .collect::<Vec<_>>();
         // Reconstruct every installed release as a locked candidate. Only packages
         // retained by policy become exact roots; PubGrub owns dependency movement.
-        let retained_universe = (!retained.is_empty()).then(|| {
+        let missing_installed = installed
+            .iter()
+            .any(|package| universe.release(&package.key, &package.version).is_none());
+        let retained_universe = missing_installed.then(|| {
             let mut universe = universe.clone();
             for package in installed {
                 if universe.release(&package.key, &package.version).is_none() {
