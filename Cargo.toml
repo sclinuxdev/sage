@@ -11,6 +11,7 @@ members = [
     "crates/sage-build",
     "crates/sage-repo",
 ]
+default-members = ["crates/sage"]
 
 [workspace.package]
 version = "0.4.0"
@@ -45,6 +46,7 @@ pubgrub = "0.3"
 tar = "0.4"
 zstd = "0.13"
 rayon = "1.10"
+rand = { version = "0.8", features = ["small_rng"] }
 nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
 goblin = "0.9"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

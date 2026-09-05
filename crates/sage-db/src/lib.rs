@@ -40,7 +40,7 @@ pub struct InstalledPackage {
     pub provides: Vec<String>,
     pub conflicts: Vec<String>,
     pub files: Vec<String>,
-    /// Original package hashes for three-way configuration upgrades.
+    /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
@@ -115,13 +115,21 @@ pub struct SageDatabase {
 impl SageDatabase {
     /// Opens the state directory and creates all schema-v1 tables atomically.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
-        let db_path = path.as_ref().to_path_buf();
+        Self::open_inner(path.as_ref(), MAP_SIZE)
+    }
+    /// Opens the state directory with an explicit LMDB map size for boundary tests.
+    #[cfg(feature = "torture")]
+    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> Result<Self, DbError> {
+        Self::open_inner(path.as_ref(), map_size)
+    }
+    fn open_inner(path: &Path, map_size: usize) -> Result<Self, DbError> {
+        let db_path = path.to_path_buf();
         fs::create_dir_all(&db_path)?;
         // SAFETY: Sage owns this directory, uses one fixed map size for every opener,
         // and never opens the same LMDB files through a second environment in-process.
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(MAP_SIZE)
+                .map_size(map_size)
                 .max_dbs(8)
                 .open(&db_path)?
         };
@@ -167,24 +175,48 @@ impl SageDatabase {
     /// Publishes a package and all reverse indexes in one write transaction.
     pub fn install(&self, package: &InstalledPackage, allow_shared: bool) -> Result<(), DbError> {
         let mut txn = self.env.write_txn()?;
+        self.install_in_txn(&mut txn, package, allow_shared)?;
+        txn.commit()?;
+        Ok(())
+    }
+    /// Publishes a complete package set in one all-or-nothing LMDB transaction.
+    #[cfg(feature = "torture")]
+    pub fn install_batch(
+        &self,
+        packages: &[InstalledPackage],
+        allow_shared: bool,
+    ) -> Result<(), DbError> {
+        let mut txn = self.env.write_txn()?;
+        for package in packages {
+            self.install_in_txn(&mut txn, package, allow_shared)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+    fn install_in_txn(
+        &self,
+        txn: &mut RwTxn<'_>,
+        package: &InstalledPackage,
+        allow_shared: bool,
+    ) -> Result<(), DbError> {
         let id = package.key.canonical_id();
         // Replacing an installed version is one transaction: remove reverse
         // indexes that disappeared before validating and adding the new set.
-        if let Some(previous) = get_owned::<InstalledPackage>(&self.packages, &txn, &id)? {
+        if let Some(previous) = get_owned::<InstalledPackage>(&self.packages, txn, &id)? {
             for path in previous.files {
                 if !package.files.contains(&path) {
-                    remove_member(&self.files, &mut txn, &path, &package.key)?;
+                    remove_member(&self.files, txn, &path, &package.key)?;
                 }
             }
             for symbol in previous.provides {
                 if !package.provides.contains(&symbol) {
-                    remove_member(&self.provides, &mut txn, &symbol, &package.key)?;
+                    remove_member(&self.provides, txn, &symbol, &package.key)?;
                 }
             }
         }
         for path in &package.files {
             let mut owners: Vec<PackageKey> =
-                get_owned(&self.files, &txn, path)?.unwrap_or_default();
+                get_owned(&self.files, txn, path)?.unwrap_or_default();
             if !owners.is_empty() && !owners.contains(&package.key) && !allow_shared {
                 return Err(DbError::FileConflict {
                     path: path.clone(),
@@ -193,19 +225,18 @@ impl SageDatabase {
             }
             if !owners.contains(&package.key) {
                 owners.push(package.key.clone());
-                put_encoded(&self.files, &mut txn, path, &owners)?;
+                put_encoded(&self.files, txn, path, &owners)?;
             }
         }
         for symbol in &package.provides {
             let mut providers: Vec<PackageKey> =
-                get_owned(&self.provides, &txn, symbol)?.unwrap_or_default();
+                get_owned(&self.provides, txn, symbol)?.unwrap_or_default();
             if !providers.contains(&package.key) {
                 providers.push(package.key.clone());
-                put_encoded(&self.provides, &mut txn, symbol, &providers)?;
+                put_encoded(&self.provides, txn, symbol, &providers)?;
             }
         }
-        put_encoded(&self.packages, &mut txn, &id, package)?;
-        txn.commit()?;
+        put_encoded(&self.packages, txn, &id, package)?;
         Ok(())
     }
     /// Removes a package and prunes empty ownership/provider entries atomically.
@@ -228,6 +259,20 @@ impl SageDatabase {
     pub fn owners(&self, path: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;
         Ok(get_owned(&self.files, &txn, path)?.unwrap_or_default())
+    }
+    /// Returns the complete reverse file-ownership index in LMDB key order.
+    #[cfg(feature = "torture")]
+    pub fn file_owners(&self) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
+        let txn = self.env.read_txn()?;
+        let owners = self
+            .files
+            .iter(&txn)?
+            .map(|entry| {
+                let (path, bytes) = entry?;
+                Ok((path.into(), decode(bytes)?))
+            })
+            .collect();
+        owners
     }
     pub fn providers(&self, symbol: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;

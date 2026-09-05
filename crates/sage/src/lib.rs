@@ -147,7 +147,7 @@ pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
 /// Executes one parsed command through the binary's production interface.
-pub async fn execute(cli: Cli) -> Result<()> {
+pub async fn execute(mut cli: Cli) -> Result<()> {
     if cli.verbose {
         tracing_subscriber::fmt::init();
     }
@@ -157,6 +157,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
             action: ChannelAction::List
         } | Commands::Query { .. }
     );
+    cli.root = std::fs::canonicalize(&cli.root)
+        .with_context(|| format!("cannot resolve target root {}", cli.root.display()))?;
     let lock_path = under_root(&cli.root, Path::new("/run/sage/operation.lock"));
     let _lock = if cli.dry_run || read_only {
         sage_core::HostLock::acquire_shared(lock_path)?

@@ -13,17 +13,17 @@
    - 压缩归档采用 `tar` + `zstd-rs` 流式处理。
    - CLI 前端完全基于 `clap` (derive) 与 `indicatif`，**当前阶段不引入 TUI**。
    - 沙箱隔离直接调用系统的 `bwrap` (Bubblewrap) 与 `fakeroot`。
-2. **绝对零硬编码与完全可扩展性 (Zero-Hardcoded & Purely Data-Driven)**：
-   - **严禁在 Rust 源码中硬编码任何可扩展业务逻辑**。
+2. **沿用明确的数据边界**：
+   - 新增行为只实现当前需求；仅在确实需要用户配置或已有多个使用场景时扩展配置，不为“完全可扩展”新增配置或模板层。
    - 触发器（ldconfig, ca-certificates 等）全量由 `triggers/*.toml` 声明。
    - Init 服务转换由 `rclass/init-*.toml` 模板引擎驱动。
    - 编译器/工具链由 `rclass/*.toml` 驱动。
    - 软件源镜像 URL 完全由配置文件提供，代码中零预设 URL。
 3. **原生支持多版本共存 (Native Multi-Version Slots)**：
    - 领域标识基于 `(Channel, PackageName, Slot)`，不同 Slot 与不同 Channel 的包在求解器与数据库中天然共存。
-4. **极致性能与精简代码 (< 9,000 行)**：
-   - 全 Workspace 所有 Rust 代码总量严格控制在 **9,000 行以内**。
-   - 零多余抽象，关键路径无锁零拷贝 (`mmap`)，符号 Interning 整数化比对。
+4. **极致性能与精简代码 (KISS)**：
+   - 坚持 KISS 原则，以直接、清晰、易维护的实现为先，避免不必要的抽象与重复代码。
+   - 关键路径优先采用无锁零拷贝 (`mmap`) 与符号 Interning 整数化比对。
 
 ---
 

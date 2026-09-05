@@ -102,4 +102,5 @@ mod db_tests {
         record.op_id = "op-2".into();
         assert!(matches!(record.validate(), Err(DbError::InvalidJournal(_))));
     }
+
 }

@@ -14,6 +14,9 @@ path = "src/lib.rs"
 name = "sage"
 path = "src/main.rs"
 
+[features]
+torture = ["sage-db/torture"]
+
 [dependencies]
 sage-core = { workspace = true }
 sage-db = { workspace = true }

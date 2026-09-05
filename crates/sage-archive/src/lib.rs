@@ -4,7 +4,7 @@ use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::sys::stat::{fchmod, mkdirat, Mode};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -104,7 +104,8 @@ pub fn inspect_package(path: impl AsRef<Path>) -> Result<PackageInspection, Arch
 pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ArchiveError::InvalidMetadata("files.idx is not UTF-8".into()))?;
-    text.lines()
+    let records = text
+        .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| {
             let mut fields = line.split('\t');
@@ -131,7 +132,17 @@ pub fn parse_file_index(bytes: &[u8]) -> Result<Vec<FileRecord>, ArchiveError> {
                 sha256: sha256.to_ascii_lowercase(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = BTreeSet::new();
+    if records
+        .iter()
+        .any(|record| !paths.insert(record.path.clone()))
+    {
+        return Err(ArchiveError::InvalidMetadata(
+            "files.idx contains duplicate canonical paths".into(),
+        ));
+    }
+    Ok(records)
 }
 
 /// Builds a sorted integrity index for a staged payload tree.
@@ -163,12 +174,13 @@ pub fn build_file_index(root: &Path) -> Result<Vec<FileRecord>, ArchiveError> {
                 });
             } else if metadata.file_type().is_symlink() {
                 let target = fs::read_link(&path)?;
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("recursive walk stays below root");
+                validate_link_target(relative, &target)?;
                 let bytes = target.as_os_str().as_encoded_bytes();
                 output.push(FileRecord {
-                    path: path
-                        .strip_prefix(root)
-                        .expect("recursive walk stays below root")
-                        .to_path_buf(),
+                    path: relative.to_path_buf(),
                     mode: 0o777,
                     size: bytes.len() as u64,
                     sha256: hex::encode(Sha256::digest(bytes)),
@@ -266,9 +278,10 @@ fn collect_paths(root: &Path) -> Result<Vec<PathBuf>, ArchiveError> {
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
-            paths.push(path.clone());
             if entry.file_type()?.is_dir() {
                 visit(&path, paths)?;
+            } else {
+                paths.push(path);
             }
         }
         Ok(())
@@ -292,12 +305,7 @@ fn append_deterministic<W: Write>(
     header.set_gid(0);
     header.set_mtime(0);
     header.set_mode(metadata.mode() & 0o7777);
-    if metadata.is_dir() {
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_size(0);
-        header.set_cksum();
-        builder.append_data(&mut header, relative, io::empty())?;
-    } else if metadata.is_file() {
+    if metadata.is_file() {
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(metadata.len());
         header.set_cksum();
@@ -341,12 +349,26 @@ pub fn extract_package_with_config(
     index: &[FileRecord],
     previous_hashes: &BTreeMap<String, String>,
 ) -> Result<ExtractionReport, ArchiveError> {
+    validate_package_payload(package.as_ref(), index)?;
+    extract_prevalidated_package(package.as_ref(), sysroot.as_ref(), index, previous_hashes)
+}
+
+/// Publishes a payload after the caller validated the same archive and index.
+/// Per-file hashes and dirfd-relative writes remain enforced during extraction.
+/// Callers recovering an earlier transaction must use `extract_package_with_config`
+/// to validate the current archive before any publication.
+pub fn extract_prevalidated_package(
+    package: &Path,
+    sysroot: &Path,
+    index: &[FileRecord],
+    previous_hashes: &BTreeMap<String, String>,
+) -> Result<ExtractionReport, ArchiveError> {
     let expected: BTreeMap<_, _> = index
         .iter()
         .map(|record| (record.path.clone(), record))
         .collect();
     let root_raw = open(
-        sysroot.as_ref(),
+        sysroot,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
@@ -424,6 +446,118 @@ pub fn extract_package_with_config(
         ));
     }
     Ok(report)
+}
+
+/// Validates every payload entry without writing to the target filesystem.
+///
+/// The scan rejects unsupported types, duplicate and ancestor-colliding paths,
+/// missing index entries, unsafe links, and content mismatches. Package-manager
+/// preflight calls this before creating a recovery journal. Direct extraction
+/// and journal recovery also validate their current archive before publication.
+pub fn validate_package_payload(
+    package: impl AsRef<Path>,
+    index: &[FileRecord],
+) -> Result<(), ArchiveError> {
+    let expected: BTreeMap<_, _> = index
+        .iter()
+        .map(|record| (record.path.clone(), record))
+        .collect();
+    if expected.len() != index.len() {
+        return Err(ArchiveError::InvalidMetadata(
+            "files.idx contains duplicate canonical paths".into(),
+        ));
+    }
+    let mut allowed_directories = BTreeSet::new();
+    for path in expected.keys() {
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if expected.contains_key(ancestor) {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "indexed payload {} has non-directory ancestor {}",
+                    path.display(),
+                    ancestor.display()
+                )));
+            }
+            allowed_directories.insert(ancestor.to_path_buf());
+        }
+    }
+    let decoder = zstd::Decoder::new(File::open(package.as_ref())?)?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut seen = BTreeSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = clean_archive_path(&entry.path()?)?;
+        if path.starts_with(".METADATA") {
+            if entry.header().entry_type().is_file() {
+                validate_metadata_path(&path)?;
+            }
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix("data") else {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "unsupported top-level entry {}",
+                path.display()
+            )));
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if entry.header().entry_type().is_dir() {
+            if !allowed_directories.contains(relative) {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "unindexed payload directory {}",
+                    relative.display()
+                )));
+            }
+            continue;
+        }
+        let record = expected.get(relative).ok_or_else(|| {
+            ArchiveError::InvalidMetadata(format!("unindexed payload {}", relative.display()))
+        })?;
+        if !seen.insert(relative.to_path_buf()) {
+            return Err(ArchiveError::InvalidMetadata(format!(
+                "duplicate payload {}",
+                relative.display()
+            )));
+        }
+        if entry.header().entry_type().is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| ArchiveError::InvalidMetadata("symlink has no target".into()))?;
+            validate_link_target(relative, &target)?;
+            let bytes = target.as_os_str().as_encoded_bytes();
+            if bytes.len() as u64 != record.size
+                || hex::encode(Sha256::digest(bytes)) != record.sha256
+            {
+                return Err(ArchiveError::ChecksumMismatch {
+                    path: relative.into(),
+                    expected: record.sha256.clone(),
+                    actual: hex::encode(Sha256::digest(bytes)),
+                });
+            }
+        } else if entry.header().entry_type().is_file() {
+            if entry.size() != record.size {
+                return Err(ArchiveError::InvalidMetadata(format!(
+                    "size mismatch for {}",
+                    relative.display()
+                )));
+            }
+            verify_reader(relative, record, &mut entry)?;
+        } else {
+            return Err(ArchiveError::UnsafePath(format!(
+                "unsupported entry {}",
+                relative.display()
+            )));
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(ArchiveError::InvalidMetadata(
+            "archive payload does not match files.idx".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_verified_symlink(
@@ -531,7 +665,7 @@ fn write_verified(
         Some(directory.as_raw_fd()),
         temp.as_str(),
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::from_bits_truncate(record.mode),
+        archive_mode(record.mode),
     )?;
     let mut temporary = TempGuard {
         dirfd: directory.as_raw_fd(),
@@ -554,7 +688,7 @@ fn write_verified(
             path.display()
         )));
     }
-    fchmod(output.as_raw_fd(), Mode::from_bits_truncate(record.mode))?;
+    fchmod(output.as_raw_fd(), archive_mode(record.mode))?;
     output.sync_all()?;
     let actual = hex::encode(hasher.finalize());
     if actual != record.sha256 {
@@ -577,6 +711,15 @@ fn write_verified(
     } else {
         WriteOutcome::Written
     })
+}
+
+/// Converts the portable `u32` mode stored in `files.idx` into the host
+/// `mode_t`. Darwin defines `mode_t` as `u16` while Linux uses `u32`; the
+/// archive schema intentionally stores the wider representation so packages
+/// remain architecture independent. `Mode` discards bits it does not support,
+/// so narrowing here preserves every portable permission and special bit.
+fn archive_mode(mode: u32) -> Mode {
+    Mode::from_bits_truncate(mode as nix::libc::mode_t)
 }
 
 fn hash_at(directory: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<String>, ArchiveError> {
