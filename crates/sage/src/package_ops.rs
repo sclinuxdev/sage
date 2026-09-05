@@ -464,9 +464,7 @@ async fn publish_packages(
         architecture,
         changes,
         retired,
-        rebuild
-            .as_ref()
-            .and_then(|continuation| continuation.provider_bindings.get("init")),
+        rebuild.as_ref(),
     )
     .await?;
     let op_id = operation_id("install")?;
@@ -483,7 +481,7 @@ async fn publish_packages(
     }
     let mut journal = sage_db::JournalRecord::new(
         op_id,
-        "packages",
+        if rebuild.is_some() { "rebuild-cleanup" } else { "packages" },
         sage_db::JournalAction::Install {
             architecture: architecture.into(),
             changes: changes.clone(),
@@ -593,11 +591,11 @@ async fn preflight_packages(
     architecture: &str,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
     retired: &[sage_db::InstalledPackage],
-    init_provider: Option<&sage_core::PackageKey>,
+    rebuild: Option<&sage_db::RebuildContinuation>,
 ) -> Result<Vec<(sage_core::PackageKey, sage_core::Version)>> {
     let package_cache = under_root(root, Path::new("/var/cache/sage/packages"));
     let engine = sage_repo::DownloadEngine::new(&package_cache)?;
-    let renderer_path = init_provider
+    let renderer_path = rebuild.and_then(|continuation| continuation.provider_bindings.get("init"))
         .map(|provider| format!("usr/share/sage/rclass/init-{}.toml", provider.name));
     let mut planned_renderer = None;
     let mut planned_services = if renderer_path.is_some() {
@@ -606,6 +604,7 @@ async fn preflight_packages(
         None
     };
     let mut replacement_services = BTreeMap::new();
+    let mut payloads = BTreeMap::new();
     let mut planned = BTreeMap::<String, sage_core::PackageKey>::new();
     let mut final_paths = retired
         .iter()
@@ -645,6 +644,18 @@ async fn preflight_packages(
             .strip_prefix("/")
             .unwrap_or(&source.target_root);
         let declarations = PackageDeclarations::parse(&inspection, key)?;
+        if renderer_path.is_some() {
+        for record in &inspection.files {
+            let physical = prefix.join(&record.path);
+            if physical.parent() == Some(Path::new("usr/share/sage/services"))
+                && physical.extension().is_some_and(|extension| extension == "toml")
+            {
+                let bytes = sage_archive::read_payload_file(&archive, &record.path)?;
+                replacement_services.insert(physical.to_string_lossy().into_owned(), sage_sys::ServiceSpec::parse(&bytes)?);
+            }
+            payloads.insert(physical, (archive.clone(), record.path.clone(), record.mode));
+        }
+        }
         if let Some(path) = &renderer_path {
             if let Some(record) = inspection
                 .files
@@ -729,9 +740,27 @@ async fn preflight_packages(
         };
         if let Some(services) = planned_services {
             let services = services.into_values().collect::<Vec<_>>();
+            let config: sage_sys::SystemConfig = toml::from_str(std::str::from_utf8(&rebuild.expect("renderer requires rebuild").system_config)?)?;
+            for name in &config.services {
+                if !services.iter().any(|service| &service.name == name) {
+                    bail!("enabled service '{name}' has no planned declaration");
+                }
+            }
             generator
                 .validate_service_set(&services, root)
                 .with_context(|| format!("invalid planned init renderer {path}"))?;
+            let mut removed = installed_paths.iter().filter(|(path, owners)| {
+                !planned.contains_key(*path) && owners.iter().all(|owner| {
+                    final_paths.get(owner).is_some_and(|paths| !paths.contains(*path))
+                })
+            }).map(|(path, _)| PathBuf::from(path)).collect::<BTreeSet<_>>();
+            // Generated declarations replace any live payload at their path with
+            // non-executable data, so the old file cannot satisfy a program lookup.
+            removed.extend(planned.keys().filter(|path| !payloads.contains_key(Path::new(path)))
+                .map(PathBuf::from));
+            for program in generator.required_programs(&services, &config.services, root)? {
+                validate_planned_program(root, &program, &payloads, &removed)?;
+            }
         }
     }
     for (path, claimant) in &planned {
@@ -845,8 +874,76 @@ async fn preflight_packages(
     if ordered.len() != changes.len() {
         bail!("cyclic file ownership handoff in package transaction");
     }
+    if rebuild.is_some() {
+        let path = under_root(root, Path::new("var/lib/sage/rendered-services.toml"));
+        if path.exists() {
+            let previous = sage_sys::RenderedServicesState::load(&path)?;
+            for service in &previous.services {
+                if let Some(program) = previous.generator.disable_program(service, root)? {
+                    validate_planned_program(root, &program, &BTreeMap::new(), &BTreeSet::new())?;
+                }
+            }
+        }
+    }
     Ok(ordered)
 }
+/// Checks a program against the final payload/retained-file overlay without
+/// publishing it. Resolve every symlink component in that same overlay so a
+/// retained link cannot conceal a removed target or escape the target root.
+fn validate_planned_program(
+    root: &Path,
+    program: &Path,
+    payloads: &BTreeMap<PathBuf, (PathBuf, PathBuf, u32)>,
+    removed: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut pending = program.strip_prefix(root)?.components()
+        .map(|component| PathBuf::from(component.as_os_str()))
+        .collect::<std::collections::VecDeque<_>>();
+    let mut relative = PathBuf::new();
+    let mut links = BTreeSet::new();
+    while let Some(component) = pending.pop_front() {
+        if component == Path::new(".") { continue; }
+        if component == Path::new("..") {
+            if !relative.pop() { bail!("program escapes sysroot: {}", program.display()); }
+            continue;
+        }
+        relative.push(component);
+        if removed.contains(&relative) {
+            bail!("planned program {} uses removed path {}", program.display(), relative.display());
+        }
+        let (link, regular, mode) = if let Some((archive, path, mode)) = payloads.get(&relative) {
+            (sage_archive::payload_link_target(archive, path)?, true, *mode)
+        } else if !pending.is_empty() && payloads.keys().any(|path| path.starts_with(&relative)) {
+            // Payload ancestors are created by extraction, even on a fresh root.
+            (None, false, 0)
+        } else {
+            let path = root.join(&relative);
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("missing planned program {}", program.display()))?;
+            (metadata.is_symlink().then(|| std::fs::read_link(&path)).transpose()?,
+             metadata.is_file(), metadata.permissions().mode())
+        };
+        if let Some(link) = link {
+            if link.is_absolute() || !links.insert(relative.clone()) {
+                bail!("unsafe program symlink {}", relative.display());
+            }
+            relative.pop();
+            for component in link.components().rev() {
+                pending.push_front(PathBuf::from(component.as_os_str()));
+            }
+        } else if pending.is_empty() {
+            if !regular || mode & 0o111 == 0 {
+                bail!("planned program is not executable: {}", program.display());
+            }
+            return Ok(());
+        } else if regular {
+            bail!("program ancestor is not a directory: {}", relative.display());
+        }
+    }
+    bail!("planned program is not a regular file: {}", program.display())
+}
+
 async fn resume_install(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -883,6 +980,29 @@ async fn resume_install(
     }
     let mut modified = Vec::new();
     let mut removed_paths = Vec::new();
+    if journal.stage == "rebuild-cleanup" {
+        // Disable the previous generation while all of its programs and libraries
+        // still exist. Persist the emptied state before entering package publication;
+        // recovery must never rerun an old command after its package is retired.
+        // Any changed package may supply a runtime dependency of these programs.
+        if !changes.is_empty() || !retired_packages.is_empty() {
+            let relative = Path::new("var/lib/sage/rendered-services.toml");
+            let path = under_root(root, relative);
+            if path.exists() {
+                let mut previous = sage_sys::RenderedServicesState::load(&path)?;
+                for service in &previous.services {
+                    previous.generator.disable_service(service, root)?;
+                    previous.generator.remove_service(service, root)?;
+                }
+                previous.services.clear();
+                previous.enabled.clear();
+                write_atomic_under_root(root, relative, toml::to_string_pretty(&previous)?.as_bytes())?;
+            }
+        }
+        crash_point(root, "rebuild-cleanup")?;
+        journal.advance("packages");
+        database.write_journal(journal)?;
+    }
     if journal.stage == "packages" {
     for package in &retired_packages {
         database.remove(&package.key)?;
@@ -1740,6 +1860,42 @@ fn query_state(root: &Path, action: QueryAction) -> Result<()> {
 #[cfg(test)]
 mod package_ops_tests {
     use super::*;
+
+    #[test]
+    fn planned_program_links_resolve_in_the_final_filesystem() {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let data = stage.path().join("data");
+        std::fs::create_dir_all(data.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(stage.path().join(".METADATA")).unwrap();
+        std::fs::write(data.join("usr/bin/real"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(data.join("usr/bin/real"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("real", data.join("usr/bin/ctl")).unwrap();
+        std::fs::write(stage.path().join(".METADATA/manifest.toml"),
+            "schema_version=1\nname=\"program\"\nversion=\"1\"\nrelease=1\narch=\"noarch\"\nchannel=\"system\"\ndescription=\"Program\"\nlicense=\"MIT\"\n").unwrap();
+        let records = sage_archive::build_file_index(&data).unwrap();
+        std::fs::write(stage.path().join(".METADATA/files.idx"), sage_archive::format_file_index(&records)).unwrap();
+        let archive = stage.path().join("program.pkg.tar.zst");
+        sage_archive::create_package(stage.path(), &archive, 1).unwrap();
+        sage_archive::validate_package_payload(&archive, &records).unwrap();
+        let mut payloads = records.into_iter().map(|record| {
+            (record.path.clone(), (archive.clone(), record.path, record.mode))
+        }).collect::<BTreeMap<_, _>>();
+        let program = root.path().join("usr/bin/ctl");
+        validate_planned_program(root.path(), &program, &payloads, &BTreeSet::new()).unwrap();
+        payloads.remove(Path::new("usr/bin/real"));
+        let removed = BTreeSet::from([PathBuf::from("usr/bin/real")]);
+        assert!(validate_planned_program(root.path(), &program, &payloads, &removed).is_err());
+        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        symlink("real", &program).unwrap();
+        std::fs::copy(data.join("usr/bin/real"), root.path().join("usr/bin/real")).unwrap();
+        validate_planned_program(root.path(), &program, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        assert!(validate_planned_program(root.path(), &program, &BTreeMap::new(), &removed).is_err());
+        std::fs::remove_file(&program).unwrap();
+        symlink(data.join("usr/bin/real"), &program).unwrap();
+        assert!(validate_planned_program(root.path(), &program, &BTreeMap::new(), &BTreeSet::new()).is_err());
+    }
 
     fn system_config(provider: Option<&str>) -> sage_sys::SystemConfig {
         sage_sys::SystemConfig {

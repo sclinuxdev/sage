@@ -439,11 +439,21 @@ async fn provider_changes_fail_before_mutating_the_working_system() {
     std::fs::write(&config_path, &config).unwrap();
     let unsafe_renderer = "schema_version=1\n[service_generator]\ntarget_path=\"../../etc/${service.name}\"\nmode=420\ntemplate=\"\"\n";
     let unsupported_renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\nsupported_types=[\"forking\"]\n";
+    let missing_validate = format!("{renderer}validate_command=\"/usr/bin/missing\"\n");
+    let missing_enable = format!("{renderer}enable_command=\"/usr/bin/missing\"\n");
+    let missing_disable = format!("{renderer}disable_command=\"/usr/bin/missing\"\n");
+    let missing_compile = format!(
+        "{renderer}compile_command=[\"/usr/bin/missing\",\"${{INPUT}}\",\"${{OUTPUT}}\"]\n"
+    );
     for (index, (renderer, valid)) in [
         (None, false),
         (Some("invalid TOML ["), false),
         (Some(unsafe_renderer), false),
         (Some(unsupported_renderer), false),
+        (Some(missing_validate.as_str()), false),
+        (Some(missing_enable.as_str()), false),
+        (Some(missing_disable.as_str()), false),
+        (Some(missing_compile.as_str()), false),
         (Some(renderer), true),
     ]
     .into_iter()
@@ -501,6 +511,159 @@ async fn provider_changes_fail_before_mutating_the_working_system() {
         );
         assert!(database.pending_journals().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn provider_cleanup_precedes_retirement_and_survives_recovery() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    let renderer = "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native/${service.name}\"\nmode=420\ntemplate=\"\"\n";
+    let service = "schema_version=1\n[service]\nname=\"daemon\"\ndescription=\"Daemon\"\ncommand=[\"/usr/bin/daemon\"]\nuser=\"root\"\ngroup=\"root\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n";
+    lab.add(
+        "system",
+        "daemon",
+        1,
+        "usr/share/sage/services/daemon.toml",
+        service,
+    )
+    .unwrap();
+    for name in ["loom", "systemd"] {
+        let command = if name == "loom" {
+            "disable_command=\"/usr/bin/loomctl ${SYSROOT}/cleanup-log\"\n"
+        } else {
+            "validate_command=\"/usr/bin/systemdctl\"\nenable_command=\"/usr/bin/systemdctl\"\n"
+        };
+        let mut provider = sage_tests::PackageSpec::new(
+            "system",
+            name,
+            1,
+            &format!("usr/share/sage/rclass/init-{name}.toml"),
+            &format!("{renderer}{command}"),
+        );
+        provider.provides.push("virtual/init".into());
+        let program = format!("usr/bin/{name}ctl");
+        provider.files.insert(
+            program.clone(),
+            if name == "loom" {
+                b"#!/bin/sh\nprintf x >> \"$1\"\n".to_vec()
+            } else {
+                b"#!/bin/sh\nexit 0\n".to_vec()
+            },
+        );
+        provider.executables.insert(program);
+        lab.add_package(provider).unwrap();
+    }
+    lab.publish().unwrap();
+    let config_path = lab.root().join("etc/sage/system.toml");
+    let config = "schema_version=1\npackages=[\"loom\",\"daemon\"]\nservices=[\"daemon\"]\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n[providers]\ninit=\"loom\"\n";
+    std::fs::write(&config_path, config).unwrap();
+    let rebuild = |root: &std::path::Path| sage::Cli {
+        verbose: false,
+        dry_run: false,
+        root: root.into(),
+        command: sage::Commands::Rebuild { no_prune: false },
+    };
+    sage::execute(rebuild(lab.root())).await.unwrap();
+    std::fs::write(&config_path, config.replace("loom", "systemd")).unwrap();
+    for fault in ["rebuild-cleanup", "before-lmdb-write"] {
+        lab.inject(fault).unwrap();
+        assert!(sage::execute(rebuild(lab.root())).await.is_err());
+        assert_eq!(std::fs::read(lab.root().join("cleanup-log")).unwrap(), b"x");
+    }
+    sage::execute(rebuild(lab.root())).await.unwrap();
+    assert_eq!(std::fs::read(lab.root().join("cleanup-log")).unwrap(), b"x");
+    assert!(!lab.root().join("usr/bin/loomctl").exists());
+    assert!(lab.root().join("etc/native/daemon").exists());
+    assert!(sage_db::SageDatabase::open(lab.root().join("var/lib/sage"))
+        .unwrap()
+        .pending_journals()
+        .unwrap()
+        .is_empty());
+
+    // Neither a non-executable replacement nor an obsolete live program can
+    // satisfy commands of the next generation.
+    let before = lab.snapshot().unwrap();
+    for version in [2, 3] {
+        let mut provider = sage_tests::PackageSpec::new(
+            "system",
+            "systemd",
+            version,
+            "usr/share/sage/rclass/init-systemd.toml",
+            &format!("{renderer}validate_command=\"/usr/bin/systemdctl\"\n"),
+        );
+        provider.provides.push("virtual/init".into());
+        if version == 2 {
+            provider
+                .files
+                .insert("usr/bin/systemdctl".into(), b"not executable".to_vec());
+        }
+        lab.add_package(provider).unwrap();
+        let mut force = sage_tests::PackageSpec::new(
+            "system",
+            "force-upgrade",
+            version,
+            "usr/lib/torture/force-upgrade",
+            "force",
+        );
+        force.dependencies.push(format!("systemd >= {version}-1"));
+        lab.add_package(force).unwrap();
+        lab.publish().unwrap();
+        std::fs::write(
+            &config_path,
+            config
+                .replace("loom", "systemd")
+                .replace("\"daemon\"]", "\"daemon\",\"force-upgrade\"]")
+                .replace(
+                    "services=[\"daemon\",\"force-upgrade\"]",
+                    "services=[\"daemon\"]",
+                ),
+        )
+        .unwrap();
+        assert!(sage::execute(rebuild(lab.root())).await.is_err());
+        assert_eq!(lab.snapshot().unwrap(), before);
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert!(database.pending_journals().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn obsolete_upgrade_paths_run_the_old_removal_trigger() {
+    let mut lab = sage_tests::TortureLab::new().unwrap();
+    let mut tool = sage_tests::PackageSpec::new(
+        "system",
+        "record",
+        1,
+        "usr/bin/record",
+        "#!/bin/sh\nprintf removed > \"$1\"\n",
+    );
+    tool.executables.insert("usr/bin/record".into());
+    lab.add_package(tool).unwrap();
+    let mut package =
+        sage_tests::PackageSpec::new("system", "old-path", 1, "usr/lib/torture/obsolete", "old");
+    package.files.insert("usr/share/sage/triggers/obsolete.toml".into(),
+        b"schema_version=1\nname=\"obsolete\"\ndescription=\"Record removal\"\non_paths=[\"usr/lib/torture/obsolete\"]\nexec=[\"/usr/bin/record\",\"${sysroot}/removal-log\"]\npriority=1\nevents=[\"post-remove\"]\n".to_vec());
+    lab.add_package(package).unwrap();
+    lab.publish().unwrap();
+    lab.install("record", "system").await.unwrap();
+    lab.install("old-path", "system").await.unwrap();
+    assert!(!lab.root().join("removal-log").exists());
+    lab.add(
+        "system",
+        "old-path",
+        2,
+        "usr/lib/torture/replacement",
+        "new",
+    )
+    .unwrap();
+    lab.publish().unwrap();
+    lab.inject("triggers").unwrap();
+    assert!(lab.upgrade("old-path", "system").await.is_err());
+    lab.upgrade("old-path", "system").await.unwrap();
+    assert_eq!(
+        std::fs::read(lab.root().join("removal-log")).unwrap(),
+        b"removed"
+    );
+    assert!(!lab.root().join("usr/lib/torture/obsolete").exists());
+    lab.snapshot().unwrap();
 }
 
 #[tokio::test]
@@ -1007,45 +1170,3 @@ fn append_raw_entry<W: std::io::Write>(
     header.set_cksum();
     builder.append_data(&mut header, path, payload).unwrap();
 }
-
-#[tokio::test]
-async fn obsolete_upgrade_paths_run_the_old_removal_trigger() {
-    let mut lab = sage_tests::TortureLab::new().unwrap();
-    let mut tool = sage_tests::PackageSpec::new(
-        "system",
-        "record",
-        1,
-        "usr/bin/record",
-        "#!/bin/sh\nprintf removed > \"$1\"\n",
-    );
-    tool.executables.insert("usr/bin/record".into());
-    lab.add_package(tool).unwrap();
-    let mut package =
-        sage_tests::PackageSpec::new("system", "old-path", 1, "usr/lib/torture/obsolete", "old");
-    package.files.insert("usr/share/sage/triggers/obsolete.toml".into(),
-        b"schema_version=1\nname=\"obsolete\"\ndescription=\"Record removal\"\non_paths=[\"usr/lib/torture/obsolete\"]\nexec=[\"/usr/bin/record\",\"${sysroot}/removal-log\"]\npriority=1\nevents=[\"post-remove\"]\n".to_vec());
-    lab.add_package(package).unwrap();
-    lab.publish().unwrap();
-    lab.install("record", "system").await.unwrap();
-    lab.install("old-path", "system").await.unwrap();
-    assert!(!lab.root().join("removal-log").exists());
-    lab.add(
-        "system",
-        "old-path",
-        2,
-        "usr/lib/torture/replacement",
-        "new",
-    )
-    .unwrap();
-    lab.publish().unwrap();
-    lab.inject("triggers").unwrap();
-    assert!(lab.upgrade("old-path", "system").await.is_err());
-    lab.upgrade("old-path", "system").await.unwrap();
-    assert_eq!(
-        std::fs::read(lab.root().join("removal-log")).unwrap(),
-        b"removed"
-    );
-    assert!(!lab.root().join("usr/lib/torture/obsolete").exists());
-    lab.snapshot().unwrap();
-}
-

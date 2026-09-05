@@ -522,6 +522,42 @@ impl TemplateServiceGenerator {
         Ok(())
     }
 
+    /// Returns the normalized provider programs needed by this generation.
+    /// Template and path errors are returned without executing any command.
+    pub fn required_programs(
+        &self,
+        services: &[ServiceSpec],
+        enabled: &BTreeSet<String>,
+        sysroot: &Path,
+    ) -> Result<BTreeSet<PathBuf>, SysError> {
+        let mut programs = BTreeSet::new();
+        for service in services {
+            let variables = self.service_variables(service, sysroot)?;
+            if let Some(program) = self.validate_compile_command(&variables, sysroot)? {
+                programs.insert(program);
+            }
+            for (kind, command) in [
+                ("validate", self.validate_command.as_deref()),
+                ("enable", self.enable_command.as_deref().filter(|_| enabled.contains(&service.name))),
+                // Persisted generations must remain removable, including disabled services.
+                ("disable", self.disable_command.as_deref()),
+            ] {
+                if let Some(command) = command {
+                    programs.insert(self.validate_command_path(kind, command, &variables, sysroot)?);
+                }
+            }
+        }
+        Ok(programs)
+    }
+
+    /// Returns the old generation's cleanup program without executing it.
+    /// Invalid templates and paths are returned as errors.
+    pub fn disable_program(&self, service: &ServiceSpec, sysroot: &Path) -> Result<Option<PathBuf>, SysError> {
+        self.disable_command.as_deref().map(|command| {
+            self.validate_command_path("disable", command, &self.service_variables(service, sysroot)?, sysroot)
+        }).transpose()
+    }
+
     /// Runs the provider's whole-tree validator after all definitions exist.
     pub fn validate_rendered_services(
         &self,
@@ -609,9 +645,9 @@ impl TemplateServiceGenerator {
         &self,
         variables: &BTreeMap<String, String>,
         sysroot: &Path,
-    ) -> Result<(), SysError> {
+    ) -> Result<Option<PathBuf>, SysError> {
         let Some((program, arguments)) = self.compile_command.split_first() else {
-            return Ok(());
+            return Ok(None);
         };
         let mut variables = variables.clone();
         variables.insert(
@@ -629,11 +665,11 @@ impl TemplateServiceGenerator {
                 .to_string(),
         );
         let program = expand_template(program, &variables)?;
-        target_path(sysroot, Path::new(&program))?;
+        let program = target_path(sysroot, Path::new(&program))?;
         for argument in arguments {
             expand_template(argument, &variables)?;
         }
-        Ok(())
+        Ok(Some(program))
     }
 
     fn validate_command_path(
@@ -642,7 +678,7 @@ impl TemplateServiceGenerator {
         command: &str,
         variables: &BTreeMap<String, String>,
         sysroot: &Path,
-    ) -> Result<(), SysError> {
+    ) -> Result<PathBuf, SysError> {
         let command = expand_template(command, variables)?;
         let program = command
             .split_whitespace()
@@ -650,8 +686,7 @@ impl TemplateServiceGenerator {
             .ok_or_else(|| SysError::Invalid(format!("empty {kind} command")))?;
         target_path(sysroot, Path::new(program)).map_err(|error| {
             SysError::Invalid(format!("invalid {kind} command program: {error}"))
-        })?;
-        Ok(())
+        })
     }
 
     fn service_variables(
