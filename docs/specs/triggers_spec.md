@@ -133,9 +133,36 @@ priority = 50
 
 Triggers may declare `events = ["post-change", "post-remove", "rebuild"]`.
 Omitting the field preserves schema-v1 compatibility and enables post-change and
-post-remove. Package declarations are retained in memory through removal and run
-only after filesystem and ownership publication. Standard input stays closed,
-arguments expand without a shell, and identical commands are deduplicated.
+post-remove. Triggers run only after filesystem and ownership publication.
+Standard input stays closed, arguments expand without a shell, and identical
+expanded commands are deduplicated within each declaration.
+
+| Operation | Event and declaration lifetime |
+| :--- | :--- |
+| Install or upgrade | `post-change`, using declarations present in the published target root |
+| Ordinary package removal | `post-remove`, using declarations captured in the removal journal before deletion |
+| System rebuild | `rebuild`, using declarations present after package and service reconciliation |
+
+An upgrade is one post-change operation, including paths deleted because the new
+package no longer owns them. It does not invoke the previous version's
+post-remove declarations. A new or surviving post-change declaration can match
+those deleted paths, but its command and required runtime files must be available
+in the final target root. Retired declarations, executables, and runtime files are
+not kept alive or restored to run an old removal hook. Ordinary removal preserves
+its existing post-remove behavior; capturing a declaration does not preserve its
+executable or runtime files, so removal handlers must use surviving resources or
+explicitly allow a missing binary.
+
+The operation journal retains changed paths before entering the trigger stage.
+An interruption before trigger execution resumes the same event and changed-path
+set on the next mutating command, including an unrelated command. Once the entire
+trigger batch succeeds, Sage durably advances the journal to its next stage
+(`complete` for standalone package operations); recovery does not execute that
+completed batch again. Rebuild retains a separate captured `post-remove` batch
+for whole packages it prunes, excluding paths handed to replacement owners and
+preserved configurations. Upgrade-only obsolete paths remain `post-change` only. This checkpoint is
+for the whole batch, not each command: an interruption during execution or before
+the completion checkpoint can replay effects, so handlers must be idempotent.
 
 | Legacy hook purpose | Sage declaration |
 | :--- | :--- |
