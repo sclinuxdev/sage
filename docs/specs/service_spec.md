@@ -92,7 +92,10 @@ Provider state queries (`is_enabled_cmd`) require an explicitly distinguishable
 disabled result (exit code 1) before skipping disable actions; query failures
 (non-zero error exit codes or execution errors) leave the journal pending to
 guarantee that managed-disabled declarations are never published while external
-service state remains ambiguous or active.
+service state remains ambiguous or active. Preview operations (`--dry-run`) validate
+this read-only query during `service enable` whenever the existing native definition
+permits it (and unconditionally during `service disable` and `service adopt`),
+ensuring query errors are surfaced before mutating state or persisting journals.
 
 ---
 

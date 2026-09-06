@@ -1587,6 +1587,14 @@ fn execute_service_lifecycle(
 }
 
 /// Enables a service in `/etc/sage/services.toml` and activates it in the init provider.
+///
+/// If `dry_run` is set to `true`, validates generator compatibility and executes the
+/// provider's read-only state query (`is_enabled_cmd`) whenever the rendered service
+/// definition already exists on disk. This surfaces query failures (such as non-zero
+/// error exit codes) during preview without modifying declarations or persisting journals.
+///
+/// When `dry_run` is `false`, persists a lifecycle journal, renders the definition,
+/// activates the service in the provider if needed, and publishes declarative mutations.
 pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
     let services = load_available_services(root)?;
     let spec = services
@@ -1604,7 +1612,17 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
     }
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
-    if !dry_run {
+    if dry_run {
+        // Preview operations must validate the read-only state query whenever the
+        // native service definition already exists on disk. This surfaces query
+        // failures (such as non-zero error status codes from is_enabled_command)
+        // during dry-run before committing any declarative state or leaving an
+        // uncommitted provider-stage journal pending.
+        let rendered = generator.rendered_path(&spec, root)?;
+        if rendered.is_file() {
+            let _ = generator.is_service_enabled(&spec, root)?;
+        }
+    } else {
         config.enabled.insert(service_name.to_string());
         config.disabled.remove(service_name);
         let mutations = lifecycle_mutations(root, &config, &spec, true)?;
@@ -1621,6 +1639,13 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
 }
 
 /// Disables a service in `/etc/sage/services.toml` and deactivates it in the init provider.
+///
+/// If `dry_run` is set to `true`, validates generator compatibility and executes the
+/// provider's read-only state query (`is_enabled_cmd`) to detect query failures before
+/// mutating declarations.
+///
+/// When `dry_run` is `false`, persists a lifecycle journal, deactivates the service in the
+/// provider if it was active, and marks it as disabled in `/etc/sage/services.toml`.
 pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
     let services = load_available_services(root)?;
     let spec = services
@@ -1657,6 +1682,11 @@ pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result
 }
 
 /// Adopts an externally enabled service into `/etc/sage/services.toml` without modifying host state.
+///
+/// Queries the init provider via `is_service_enabled`. If the service is verified to be
+/// externally enabled, renders the definition and records it under declarative management.
+/// Returns an error if the query fails, if the service is not enabled, or if its state
+/// cannot be determined.
 pub fn service_adopt(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
     let services = load_available_services(root)?;
     let spec = services

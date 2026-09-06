@@ -1360,6 +1360,77 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
 }
 
 #[tokio::test]
+async fn state_query_failure_when_enabling_service_leaves_journal_pending_and_fails_preview_if_definition_exists()
+ {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
+
+    // "daemon" is already rendered on disk (/etc/native-old/daemon).
+    // The dry-run preview validates the read-only query and must fail with exit 2,
+    // without mutating services.toml and without writing a recovery journal.
+    let dry_run_error = sage_sys::service_enable(lab.root(), "daemon", true).unwrap_err();
+    assert!(dry_run_error.to_string().contains("exited with"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    drop(database);
+
+    // The real operation persists a journal, renders the definition, fails the query,
+    // and leaves a pending provider-stage journal.
+    let error = sage_sys::service_enable(lab.root(), "daemon", false).unwrap_err();
+    assert!(error.to_string().contains("exited with"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let pending = database.pending_journals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stage, "provider");
+    drop(database);
+
+    // After resolving the query error, settle_journals recovers the pending journal.
+    fs::remove_file(lab.root().join("var/lib/sage/fail-is-enabled")).unwrap();
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(&config_path).unwrap();
+    assert!(config.enabled.contains("daemon"));
+    assert!(!config.disabled.contains("daemon"));
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    drop(database);
+
+    // If the native definition does not exist on disk yet, preview skips the query.
+    fs::remove_file(lab.root().join("etc/native-old/inactive")).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
+
+    assert!(sage_sys::service_enable(lab.root(), "inactive", true).is_ok());
+
+    // A real enable on "inactive" will render the file and then fail the query,
+    // leaving a provider-stage journal pending.
+    let error = sage_sys::service_enable(lab.root(), "inactive", false).unwrap_err();
+    assert!(error.to_string().contains("exited with"));
+    assert!(lab.root().join("etc/native-old/inactive").is_file());
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let pending = database.pending_journals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stage, "provider");
+    drop(database);
+
+    fs::remove_file(lab.root().join("var/lib/sage/fail-is-enabled")).unwrap();
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(&config_path).unwrap();
+    assert!(config.enabled.contains("inactive"));
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn state_query_failure_when_disabling_service_leaves_journal_pending_and_preserves_declarations()
  {
     let lab = initial_system().await;
