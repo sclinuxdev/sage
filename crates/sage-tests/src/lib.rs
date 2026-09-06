@@ -1,8 +1,8 @@
 //! Hermetic, model-checked fixtures for Sage package-manager torture testing.
-use anyhow::{bail, Context, Result};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use anyhow::{Context, Result, bail};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use sage::{Cli, Commands};
-use sage_core::{Dependency, Package, PackageKey, Version, SCHEMA_VERSION};
+use sage_core::{Dependency, Package, PackageKey, SCHEMA_VERSION, Version};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

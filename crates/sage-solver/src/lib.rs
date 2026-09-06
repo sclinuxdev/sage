@@ -1,9 +1,9 @@
 //! Slot-aware PubGrub dependency resolution with channel inheritance.
 use pubgrub::{
-    resolve, DefaultStringReporter, Dependencies, DependencyProvider, Map,
-    PackageResolutionStatistics, PubGrubError, Ranges, Reporter,
+    DefaultStringReporter, Dependencies, DependencyProvider, Map, PackageResolutionStatistics,
+    PubGrubError, Ranges, Reporter, resolve,
 };
-use sage_core::{ConstraintOp, Dependency, Package, PackageKey, Version, DEFAULT_SLOT};
+use sage_core::{ConstraintOp, DEFAULT_SLOT, Dependency, Package, PackageKey, Version};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -337,10 +337,11 @@ impl DependencyProvider for SageProvider {
         let Some(versions) = self.releases.get(package) else {
             return Ok(None);
         };
-        if let Some(locked) = self.locked.get(package) {
-            if versions.contains_key(locked) && range.contains(locked) {
-                return Ok(Some(locked.clone()));
-            }
+        if let Some(locked) = self.locked.get(package)
+            && versions.contains_key(locked)
+            && range.contains(locked)
+        {
+            return Ok(Some(locked.clone()));
         }
         Ok(versions
             .keys()

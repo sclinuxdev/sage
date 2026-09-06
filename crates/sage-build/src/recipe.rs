@@ -470,13 +470,13 @@ impl BuildGraph {
         for unit in &mut units {
             let mut resolved = BTreeSet::new();
             for symbol in &unit.consumes {
-                if let BuildSymbol::Package(key) = symbol {
-                    if !producers.contains_key(symbol) {
-                        let provider = BuildSymbol::Provided(key.name.clone());
-                        if producers.contains_key(&provider) {
-                            resolved.insert(provider);
-                            continue;
-                        }
+                if let BuildSymbol::Package(key) = symbol
+                    && !producers.contains_key(symbol)
+                {
+                    let provider = BuildSymbol::Provided(key.name.clone());
+                    if producers.contains_key(&provider) {
+                        resolved.insert(provider);
+                        continue;
                     }
                 }
                 resolved.insert(symbol.clone());

@@ -447,19 +447,19 @@ impl TemplateServiceGenerator {
             }
             return Err(error.into());
         }
-        if let Some(service) = services.first() {
-            if let Err(error) = self.validate_rendered_services(service, sysroot) {
-                let rejected = parent.join(format!(
-                    ".{leaf}.sage-rejected-{}-{generation}",
-                    std::process::id()
-                ));
-                let _ = fs::rename(&target_directory, &rejected);
-                if had_previous {
-                    let _ = fs::rename(&backup, &target_directory);
-                }
-                let _ = fs::remove_dir_all(rejected);
-                return Err(error);
+        if let Some(service) = services.first()
+            && let Err(error) = self.validate_rendered_services(service, sysroot)
+        {
+            let rejected = parent.join(format!(
+                ".{leaf}.sage-rejected-{}-{generation}",
+                std::process::id()
+            ));
+            let _ = fs::rename(&target_directory, &rejected);
+            if had_previous {
+                let _ = fs::rename(&backup, &target_directory);
             }
+            let _ = fs::remove_dir_all(rejected);
+            return Err(error);
         }
         if had_previous {
             fs::remove_dir_all(backup)?;

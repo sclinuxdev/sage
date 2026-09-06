@@ -1279,8 +1279,8 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
                         "Would disable service {} from init provider {}",
                         service.name, previous.provider
                     );
-                } else if let Some(gen) = &prev_gen {
-                    gen.disable_service(service, root)?;
+                } else if let Some(generator) = &prev_gen {
+                    generator.disable_service(service, root)?;
                 }
             }
             if stale {
@@ -1289,8 +1289,8 @@ fn render_services(root: &Path, config: &sage_sys::SystemConfig, dry_run: bool) 
                         "Would remove stale native definition for service {}",
                         service.name
                     );
-                } else if let Some(gen) = &prev_gen {
-                    gen.remove_service(service, root)?;
+                } else if let Some(generator) = &prev_gen {
+                    generator.remove_service(service, root)?;
                 }
             }
         }

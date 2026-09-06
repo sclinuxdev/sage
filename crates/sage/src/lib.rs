@@ -9,13 +9,13 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 pub use sage_build::{
-    bootstrap_sources, build_recipe, mass_rebuild, stage_declarative_metadata, stage_sysusers,
-    BuildInvocation,
+    BuildInvocation, bootstrap_sources, build_recipe, mass_rebuild, stage_declarative_metadata,
+    stage_sysusers,
 };
 pub use sage_repo::{ReleaseLocation, ReleaseSource};
 pub use sage_sys::{
-    apply_packages, canonical_channel, load_available_with_pool, rebuild_system, remove_packages,
-    sync_channels, upgrade_packages, AvailablePackages,
+    AvailablePackages, apply_packages, canonical_channel, load_available_with_pool, rebuild_system,
+    remove_packages, sync_channels, upgrade_packages,
 };
 
 #[derive(Parser)]

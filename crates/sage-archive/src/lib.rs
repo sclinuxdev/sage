@@ -1,8 +1,8 @@
 //! Deterministic tar.zst packaging, constant-cost inspection, and safe extraction.
 
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, OFlag};
-use nix::sys::stat::{fchmod, mkdirat, Mode};
+use nix::fcntl::{OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, fchmod, mkdirat};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -642,11 +642,12 @@ fn write_verified(
     } else {
         None
     };
-    if let (Some(previous), Some(live)) = (previous_hash, live_hash.as_deref()) {
-        if live != previous && record.sha256 == previous {
-            verify_reader(path, record, reader)?;
-            return Ok(WriteOutcome::Preserved);
-        }
+    if let (Some(previous), Some(live)) = (previous_hash, live_hash.as_deref())
+        && live != previous
+        && record.sha256 == previous
+    {
+        verify_reader(path, record, reader)?;
+        return Ok(WriteOutcome::Preserved);
     }
     let conflict = previous_hash
         .zip(live_hash.as_deref())

@@ -1,7 +1,7 @@
 # Sage
 
 [![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
-[![Rust: 2021](https://img.shields.io/badge/Rust-2021_Edition-orange.svg)](https://www.rust-lang.org)
+[![Rust: 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org)
 
 **Sage** is an ultra-fast, declarative Linux package manager and system reconciliation engine written in Rust.  
 **Sage** 是一个采用 Rust 编写的现代 Linux 极速声明式包管理器与系统状态调和引擎。

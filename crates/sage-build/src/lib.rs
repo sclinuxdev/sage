@@ -51,7 +51,7 @@ pub enum BuildError {
     },
 }
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 include!("recipe.rs");
 include!("sources.rs");

@@ -30,10 +30,12 @@ fn batch_conflicts_rollback_every_package_record() {
         Err(sage_db::DbError::FileConflict { .. })
     ));
     assert!(database.packages().unwrap().is_empty());
-    assert!(database
-        .owners("usr/lib/torture/shared")
-        .unwrap()
-        .is_empty());
+    assert!(
+        database
+            .owners("usr/lib/torture/shared")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -48,10 +50,12 @@ fn archive_attack_matrix_is_fail_closed() {
     }
     assert!(sage_archive::parse_file_index(&[0xff, b'\n']).is_err());
     let hash = "0".repeat(64);
-    assert!(sage_archive::parse_file_index(
-        format!("usr//bin/tool\t0644\t1\t{hash}\nusr/bin/tool\t0644\t1\t{hash}\n").as_bytes()
-    )
-    .is_err());
+    assert!(
+        sage_archive::parse_file_index(
+            format!("usr//bin/tool\t0644\t1\t{hash}\nusr/bin/tool\t0644\t1\t{hash}\n").as_bytes()
+        )
+        .is_err()
+    );
 
     let mut lab = sage_tests::TortureLab::new().unwrap();
     let package = lab
@@ -246,10 +250,12 @@ fn filesystem_type_permission_and_length_boundaries_are_fail_closed() {
         sage_archive::extract_package(&package, directory_target.path(), &inspection.files)
             .is_err()
     );
-    assert!(directory_target
-        .path()
-        .join("usr/lib/torture/swap/keep")
-        .exists());
+    assert!(
+        directory_target
+            .path()
+            .join("usr/lib/torture/swap/keep")
+            .exists()
+    );
 
     let mut nested_lab = sage_tests::TortureLab::new().unwrap();
     let nested = nested_lab
@@ -441,18 +447,20 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     }
     cycle.publish().unwrap();
     let before = cycle.audit().unwrap();
-    assert!(sage::execute(sage::Cli {
-        verbose: false,
-        dry_run: false,
-        root: cycle.root().into(),
-        command: sage::Commands::Upgrade {
-            packages: vec!["cycle-a".into(), "cycle-b".into()],
-            channel: Some("system".into()),
-            sync: false,
-        },
-    })
-    .await
-    .is_err());
+    assert!(
+        sage::execute(sage::Cli {
+            verbose: false,
+            dry_run: false,
+            root: cycle.root().into(),
+            command: sage::Commands::Upgrade {
+                packages: vec!["cycle-a".into(), "cycle-b".into()],
+                channel: Some("system".into()),
+                sync: false,
+            },
+        })
+        .await
+        .is_err()
+    );
     assert_eq!(cycle.audit().unwrap(), before);
 
     let mut hierarchy = sage_tests::TortureLab::new().unwrap();
@@ -566,10 +574,10 @@ fn host_lock_namespace_is_anchored_and_private() {
     let unsafe_tree = unsafe_root.path().join("shared");
     std::fs::create_dir(&unsafe_tree).unwrap();
     std::fs::set_permissions(&unsafe_tree, std::fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(sage_core::HostLock::acquire_exclusive(
-        unsafe_tree.join("root/run/sage/operation.lock")
-    )
-    .is_err());
+    assert!(
+        sage_core::HostLock::acquire_exclusive(unsafe_tree.join("root/run/sage/operation.lock"))
+            .is_err()
+    );
 }
 
 #[test]

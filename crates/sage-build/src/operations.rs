@@ -704,15 +704,15 @@ async fn prepare_package_tree(
             )
         })?;
         for record in &inspection.files {
-            if record.path != Path::new("usr/share/info/dir") {
-                if let Some(owner) = owned.insert(record.path.clone(), (key.clone(), version.clone())) {
-                    bail!(
-                        "build dependency file conflict at {} between {} and {}",
-                        record.path.display(),
-                        key,
-                        owner.0
-                    );
-                }
+            if record.path != Path::new("usr/share/info/dir")
+                && let Some(owner) = owned.insert(record.path.clone(), (key.clone(), version.clone()))
+            {
+                bail!(
+                    "build dependency file conflict at {} between {} and {}",
+                    record.path.display(),
+                    key,
+                    owner.0
+                );
             }
         }
         sage_archive::extract_package(&archive, &tree, &inspection.files)?;

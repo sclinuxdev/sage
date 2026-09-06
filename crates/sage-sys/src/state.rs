@@ -278,13 +278,12 @@ impl SysusersEngine {
             if let Some(previous) = unique.insert(
                 (account.kind.clone(), account.name.clone()),
                 account.clone(),
-            ) {
-                if previous != account {
-                    return Err(SysError::Invalid(format!(
-                        "conflicting declarations for system account {}",
-                        account.name
-                    )));
-                }
+            ) && previous != account
+            {
+                return Err(SysError::Invalid(format!(
+                    "conflicting declarations for system account {}",
+                    account.name
+                )));
             }
         }
 

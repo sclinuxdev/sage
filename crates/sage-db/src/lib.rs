@@ -264,15 +264,13 @@ impl SageDatabase {
     #[cfg(feature = "torture")]
     pub fn file_owners(&self) -> Result<BTreeMap<String, Vec<PackageKey>>, DbError> {
         let txn = self.env.read_txn()?;
-        let owners = self
-            .files
+        self.files
             .iter(&txn)?
             .map(|entry| {
                 let (path, bytes) = entry?;
                 Ok((path.into(), decode(bytes)?))
             })
-            .collect();
-        owners
+            .collect()
     }
     pub fn providers(&self, symbol: &str) -> Result<Vec<PackageKey>, DbError> {
         let txn = self.env.read_txn()?;

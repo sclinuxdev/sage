@@ -35,7 +35,7 @@ pub enum SysError {
     Solver(#[from] sage_solver::SolverError),
 }
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 fn validate_schema(version: u32) -> Result<(), SysError> {

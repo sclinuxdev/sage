@@ -1,8 +1,8 @@
 //! Core domain models, version algebra, symbol interning, and host locking.
 
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, OFlag};
-use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::{Mode, fchmod, fstat, mkdirat};
 use nix::unistd::{fchown, geteuid};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -504,7 +504,7 @@ impl Package {
 
 mod dependency_strings {
     use super::Dependency;
-    use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
     pub fn serialize<S>(dependencies: &[Dependency], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -659,7 +659,7 @@ fn open_lock_file(path: &Path) -> Result<File, CoreError> {
                 return Err(CoreError::InvalidMetadata(format!(
                     "unsafe operation lock path {}",
                     path.display()
-                )))
+                )));
             }
         };
         match mkdirat(
