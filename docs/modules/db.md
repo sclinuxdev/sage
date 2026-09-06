@@ -39,4 +39,4 @@
 
 ## 3. 崩溃恢复状态机 (`operations` 表)
 
-`sage` 启动时扫描 `operations` 表并验证 `journal_sha256`。journal 保存安装版本、删除快照和声明式元数据，可从 packages、alternatives、triggers、declaration 阶段继续；system.toml 的前后字节也随 journal 保存，在包状态完成后才提交声明文件。重复的文件与 LMDB 操作均为幂等操作。
+`sage` 启动时扫描 `operations` 表并验证 `journal_sha256`。journal 保存安装版本、删除快照、服务 provider 操作和声明式元数据，可从 packages、alternatives、triggers、provider、declaration 阶段继续；system.toml、services.toml 与 rendered service state 的前后字节随对应 journal 保存，在外部状态完成后才提交声明文件。重复的文件、LMDB 操作与 provider 命令均须可安全重试。

@@ -80,8 +80,14 @@ Provider commands must be retry-safe: process termination can occur between an
 external command's success and its durable checkpoint. Static executable checks
 do not prove that an arbitrary compiler, validator, or runtime dependency will
 succeed. A runtime error leaves the journal pending for forward recovery; it does
-not claim that the rebuild completed. No legacy journal or rendered-state
-migration is provided by the 0.4 implementation.
+not claim that the rebuild completed.
+
+Interactive `service enable`, `service disable`, and `service adopt` transitions
+use the same forward-recovery rule. The journal captures the service, active
+generator, and exact before/after bytes for `services.toml` and rendered state
+before the provider is changed. Declaration publication is idempotent, so a
+write failure or interruption after the provider succeeds is completed by the
+next mutating command instead of leaving permanent provider/declaration drift.
 
 ---
 

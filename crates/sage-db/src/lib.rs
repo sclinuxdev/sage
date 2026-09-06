@@ -56,8 +56,8 @@ pub struct RebuildContinuation {
     pub rendered_services: Vec<u8>,
 }
 
-/// A declaration mutation applied only after the package transaction reaches
-/// its final durable stage.
+/// A declaration mutation applied only after the corresponding external state
+/// transition reaches its durable stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMutation {
     /// Sysroot-relative path, using `/` separators in the journal payload.
@@ -65,6 +65,18 @@ pub struct FileMutation {
     pub previous: Option<Vec<u8>>,
     pub next: Option<Vec<u8>>,
 }
+
+/// Provider-side transition retained by a service lifecycle journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceProviderAction {
+    /// Render and enable a service through the active init provider.
+    Enable,
+    /// Disable a service through the active init provider.
+    Disable,
+    /// Render an already enabled external service without changing activation.
+    Adopt,
+}
+
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -82,6 +94,15 @@ pub enum JournalAction {
         modified_paths: Vec<String>,
         trigger_documents: Vec<Vec<u8>>,
         alternative_documents: Vec<Vec<u8>>,
+    },
+    /// A service transition whose provider mutation precedes declaration
+    /// publication. Opaque TOML snapshots make recovery independent of newer
+    /// package metadata or provider selection.
+    ServiceLifecycle {
+        service: Vec<u8>,
+        generator: Vec<u8>,
+        provider_action: ServiceProviderAction,
+        mutations: Vec<FileMutation>,
     },
 }
 /// Durable operation marker used for idempotent forward recovery.

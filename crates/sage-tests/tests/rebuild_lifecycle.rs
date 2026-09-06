@@ -1318,9 +1318,20 @@ async fn provider_enable_failure_does_not_publish_managed_enabled_state() {
     let error = sage_sys::service_enable(lab.root(), "inactive", false).unwrap_err();
 
     assert!(error.to_string().contains("exited with"));
-    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert_eq!(fs::read(&config_path).unwrap(), before);
     assert!(
         !lab.root()
+            .join("var/lib/sage/enabled-old-inactive")
+            .exists()
+    );
+    fs::remove_file(lab.root().join("var/lib/sage/fail-enable")).unwrap();
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(config.enabled.contains("inactive"));
+    assert!(
+        lab.root()
             .join("var/lib/sage/enabled-old-inactive")
             .exists()
     );
@@ -1336,8 +1347,16 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
     let error = sage_sys::service_disable(lab.root(), "daemon", false).unwrap_err();
 
     assert!(error.to_string().contains("exited with"));
-    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert_eq!(fs::read(&config_path).unwrap(), before);
     assert!(lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+    fs::remove_file(lab.root().join("var/lib/sage/fail-disable")).unwrap();
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(!config.enabled.contains("daemon"));
+    assert!(config.disabled.contains("daemon"));
+    assert!(!lab.root().join("var/lib/sage/enabled-old-daemon").exists());
 }
 
 #[tokio::test]
@@ -1362,6 +1381,148 @@ async fn lifecycle_dry_runs_reject_a_malformed_init_generator_without_mutation()
             .join("var/lib/sage/enabled-old-inactive")
             .exists()
     );
+}
+
+#[tokio::test]
+async fn lifecycle_operations_validate_the_generator_before_journaling() {
+    for invalid in ["target", "template", "service-type"] {
+        let lab = initial_system().await;
+        let config_path = lab.root().join("etc/sage/services.toml");
+        let rendered_path = lab.root().join("var/lib/sage/rendered-services.toml");
+        let mut rendered = sage_sys::RenderedServicesState::load(&rendered_path).unwrap();
+        let expected = match invalid {
+            "target" => {
+                rendered.generator.target_path_template = "/etc/${unknown}".into();
+                "unknown variable"
+            }
+            "template" => {
+                rendered.generator.template = "${unknown}".into();
+                "unknown variable"
+            }
+            "service-type" => {
+                rendered.generator.supported_types = vec!["oneshot".into()];
+                "does not support service type"
+            }
+            _ => unreachable!(),
+        };
+        rendered.save(&rendered_path).unwrap();
+        let inactive_marker = lab.root().join("var/lib/sage/enabled-old-inactive");
+        fs::write(&inactive_marker, b"enabled").unwrap();
+        let before_config = fs::read(&config_path).unwrap();
+        let before = lifecycle_snapshot(&lab);
+
+        for dry_run in [true, false] {
+            for error in [
+                sage_sys::service_enable(lab.root(), "inactive", dry_run).unwrap_err(),
+                sage_sys::service_disable(lab.root(), "daemon", dry_run).unwrap_err(),
+                sage_sys::service_adopt(lab.root(), "inactive", dry_run).unwrap_err(),
+            ] {
+                assert!(
+                    error.to_string().contains(expected),
+                    "{invalid}, dry_run={dry_run}: {error}"
+                );
+            }
+        }
+
+        assert_eq!(fs::read(config_path).unwrap(), before_config);
+        assert_eq!(lifecycle_snapshot(&lab), before);
+        assert!(inactive_marker.is_file());
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert!(database.pending_journals().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn service_enable_recovers_declarations_after_a_post_provider_failure() {
+    let mut lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    lab.inject("service-provider").unwrap();
+
+    let error = sage_sys::service_enable(lab.root(), "inactive", false).unwrap_err();
+
+    assert!(error.to_string().contains("injected crash"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(
+        lab.root()
+            .join("var/lib/sage/enabled-old-inactive")
+            .exists()
+    );
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let pending = database.pending_journals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stage, "declaration");
+    drop(database);
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(config.enabled.contains("inactive"));
+    assert!(!config.disabled.contains("inactive"));
+    let rendered = sage_sys::RenderedServicesState::load(
+        lab.root().join("var/lib/sage/rendered-services.toml"),
+    )
+    .unwrap();
+    assert!(rendered.enabled.contains("inactive"));
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn service_disable_recovers_declarations_after_a_post_provider_failure() {
+    let mut lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    lab.inject("service-provider").unwrap();
+
+    let error = sage_sys::service_disable(lab.root(), "daemon", false).unwrap_err();
+
+    assert!(error.to_string().contains("injected crash"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(!lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let pending = database.pending_journals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stage, "declaration");
+    drop(database);
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(!config.enabled.contains("daemon"));
+    assert!(config.disabled.contains("daemon"));
+    let rendered = sage_sys::RenderedServicesState::load(
+        lab.root().join("var/lib/sage/rendered-services.toml"),
+    )
+    .unwrap();
+    assert!(!rendered.enabled.contains("daemon"));
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn service_adopt_recovers_declarations_after_a_post_provider_failure() {
+    let mut lab = initial_system().await;
+    let marker = lab.root().join("var/lib/sage/enabled-old-inactive");
+    fs::write(&marker, b"enabled").unwrap();
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    lab.inject("service-provider").unwrap();
+
+    let error = sage_sys::service_adopt(lab.root(), "inactive", false).unwrap_err();
+
+    assert!(error.to_string().contains("injected crash"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(marker.exists());
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(config.enabled.contains("inactive"));
+    assert!(!config.disabled.contains("inactive"));
+    assert!(marker.exists());
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
 }
 
 #[tokio::test]

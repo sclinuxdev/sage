@@ -223,6 +223,9 @@ pub async fn settle_journals(root: &Path) -> Result<()> {
             sage_db::JournalAction::Remove { .. } => {
                 resume_remove(root, &database, &mut journal)?;
             }
+            sage_db::JournalAction::ServiceLifecycle { .. } => {
+                crate::services::resume_service_lifecycle(root, &database, &mut journal)?;
+            }
         }
         eprintln!("Recovered operation {}", journal.op_id);
     }
