@@ -70,35 +70,8 @@ impl TriggerEngine {
     ) -> Result<Vec<String>, SysError> {
         let mut executed = Vec::new();
         for trigger in triggers {
-            if !trigger.events.contains(&event) {
-                continue;
-            }
-            let patterns: Vec<_> = trigger
-                .on_paths
-                .iter()
-                .map(|pattern| {
-                    sage_core::glob::Pattern::new(pattern).map_err(|error| {
-                        SysError::Invalid(format!("trigger {}: {error}", trigger.name))
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            let matching_paths = modified_paths
-                .iter()
-                .filter(|path| patterns.iter().any(|pattern| pattern.matches_path(path)));
-            let commands = matching_paths
-                .map(|path| {
-                    trigger
-                        .exec
-                        .iter()
-                        .map(|argument| expand_trigger_argument(argument, path, sysroot))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if commands.is_empty() {
-                continue;
-            }
             let mut ran = false;
-            for command in commands {
+            for command in trigger.commands_for(modified_paths, sysroot, event)? {
                 let binary = target_path(sysroot, Path::new(&command[0]))?;
                 if !binary.exists() && trigger.ignore_missing_binary {
                     continue;
@@ -129,6 +102,39 @@ impl TriggerEngine {
 }
 
 impl TriggerSpec {
+    /// Expands and deduplicates the commands eligible for one event and path set.
+    /// Preflight and execution share this selection so only commands that will
+    /// actually run require resources. Invalid globs or arguments return errors
+    /// without executing commands or changing the target root.
+    pub(crate) fn commands_for(
+        &self,
+        modified_paths: &[PathBuf],
+        sysroot: &Path,
+        event: TriggerEvent,
+    ) -> Result<BTreeSet<Vec<String>>, SysError> {
+        if !self.events.contains(&event) {
+            return Ok(BTreeSet::new());
+        }
+        let patterns = self
+            .on_paths
+            .iter()
+            .map(|pattern| {
+                sage_core::glob::Pattern::new(pattern)
+                    .map_err(|error| SysError::Invalid(format!("trigger {}: {error}", self.name)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        modified_paths
+            .iter()
+            .filter(|path| patterns.iter().any(|pattern| pattern.matches_path(path)))
+            .map(|path| {
+                self.exec
+                    .iter()
+                    .map(|argument| expand_trigger_argument(argument, path, sysroot))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect()
+    }
+
     /// Loads and validates one schema-v1 trigger declaration.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
         Self::parse(&fs::read(path)?)

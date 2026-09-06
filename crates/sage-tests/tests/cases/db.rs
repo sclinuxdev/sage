@@ -75,6 +75,7 @@ mod db_tests {
                 previous_packages: vec![],
                 modified_paths: vec![],
                 previous_alternative_documents: vec![],
+                rebuild: None,
             },
         );
         SageDatabase::open(dir.path())
@@ -94,6 +95,7 @@ mod db_tests {
             previous_packages: vec![],
             modified_paths: vec![],
             previous_alternative_documents: vec![],
+            rebuild: None,
         };
         let mut record = JournalRecord::new("op-1".into(), "packages", action.clone());
         record.stage = "triggers".into();
@@ -102,5 +104,4 @@ mod db_tests {
         record.op_id = "op-2".into();
         assert!(matches!(record.validate(), Err(DbError::InvalidJournal(_))));
     }
-
 }

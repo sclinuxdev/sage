@@ -43,6 +43,18 @@ pub struct InstalledPackage {
     /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
+/// The remaining rebuild work travels with package publication so any mutating
+/// command can finish the original transition without reading a newer config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildContinuation {
+    pub provider_bindings: BTreeMap<String, PackageKey>,
+    pub retired_packages: Vec<InstalledPackage>,
+    /// True retirement paths, excluding files handed to a replacement owner.
+    pub removed_paths: Vec<String>,
+    pub removal_trigger_documents: Vec<Vec<u8>>,
+    /// Serialized planned native-service generation, opaque to the database.
+    pub rendered_services: Vec<u8>,
+}
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -53,6 +65,7 @@ pub enum JournalAction {
         previous_packages: Vec<InstalledPackage>,
         modified_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
+        rebuild: Option<RebuildContinuation>,
     },
     Remove {
         packages: Vec<InstalledPackage>,
@@ -290,6 +303,30 @@ impl SageDatabase {
             .get(&txn, interface)?
             .map(str::parse)
             .transpose()?)
+    }
+    /// Reads all configured interface bindings in one consistent transaction.
+    pub fn system_providers(&self) -> Result<BTreeMap<String, PackageKey>, DbError> {
+        let txn = self.env.read_txn()?;
+        self.system
+            .iter(&txn)?
+            .map(|entry| {
+                let (interface, key) = entry?;
+                Ok((interface.to_owned(), key.parse()?))
+            })
+            .collect()
+    }
+    /// Replaces the resolved binding set atomically, including stale removals.
+    pub fn replace_system_providers(
+        &self,
+        bindings: &BTreeMap<String, PackageKey>,
+    ) -> Result<(), DbError> {
+        let mut txn = self.env.write_txn()?;
+        self.system.clear(&mut txn)?;
+        for (interface, key) in bindings {
+            self.system.put(&mut txn, interface, &key.canonical_id())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
     /// Starts or advances an operation by replacing its durable journal record.
     pub fn write_journal(&self, record: &JournalRecord) -> Result<(), DbError> {
