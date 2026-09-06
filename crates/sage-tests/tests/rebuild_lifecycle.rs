@@ -858,3 +858,196 @@ async fn configured_provider_symbols_survive_rebuild_and_recovery() {
         assert_eq!(database.system_provider(binding).unwrap(), None);
     }
 }
+
+#[tokio::test]
+async fn retired_file_to_directory_handoffs_recover_without_repeating_retirement() {
+    for (point, symlink) in [
+        (None, false),
+        (None, true),
+        (Some("removal"), false),
+        (Some("rebuild-retirement"), false),
+        (Some("extraction"), false),
+        (Some("before-lmdb-write"), false),
+        (Some("lmdb-publication"), false),
+    ] {
+        let mut lab = initial_system().await;
+        lab.add("system", "old-tool", 1, "usr/lib/torture/tool", "old file")
+            .unwrap();
+        lab.publish().unwrap();
+        lab.install("old-tool", "system").await.unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("sentinel"), b"outside").unwrap();
+        if symlink {
+            let old = lab.root().join("usr/lib/torture/tool");
+            fs::remove_file(&old).unwrap();
+            std::os::unix::fs::symlink(outside.path(), old).unwrap();
+        }
+        lab.add(
+            "system",
+            "new-tool",
+            1,
+            "usr/lib/torture/tool/helper",
+            "new helper",
+        )
+        .unwrap();
+        lab.publish().unwrap();
+        configure(&lab, &["loom", "daemon", "new-tool"], "loom", &["daemon"]);
+        if let Some(point) = point {
+            lab.inject(&format!("abort:{point}")).unwrap();
+            let interrupted = aborting_rebuild(lab.root());
+            assert!(!interrupted.status.success());
+            assert!(
+                !lab.root().join("run/sage/crash-point").exists(),
+                "{point}: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            lab.install("daemon", "system")
+                .await
+                .unwrap_or_else(|error| panic!("{point}: {error:#}"));
+        } else {
+            rebuild(&lab, false).await.unwrap();
+        }
+        assert_settled(&lab, "loom", "0", "old");
+        assert_eq!(
+            fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside"
+        );
+        assert!(!outside.path().join("helper").exists());
+        let state = lab.snapshot().unwrap();
+        assert!(!state.packages.contains_key("main/system:old-tool:0"));
+        assert!(lab.root().join("usr/lib/torture/tool").is_dir());
+        assert_eq!(
+            fs::read(lab.root().join("usr/lib/torture/tool/helper")).unwrap(),
+            b"new helper"
+        );
+        assert!(!state.owners.contains_key("usr/lib/torture/tool"));
+        assert_eq!(
+            state.owners["usr/lib/torture/tool/helper"],
+            ["main/system:new-tool:0"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn renderer_programs_and_outputs_use_directories_created_by_retirement_handoffs() {
+    let mut lab = initial_system().await;
+    lab.add("system", "old-tool", 1, "usr/lib/torture/tool", "old file")
+        .unwrap();
+    lab.publish().unwrap();
+    lab.install("old-tool", "system").await.unwrap();
+    let mut new = provider("fir", "0", "new");
+    let program = new.files.remove("usr/bin/firctl").unwrap();
+    new.files.insert(
+        "usr/lib/torture/tool/control".into(),
+        String::from_utf8(program)
+            .unwrap()
+            .replace("/etc/native-new", "/usr/lib/torture/tool/native")
+            .into_bytes(),
+    );
+    new.executable_files = ["usr/lib/torture/tool/control".into()]
+        .into_iter()
+        .collect();
+    new.files.insert(
+        "usr/share/sage/rclass/init-fir.toml".into(),
+        renderer("fir", "new")
+            .replace("/usr/bin/firctl", "/usr/lib/torture/tool/control")
+            .replace("/etc/native-new", "/usr/lib/torture/tool/native")
+            .into_bytes(),
+    );
+    lab.add_package(new).unwrap();
+    lab.publish().unwrap();
+    configure(&lab, &["fir", "daemon"], "fir", &["daemon"]);
+    rebuild(&lab, false).await.unwrap();
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert_eq!(
+        database.system_provider("init").unwrap(),
+        Some(PackageKey::new("main/system", "fir", "0"))
+    );
+    assert!(database.pending_journals().unwrap().is_empty());
+    assert_eq!(
+        database.owners("usr/lib/torture/tool/control").unwrap(),
+        [PackageKey::new("main/system", "fir", "0")]
+    );
+    assert_eq!(
+        fs::read(lab.root().join("usr/lib/torture/tool/native/daemon")).unwrap(),
+        b"new: daemon"
+    );
+    assert!(lab.root().join("var/lib/sage/enabled-new-daemon").is_file());
+    assert!(!lab.root().join("etc/native-old/daemon").exists());
+}
+
+#[tokio::test]
+async fn hierarchy_handoffs_keep_retained_and_preserved_paths_protected() {
+    for case in [
+        "retained",
+        "shared",
+        "modified-config",
+        "unowned-symlink",
+        "directory-to-file",
+    ] {
+        let mut lab = initial_system().await;
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("sentinel"), b"outside").unwrap();
+        let path = if case == "modified-config" {
+            "etc/torture-tool"
+        } else {
+            "usr/lib/torture/tool"
+        };
+        if case == "unowned-symlink" {
+            fs::create_dir_all(lab.root().join("usr/lib/torture")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), lab.root().join(path)).unwrap();
+        } else {
+            let owned = if case == "directory-to-file" {
+                format!("{path}/old-helper")
+            } else {
+                path.into()
+            };
+            lab.add("system", "old-tool", 1, &owned, "original")
+                .unwrap();
+            lab.publish().unwrap();
+            lab.install("old-tool", "system").await.unwrap();
+        }
+        if case == "modified-config" {
+            fs::write(lab.root().join(path), b"administrator edit").unwrap();
+        }
+        if case == "shared" {
+            let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+            let mut owner = database
+                .package(&PackageKey::new("main/system", "old-tool", "0"))
+                .unwrap()
+                .unwrap();
+            owner.key = PackageKey::new("main/system", "retained-owner", "0");
+            database.install(&owner, true).unwrap();
+        }
+        let new_path = if case == "directory-to-file" {
+            path.into()
+        } else {
+            format!("{path}/helper")
+        };
+        lab.add("system", "new-tool", 1, &new_path, "new helper")
+            .unwrap();
+        lab.publish().unwrap();
+        let mut desired = vec!["loom", "daemon", "new-tool"];
+        if case == "retained" {
+            desired.push("old-tool");
+        }
+        if case == "shared" {
+            desired.push("retained-owner");
+        }
+        configure(&lab, &desired, "loom", &["daemon"]);
+        let before = lifecycle_snapshot(&lab);
+        let error = rebuild(&lab, false).await.unwrap_err();
+        assert_eq!(lifecycle_snapshot(&lab), before, "{case}: {error:#}");
+        assert_eq!(
+            fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside"
+        );
+        assert!(!outside.path().join("helper").exists());
+        if case == "modified-config" {
+            assert_eq!(
+                fs::read(lab.root().join(path)).unwrap(),
+                b"administrator edit"
+            );
+        }
+    }
+}

@@ -667,6 +667,30 @@ async fn preflight_packages(
                 .insert(package.key.clone());
         }
     }
+    // Only paths that retirement really deletes may become directories. Shared
+    // retained ownership and preserved administrator configuration still block
+    // a handoff, even when one of their owners is in the retirement set.
+    let mut retiring_paths = BTreeSet::new();
+    for (path, owners) in &installed_paths {
+        if owners
+            .iter()
+            .all(|owner| retired.iter().any(|package| package.key == *owner))
+        {
+            let mut removable = true;
+            for package in retired
+                .iter()
+                .filter(|package| owners.contains(&package.key))
+            {
+                if should_preserve_config(&root.join(path), path, &package.config_hashes)? {
+                    removable = false;
+                    break;
+                }
+            }
+            if removable {
+                retiring_paths.insert(path.clone());
+            }
+        }
+    }
     for (path, claimant) in &planned {
         let components = Path::new(path)
             .components()
@@ -680,6 +704,13 @@ async fn preflight_packages(
             destination.push(component);
             match std::fs::symlink_metadata(&destination) {
                 Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
+                    if retiring_paths
+                        .contains(destination.strip_prefix(root)?.to_string_lossy().as_ref())
+                    {
+                        // Retirement unlinks this ancestor before extraction. Do
+                        // not walk into a stale file or follow its symlink target.
+                        break;
+                    }
                     bail!("file hierarchy conflict for {path}: an ancestor is not a directory")
                 }
                 Ok(metadata) if index + 1 == components.len() && metadata.is_dir() => {
@@ -700,7 +731,9 @@ async fn preflight_packages(
                     "transaction ownership paths conflict: {owner} owns ancestor {ancestor} of {claimant}'s {path}"
                 );
             }
-            if let Some(owners) = installed_paths.get(ancestor.as_ref()) {
+            if let Some(owners) = installed_paths.get(ancestor.as_ref())
+                && !retiring_paths.contains(ancestor.as_ref())
+            {
                 bail!(
                     "file hierarchy conflict for {path}: ancestor {ancestor} is currently owned by {owners:?}"
                 );
@@ -819,7 +852,7 @@ async fn resume_install(
             &next,
             !previous_packages.is_empty() || !work.retired_packages.is_empty(),
         )?;
-        journal.advance("packages");
+        journal.advance("rebuild-retirement");
         database.write_journal(journal)?;
         crash_point(root, "rebuild-cleanup-complete")?;
     }
@@ -829,29 +862,41 @@ async fn resume_install(
     for package in previous_packages.values() {
         previous_config.extend(package.config_hashes.clone());
     }
-    let mut modified = Vec::new();
-    let mut retired_paths = Vec::new();
-    if journal.stage == "packages" {
-        // Cleanup finished while all old packages were intact. Retirement can now
-        // release ownership before the new slot claims the same physical paths.
-        if let Some(work) = &rebuild {
-            for package in &work.retired_packages {
-                database.remove(&package.key)?;
-                crash_point(root, "removal")?;
-            }
-            for package in &work.retired_packages {
-                for relative in &package.files {
-                    if database.owners(relative)?.is_empty() {
-                        let path = root.join(relative);
-                        if !should_preserve_config(&path, relative, &package.config_hashes)? {
-                            remove_file_beneath(root, &path)?;
-                            retired_paths.push(relative.clone());
-                        }
+    if let Some(work) = &rebuild {
+        for package in &work.retired_packages {
+            previous_config.extend(package.config_hashes.clone());
+        }
+    }
+    if journal.stage == "rebuild-retirement" {
+        let work = rebuild.as_mut().context("missing rebuild continuation")?;
+        let mut retired_paths = Vec::new();
+        for package in &work.retired_packages {
+            database.remove(&package.key)?;
+            crash_point(root, "removal")?;
+        }
+        for package in &work.retired_packages {
+            for relative in &package.files {
+                if database.owners(relative)?.is_empty() {
+                    let path = root.join(relative);
+                    if !should_preserve_config(&path, relative, &package.config_hashes)? {
+                        remove_file_beneath(root, &path)?;
+                        retired_paths.push(relative.clone());
                     }
                 }
-                previous_config.extend(package.config_hashes.clone());
             }
         }
+        work.removed_paths = retired_paths;
+        if let sage_db::JournalAction::Install { rebuild: saved, .. } = &mut journal.action {
+            *saved = rebuild.clone();
+        }
+        // Once extraction starts, old file paths may be new directories. A
+        // durable boundary prevents recovery from unlinking those paths again.
+        journal.advance("packages");
+        database.write_journal(journal)?;
+        crash_point(root, "rebuild-retirement")?;
+    }
+    let mut modified = Vec::new();
+    if journal.stage == "packages" {
         for (key, version) in &changes {
             let source = available
                 .releases
@@ -966,12 +1011,13 @@ async fn resume_install(
             }
         }
         if let Some(work) = &mut rebuild {
-            work.removed_paths.clear();
-            for path in retired_paths {
-                if database.owners(&path)?.is_empty() {
-                    work.removed_paths.push(path);
+            let mut removed = Vec::new();
+            for path in &work.removed_paths {
+                if database.owners(path)?.is_empty() {
+                    removed.push(path.clone());
                 }
             }
+            work.removed_paths = removed;
         }
         if let sage_db::JournalAction::Install {
             modified_paths,
@@ -1306,7 +1352,10 @@ fn validate_planned_program(
             continue;
         }
         relative.push(component);
-        if removed.contains(&relative) {
+        let planned_directory = payloads
+            .keys()
+            .any(|path| path != &relative && path.starts_with(&relative));
+        if removed.contains(&relative) && !planned_directory {
             bail!(
                 "planned program {} uses removed path {}",
                 program.display(),
@@ -1319,7 +1368,7 @@ fn validate_planned_program(
                 true,
                 *mode,
             )
-        } else if !pending.is_empty() && payloads.keys().any(|path| path.starts_with(&relative)) {
+        } else if planned_directory {
             // Payload ancestors are created by extraction, even on a fresh root.
             (None, false, 0)
         } else {
@@ -1625,6 +1674,14 @@ async fn plan_services(
                     if (physical != *target || directory)
                         && (!metadata.is_dir() || metadata.is_symlink()) =>
                 {
+                    let relative = physical.strip_prefix(root)?;
+                    if removed.contains(relative)
+                        && payloads
+                            .keys()
+                            .any(|path| path != relative && path.starts_with(relative))
+                    {
+                        break;
+                    }
                     bail!(
                         "unsafe native service output directory: {}",
                         physical.display()
