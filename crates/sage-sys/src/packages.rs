@@ -1067,7 +1067,8 @@ pub fn remove_packages(
     for (interface, provider) in database.system_providers()? {
         if requested.contains(&provider) {
             bail!(
-                "cannot remove bound provider {provider} for virtual/{interface}; switch providers with rebuild first"
+                "cannot remove bound provider {provider} for {}; switch providers with rebuild first",
+                provider_symbol(&interface)
             );
         }
     }
@@ -1386,8 +1387,9 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
             .universe
             .release(key, version)
             .with_context(|| format!("resolved provider release {key} {version} is missing"))?;
-        if !release.provides.contains(&format!("virtual/{interface}")) {
-            bail!("resolved provider {key} {version} does not provide virtual/{interface}");
+        let symbol = provider_symbol(interface);
+        if !release.provides.contains(&symbol) {
+            bail!("resolved provider {key} {version} does not provide {symbol}");
         }
     }
     let provider = plan
@@ -1408,7 +1410,7 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
         println!("Remove {} {}", package.key, package.version);
     }
     for (interface, key) in &plan.provider_bindings {
-        println!("Bind virtual/{interface} to {key}");
+        println!("Bind {} to {key}", provider_symbol(interface));
     }
     // A dry-run remains useful before a new provider has been downloaded or
     // installed. Solving and binding validation still happen without writes.

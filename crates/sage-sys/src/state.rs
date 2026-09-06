@@ -43,16 +43,22 @@ impl SystemConfig {
         self.providers
             .iter()
             .map(|(interface, selector)| {
-                let symbol = if interface.starts_with("virtual/") || interface.starts_with("so:") {
-                    interface.clone()
-                } else {
-                    format!("virtual/{interface}")
-                };
+                let symbol = provider_symbol(interface);
                 sage_core::PackageKey::in_channel(channel, selector)
                     .map(|key| (symbol, key))
                     .map_err(|error| SysError::Invalid(error.to_string()))
             })
             .collect()
+    }
+}
+
+/// Restores a configured or persisted binding key to its solver symbol. Virtual
+/// bindings use short keys in the state table; shared-library symbols stay exact.
+fn provider_symbol(interface: &str) -> String {
+    if interface.starts_with("virtual/") || interface.starts_with("so:") {
+        interface.to_owned()
+    } else {
+        format!("virtual/{interface}")
     }
 }
 

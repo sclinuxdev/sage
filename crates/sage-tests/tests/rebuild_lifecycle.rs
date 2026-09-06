@@ -795,3 +795,66 @@ async fn cleanup_keeps_old_commands_and_runtime_alive_and_recovery_finishes_the_
         );
     }
 }
+
+#[tokio::test]
+async fn configured_provider_symbols_survive_rebuild_and_recovery() {
+    for (spelling, symbol, binding) in [
+        ("libc", "virtual/libc", "libc"),
+        ("virtual/libc", "virtual/libc", "libc"),
+        ("so:libc.so.6", "so:libc.so.6", "so:libc.so.6"),
+    ] {
+        let mut lab = initial_system().await;
+        let mut library = PackageSpec::new(
+            "system",
+            "libc-provider",
+            1,
+            "usr/lib/torture/libc-provider",
+            "library",
+        );
+        library.slot = "1".into();
+        library.provides.push(symbol.into());
+        lab.add_package(library).unwrap();
+        lab.publish().unwrap();
+        configure(&lab, &["loom", "daemon"], "loom", &["daemon"]);
+        let config_path = lab.root().join("etc/sage/system.toml");
+        let config = format!(
+            "{}\n{spelling:?}=\"libc-provider:1\"\n",
+            fs::read_to_string(&config_path).unwrap()
+        );
+        fs::write(&config_path, &config).unwrap();
+        let before = lifecycle_snapshot(&lab);
+        rebuild(&lab, true).await.unwrap();
+        assert_eq!(lifecycle_snapshot(&lab), before);
+        lab.inject("rebuild-bindings").unwrap();
+        assert!(
+            rebuild(&lab, false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected crash")
+        );
+        configure(&lab, &["loom", "daemon"], "loom", &["daemon"]);
+        lab.install("daemon", "system").await.unwrap();
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert_eq!(
+            database.system_provider(binding).unwrap(),
+            Some(PackageKey::new("main/system", "libc-provider", "1"))
+        );
+        assert_eq!(
+            database
+                .system_provider(&format!("virtual/{binding}"))
+                .unwrap(),
+            None
+        );
+        assert!(database.pending_journals().unwrap().is_empty());
+        drop(database);
+        let error = lab.remove("libc-provider:1", "system").await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("for {symbol};")),
+            "{error:#}"
+        );
+        rebuild(&lab, false).await.unwrap();
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert_eq!(database.system_provider(binding).unwrap(), None);
+    }
+}
