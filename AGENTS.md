@@ -50,6 +50,7 @@
 | 规范对象 | 对应文件 / 路径 | 规范文档 |
 | :--- | :--- | :--- |
 | **声明式系统配置** | `/etc/sage/system.toml` | [system_spec.md](file:///home/ir/sage/docs/specs/system_spec.md) |
+| **声明式服务配置** | `/etc/sage/services.toml` | [system_spec.md](file:///home/ir/sage/docs/specs/system_spec.md) |
 | **通道源配置** | `/etc/sage/channels.toml` | [channels_spec.md](file:///home/ir/sage/docs/specs/channels_spec.md) |
 | **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](file:///home/ir/sage/docs/specs/build_config_spec.md) |
 | **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](file:///home/ir/sage/docs/specs/bootstrap_spec.md) |

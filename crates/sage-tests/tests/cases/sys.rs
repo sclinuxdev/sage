@@ -48,7 +48,6 @@ fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
             .iter()
             .map(|(symbol, key)| ((*symbol).into(), (*key).into()))
             .collect(),
-        services: BTreeSet::new(),
     }
 }
 
@@ -594,7 +593,6 @@ fn reconciliation_computes_dependency_closed_difference() {
         },
         providers: BTreeMap::new(),
         packages: BTreeSet::from(["app".into()]),
-        services: BTreeSet::new(),
     };
     let plan = ReconcilePlan::compute(&config, &[old], &universe, false).unwrap();
     assert_eq!(plan.install.len(), 2);
@@ -640,7 +638,6 @@ fn reconciliation_switches_and_prunes_virtual_provider() {
         },
         providers: BTreeMap::from([("libc".into(), "musl".into())]),
         packages: BTreeSet::from(["app".into()]),
-        services: BTreeSet::new(),
     };
     let plan = ReconcilePlan::compute(&config, &[glibc], &universe, false).unwrap();
     assert!(plan.install.iter().any(|(key, _)| key.name == "musl"));

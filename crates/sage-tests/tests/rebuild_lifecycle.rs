@@ -45,8 +45,13 @@ fn configure(lab: &TortureLab, packages: &[&str], init: &str, enabled: &[&str]) 
     fs::write(
         lab.root().join("etc/sage/system.toml"),
         format!(
-            "schema_version=1\npackages={packages:?}\nservices={enabled:?}\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n[providers]\ninit={init:?}\n"
+            "schema_version=1\npackages={packages:?}\n[system]\narchitecture=\"amd64\"\nprofile=\"default\"\n[providers]\ninit={init:?}\n"
         ),
+    )
+    .unwrap();
+    fs::write(
+        lab.root().join("etc/sage/services.toml"),
+        format!("schema_version=1\nenabled={enabled:?}\n"),
     )
     .unwrap();
 }

@@ -45,13 +45,6 @@ packages = [
     "neovim",
     "ripgrep"
 ]
-
-# 全局启用的服务列表 (Rebuild 时将自动由 rclass 编译并激活)
-services = [
-    "sshd",
-    "udev",
-    "dhcpcd"
-]
 ```
 
 ---
@@ -72,9 +65,19 @@ services = [
   dracut, or any other generator.
 - **原子状态切换**: 当用户将 `init = "loom"` 修改为 `init = "systemd"` 并执行 `sage rebuild` 时，系统自动计算差集，完成旧包卸载、新包安装以及全量服务配置重编译。
 
-### 2.3 `packages` 与 `services`
+### 2.3 `packages` 与服务解耦 (`/etc/sage/services.toml`)
 - `packages`: 系统声明式常驻包列表。
-- `services`: 开机自启的服务名列表，对应各包携带的 `.METADATA/service.toml`。
+- **服务配置解耦**: 服务不存放在 `system.toml` 中，而是由独立的 `/etc/sage/services.toml` (`ServicesConfig`) 维护，专职管理开机自启的服务名列表：
+  ```toml
+  # /etc/sage/services.toml
+  schema_version = 1
+  enabled = [
+      "sshd",
+      "udev",
+      "dhcpcd"
+  ]
+  ```
+  在执行 `sage rebuild` 时，系统加载 `system.toml` 获得声明式软件包与 provider，并加载 `services.toml` 获得需激活的服务列表，由对应 Init rclass 模板引擎编译生成服务配置。
 
 ### 2.4 Provider selection and retained packages
 

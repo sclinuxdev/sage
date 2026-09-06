@@ -71,7 +71,7 @@ impl TemplateServiceGenerator {
 ## 4. 声明式系统调和 (`Reconciler`)
 
 `sage rebuild` 执行流水线：
-1. 读取 `/etc/sage/system.toml`。
+1. 读取 `/etc/sage/system.toml`（包集合与 provider 映射）与 `/etc/sage/services.toml`（启用服务集合）。
 2. 比对 LMDB 中当前已安装的 `(Channel, PackageName, Slot)` 集合。
 3. 动态加载目标 Init 系统的 `init-*.toml` rclass 渲染器。
 4. 调度 `sage-solver` 执行依赖求解，调度 `sage-archive` 执行两阶段文件原子交接。

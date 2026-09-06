@@ -18,8 +18,6 @@ pub struct SystemConfig {
     pub providers: BTreeMap<String, String>,
     #[serde(default)]
     pub packages: BTreeSet<String>,
-    #[serde(default)]
-    pub services: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +77,6 @@ pub struct ReconcilePlan {
     pub install: Vec<(sage_core::PackageKey, sage_core::Version)>,
     pub remove: Vec<sage_core::PackageKey>,
     pub provider_bindings: BTreeMap<String, sage_core::PackageKey>,
-    pub services: BTreeSet<String>,
 }
 
 impl ReconcilePlan {
@@ -163,7 +160,6 @@ impl ReconcilePlan {
             install,
             remove,
             provider_bindings,
-            services: config.services.clone(),
         })
     }
 }

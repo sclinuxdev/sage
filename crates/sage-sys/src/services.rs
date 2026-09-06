@@ -50,6 +50,50 @@ pub struct ServiceDocument {
     pub services: Vec<ServiceSpec>,
 }
 
+/// Desired service enablement state from `/etc/sage/services.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServicesConfig {
+    pub schema_version: u32,
+    #[serde(alias = "services", default)]
+    pub enabled: BTreeSet<String>,
+}
+
+impl ServicesConfig {
+    /// Loads service configuration from path, returning an empty default if the file is absent.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self {
+                schema_version: sage_core::SCHEMA_VERSION,
+                enabled: BTreeSet::new(),
+            });
+        }
+        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        validate_schema(config.schema_version)?;
+        Ok(config)
+    }
+
+    /// Saves service configuration atomically to the target path.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), SysError> {
+        let path = path.as_ref();
+        let parent = path.parent().ok_or_else(|| {
+            SysError::Invalid(format!(
+                "services config path has no parent: {}",
+                path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(
+            ".services-config-{}",
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let content = toml::to_string_pretty(self).map_err(|e| SysError::Invalid(e.to_string()))?;
+        fs::write(&temporary, content)?;
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
+}
+
 /// Last successfully reconciled native-service state. Keeping the generic
 /// declarations lets Sage disable and remove stale output after an init switch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

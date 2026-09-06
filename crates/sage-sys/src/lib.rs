@@ -3,21 +3,44 @@
 use std::sync::atomic::AtomicU64;
 use thiserror::Error;
 
-pub mod channel;
-pub mod query;
-pub mod recovery;
-pub mod services;
-pub mod state;
-pub mod transaction;
-pub mod triggers;
+mod channel;
+mod query;
+mod recovery;
+mod services;
+mod state;
+mod transaction;
+mod triggers;
 
-pub use channel::*;
-pub use query::*;
-pub use recovery::*;
-pub use services::*;
-pub use state::*;
-pub use transaction::*;
-pub use triggers::*;
+// 1. Transaction execution entry points
+pub use transaction::{
+    TransactionPlan, apply_packages, rebuild_system, remove_packages, upgrade_packages,
+};
+
+// 2. Recovery
+pub use recovery::settle_journals;
+
+// 3. State query and environment activation
+pub use query::{
+    QueryAction, list_channels, query_info, query_installed, query_owner, query_state,
+    use_toolchain,
+};
+
+// 4. Repository channels and availability pools
+pub use channel::{
+    AvailablePackages, canonical_channel, load_available_with_pool, obtain_release_archive,
+    sync_channels,
+};
+
+// 5. Metadata and configuration specifications
+pub use services::{
+    RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig, TemplateServiceGenerator,
+};
+pub use state::{
+    Alternative, AlternativeDeclaration, AlternativesDocument, ProfileEngine, ReconcilePlan,
+    SystemConfig, SystemMetadata, SysuserDeclaration, SysusersDocument, SysusersEngine,
+    provider_symbol,
+};
+pub use triggers::{TriggerEngine, TriggerEvent, TriggerSpec};
 
 pub(crate) static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
