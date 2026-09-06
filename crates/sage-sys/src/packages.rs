@@ -1608,7 +1608,20 @@ async fn plan_services(
         bail!("enabled service '{name}' has no planned declaration");
     }
     generator.validate_service_set(&services, root)?;
-    let final_owned = installed
+    // Removed package ownership does not imply physical removal: administrator
+    // configuration edits survive retirement and obsolete-path cleanup. Protect
+    // those files before accepting a native output or managed directory.
+    let mut preserved_configs = BTreeSet::new();
+    for package in installed {
+        for path in package.config_hashes.keys() {
+            if removed.contains(Path::new(path))
+                && should_preserve_config(&root.join(path), path, &package.config_hashes)?
+            {
+                preserved_configs.insert(PathBuf::from(path));
+            }
+        }
+    }
+    let protected_paths = installed
         .iter()
         .filter(|package| {
             !changes.iter().any(|(key, _)| *key == package.key)
@@ -1616,6 +1629,7 @@ async fn plan_services(
         })
         .flat_map(|package| package.files.iter().map(PathBuf::from))
         .chain(payloads.keys().chain(documents.keys()).cloned())
+        .chain(preserved_configs.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut targets = BTreeSet::<PathBuf>::new();
     for service in &services {
@@ -1623,12 +1637,12 @@ async fn plan_services(
         let relative = target.strip_prefix(root)?;
         // Native output must not replace a package's command, data, or parent
         // directory. This checks the final overlay, before any old cleanup.
-        if final_owned
+        if protected_paths
             .iter()
             .any(|path| path.starts_with(relative) || relative.starts_with(path))
         {
             bail!(
-                "native service output conflicts with package ownership: {}",
+                "native service output conflicts with an existing or planned file: {}",
                 target.display()
             );
         }
@@ -1647,12 +1661,12 @@ async fn plan_services(
         .transpose()?;
     if let Some(directory) = &managed_directory {
         let relative = directory.strip_prefix(root)?;
-        if final_owned
+        if protected_paths
             .iter()
             .any(|path| path.starts_with(relative) || relative.starts_with(path))
         {
             bail!(
-                "managed service directory conflicts with package-owned files: {}",
+                "managed service directory conflicts with an existing or planned file: {}",
                 directory.display()
             );
         }
@@ -1673,11 +1687,11 @@ async fn plan_services(
                         && (!metadata.is_dir() || metadata.is_symlink()) =>
                 {
                     let relative = physical.strip_prefix(root)?;
-                    if removed.contains(relative)
-                        && payloads
-                            .keys()
-                            .any(|path| path != relative && path.starts_with(relative))
-                    {
+                    if removed.contains(relative) {
+                        // This walk already identifies a required native
+                        // directory, including an empty managed generation.
+                        // Surviving owners and preserved configs were rejected
+                        // above; publication removes this obsolete leaf first.
                         break;
                     }
                     bail!(

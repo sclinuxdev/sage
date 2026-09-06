@@ -1080,3 +1080,157 @@ async fn dry_run_removal_reads_bindings_without_writing_the_database() {
     assert_eq!(after, before);
     assert_settled(&lab, "loom", "0", "old");
 }
+
+fn native_handoff_provider(directory: &str, managed: bool) -> PackageSpec {
+    let mut package = provider("fir", "0", "new");
+    for bytes in package.files.values_mut() {
+        *bytes = String::from_utf8(bytes.clone())
+            .unwrap()
+            .replace("/etc/native-new", directory)
+            .into_bytes();
+    }
+    if managed {
+        package
+            .files
+            .get_mut("usr/share/sage/rclass/init-fir.toml")
+            .unwrap()
+            .extend_from_slice(format!("managed_directory={directory:?}\n").as_bytes());
+    }
+    package
+}
+
+#[tokio::test]
+async fn native_outputs_create_directories_after_retirement_without_payload_children() {
+    for (managed, empty, checkpoint) in [
+        (false, false, None),
+        (false, false, Some("rebuild-retirement")),
+        (true, false, None),
+        (true, false, Some("rebuild-services")),
+        (true, true, None),
+        (true, true, Some("rebuild-bindings")),
+    ] {
+        let mut lab = initial_system().await;
+        lab.add("system", "old-layout", 1, "etc/init", "old layout")
+            .unwrap();
+        lab.publish().unwrap();
+        lab.install("old-layout", "system").await.unwrap();
+        // The managed empty generation covers replacing the directory itself;
+        // nonempty managed output also covers a parent of the managed directory.
+        let directory = if managed && !empty {
+            "/etc/init/services"
+        } else {
+            "/etc/init"
+        };
+        lab.add_package(native_handoff_provider(directory, managed))
+            .unwrap();
+        lab.publish().unwrap();
+        configure(
+            &lab,
+            if empty { &["fir"] } else { &["fir", "daemon"] },
+            "fir",
+            if empty { &[] } else { &["daemon"] },
+        );
+        if let Some(point) = checkpoint {
+            lab.inject(&format!("abort:{point}")).unwrap();
+            let interrupted = aborting_rebuild(lab.root());
+            assert!(!interrupted.status.success());
+            assert!(
+                !lab.root().join("run/sage/crash-point").exists(),
+                "{point}: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            lab.install("fir", "system").await.unwrap();
+        } else {
+            rebuild(&lab, false).await.unwrap();
+        }
+        let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+        assert_eq!(
+            database.system_provider("init").unwrap(),
+            Some(PackageKey::new("main/system", "fir", "0"))
+        );
+        assert!(
+            database
+                .package(&PackageKey::new("main/system", "old-layout", "0"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(database.owners("etc/init").unwrap().is_empty());
+        assert!(database.pending_journals().unwrap().is_empty());
+        let output = lab.root().join(directory.trim_start_matches('/'));
+        assert!(output.is_dir());
+        if empty {
+            assert_eq!(fs::read_dir(output).unwrap().count(), 0);
+        } else {
+            assert_eq!(fs::read(output.join("daemon")).unwrap(), b"new: daemon");
+            assert!(lab.root().join("var/lib/sage/enabled-new-daemon").is_file());
+        }
+        assert!(!lab.root().join("etc/native-old/daemon").exists());
+        assert!(!lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+    }
+}
+
+#[tokio::test]
+async fn native_directory_handoffs_reject_protected_ancestors_before_publication() {
+    for managed in [false, true] {
+        for case in [
+            "modified-config",
+            "retained-owner",
+            "shared-owner",
+            "unowned-symlink",
+        ] {
+            let mut lab = initial_system().await;
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("sentinel"), b"outside").unwrap();
+            if case == "unowned-symlink" {
+                std::os::unix::fs::symlink(outside.path(), lab.root().join("etc/init")).unwrap();
+            } else {
+                lab.add("system", "old-layout", 1, "etc/init", "old layout")
+                    .unwrap();
+                lab.publish().unwrap();
+                lab.install("old-layout", "system").await.unwrap();
+            }
+            if case == "modified-config" {
+                fs::write(lab.root().join("etc/init"), b"administrator edit").unwrap();
+            }
+            if case == "shared-owner" {
+                let database =
+                    sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+                let mut shared = database
+                    .package(&PackageKey::new("main/system", "old-layout", "0"))
+                    .unwrap()
+                    .unwrap();
+                shared.key = PackageKey::new("main/system", "shared-layout", "0");
+                database.install(&shared, true).unwrap();
+            }
+            lab.add_package(native_handoff_provider("/etc/init", managed))
+                .unwrap();
+            lab.publish().unwrap();
+            let mut desired = vec!["fir", "daemon"];
+            if case == "retained-owner" {
+                desired.push("old-layout");
+            }
+            if case == "shared-owner" {
+                desired.push("shared-layout");
+            }
+            configure(&lab, &desired, "fir", &["daemon"]);
+            let before = lifecycle_snapshot(&lab);
+            let error = rebuild(&lab, false).await.unwrap_err();
+            assert_eq!(
+                lifecycle_snapshot(&lab),
+                before,
+                "{case}, managed={managed}: {error:#}"
+            );
+            if case == "modified-config" {
+                assert_eq!(
+                    fs::read(lab.root().join("etc/init")).unwrap(),
+                    b"administrator edit"
+                );
+            }
+            assert_eq!(
+                fs::read(outside.path().join("sentinel")).unwrap(),
+                b"outside"
+            );
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        }
+    }
+}
