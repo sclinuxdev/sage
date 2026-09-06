@@ -55,6 +55,16 @@ pub struct RebuildContinuation {
     /// Serialized planned native-service generation, opaque to the database.
     pub rendered_services: Vec<u8>,
 }
+
+/// A declaration mutation applied only after the package transaction reaches
+/// its final durable stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMutation {
+    /// Sysroot-relative path, using `/` separators in the journal payload.
+    pub path: String,
+    pub previous: Option<Vec<u8>>,
+    pub next: Option<Vec<u8>>,
+}
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -81,7 +91,33 @@ pub struct JournalRecord {
     pub stage: String,
     pub journal_sha256: String,
     pub action: JournalAction,
+    /// Declaration bytes committed after package publication and recovery
+    /// stages. Legacy records are upgraded by `decode_journal`.
+    #[serde(default)]
+    pub declaration: Option<FileMutation>,
 }
+
+/// On-disk layout written before declaration mutations joined the journal.
+#[derive(Debug, Deserialize)]
+struct LegacyJournalRecord {
+    op_id: String,
+    stage: String,
+    journal_sha256: String,
+    action: JournalAction,
+}
+
+impl From<LegacyJournalRecord> for JournalRecord {
+    fn from(record: LegacyJournalRecord) -> Self {
+        Self {
+            op_id: record.op_id,
+            stage: record.stage,
+            journal_sha256: record.journal_sha256,
+            action: record.action,
+            declaration: None,
+        }
+    }
+}
+
 impl JournalRecord {
     /// Creates a sealed journal that startup can integrity-check.
     pub fn new(op_id: String, stage: &str, action: JournalAction) -> Self {
@@ -90,27 +126,72 @@ impl JournalRecord {
             stage: stage.into(),
             journal_sha256: String::new(),
             action,
+            declaration: None,
         };
         record.seal();
         record
     }
+
+    /// Attaches a declaration mutation and reseals the journal record.
+    pub fn set_declaration(&mut self, declaration: Option<FileMutation>) {
+        self.declaration = declaration;
+        self.seal();
+    }
+
     pub fn advance(&mut self, stage: &str) {
         self.stage = stage.into();
         self.seal();
     }
     pub fn validate(&self) -> Result<(), DbError> {
-        if self.journal_sha256 == record_digest(&self.op_id, &self.stage, &self.action)? {
+        let digest = record_digest(
+            &self.op_id,
+            &self.stage,
+            &self.action,
+            self.declaration.as_ref(),
+        )?;
+        let legacy_digest = self
+            .declaration
+            .is_none()
+            .then(|| legacy_record_digest(&self.op_id, &self.stage, &self.action));
+        if self.journal_sha256 == digest
+            || legacy_digest
+                .transpose()?
+                .is_some_and(|digest| self.journal_sha256 == digest)
+        {
             Ok(())
         } else {
             Err(DbError::InvalidJournal(self.op_id.clone()))
         }
     }
     fn seal(&mut self) {
-        self.journal_sha256 = record_digest(&self.op_id, &self.stage, &self.action)
-            .expect("serializing an in-memory journal action cannot fail");
+        self.journal_sha256 = record_digest(
+            &self.op_id,
+            &self.stage,
+            &self.action,
+            self.declaration.as_ref(),
+        )
+        .expect("serializing an in-memory journal action cannot fail");
     }
 }
-fn record_digest(op_id: &str, stage: &str, action: &JournalAction) -> Result<String, DbError> {
+fn record_digest(
+    op_id: &str,
+    stage: &str,
+    action: &JournalAction,
+    declaration: Option<&FileMutation>,
+) -> Result<String, DbError> {
+    Ok(hex::encode(Sha256::digest(bincode::serialize(&(
+        op_id,
+        stage,
+        action,
+        declaration,
+    ))?)))
+}
+
+fn legacy_record_digest(
+    op_id: &str,
+    stage: &str,
+    action: &JournalAction,
+) -> Result<String, DbError> {
     Ok(hex::encode(Sha256::digest(bincode::serialize(&(
         op_id, stage, action,
     ))?)))
@@ -339,7 +420,7 @@ impl SageDatabase {
             .iter(&txn)?
             .map(|item| {
                 let (_, bytes) = item?;
-                decode::<JournalRecord>(bytes)
+                decode_journal(bytes)
             })
             .collect::<Result<Vec<_>, DbError>>()?;
         Ok(records)
@@ -433,6 +514,15 @@ fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, DbError> {
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DbError> {
     Ok(bincode::deserialize(bytes)?)
 }
+
+fn decode_journal(bytes: &[u8]) -> Result<JournalRecord, DbError> {
+    match bincode::deserialize(bytes) {
+        Ok(record) => Ok(record),
+        Err(current_error) => bincode::deserialize::<LegacyJournalRecord>(bytes)
+            .map(Into::into)
+            .map_err(|_| DbError::Serialization(current_error)),
+    }
+}
 fn get_owned<T: DeserializeOwned>(
     database: &Database<Str, Bytes>,
     txn: &RoTxn<'_>,
@@ -463,4 +553,41 @@ fn remove_member(
         put_encoded(database, txn, key, &members)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct LegacyJournalRecordForTest<'a> {
+        op_id: &'a str,
+        stage: &'a str,
+        journal_sha256: &'a str,
+        action: &'a JournalAction,
+    }
+
+    #[test]
+    fn legacy_journal_layout_decodes_and_validates() {
+        let action = JournalAction::Remove {
+            packages: vec![],
+            modified_paths: vec![],
+            trigger_documents: vec![],
+            alternative_documents: vec![],
+        };
+        let digest = legacy_record_digest("legacy-op", "packages", &action).unwrap();
+        let bytes = bincode::serialize(&LegacyJournalRecordForTest {
+            op_id: "legacy-op",
+            stage: "packages",
+            journal_sha256: &digest,
+            action: &action,
+        })
+        .unwrap();
+
+        let record = decode_journal(&bytes).unwrap();
+
+        assert_eq!(record.op_id, "legacy-op");
+        assert_eq!(record.declaration, None);
+        record.validate().unwrap();
+    }
 }

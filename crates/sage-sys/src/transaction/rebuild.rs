@@ -74,14 +74,18 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
         println!("Bind {} to {key}", provider_symbol(interface));
     }
     if dry_run {
-        if let Ok((provider_name, generator)) = crate::services::load_active_generator(root) {
-            let services = crate::services::load_available_services(root).unwrap_or_default();
+        // A dry run may inspect a planned provider that is not installed yet,
+        // but malformed installed service state must still fail loudly.
+        let services = crate::services::load_available_services(root)?;
+        if root.join("var/lib/sage/rendered-services.toml").is_file() {
+            let (provider_name, generator) = crate::services::load_active_generator(root)?;
             let drifts = crate::services::detect_service_drift(
                 root,
                 &generator,
                 &provider_name,
                 &services,
                 &services_config.enabled,
+                &services_config.disabled,
             );
             if !drifts.is_empty() {
                 crate::services::warn_service_drift(&drifts, Some(&generator), root);
@@ -146,6 +150,7 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
         &provider.name,
         &next.services,
         &services_config.enabled,
+        &services_config.disabled,
     );
     if !drifts.is_empty() {
         crate::services::warn_service_drift(&drifts, Some(&next.generator), root);

@@ -1,6 +1,7 @@
 //! Package deployment, removal, upgrades, and publication operations.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -29,7 +30,7 @@ pub async fn apply_packages(
     dry_run: bool,
 ) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
-    let mut config = SystemConfig::load(&config_path)?;
+    let config = SystemConfig::load(&config_path)?;
     let mut available = load_available_with_pool(root, Some(&config.system.architecture), None)?;
     let channel = canonical_channel(&available, channel)?;
     let requested: Vec<_> = names
@@ -78,7 +79,22 @@ pub async fn apply_packages(
     if dry_run {
         return Ok(());
     }
-    if !plan.is_empty() {
+    let declaration = if save && channel == "main/system" {
+        let mut next = config.clone();
+        next.packages.extend(names.iter().cloned());
+        if next.packages == config.packages {
+            None
+        } else {
+            Some(sage_db::FileMutation {
+                path: "etc/sage/system.toml".into(),
+                previous: Some(fs::read(&config_path)?),
+                next: Some(toml::to_string_pretty(&next)?.into_bytes()),
+            })
+        }
+    } else {
+        None
+    };
+    if !plan.is_empty() || declaration.is_some() {
         let database = sage_db::SageDatabase::open(&db_path)?;
         publish_packages(
             root,
@@ -86,16 +102,9 @@ pub async fn apply_packages(
             &available,
             &config.system.architecture,
             &plan,
+            declaration,
         )
         .await?;
-    }
-    if save && channel == "main/system" {
-        config.packages.extend(names.iter().cloned());
-        write_atomic_under_root(
-            root,
-            Path::new("etc/sage/system.toml"),
-            toml::to_string_pretty(&config)?.as_bytes(),
-        )?;
     }
     Ok(())
 }
@@ -155,6 +164,7 @@ pub(crate) async fn publish_packages(
     available: &AvailablePackages,
     architecture: &str,
     plan: &TransactionPlan,
+    declaration: Option<sage_db::FileMutation>,
 ) -> Result<()> {
     let changes = preflight_packages(
         root,
@@ -189,6 +199,7 @@ pub(crate) async fn publish_packages(
             )?,
         },
     );
+    journal.set_declaration(declaration);
     database.write_journal(&journal)?;
     resume_install(root, database, available, &mut journal, true).await
 }
@@ -371,19 +382,28 @@ pub fn remove_packages(
     if dry_run {
         return Ok(());
     }
-    if update_saved && canonical == "main/system" {
+    let declaration = if update_saved && canonical == "main/system" {
         let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
         let mut config = SystemConfig::load(&config_path)?;
+        let original_packages = config.packages.clone();
         config.packages.retain(|selector| {
             sage_core::PackageKey::in_channel(&canonical, selector)
                 .map_or(true, |key| !requested.contains(&key))
         });
-        write_atomic_under_root(
-            root,
-            Path::new("etc/sage/system.toml"),
-            toml::to_string_pretty(&config)?.as_bytes(),
-        )?;
-    }
+        if config.packages == original_packages {
+            None
+        } else {
+            let previous = fs::read(&config_path)?;
+            let next = toml::to_string_pretty(&config)?.into_bytes();
+            Some(sage_db::FileMutation {
+                path: "etc/sage/system.toml".into(),
+                previous: Some(previous),
+                next: Some(next),
+            })
+        }
+    } else {
+        None
+    };
     let database = sage_db::SageDatabase::open(&db_path)?;
     let op_id = operation_id("remove")?;
     let mut journal = sage_db::JournalRecord::new(
@@ -396,6 +416,7 @@ pub fn remove_packages(
             alternative_documents: read_documents(root, Path::new("usr/share/sage/alternatives"))?,
         },
     );
+    journal.set_declaration(declaration);
     database.write_journal(&journal)?;
     resume_remove(root, &database, &mut journal)
 }

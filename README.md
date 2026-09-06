@@ -28,8 +28,8 @@
   基于 `(Channel, Name, Slot)` 领域实体，天然支持多版本运行时与工具链并行共存、互不污染。
 
 - **Declarative System Reconciliation / 声明式系统调和 (`sage rebuild`)**:
-  Computes exact diffs between `/etc/sage/system.toml` and installed state, orchestrating atomic transactions, service rendering, and trigger execution.  
-  以 `/etc/sage/system.toml` 为系统唯一真相源，自动化执行差集求解、双阶段文件原子替换、服务配置渲染与触发器执行。
+  Computes exact diffs between the package/provider declaration in `/etc/sage/system.toml`, the service declaration in `/etc/sage/services.toml`, and installed state, orchestrating atomic transactions, service rendering, and trigger execution.
+  分别以 `/etc/sage/system.toml`（软件包与 provider）和 `/etc/sage/services.toml`（服务状态）作为声明源，自动化执行差集求解、双阶段文件原子替换、服务配置渲染与触发器执行。
 
 - **Hermetic Sandbox & Carving / 密闭沙箱与单配方多包切分**:
   `bwrap` sandboxed builds with configured-tool wrapper provenance, automatic ELF symbol resolution (`so:libfoo`), and mutually exclusive payload carving (`libs`, `dev`, `doc`).
@@ -52,15 +52,15 @@ sage/
     ├── sage-db/       # LMDB state storage, file ownership & crash recovery log
     ├── sage-archive/  # Streaming tar.zst & openat traversal-safe unpacking
     ├── sage-solver/   # PubGrub SAT solver adapter & causality diagnosis
-    ├── sage-sys/      # Declarative triggers, init renderer & reconciler
-    ├── sage-build/    # bwrap sandbox, rclass execution & payload carver
+    ├── sage-sys/      # System application services: reconcile & init lifecycle
+    ├── sage-build/    # Build application services: sandbox & payload orchestration
     ├── sage-repo/     # Remote index sync, Ed25519 verification & indexer
     └── sage/          # Pure Clap CLI binary
 ```
 
 ---
 
-## Quick Start / 快速开始
+## Developer Quick Start / 开发者快速开始
 
 ### Build & Test / 编译与测试
 
@@ -72,6 +72,19 @@ cargo build --release
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
+
+### User Quick Start / 包管理器快速开始
+
+Sage keeps package/provider declarations separate from service activation:
+
+```text
+/etc/sage/system.toml    packages and provider preferences
+/etc/sage/services.toml  enabled and disabled service declarations
+```
+
+After both files and the corresponding package indexes are available, reconcile
+the target system with `sage rebuild`, then inspect service state with
+`sage service list`.
 
 ---
 

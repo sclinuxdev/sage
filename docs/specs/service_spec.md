@@ -100,7 +100,7 @@ $$\text{Actual Init State} = \text{Sage Managed State} + \text{Administrator Man
    - Sage 负责渲染配置并调用 Init Provider 的 `enable_cmd`，保证开机自启。
 2. **`managed-disabled`**：
    - 在 `/etc/sage/services.toml` 的 `disabled` 中声明，或曾记录在 `var/lib/sage/rendered-services.toml` 的 `enabled` 集合中但在重配置后被移除。
-   - Sage 负责调用 Init Provider 的 `disable_cmd`，保证处于非激活状态。
+   - Sage 负责在显式禁用操作中调用 Init Provider 的 `disable_cmd`。如果管理员随后在 Sage 外部启用它，Sage 报告 `managed-disabled (drift)`，但不会自动撤销管理员状态。
 3. **`unmanaged`**：
    - 从未被 Sage 接管或声明。
    - Sage 绝对不擅自执行 `disable`。若管理员在外部执行了 `systemctl enable`，Sage 在调和时予以保留，绝不破坏管理员的手工操作。
@@ -110,19 +110,18 @@ Init Provider 的 `rclass/init-*.toml` 可声明 `is_enabled_cmd`：
 ```toml
 is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.service"
 ```
-在 `sage rebuild` 时，若发现已安装包中的某服务在底层 Init 中处于 `enabled` 状态，但属于 Sage 的 `unmanaged` 集合，Sage 将输出漂移警告与处理建议（不中断构建也不强制禁用）：
+在 `sage rebuild` 时，若发现已安装包中的某服务在底层 Init 中处于 `enabled` 状态，但属于 Sage 的 `unmanaged` 或 `managed-disabled` 集合，Sage 将输出漂移警告与处理建议（不中断构建也不强制禁用）：
 ```text
 warning: service 'sshd' is enabled outside Sage
          systemd: enabled
          services.toml: unmanaged
 Hint:
   sage service adopt sshd
-  systemctl disable sshd
+  no automatic provider state change was made
 ```
 
 ### 3.4 交互管理命令 (`sage service`)
 - `sage service enable <svc>`：将服务写入 `services.toml`（`enabled`），并立即调用底层 Init Provider 激活。
 - `sage service disable <svc>`：从 `enabled` 移除并记录入 `disabled`，调用底层 Init Provider 禁用。
 - `sage service adopt <svc>`：将管理员外部手工启用的服务平滑纳管至 Sage 声明式配置中（转为 `managed-enabled`）。
-- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`unmanaged`、`unmanaged (drift)`）。
-
+- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。

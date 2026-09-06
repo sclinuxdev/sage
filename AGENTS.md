@@ -7,21 +7,15 @@
 
 ## 1. 核心设计原则 (Core Principles)
 
-1. **拒绝重复造轮子 (Leverage Existing Ecosystem)**：
-   - 依赖求解基于成熟高性能的 `pubgrub` crate。
-   - **全链路统一 LMDB 数据库**：本地状态存储与软件源远端索引全量采用 `heed` (LMDB Rust 绑定)，实现全链路 `mmap` 零拷贝极速读取与 ACID 事务。
-   - 压缩归档采用 `tar` + `zstd-rs` 流式处理。
-   - CLI 前端完全基于 `clap` (derive) 与 `indicatif`，**当前阶段不引入 TUI**。
-   - 沙箱隔离直接调用系统的 `bwrap` (Bubblewrap) 与 `fakeroot`。
-2. **沿用明确的数据边界**：
+1. **沿用明确的数据边界**：
    - 新增行为只实现当前需求；仅在确实需要用户配置或已有多个使用场景时扩展配置，不为“完全可扩展”新增配置或模板层。
    - 触发器（ldconfig, ca-certificates 等）全量由 `triggers/*.toml` 声明。
    - Init 服务转换由 `rclass/init-*.toml` 模板引擎驱动。
    - 编译器/工具链由 `rclass/*.toml` 驱动。
    - 软件源镜像 URL 完全由配置文件提供，代码中零预设 URL。
-3. **原生支持多版本共存 (Native Multi-Version Slots)**：
+2. **原生支持多版本共存 (Native Multi-Version Slots)**：
    - 领域标识基于 `(Channel, PackageName, Slot)`，不同 Slot 与不同 Channel 的包在求解器与数据库中天然共存。
-4. **极致性能与精简代码 (KISS)**：
+3. **极致性能与精简代码 (KISS)**：
    - 坚持 KISS 原则，以直接、清晰、易维护的实现为先，避免不必要的抽象与重复代码。
    - 关键路径优先采用无锁零拷贝 (`mmap`) 与符号 Interning 整数化比对。
 
@@ -36,8 +30,8 @@
 | **`sage-db`** | `crates/sage-db` | LMDB 状态存储、Slot 所有权追踪、事务崩溃恢复日志 | [db.md](docs/modules/db.md) |
 | **`sage-archive`** | `crates/sage-archive` | 流式 `tar.zst` 读写、`openat` 安全解包、`reflink` 零拷贝写出 | [archive.md](docs/modules/archive.md) |
 | **`sage-solver`** | `crates/sage-solver` | PubGrub 依赖求解器适配、LMDB 索引零拷贝点查、因果诊断 | [solver.md](docs/modules/solver.md) |
-| **`sage-sys`** | `crates/sage-sys` | Channel 聚合 (含 Python Channel)、系统调和 (Rebuild)、Init 服务 | [sys.md](docs/modules/sys.md) |
-| **`sage-build`** | `crates/sage-build` | `bwrap` 密闭沙箱、`rclass` 阶段执行、工具链审计、ELF 扫描 | [build.md](docs/modules/build.md) |
+| **`sage-sys`** | `crates/sage-sys` | 系统 application-service 层：Channel 聚合、系统调和 (Rebuild)、Init 服务生命周期 | [sys.md](docs/modules/sys.md) |
+| **`sage-build`** | `crates/sage-build` | 构建 application-service 层：`bwrap` 沙箱、`rclass` 阶段编排、工具链审计、ELF 扫描 | [build.md](docs/modules/build.md) |
 | **`sage-repo`** | `crates/sage-repo` | 软件源 LMDB 索引同步、Ed25519 签名验证、分块下载 | [repo.md](docs/modules/repo.md) |
 | **`sage-tests`** | `crates/sage-tests` | 统一集成测试与 Torture Lab（状态一致性、崩溃恢复、确定性随机压测） | [TORTURE_LAB.md](docs/TORTURE_LAB.md) |
 
@@ -50,7 +44,7 @@
 | 规范对象 | 对应文件 / 路径 | 规范文档 |
 | :--- | :--- | :--- |
 | **声明式系统配置** | `/etc/sage/system.toml` | [system_spec.md](docs/specs/system_spec.md) |
-| **声明式服务配置** | `/etc/sage/services.toml` | [system_spec.md](docs/specs/system_spec.md) |
+| **声明式服务配置** | `/etc/sage/services.toml` | [service_spec.md](docs/specs/service_spec.md) |
 | **通道源配置** | `/etc/sage/channels.toml` | [channels_spec.md](docs/specs/channels_spec.md) |
 | **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](docs/specs/build_config_spec.md) |
 | **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](docs/specs/bootstrap_spec.md) |

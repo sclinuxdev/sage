@@ -33,7 +33,7 @@ fn provider(name: &str, slot: &str, generation: &str) -> PackageSpec {
     package.files.insert(
         program.clone(),
         format!(
-            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable) printf enabled > \"$marker\" ;;\nis-enabled) test -f \"$marker\" ;;\ndisable)\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
+            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable)\n  test ! -f \"$root/var/lib/sage/fail-enable\"\n  printf enabled > \"$marker\"\n  ;;\nis-enabled) test -f \"$marker\" ;;\ndisable)\n  test ! -f \"$root/var/lib/sage/fail-disable\"\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
         )
         .into_bytes(),
     );
@@ -1286,4 +1286,115 @@ async fn unmanaged_manually_enabled_service_survives_rebuild_and_detects_drift()
     let services = sage_sys::list_services(lab.root()).unwrap();
     let inactive = services.iter().find(|s| s.name == "inactive").unwrap();
     assert_eq!(inactive.state, "managed-enabled");
+}
+
+#[tokio::test]
+async fn adopting_an_actually_disabled_service_does_not_change_declarations() {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+
+    let dry_error = sage_sys::service_adopt(lab.root(), "inactive", true).unwrap_err();
+
+    assert!(dry_error.to_string().contains("not externally enabled"));
+    let error = sage_sys::service_adopt(lab.root(), "inactive", false).unwrap_err();
+
+    assert!(error.to_string().contains("not externally enabled"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/enabled-old-inactive")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn provider_enable_failure_does_not_publish_managed_enabled_state() {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-enable"), b"fail").unwrap();
+
+    let error = sage_sys::service_enable(lab.root(), "inactive", false).unwrap_err();
+
+    assert!(error.to_string().contains("exited with"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/enabled-old-inactive")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-disable"), b"fail").unwrap();
+
+    let error = sage_sys::service_disable(lab.root(), "daemon", false).unwrap_err();
+
+    assert!(error.to_string().contains("exited with"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert!(lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+}
+
+#[tokio::test]
+async fn managed_disabled_external_enablement_is_reported_as_managed_drift() {
+    let lab = initial_system().await;
+    let manual_marker = lab.root().join("var/lib/sage/enabled-old-inactive");
+    fs::write(&manual_marker, b"enabled").unwrap();
+    sage_sys::service_adopt(lab.root(), "inactive", false).unwrap();
+    sage_sys::service_disable(lab.root(), "inactive", false).unwrap();
+    fs::write(&manual_marker, b"enabled").unwrap();
+
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let inactive = services
+        .iter()
+        .find(|service| service.name == "inactive")
+        .unwrap();
+
+    assert_eq!(inactive.state, "managed-disabled (drift)");
+    assert!(manual_marker.is_file());
+}
+
+#[test]
+fn services_config_rejects_an_overlapping_enablement_declaration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("services.toml");
+    fs::write(
+        &path,
+        "schema_version=1\nenabled=[\"daemon\"]\ndisabled=[\"daemon\"]\n",
+    )
+    .unwrap();
+
+    let error = sage_sys::ServicesConfig::load(path).unwrap_err();
+
+    assert!(error.to_string().contains("both enabled and disabled"));
+}
+
+#[test]
+fn missing_init_provider_does_not_fallback_to_systemd_or_the_workspace() {
+    let lab = TortureLab::new().unwrap();
+
+    let error = sage_sys::load_active_generator(lab.root()).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("no active init provider is known; run sage rebuild first")
+    );
+}
+
+#[test]
+fn malformed_installed_service_document_fails_loudly() {
+    let lab = TortureLab::new().unwrap();
+    let directory = lab.root().join("usr/share/sage/services");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("broken.toml"), b"invalid TOML [").unwrap();
+
+    let error = sage_sys::load_available_services(lab.root()).unwrap_err();
+
+    assert!(error.to_string().contains("invalid service document"));
 }
