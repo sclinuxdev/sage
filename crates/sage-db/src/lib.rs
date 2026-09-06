@@ -43,6 +43,18 @@ pub struct InstalledPackage {
     /// Original package hashes keyed by exact physical ownership path.
     pub config_hashes: BTreeMap<String, String>,
 }
+/// The remaining rebuild work travels with package publication so any mutating
+/// command can finish the original transition without reading a newer config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildContinuation {
+    pub provider_bindings: BTreeMap<String, PackageKey>,
+    pub retired_packages: Vec<InstalledPackage>,
+    /// True retirement paths, excluding files handed to a replacement owner.
+    pub removed_paths: Vec<String>,
+    pub removal_trigger_documents: Vec<Vec<u8>>,
+    /// Serialized planned native-service generation, opaque to the database.
+    pub rendered_services: Vec<u8>,
+}
 /// Recovery inputs; metadata stays opaque to avoid reverse crate dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalAction {
@@ -53,6 +65,7 @@ pub enum JournalAction {
         previous_packages: Vec<InstalledPackage>,
         modified_paths: Vec<String>,
         previous_alternative_documents: Vec<Vec<u8>>,
+        rebuild: Option<RebuildContinuation>,
     },
     Remove {
         packages: Vec<InstalledPackage>,
@@ -291,6 +304,19 @@ impl SageDatabase {
             .map(str::parse)
             .transpose()?)
     }
+    /// Replaces the resolved binding set atomically, including stale removals.
+    pub fn replace_system_providers(
+        &self,
+        bindings: &BTreeMap<String, PackageKey>,
+    ) -> Result<(), DbError> {
+        let mut txn = self.env.write_txn()?;
+        self.system.clear(&mut txn)?;
+        for (interface, key) in bindings {
+            self.system.put(&mut txn, interface, &key.canonical_id())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
     /// Starts or advances an operation by replacing its durable journal record.
     pub fn write_journal(&self, record: &JournalRecord) -> Result<(), DbError> {
         record.validate()?;
@@ -346,6 +372,36 @@ pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
     }
     Ok(records)
 }
+/// Reads configured bindings without creating tables or opening a write transaction.
+/// An absent state directory returns an empty map; missing tables, invalid keys,
+/// and LMDB/I/O failures are returned without repairing or modifying the database.
+pub fn read_system_providers(path: &Path) -> Result<BTreeMap<String, PackageKey>, DbError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: the environment only opens existing tables and keeps LMDB locking.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let system: Database<Str, Str> = env.open_database(&txn, Some("system"))?.ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing system table",
+        ))
+    })?;
+    system
+        .iter(&txn)?
+        .map(|entry| {
+            let (interface, key) = entry?;
+            Ok((interface.to_owned(), key.parse()?))
+        })
+        .collect()
+}
+
 /// Reads one file-owner list without opening a write transaction.
 pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {
     if !path.exists() {

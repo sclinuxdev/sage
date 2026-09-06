@@ -25,7 +25,7 @@ pub enum SolverError {
 /// Solver releases use the canonical package record without a conversion layer.
 pub type PackageRelease = Package;
 /// Compact package universe assembled from mmap-backed repository point queries.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PackageUniverse {
     releases: BTreeMap<PackageKey, BTreeMap<Version, PackageRelease>>,
     providers: HashMap<String, Vec<PackageKey>>,
@@ -51,6 +51,11 @@ impl PackageUniverse {
             .get(key)
             .into_iter()
             .flat_map(|items| items.keys())
+    }
+
+    /// Returns metadata for one exact channel/name/slot/version candidate.
+    pub fn release(&self, key: &PackageKey, version: &Version) -> Option<&PackageRelease> {
+        self.releases.get(key)?.get(version)
     }
 }
 /// Resolver configuration including versions pinned by the installed system.
@@ -93,6 +98,72 @@ impl<'a> SageSolver<'a> {
             .map(|key| (key, VersionRange::full()))
             .collect();
         self.resolve_root(dependencies)
+            .map(|(solution, _)| solution)
+    }
+
+    /// Resolves desired roots and the concrete bindings of configured interfaces.
+    ///
+    /// Preferences rank candidates without forcing their concrete package into
+    /// the solution. An interface absent from the first solved graph becomes a
+    /// virtual root, so an unused preference still receives normal backtracking.
+    /// Existing virtual requirements keep their version and slot constraints;
+    /// adding an unconstrained duplicate could select a different provider.
+    /// Returns an error if a configured interface has incompatible concrete
+    /// choices that cannot be represented by one persistent binding.
+    pub fn resolve_with_provider_bindings(
+        &self,
+        requested: &[PackageKey],
+    ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
+        let mut dependencies: DependencyMap = requested
+            .iter()
+            .cloned()
+            .map(|key| (key, VersionRange::full()))
+            .collect();
+        let (solution, choices) = loop {
+            let (solution, choices) = self.resolve_root(dependencies.clone())?;
+            let missing: Vec<_> = self
+                .preferred_providers
+                .iter()
+                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| choice == *symbol))
+                .collect();
+            if missing.is_empty() {
+                break (solution, choices);
+            }
+            // A newly required interface may backtrack a consumer to a release
+            // without another interface. Each pass adds previously absent roots,
+            // so every configured interface remains required in the final solve.
+            for (symbol, preferred) in missing {
+                let key = virtual_key(
+                    &preferred.channel,
+                    &Dependency {
+                        name: symbol.clone(),
+                        slot: None,
+                        channel: None,
+                        op: ConstraintOp::Any,
+                        version: None,
+                    },
+                );
+                if dependencies.insert(key, VersionRange::full()).is_some() {
+                    return Err(SolverError::InvalidMetadata(format!(
+                        "configured interface {symbol} has no virtual provider binding"
+                    )));
+                }
+            }
+        };
+        let mut bindings = BTreeMap::new();
+        for (symbol, key) in choices {
+            if !self.preferred_providers.contains_key(&symbol) {
+                continue;
+            }
+            if let Some(previous) = bindings.insert(symbol.clone(), key.clone())
+                && previous != key
+            {
+                return Err(SolverError::NoSolution(format!(
+                    "configured interface {symbol} requires both {previous} and {key}"
+                )));
+            }
+        }
+        Ok((solution, bindings))
     }
     /// Resolves arbitrary root constraints in one pass. Source builds use this
     /// for explicit and rclass-provided build dependencies without installing
@@ -119,8 +190,12 @@ impl<'a> SageSolver<'a> {
                 .or_insert(range);
         }
         self.resolve_root_with(&root, &root_version, dependencies)
+            .map(|(solution, _)| solution)
     }
-    fn resolve_root(&self, dependencies: DependencyMap) -> Result<Solution, SolverError> {
+    fn resolve_root(
+        &self,
+        dependencies: DependencyMap,
+    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
         let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
         let root_version = Version::new(0, "0", 0);
         self.resolve_root_with(&root, &root_version, dependencies)
@@ -130,7 +205,7 @@ impl<'a> SageSolver<'a> {
         root: &PackageKey,
         root_version: &Version,
         dependencies: DependencyMap,
-    ) -> Result<Solution, SolverError> {
+    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
         let provider = SageProvider::build(
             self.universe,
             &self.locked,
@@ -140,10 +215,31 @@ impl<'a> SageSolver<'a> {
             dependencies,
         )?;
         match resolve(&provider, root.clone(), root_version.clone()) {
-            Ok(selected) => Ok(selected
-                .into_iter()
-                .filter(|(key, _)| key != root && key.channel != "__sage")
-                .collect()),
+            Ok(selected) => {
+                let mut choices = Vec::new();
+                for (key, version) in &selected {
+                    let Some((_, _, requirement)) = virtual_requirement(key) else {
+                        continue;
+                    };
+                    // Concrete-name fallbacks are implementation proxies, not
+                    // system interfaces that may become configured bindings.
+                    if requirement.name.starts_with("virtual/provider/") {
+                        continue;
+                    }
+                    let concrete = provider.releases[key][version]
+                        .keys()
+                        .find(|candidate| !is_proxy_key(candidate))
+                        .expect("a virtual proxy depends on one concrete release");
+                    choices.push((requirement.name, concrete.clone()));
+                }
+                Ok((
+                    selected
+                        .into_iter()
+                        .filter(|(key, _)| key != root && key.channel != "__sage")
+                        .collect(),
+                    choices,
+                ))
+            }
             Err(PubGrubError::NoSolution(mut tree)) => {
                 tree.collapse_no_versions();
                 Err(SolverError::NoSolution(DefaultStringReporter::report(
@@ -230,7 +326,16 @@ impl SageProvider {
                     continue;
                 }
                 for (version_index, version) in universe.versions(key).enumerate() {
-                    if !dependency_range(&requirement).contains(version) {
+                    // The key-level index only discovers candidates. Different
+                    // releases of the same key can advertise different symbols.
+                    if !dependency_range(&requirement).contains(version)
+                        || !universe.release(key, version).is_some_and(|release| {
+                            release
+                                .provides
+                                .iter()
+                                .any(|symbol| symbol == provider_name)
+                        })
+                    {
                         continue;
                     }
                     let preferred = preferred_providers.get(provider_name) == Some(key);
@@ -278,6 +383,7 @@ impl SageProvider {
                     .into_iter()
                     .flatten()
                     .filter(|key| key.channel == system_channel(&owner.channel))
+                    .filter(|key| conflict.slot.as_ref().is_none_or(|slot| &key.slot == slot))
                     .cloned()
                     .collect()
             } else {
@@ -286,7 +392,12 @@ impl SageProvider {
             for target in targets {
                 if let Some(versions) = releases.get_mut(&target) {
                     for (version, dependencies) in versions {
-                        if dependency_range(&conflict).contains(version) {
+                        if dependency_range(&conflict).contains(version)
+                            && (!is_virtual(&conflict)
+                                || universe.release(&target, version).is_some_and(|release| {
+                                    release.provides.contains(&conflict.name)
+                                }))
+                        {
                             dependencies
                                 .insert(marker.clone(), VersionRange::singleton(zero.clone()));
                         }

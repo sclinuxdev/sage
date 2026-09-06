@@ -75,3 +75,25 @@ services = [
 ### 2.3 `packages` 与 `services`
 - `packages`: 系统声明式常驻包列表。
 - `services`: 开机自启的服务名列表，对应各包携带的 `.METADATA/service.toml`。
+
+### 2.4 Provider selection and retained packages
+
+Each configured provider declares a required virtual interface and a preferred
+concrete package, including its channel and slot. The preference may backtrack
+to another compatible provider. An interface already required by the solved
+dependency graph uses that constrained virtual choice; an otherwise unused
+configured interface is added as a virtual root, never as an unconditional
+concrete package root. Only configured interfaces are persisted as bindings,
+using the exact concrete key selected by the solver. Conflicting concrete
+choices for one configured interface make planning fail before publication.
+Concrete-name provider fallbacks and unconfigured virtual interfaces do not
+create persistent configured bindings.
+
+Normal rebuilds retain installed packages outside `main/system`; `--no-prune`
+retains all installed package identities. Retention preserves channel/name/slot
+roots, not exact version pins. Installed versions remain preferred candidates,
+including releases no longer present in the repository. PubGrub may move those
+versions and their dependencies when other desired roots require compatible
+releases. A normal pruning rebuild may remove an obsolete provider when no
+desired or retained package requires it. `--no-prune` does not authorize removing
+a conflicting retained package: an unsatisfiable combined graph fails planning.

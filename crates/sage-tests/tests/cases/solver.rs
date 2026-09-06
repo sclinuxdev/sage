@@ -219,4 +219,73 @@ mod solver_tests {
         assert!(matches!(error, SolverError::InvalidMetadata(_)));
         assert!(error.to_string().contains("lib >= invalid"));
     }
+
+    #[test]
+    fn virtual_candidates_require_the_symbol_on_the_exact_release() {
+        let key = PackageKey::new("main/system", "libc", "2");
+        let mut universe = PackageUniverse::default();
+        for (version, provides) in [("1-1", vec!["virtual/libc".into()]), ("2-1", vec![])] {
+            universe.insert(sage_core::Package::from_release(
+                key.clone(),
+                version.parse().unwrap(),
+                vec![],
+                provides,
+            ));
+        }
+        let selected = SageSolver::new(&universe)
+            .resolve_dependencies("main/python", &["virtual/libc:2".parse().unwrap()])
+            .unwrap();
+        assert_eq!(selected, Solution::from([(key, "1-1".parse().unwrap())]));
+        assert!(
+            SageSolver::new(&universe)
+                .resolve_dependencies("main/python", &["virtual/libc:2 >= 2-1".parse().unwrap()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn virtual_conflicts_only_match_releases_and_slots_that_provide_the_symbol() {
+        let mut universe = PackageUniverse::default();
+        let mut guard = release("main/system", "guard", "1-1", &[]);
+        guard.conflicts.push("virtual/libc:2".into());
+        universe.insert(guard);
+        for (slot, version, provides) in [
+            ("2", "1-1", vec!["virtual/libc".into()]),
+            ("2", "2-1", vec![]),
+            ("3", "1-1", vec!["virtual/libc".into()]),
+        ] {
+            universe.insert(sage_core::Package::from_release(
+                PackageKey::new("main/system", "libc", slot),
+                version.parse().unwrap(),
+                vec![],
+                provides,
+            ));
+        }
+        let selected = SageSolver::new(&universe)
+            .resolve_dependencies(
+                "main/system",
+                &[
+                    "guard".parse().unwrap(),
+                    "libc:2 = 2-1".parse().unwrap(),
+                    "libc:3 = 1-1".parse().unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            selected[&PackageKey::new("main/system", "libc", "2")],
+            "2-1".parse().unwrap()
+        );
+        assert_eq!(
+            selected[&PackageKey::new("main/system", "libc", "3")],
+            "1-1".parse().unwrap()
+        );
+        assert!(
+            SageSolver::new(&universe)
+                .resolve_dependencies(
+                    "main/system",
+                    &["guard".parse().unwrap(), "libc:2 = 1-1".parse().unwrap()]
+                )
+                .is_err()
+        );
+    }
 }

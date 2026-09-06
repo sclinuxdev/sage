@@ -5,6 +5,363 @@ mod sys_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
+    fn release(
+        key: sage_core::PackageKey,
+        version: &str,
+        dependencies: &[&str],
+        provides: &[&str],
+    ) -> sage_core::Package {
+        sage_core::Package::from_release(
+            key,
+            version.parse().unwrap(),
+            dependencies
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+            provides.iter().map(|value| (*value).into()).collect(),
+        )
+    }
+
+    fn installed(package: &sage_core::Package) -> sage_db::InstalledPackage {
+        let coordinate = package.coordinate();
+        sage_db::InstalledPackage {
+            key: coordinate.key,
+            version: coordinate.version,
+            arch: "amd64".into(),
+            installed_size: 0,
+            dependencies: package.dependencies.clone(),
+            provides: package.provides.clone(),
+            conflicts: package.conflicts.clone(),
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        }
+    }
+
+    fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
+        SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            packages: packages.iter().map(|name| (*name).into()).collect(),
+            providers: providers
+                .iter()
+                .map(|(symbol, key)| ((*symbol).into(), (*key).into()))
+                .collect(),
+            services: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn configured_provider_backtracks_with_and_without_a_consumer() {
+        use sage_core::PackageKey;
+        for dependency in [vec![], vec!["virtual/libc"]] {
+            let mut universe = sage_solver::PackageUniverse::default();
+            let mut guard = release(
+                PackageKey::new("main/system", "guard", "0"),
+                "1-1",
+                &dependency,
+                &[],
+            );
+            guard.conflicts.push("musl".into());
+            universe.insert(guard);
+            for name in ["glibc", "musl"] {
+                universe.insert(release(
+                    PackageKey::new("main/system", name, "0"),
+                    "1-1",
+                    &[],
+                    &["virtual/libc"],
+                ));
+            }
+            let plan = ReconcilePlan::compute(
+                &config(&["guard"], &[("libc", "musl")]),
+                &[],
+                &universe,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                plan.provider_bindings,
+                BTreeMap::from([("libc".into(), PackageKey::new("main/system", "glibc", "0"))])
+            );
+            assert_eq!(
+                plan.install,
+                vec![
+                    (
+                        PackageKey::new("main/system", "glibc", "0"),
+                        "1-1".parse().unwrap()
+                    ),
+                    (
+                        PackageKey::new("main/system", "guard", "0"),
+                        "1-1".parse().unwrap()
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn configured_binding_comes_from_the_constrained_virtual_choice() {
+        use sage_core::PackageKey;
+        let mut universe = sage_solver::PackageUniverse::default();
+        for package in [
+            release(
+                PackageKey::new("main/system", "app", "0"),
+                "1-1",
+                &["virtual/libc:2 >= 2-1"],
+                &[],
+            ),
+            release(
+                PackageKey::new("main/system", "preferred", "1"),
+                "1-1",
+                &[],
+                &["virtual/libc"],
+            ),
+            release(
+                PackageKey::new("main/system", "selected", "2"),
+                "2-1",
+                &[],
+                &["virtual/libc"],
+            ),
+        ] {
+            universe.insert(package);
+        }
+        let plan = ReconcilePlan::compute(
+            &config(&["app", "preferred:1"], &[("libc", "preferred:1")]),
+            &[],
+            &universe,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.provider_bindings["libc"],
+            PackageKey::new("main/system", "selected", "2")
+        );
+        assert!(plan.install.contains(&(
+            PackageKey::new("main/system", "selected", "2"),
+            "2-1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn configured_bindings_reject_invalid_and_ambiguous_providers() {
+        use sage_core::PackageKey;
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(
+            PackageKey::new("main/system", "not-a-provider", "0"),
+            "1-1",
+            &[],
+            &[],
+        ));
+        assert!(
+            ReconcilePlan::compute(
+                &config(&[], &[("libc", "not-a-provider")]),
+                &[],
+                &universe,
+                false
+            )
+            .is_err()
+        );
+        for (name, dependency) in [
+            ("old-app", "virtual/libc < 2-1"),
+            ("new-app", "virtual/libc >= 2-1"),
+        ] {
+            universe.insert(release(
+                PackageKey::new("main/system", name, "0"),
+                "1-1",
+                &[dependency],
+                &[],
+            ));
+        }
+        for (name, version) in [("old-libc", "1-1"), ("new-libc", "2-1")] {
+            universe.insert(release(
+                PackageKey::new("main/system", name, "0"),
+                version,
+                &[],
+                &["virtual/libc"],
+            ));
+        }
+        assert!(
+            ReconcilePlan::compute(
+                &config(&["old-app", "new-app"], &[("libc", "new-libc")]),
+                &[],
+                &universe,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reconciliation_keeps_missing_installed_desired_release() {
+        use sage_core::PackageKey;
+        let key = PackageKey::new("main/system", "app", "2");
+        let current = installed(&release(key.clone(), "2-1", &[], &[]));
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(key, "1-1", &[], &[]));
+        let plan =
+            ReconcilePlan::compute(&config(&["app:2"], &[]), &[current], &universe, false).unwrap();
+        assert!(plan.install.is_empty());
+        assert!(plan.remove.is_empty());
+    }
+
+    #[test]
+    fn configured_interfaces_remain_required_after_consumer_backtracking() {
+        use sage_core::PackageKey;
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(
+            PackageKey::new("main/system", "app", "0"),
+            "2-1",
+            &["virtual/libc"],
+            &[],
+        ));
+        universe.insert(release(
+            PackageKey::new("main/system", "app", "0"),
+            "1-1",
+            &[],
+            &[],
+        ));
+        universe.insert(release(
+            PackageKey::new("main/system", "libc", "0"),
+            "1-1",
+            &[],
+            &["virtual/libc"],
+        ));
+        let mut init = release(
+            PackageKey::new("main/system", "init", "0"),
+            "1-1",
+            &[],
+            &["virtual/init"],
+        );
+        init.conflicts.push("app >= 2-1".into());
+        universe.insert(init);
+        let plan = ReconcilePlan::compute(
+            &config(&["app"], &[("libc", "libc"), ("init", "init")]),
+            &[],
+            &universe,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.provider_bindings,
+            BTreeMap::from([
+                ("libc".into(), PackageKey::new("main/system", "libc", "0")),
+                ("init".into(), PackageKey::new("main/system", "init", "0")),
+            ])
+        );
+        assert!(plan.install.contains(&(
+            PackageKey::new("main/system", "app", "0"),
+            "1-1".parse().unwrap()
+        )));
+    }
+
+    #[test]
+    fn retained_cross_channel_consumer_can_switch_its_virtual_provider() {
+        use sage_core::PackageKey;
+        let old = release(
+            PackageKey::new("main/system", "old-libc", "0"),
+            "1-1",
+            &[],
+            &["virtual/libc"],
+        );
+        let consumer = release(
+            PackageKey::new("main/python", "consumer", "3"),
+            "1-1",
+            &["virtual/libc"],
+            &[],
+        );
+        let replacement = PackageKey::new("main/system", "new-libc", "2");
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(replacement.clone(), "2-1", &[], &["virtual/libc"]));
+        let plan = ReconcilePlan::compute(
+            &config(&[], &[("libc", "new-libc:2")]),
+            &[installed(&old), installed(&consumer)],
+            &universe,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.provider_bindings["libc"], replacement);
+        assert_eq!(plan.install, vec![(replacement, "2-1".parse().unwrap())]);
+        assert_eq!(plan.remove, vec![old.coordinate().key]);
+    }
+
+    #[test]
+    fn unconfigured_virtual_and_concrete_fallback_choices_are_not_bindings() {
+        use sage_core::PackageKey;
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(
+            PackageKey::new("main/system", "app", "0"),
+            "1-1",
+            &["virtual/libc", "libz"],
+            &[],
+        ));
+        universe.insert(release(
+            PackageKey::new("main/system", "libc", "0"),
+            "1-1",
+            &[],
+            &["virtual/libc"],
+        ));
+        universe.insert(release(
+            PackageKey::new("main/system", "zlib", "2"),
+            "1-1",
+            &[],
+            &["libz"],
+        ));
+        let plan = ReconcilePlan::compute(&config(&["app"], &[]), &[], &universe, false).unwrap();
+        assert_eq!(plan.install.len(), 3);
+        assert!(plan.provider_bindings.is_empty());
+    }
+
+    #[test]
+    fn retained_consumers_keep_dependencies_in_the_solve_and_allow_upgrades() {
+        use sage_core::PackageKey;
+        for (channel, no_prune) in [("main/python", false), ("main/system", true)] {
+            let consumer = release(
+                PackageKey::new(channel, "consumer", "3"),
+                "1-1",
+                &["main/system/lib:2 >= 1-1"],
+                &[],
+            );
+            let old_lib = release(PackageKey::new("main/system", "lib", "2"), "1-1", &[], &[]);
+            let mut universe = sage_solver::PackageUniverse::default();
+            universe.insert(release(
+                PackageKey::new("main/system", "lib", "2"),
+                "2-1",
+                &[],
+                &[],
+            ));
+            universe.insert(release(
+                PackageKey::new("main/system", "app", "0"),
+                "1-1",
+                &["lib:2 >= 2-1"],
+                &[],
+            ));
+            let current = [installed(&consumer), installed(&old_lib)];
+            let retained_plan =
+                ReconcilePlan::compute(&config(&[], &[]), &current, &universe, no_prune).unwrap();
+            assert!(retained_plan.install.is_empty());
+            assert!(retained_plan.remove.is_empty());
+            let plan =
+                ReconcilePlan::compute(&config(&["app"], &[]), &current, &universe, no_prune)
+                    .unwrap();
+            assert_eq!(
+                plan.install,
+                vec![
+                    (
+                        PackageKey::new("main/system", "app", "0"),
+                        "1-1".parse().unwrap()
+                    ),
+                    (
+                        PackageKey::new("main/system", "lib", "2"),
+                        "2-1".parse().unwrap()
+                    ),
+                ]
+            );
+            assert!(plan.remove.is_empty());
+        }
+    }
+
     #[test]
     fn administrator_trigger_overrides_vendor_definition() {
         let root = tempfile::tempdir().unwrap();
