@@ -13,7 +13,6 @@ sage-archive = { workspace = true }
 sage-sys = { workspace = true }
 sage-repo = { workspace = true }
 sage-solver = { workspace = true }
-goblin = { workspace = true }
 glob = { workspace = true }
 tempfile = { workspace = true }
 serde = { workspace = true }

@@ -38,8 +38,6 @@ pub enum BuildError {
     Glob(#[from] glob::PatternError),
     #[error("filesystem traversal failed: {0}")]
     Walk(#[from] walkdir::Error),
-    #[error("ELF parse failed: {0}")]
-    Elf(#[from] goblin::error::Error),
     #[error("tool '{tool}' is not allowed by inherited rclasses")]
     UnauthorizedTool { tool: String },
     #[error("patchelf failed for {path}: {message}")]

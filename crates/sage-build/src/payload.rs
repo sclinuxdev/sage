@@ -144,6 +144,213 @@ pub struct ElfSymbols {
     pub dependencies: BTreeSet<String>,
 }
 
+/// Parsed dynamic ELF metadata relevant for dependency tracking and RUNPATH rewriting.
+#[derive(Debug, Default)]
+struct ElfBinary<'a> {
+    soname: Option<&'a str>,
+    libraries: Vec<&'a str>,
+    runpaths: Vec<&'a str>,
+    rpaths: Vec<&'a str>,
+}
+
+impl<'a> ElfBinary<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Option<Self>, String> {
+        if !bytes.starts_with(b"\x7fELF") {
+            return Ok(None);
+        }
+        if bytes.len() < 16 {
+            return Err("truncated ELF identification".into());
+        }
+
+        let is_64 = match bytes[4] {
+            1 => false,
+            2 => true,
+            other => return Err(format!("unsupported ELF class: {other}")),
+        };
+
+        let is_little = match bytes[5] {
+            1 => true,
+            2 => false,
+            other => return Err(format!("unsupported ELF data encoding: {other}")),
+        };
+
+        let read_u16 = |offset: usize| -> Result<u16, String> {
+            let slice = bytes
+                .get(offset..offset + 2)
+                .ok_or_else(|| "truncated ELF header".to_string())?;
+            Ok(if is_little {
+                u16::from_le_bytes(slice.try_into().unwrap())
+            } else {
+                u16::from_be_bytes(slice.try_into().unwrap())
+            })
+        };
+
+        let read_u32 = |offset: usize| -> Result<u32, String> {
+            let slice = bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "truncated ELF header".to_string())?;
+            Ok(if is_little {
+                u32::from_le_bytes(slice.try_into().unwrap())
+            } else {
+                u32::from_be_bytes(slice.try_into().unwrap())
+            })
+        };
+
+        let read_u64 = |offset: usize| -> Result<u64, String> {
+            let slice = bytes
+                .get(offset..offset + 8)
+                .ok_or_else(|| "truncated ELF header".to_string())?;
+            Ok(if is_little {
+                u64::from_le_bytes(slice.try_into().unwrap())
+            } else {
+                u64::from_be_bytes(slice.try_into().unwrap())
+            })
+        };
+
+        let (e_phoff, e_phentsize, e_phnum) = if is_64 {
+            if bytes.len() < 64 {
+                return Err("truncated ELF64 header".into());
+            }
+            (
+                read_u64(32)? as usize,
+                read_u16(54)? as usize,
+                read_u16(56)? as usize,
+            )
+        } else {
+            if bytes.len() < 52 {
+                return Err("truncated ELF32 header".into());
+            }
+            (
+                read_u32(28)? as usize,
+                read_u16(42)? as usize,
+                read_u16(44)? as usize,
+            )
+        };
+
+        if e_phnum == 0 || e_phoff == 0 {
+            return Ok(Some(Self::default()));
+        }
+
+        let mut load_segments = Vec::new();
+        let mut dynamic_segment = None;
+
+        for i in 0..e_phnum {
+            let ph_offset = e_phoff
+                .checked_add(i.checked_mul(e_phentsize).ok_or("overflow in program header offset")?)
+                .ok_or("overflow in program header offset")?;
+
+            let (p_type, p_offset, p_vaddr, p_filesz) = if is_64 {
+                if ph_offset + 56 > bytes.len() {
+                    return Err("truncated ELF64 program header".into());
+                }
+                let p_type = read_u32(ph_offset)?;
+                let p_offset = read_u64(ph_offset + 8)?;
+                let p_vaddr = read_u64(ph_offset + 16)?;
+                let p_filesz = read_u64(ph_offset + 32)?;
+                (p_type, p_offset, p_vaddr, p_filesz)
+            } else {
+                if ph_offset + 32 > bytes.len() {
+                    return Err("truncated ELF32 program header".into());
+                }
+                let p_type = read_u32(ph_offset)?;
+                let p_offset = read_u32(ph_offset + 4)? as u64;
+                let p_vaddr = read_u32(ph_offset + 8)? as u64;
+                let p_filesz = read_u32(ph_offset + 16)? as u64;
+                (p_type, p_offset, p_vaddr, p_filesz)
+            };
+
+            const PT_LOAD: u32 = 1;
+            const PT_DYNAMIC: u32 = 2;
+
+            if p_type == PT_LOAD {
+                load_segments.push((p_vaddr, p_filesz, p_offset));
+            } else if p_type == PT_DYNAMIC {
+                dynamic_segment = Some((p_offset as usize, p_filesz as usize));
+            }
+        }
+
+        let Some((dyn_offset, dyn_filesz)) = dynamic_segment else {
+            return Ok(Some(Self::default()));
+        };
+
+        if dyn_offset.checked_add(dyn_filesz).is_none_or(|end| end > bytes.len()) {
+            return Err("truncated dynamic section".into());
+        }
+
+        let dyn_entry_size = if is_64 { 16 } else { 8 };
+        let num_entries = dyn_filesz / dyn_entry_size;
+
+        let mut strtab_vaddr = None;
+        let mut needed_offsets = Vec::new();
+        let mut soname_offset = None;
+        let mut runpath_offsets = Vec::new();
+        let mut rpath_offsets = Vec::new();
+
+        for i in 0..num_entries {
+            let cur = dyn_offset + i * dyn_entry_size;
+            let (d_tag, d_val) = if is_64 {
+                (read_u64(cur)?, read_u64(cur + 8)?)
+            } else {
+                (read_u32(cur)? as u64, read_u32(cur + 4)? as u64)
+            };
+
+            const DT_NULL: u64 = 0;
+            const DT_NEEDED: u64 = 1;
+            const DT_STRTAB: u64 = 5;
+            const DT_SONAME: u64 = 14;
+            const DT_RPATH: u64 = 15;
+            const DT_RUNPATH: u64 = 29;
+
+            match d_tag {
+                DT_NULL => break,
+                DT_NEEDED => needed_offsets.push(d_val),
+                DT_STRTAB => strtab_vaddr = Some(d_val),
+                DT_SONAME => soname_offset = Some(d_val),
+                DT_RPATH => rpath_offsets.push(d_val),
+                DT_RUNPATH => runpath_offsets.push(d_val),
+                _ => {}
+            }
+        }
+
+        let Some(strtab_vaddr) = strtab_vaddr else {
+            return Ok(Some(Self::default()));
+        };
+
+        let strtab_offset = load_segments
+            .iter()
+            .find_map(|&(p_vaddr, p_filesz, p_offset)| {
+                if strtab_vaddr >= p_vaddr && strtab_vaddr < p_vaddr.saturating_add(p_filesz) {
+                    Some((p_offset + (strtab_vaddr - p_vaddr)) as usize)
+                } else {
+                    None
+                }
+            })
+            .or(((strtab_vaddr as usize) < bytes.len()).then_some(strtab_vaddr as usize))
+            .ok_or_else(|| "string table address could not be resolved".to_string())?;
+
+        let string_table = bytes
+            .get(strtab_offset..)
+            .ok_or_else(|| "string table offset beyond file bounds".to_string())?;
+
+        let get_string = |offset: u64| -> Option<&'a str> {
+            let offset = offset as usize;
+            if offset >= string_table.len() {
+                return None;
+            }
+            let slice = &string_table[offset..];
+            let len = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            std::str::from_utf8(&slice[..len]).ok()
+        };
+
+        Ok(Some(Self {
+            soname: soname_offset.and_then(get_string),
+            libraries: needed_offsets.into_iter().filter_map(get_string).collect(),
+            runpaths: runpath_offsets.into_iter().filter_map(get_string).collect(),
+            rpaths: rpath_offsets.into_iter().filter_map(get_string).collect(),
+        }))
+    }
+}
+
 pub struct ElfScanner;
 
 /// Summary of deterministic RUNPATH updates made below one DESTDIR.
@@ -166,14 +373,15 @@ impl ElfScanner {
             if !bytes.starts_with(b"\x7fELF") {
                 continue;
             }
-            let object = goblin::Object::parse(&bytes).map_err(|error| {
-                BuildError::InvalidSpec(format!(
-                    "ELF parse failed for {}: {error}",
-                    entry.path().display()
-                ))
-            })?;
-            let goblin::Object::Elf(elf) = object else {
-                continue;
+            let elf = match ElfBinary::parse(&bytes) {
+                Ok(Some(elf)) => elf,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "ELF parse failed for {}: {error}",
+                        entry.path().display()
+                    )));
+                }
             };
             if let Some(soname) = elf.soname {
                 symbols.provides.insert(format!("so:{soname}"));
@@ -212,14 +420,15 @@ impl ElfScanner {
             if !bytes.starts_with(b"\x7fELF") {
                 continue;
             }
-            let object = goblin::Object::parse(&bytes).map_err(|error| {
-                BuildError::InvalidSpec(format!(
-                    "ELF parse failed for {}: {error}",
-                    entry.path().display()
-                ))
-            })?;
-            let goblin::Object::Elf(elf) = object else {
-                continue;
+            let elf = match ElfBinary::parse(&bytes) {
+                Ok(Some(elf)) => elf,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "ELF parse failed for {}: {error}",
+                        entry.path().display()
+                    )));
+                }
             };
             let relative = entry
                 .path()

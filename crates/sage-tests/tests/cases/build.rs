@@ -779,6 +779,19 @@ shell="/usr/bin/nologin"
         assert!(!symbols.dependencies.is_empty());
     }
 
+    #[test]
+    fn elf_scanner_handles_non_elf_and_corrupt_files() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("text.txt"), b"plain text").unwrap();
+        let symbols = ElfScanner::scan(directory.path()).unwrap();
+        assert!(symbols.dependencies.is_empty());
+        assert!(symbols.provides.is_empty());
+
+        // Corrupted ELF should error
+        fs::write(directory.path().join("corrupted.so"), b"\x7fELF\x02\x01\x01").unwrap();
+        assert!(ElfScanner::scan(directory.path()).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn private_runpaths_are_relative_and_passed_without_a_shell() {

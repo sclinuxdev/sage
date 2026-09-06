@@ -1,7 +1,7 @@
 # 模块实现: 密闭构建沙箱与 rclass 引擎 (`sage-build`)
 
 - **Crate 路径**: `crates/sage-build`
-- **选用生态**: `bwrap` (Bubblewrap), `fakeroot`, `goblin` (ELF 动态符号解析)
+- **选用生态**: `bwrap` (Bubblewrap), `fakeroot`, 自研轻量零依赖 ELF 动态符号解析
 - **代码预算**: ~1,700 行
 - **职责**: 驱动 Bubblewrap 密闭构建沙箱、执行 `rclass` 阶段脚本、记录受管工具 wrapper 溯源、切分多包产物并扫描 ELF。
 
@@ -59,7 +59,7 @@ impl PayloadCarver {
    - 为配置的编译器与链接器安装窄 wrapper，仅在实际执行时记录工具。
    - 当前实现不使用 ptrace，也不宣称观察 wrapper 之外的所有 `execve`。
 2. **自动化 ELF 扫描 (`ElfScanner`)**:
-   - 对每个独立切分后的子包 staging 目录，使用 `goblin` 扫描其内部的 ELF 动态可执行文件与动态库。
+   - 对每个独立切分后的子包 staging 目录，扫描其内部的 ELF 动态可执行文件与动态库。
    - 提取 `DT_SONAME` 自动追加至该子包的 `provides = ["so:libfoo.so.1"]`。
     - 提取 `DT_NEEDED` 自动追加至该子包的 `dependencies = ["so:libbar.so.2"]`。
 
