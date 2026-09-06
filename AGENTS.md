@@ -39,6 +39,7 @@
 | **`sage-sys`** | `crates/sage-sys` | Channel 聚合 (含 Python Channel)、系统调和 (Rebuild)、Init 服务 | [sys.md](file:///home/ir/sage/docs/modules/sys.md) |
 | **`sage-build`** | `crates/sage-build` | `bwrap` 密闭沙箱、`rclass` 阶段执行、工具链审计、ELF 扫描 | [build.md](file:///home/ir/sage/docs/modules/build.md) |
 | **`sage-repo`** | `crates/sage-repo` | 软件源 LMDB 索引同步、Ed25519 签名验证、分块下载 | [repo.md](file:///home/ir/sage/docs/modules/repo.md) |
+| **`sage-tests`** | `crates/sage-tests` | 统一集成测试与 Torture Lab（状态一致性、崩溃恢复、确定性随机压测） | [TORTURE_LAB.md](file:///home/ir/sage/docs/TORTURE_LAB.md) |
 
 架构设计总览：[ARCHITECTURE.md](file:///home/ir/sage/docs/ARCHITECTURE.md)
 
@@ -59,6 +60,7 @@
 | **触发器与替代项** | `.METADATA/triggers.toml` / sysusers / alternatives | [triggers_spec.md](file:///home/ir/sage/docs/specs/triggers_spec.md) |
 | **二进制包归档格式** | `*.pkg.tar.zst` (`manifest.toml`, `files.idx`) | [package_archive_spec.md](file:///home/ir/sage/docs/specs/package_archive_spec.md) |
 | **软件源远端 LMDB 索引** | `index.mdb.zst` & `index.mdb.sig` | [repo_index_spec.md](file:///home/ir/sage/docs/specs/repo_index_spec.md) |
+| **极限压测与状态一致性验证** | `docs/TORTURE_LAB.md` | [TORTURE_LAB.md](file:///home/ir/sage/docs/TORTURE_LAB.md) |
 
 ---
 
@@ -99,13 +101,14 @@
 
 ### 4.5 强制 Scope 范围
 提交必须限定在以下合法作用域之一：
-- `core`, `db`, `archive`, `solver`, `sys`, `build`, `rclass`, `repo`, `cli`
+- `core`, `db`, `archive`, `solver`, `sys`, `build`, `rclass`, `repo`, `cli`, `test`
 - 若涉及全局配置或多 Crate 联合变动，可使用 `workspace` 或 `deps`。
 
 ### 4.6 提交规则与禁忌
 1. **原子性提交**：一个 Commit 只做一件事。
 2. **动词现在时**：使用现在时动词开头（如 `feat(solver): implement slot-aware candidate ranking`，严禁 `fix bug` 或非规范短语）。
 3. **CI 门禁要求**：
-   - 必须通过 `cargo fmt --check`。
-   - 必须通过 `cargo clippy --all-targets -- -D warnings`（零警告）。
-   - 单元测试全部绿灯通过 (`cargo test`)。
+   - 格式检查：必须通过 `cargo fmt --all -- --check`。
+   - 静态检查：必须通过 `cargo clippy --workspace --all-targets -- -D warnings`（零警告）。
+   - 自动化测试：单元与集成测试全部绿灯通过 (`cargo test --workspace --all-targets`)。
+   - 压测门禁（Torture Lab）：支持通过 `cargo run -p sage-tests --bin sage-torture -- quick` 进行快速一致性与故障恢复验证。
