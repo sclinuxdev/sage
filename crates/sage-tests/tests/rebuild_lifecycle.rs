@@ -1341,6 +1341,30 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
 }
 
 #[tokio::test]
+async fn lifecycle_dry_runs_reject_a_malformed_init_generator_without_mutation() {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let rendered_path = lab.root().join("var/lib/sage/rendered-services.toml");
+    let generator_path = lab.root().join("usr/share/sage/rclass/init-loom.toml");
+    fs::remove_file(rendered_path).unwrap();
+    fs::write(generator_path, b"invalid TOML [").unwrap();
+    let before = fs::read(&config_path).unwrap();
+
+    let enable_error = sage_sys::service_enable(lab.root(), "inactive", true).unwrap_err();
+    let disable_error = sage_sys::service_disable(lab.root(), "daemon", true).unwrap_err();
+
+    assert!(enable_error.to_string().contains("TOML"));
+    assert!(disable_error.to_string().contains("TOML"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    assert!(lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/enabled-old-inactive")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn managed_disabled_external_enablement_is_reported_as_managed_drift() {
     let lab = initial_system().await;
     let manual_marker = lab.root().join("var/lib/sage/enabled-old-inactive");

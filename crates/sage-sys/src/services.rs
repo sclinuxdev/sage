@@ -1418,8 +1418,8 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
     if config.enabled.contains(service_name) {
         println!("Service '{service_name}' is already enabled in services.toml");
     }
+    let (_provider, generator) = load_active_generator(root)?;
     if !dry_run {
-        let (_provider, generator) = load_active_generator(root)?;
         generator.render_service(&spec, root)?;
         generator.enable_service(&spec, root)?;
         if !config.enabled.contains(service_name) {
@@ -1449,9 +1449,10 @@ pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result
     if !config.enabled.contains(service_name) && config.disabled.contains(service_name) {
         println!("Service '{service_name}' was not enabled in services.toml");
     }
+    let (_provider, generator) = load_active_generator(root)?;
+    let is_enabled = generator.is_service_enabled(&spec, root)?;
     if !dry_run {
-        let (_provider, generator) = load_active_generator(root)?;
-        match generator.is_service_enabled(&spec, root)? {
+        match is_enabled {
             Some(true) => generator.disable_service(&spec, root)?,
             Some(false) => {}
             None => generator.disable_service(&spec, root)?,
