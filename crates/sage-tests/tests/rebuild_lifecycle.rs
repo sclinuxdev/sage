@@ -1724,3 +1724,38 @@ fn malformed_installed_service_document_fails_loudly() {
 
     assert!(error.to_string().contains("invalid service document"));
 }
+
+#[tokio::test]
+async fn absent_native_definition_or_indeterminate_query_does_not_abort_service_listing() {
+    let lab = initial_system().await;
+
+    // Add an unrendered service document to usr/share/sage/services/
+    // (simulating a package installed before sage rebuild has rendered its native unit file).
+    let services_dir = lab.root().join("usr/share/sage/services");
+    fs::write(services_dir.join("unrendered.toml"), service("unrendered")).unwrap();
+
+    // Set fail-is-enabled so any executed query exits with error (code 2).
+    fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
+
+    // list_services must not abort; unrendered definition is absent so query is skipped,
+    // and query failure on existing definitions is treated as indeterminate without error.
+    let services = sage_sys::list_services(lab.root()).unwrap();
+
+    let unrendered = services
+        .iter()
+        .find(|service| service.name == "unrendered")
+        .expect("unrendered service should be listed");
+    assert_eq!(unrendered.state, "unmanaged");
+    assert_eq!(unrendered.provider, "loom");
+
+    let daemon = services
+        .iter()
+        .find(|service| service.name == "daemon")
+        .expect("daemon service should be listed");
+    assert_eq!(daemon.state, "managed-enabled");
+
+    // Also verify listing works gracefully when no active init provider is configured.
+    let unconfigured_lab = TortureLab::new().unwrap();
+    let unconfigured_services = sage_sys::list_services(unconfigured_lab.root()).unwrap();
+    assert!(unconfigured_services.is_empty());
+}

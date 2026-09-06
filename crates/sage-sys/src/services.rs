@@ -1731,21 +1731,45 @@ pub fn service_adopt(root: &Path, service_name: &str, dry_run: bool) -> Result<(
 }
 
 /// Lists all known services and their management lifecycle status.
+///
+/// Unlike mutating lifecycle transactions that require strict error propagation to prevent
+/// inconsistent recovery states, `list_services` is a read-only query. If an active init
+/// provider is not configured or cannot be loaded, the provider is reported as `"unknown"`.
+/// If a service's native definition has not yet been rendered (for example, immediately after
+/// package installation and before `sage rebuild`) or if its provider state query is
+/// indeterminate or fails, its external enablement is treated as unknown (`None`) and the
+/// service is reported as `"unmanaged"` (or its declared state from `services.toml`).
 pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
     let services = load_available_services(root)?;
     let config_path = root.join("etc/sage/services.toml");
     let config = ServicesConfig::load(&config_path)?;
     let rendered_path = root.join("var/lib/sage/rendered-services.toml");
     let previous_rendered = if rendered_path.exists() {
-        Some(RenderedServicesState::load(&rendered_path)?)
+        RenderedServicesState::load(&rendered_path).ok()
     } else {
         None
     };
-    let (provider_name, generator) = load_active_generator(root)?;
+    let active_gen = load_active_generator(root).ok();
+    let default_provider = "unknown".to_string();
+    let provider_name = active_gen
+        .as_ref()
+        .map(|(name, _)| name.as_str())
+        .unwrap_or(&default_provider);
 
     let mut result = Vec::new();
     for service in services {
-        let is_init_enabled = generator.is_service_enabled(&service, root)?;
+        // Only attempt the provider state query if the active generator is available
+        // and the native service definition has actually been rendered to disk.
+        // Absent definitions (e.g. before rebuild) and indeterminate query errors
+        // are treated as None so that read-only listing never aborts prematurely.
+        let is_init_enabled = active_gen.as_ref().and_then(|(_, generator)| {
+            let rendered = generator.rendered_path(&service, root).ok()?;
+            if rendered.is_file() {
+                generator.is_service_enabled(&service, root).ok().flatten()
+            } else {
+                None
+            }
+        });
         let managed_disabled = config.disabled.contains(&service.name)
             || previous_rendered
                 .as_ref()
@@ -1772,7 +1796,7 @@ pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
                 service.package
             },
             state,
-            provider: provider_name.clone(),
+            provider: provider_name.to_string(),
         });
     }
     Ok(result)

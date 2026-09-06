@@ -143,4 +143,4 @@ Hint:
 - `sage service enable <svc>`：将服务写入 `services.toml`（`enabled`），并立即调用底层 Init Provider 激活。
 - `sage service disable <svc>`：从 `enabled` 移除并记录入 `disabled`，调用底层 Init Provider 禁用。
 - `sage service adopt <svc>`：将管理员外部手工启用的服务平滑纳管至 Sage 声明式配置中（转为 `managed-enabled`）。
-- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。
+- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。对尚未渲染原生单元定义（如刚安装包但尚未 `sage rebuild`）或查询状态不确定的服务，以声明状态与未知/未接管状态安全呈现，不中断只读查询。
