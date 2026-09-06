@@ -564,6 +564,43 @@ impl TemplateServiceGenerator {
     }
 }
 
+fn json_quote_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            c if c < ' ' => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_quote_array<'a>(items: impl IntoIterator<Item = &'a String>) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for item in items {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&json_quote_str(item));
+    }
+    out.push(']');
+    out
+}
+
 fn service_variables(
     service: &ServiceSpec,
     sysroot: &Path,
@@ -586,7 +623,7 @@ fn service_variables(
         ("service.description".into(), service.description.clone()),
         (
             "service.description_json".into(),
-            serde_json::to_string(&service.description)?,
+            json_quote_str(&service.description),
         ),
         ("service.command[0]".into(), service.command[0].clone()),
         ("service.command[1:]".into(), command_tail.join(" ")),
@@ -597,7 +634,7 @@ fn service_variables(
         ),
         (
             "service.command_json".into(),
-            serde_json::to_string(&service.command)?,
+            json_quote_array(&service.command),
         ),
         (
             "service.stop_command_str".into(),
@@ -609,14 +646,14 @@ fn service_variables(
         ),
         (
             "service.stop_command_json".into(),
-            serde_json::to_string(&service.stop_command)?,
+            json_quote_array(&service.stop_command),
         ),
         (
             "service.stop_action_toml".into(),
             if service.stop_command.is_empty() {
                 String::new()
             } else {
-                format!("stop = {}", serde_json::to_string(&service.stop_command)?)
+                format!("stop = {}", json_quote_array(&service.stop_command))
             },
         ),
         (
@@ -626,7 +663,7 @@ fn service_variables(
             } else {
                 format!(
                     "stop_command = {}",
-                    serde_json::to_string(&service.stop_command)?
+                    json_quote_array(&service.stop_command)
                 )
             },
         ),
@@ -640,7 +677,7 @@ fn service_variables(
         ),
         (
             "service.reload_command_json".into(),
-            serde_json::to_string(&service.reload_command)?,
+            json_quote_array(&service.reload_command),
         ),
         (
             "service.reload_action_toml".into(),
@@ -649,7 +686,7 @@ fn service_variables(
             } else {
                 format!(
                     "reload = {}",
-                    serde_json::to_string(&service.reload_command)?
+                    json_quote_array(&service.reload_command)
                 )
             },
         ),
@@ -660,24 +697,24 @@ fn service_variables(
             } else {
                 format!(
                     "reload_command = {}",
-                    serde_json::to_string(&service.reload_command)?
+                    json_quote_array(&service.reload_command)
                 )
             },
         ),
         ("service.user".into(), service.user.clone()),
         (
             "service.user_json".into(),
-            serde_json::to_string(&service.user)?,
+            json_quote_str(&service.user),
         ),
         ("service.group".into(), service.group.clone()),
         (
             "service.group_json".into(),
-            serde_json::to_string(&service.group)?,
+            json_quote_str(&service.group),
         ),
         ("service.working_dir".into(), service.working_dir.clone()),
         (
             "service.working_dir_json".into(),
-            serde_json::to_string(&service.working_dir)?,
+            json_quote_str(&service.working_dir),
         ),
         ("service.pid_file".into(), service.pid_file.clone()),
         ("service.restart".into(), service.restart.clone()),
@@ -700,17 +737,17 @@ fn service_variables(
         ),
         ("service.after".into(), after.join(" ")),
         ("service.after_space".into(), after.join(" ")),
-        ("service.after_json".into(), serde_json::to_string(&after)?),
+        ("service.after_json".into(), json_quote_array(&after)),
         ("service.before".into(), before.join(" ")),
         ("service.before_space".into(), before.join(" ")),
         (
             "service.before_json".into(),
-            serde_json::to_string(&before)?,
+            json_quote_array(&before),
         ),
         ("service.runtime".into(), service.runtime.clone()),
         (
             "service.runtime_json".into(),
-            serde_json::to_string(&service.runtime)?,
+            json_quote_str(&service.runtime),
         ),
         ("SYSROOT".into(), sysroot.display().to_string()),
     ]))
@@ -736,11 +773,11 @@ fn map_service_dependencies(
 }
 
 fn quote_command(command: &[String]) -> Result<String, SysError> {
-    command
+    Ok(command
         .iter()
-        .map(|argument| serde_json::to_string(argument).map_err(SysError::from))
-        .collect::<Result<Vec<_>, _>>()
-        .map(|arguments| arguments.join(" "))
+        .map(|argument| json_quote_str(argument))
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn expand_template(

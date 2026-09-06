@@ -35,9 +35,9 @@ pub enum BuildError {
     #[error("invalid build specification: {0}")]
     InvalidSpec(String),
     #[error("invalid glob pattern: {0}")]
-    Glob(#[from] glob::PatternError),
+    Glob(#[from] sage_core::glob::PatternError),
     #[error("filesystem traversal failed: {0}")]
-    Walk(#[from] walkdir::Error),
+    Walk(std::io::Error),
     #[error("tool '{tool}' is not allowed by inherited rclasses")]
     UnauthorizedTool { tool: String },
     #[error("patchelf failed for {path}: {message}")]
@@ -50,6 +50,7 @@ pub enum BuildError {
 }
 
 use anyhow::{Context, Result, bail};
+use sage_core::{glob, walkdir};
 
 include!("recipe.rs");
 include!("sources.rs");

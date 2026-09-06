@@ -35,4 +35,3 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
-walkdir = { workspace = true }

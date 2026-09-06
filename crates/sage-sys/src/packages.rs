@@ -273,7 +273,7 @@ pub fn load_available_with_pool(
         }
     }
     if let Some(pool) = local_pool.filter(|pool| pool.exists()) {
-        let mut packages: Vec<_> = walkdir::WalkDir::new(pool)
+        let mut packages: Vec<_> = sage_core::walkdir::WalkDir::new(pool)
             .follow_links(false)
             .into_iter()
             .filter_map(|entry| entry.ok())

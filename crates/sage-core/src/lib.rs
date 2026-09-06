@@ -812,3 +812,342 @@ pub mod hex {
         }
     }
 }
+
+/// Read-only memory map of a file descriptor for Linux.
+pub struct Mmap {
+    ptr: *mut std::ffi::c_void,
+    len: usize,
+}
+
+impl Mmap {
+    /// Maps a file into read-only memory.
+    ///
+    /// # Safety
+    /// The caller must ensure the underlying file is not modified or truncated while mapped.
+    pub unsafe fn map(file: &File) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            });
+        }
+        let ptr = unsafe {
+            nix::libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                nix::libc::PROT_READ,
+                nix::libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == nix::libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+}
+
+impl std::ops::Deref for Mmap {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        if self.len == 0 || self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+        }
+    }
+}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        if self.len > 0 && !self.ptr.is_null() {
+            unsafe {
+                nix::libc::munmap(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+unsafe impl Send for Mmap {}
+unsafe impl Sync for Mmap {}
+
+/// Minimal recursive directory tree walker without following symlinks.
+pub mod walkdir {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// A directory walker that yields entries without following symlinks.
+    #[derive(Debug, Clone)]
+    pub struct WalkDir {
+        root: PathBuf,
+    }
+
+    /// Iterator over directory entries.
+    pub struct IntoIter {
+        stack: Vec<PathBuf>,
+    }
+
+    /// An entry yielded by `WalkDir`.
+    #[derive(Debug, Clone)]
+    pub struct DirEntry {
+        path: PathBuf,
+        file_type: fs::FileType,
+    }
+
+    impl DirEntry {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+        pub fn into_path(self) -> PathBuf {
+            self.path
+        }
+        pub fn file_type(&self) -> fs::FileType {
+            self.file_type
+        }
+        pub fn file_name(&self) -> &std::ffi::OsStr {
+            self.path.file_name().unwrap_or_default()
+        }
+    }
+
+    impl WalkDir {
+        pub fn new(root: impl AsRef<Path>) -> Self {
+            Self {
+                root: root.as_ref().to_path_buf(),
+            }
+        }
+
+        pub fn follow_links(self, _follow: bool) -> Self {
+            self
+        }
+    }
+
+    impl IntoIterator for WalkDir {
+        type Item = std::io::Result<DirEntry>;
+        type IntoIter = IntoIter;
+
+        fn into_iter(self) -> Self::IntoIter {
+            IntoIter {
+                stack: vec![self.root],
+            }
+        }
+    }
+
+    impl Iterator for IntoIter {
+        type Item = std::io::Result<DirEntry>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let path = self.stack.pop()?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(err) => return Some(Err(err)),
+            };
+            let ft = metadata.file_type();
+            if ft.is_dir() {
+                match fs::read_dir(&path) {
+                    Ok(read_dir) => {
+                        let mut entries = Vec::new();
+                        for entry in read_dir {
+                            match entry {
+                                Ok(e) => entries.push(e.path()),
+                                Err(err) => return Some(Err(err)),
+                            }
+                        }
+                        // Reverse sort so popping from stack processes in alphabetical order
+                        entries.sort_by(|a, b| b.cmp(a));
+                        self.stack.extend(entries);
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+            Some(Ok(DirEntry {
+                path,
+                file_type: ft,
+            }))
+        }
+    }
+}
+
+/// Zero-dependency glob pattern matching on file paths.
+pub mod glob {
+    use std::fmt;
+    use std::path::Path;
+
+    /// Error returned when parsing an invalid glob pattern.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PatternError(pub String);
+
+    impl fmt::Display for PatternError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for PatternError {}
+
+    /// A compiled glob pattern.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Pattern {
+        raw: String,
+    }
+
+    impl Pattern {
+        /// Compiles a new glob pattern.
+        pub fn new(pattern: impl AsRef<str>) -> Result<Self, PatternError> {
+            let raw = pattern.as_ref().to_string();
+            let mut in_bracket = false;
+            for c in raw.chars() {
+                if c == '[' {
+                    in_bracket = true;
+                } else if c == ']' {
+                    in_bracket = false;
+                }
+            }
+            if in_bracket {
+                return Err(PatternError(format!("unclosed [ in pattern '{raw}'")));
+            }
+            Ok(Self { raw })
+        }
+
+        pub fn as_str(&self) -> &str {
+            &self.raw
+        }
+
+        /// Tests whether this pattern matches a given path.
+        pub fn matches_path(&self, path: &Path) -> bool {
+            let path_str = path.to_string_lossy();
+            glob_match(&self.raw, &path_str)
+        }
+    }
+
+    impl fmt::Display for Pattern {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.raw)
+        }
+    }
+
+    fn glob_match(pat: &str, text: &str) -> bool {
+        let pat = pat.strip_prefix('/').unwrap_or(pat);
+        let text = text.strip_prefix('/').unwrap_or(text);
+        let pat_chars: Vec<char> = pat.chars().collect();
+        let text_chars: Vec<char> = text.chars().collect();
+        match_chars(&pat_chars, &text_chars)
+    }
+
+    fn match_chars(pat: &[char], text: &[char]) -> bool {
+        let mut p = 0;
+        let mut t = 0;
+
+        while p < pat.len() && t < text.len() {
+            if pat[p..].starts_with(&['/', '*', '*', '/']) {
+                if match_chars(&pat[p + 3..], &text[t..]) {
+                    return true;
+                }
+                for next_slash in t..text.len() {
+                    if text[next_slash] == '/'
+                        && match_chars(&pat[p + 4..], &text[next_slash + 1..])
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            } else if pat[p..] == ['/', '*', '*'] {
+                return text[t] == '/' && text.len() > t + 1;
+            } else if pat[p..].starts_with(&['*', '*', '/']) {
+                if match_chars(&pat[p + 3..], &text[t..]) {
+                    return true;
+                }
+                for next_slash in t..text.len() {
+                    if text[next_slash] == '/'
+                        && match_chars(&pat[p + 3..], &text[next_slash + 1..])
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            } else if pat[p..] == ['*', '*'] {
+                return true;
+            } else if pat[p] == '*' {
+                let next_slash = text[t..]
+                    .iter()
+                    .position(|&c| c == '/')
+                    .map_or(text.len(), |pos| t + pos);
+                for i in t..=next_slash {
+                    if match_chars(&pat[p + 1..], &text[i..]) {
+                        return true;
+                    }
+                }
+                return false;
+            } else if pat[p] == '?' {
+                if text[t] == '/' {
+                    return false;
+                }
+                p += 1;
+                t += 1;
+            } else if pat[p] == '[' {
+                let Some(close) = pat[p + 1..].iter().position(|&c| c == ']') else {
+                    return false;
+                };
+                let content = &pat[p + 1..p + 1 + close];
+                let ch = text[t];
+                if ch == '/' {
+                    return false;
+                }
+                if match_bracket_class(content, ch) {
+                    p = p + 1 + close + 1;
+                    t += 1;
+                } else {
+                    return false;
+                }
+            } else {
+                if pat[p] != text[t] {
+                    return false;
+                }
+                p += 1;
+                t += 1;
+            }
+        }
+
+        if p == pat.len() && t == text.len() {
+            return true;
+        }
+        if pat[p..] == ['/', '*', '*'] && t < text.len() && t > 0 && text[t - 1] == '/' {
+            return true;
+        }
+        if pat[p..] == ['*', '*'] {
+            return true;
+        }
+        if pat[p..] == ['*'] && t == text.len() {
+            return true;
+        }
+        false
+    }
+
+    fn match_bracket_class(content: &[char], ch: char) -> bool {
+        let (negate, chars) = if content.starts_with(&['!']) || content.starts_with(&['^']) {
+            (true, &content[1..])
+        } else {
+            (false, content)
+        };
+        let mut i = 0;
+        let mut matched = false;
+        while i < chars.len() {
+            if i + 2 < chars.len() && chars[i + 1] == '-' {
+                if ch >= chars[i] && ch <= chars[i + 2] {
+                    matched = true;
+                    break;
+                }
+                i += 3;
+            } else {
+                if chars[i] == ch {
+                    matched = true;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        if negate { !matched } else { matched }
+    }
+}

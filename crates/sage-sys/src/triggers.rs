@@ -77,7 +77,7 @@ impl TriggerEngine {
                 .on_paths
                 .iter()
                 .map(|pattern| {
-                    glob::Pattern::new(pattern).map_err(|error| {
+                    sage_core::glob::Pattern::new(pattern).map_err(|error| {
                         SysError::Invalid(format!("trigger {}: {error}", trigger.name))
                     })
                 })
@@ -151,7 +151,7 @@ impl TriggerSpec {
             )));
         }
         for pattern in &trigger.on_paths {
-            glob::Pattern::new(pattern)
+            sage_core::glob::Pattern::new(pattern)
                 .map_err(|error| SysError::Invalid(format!("trigger {}: {error}", trigger.name)))?;
         }
         Ok(trigger)

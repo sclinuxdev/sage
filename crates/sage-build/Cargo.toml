@@ -13,11 +13,9 @@ sage-archive = { workspace = true }
 sage-sys = { workspace = true }
 sage-repo = { workspace = true }
 sage-solver = { workspace = true }
-glob = { workspace = true }
 tempfile = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-walkdir = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

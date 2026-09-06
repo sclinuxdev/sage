@@ -18,8 +18,6 @@ pub enum SysError {
     Io(#[from] std::io::Error),
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error("JSON encoding error: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("unsupported schema version {0}")]
     Schema(u32),
     #[error("invalid declaration: {0}")]

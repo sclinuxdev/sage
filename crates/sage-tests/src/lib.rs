@@ -1,6 +1,5 @@
 //! Hermetic, model-checked fixtures for Sage package-manager torture testing.
 use anyhow::{Context, Result, bail};
-use rand::{Rng, SeedableRng, rngs::SmallRng};
 use sage::{Cli, Commands};
 use sage_core::{Dependency, Package, PackageKey, SCHEMA_VERSION, Version, hex};
 use sha2::{Digest, Sha256};
@@ -480,6 +479,36 @@ pub async fn run_quick() -> Result<Vec<String>> {
         bail!("repository rollback silently downgraded the installed package");
     }
     Ok(lab.steps)
+}
+
+/// A fast, deterministic 64-bit pseudo-random number generator (SplitMix64)
+/// used exclusively for deterministic torture test sequence generation.
+pub struct SmallRng {
+    state: u64,
+}
+
+impl SmallRng {
+    /// Initializes PRNG with a 64-bit seed.
+    pub fn seed_from_u64(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Generates next pseudo-random 64-bit integer using SplitMix64 algorithm.
+    pub fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    /// Generates an integer within the half-open range `range.start..range.end`.
+    pub fn gen_range(&mut self, range: std::ops::Range<usize>) -> usize {
+        assert!(range.start < range.end, "range cannot be empty");
+        let span = (range.end - range.start) as u64;
+        let value = (self.next_u64() % span) as usize;
+        range.start + value
+    }
 }
 
 #[derive(Debug, Clone)]

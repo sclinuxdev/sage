@@ -194,7 +194,7 @@ pub fn build_index(
     signing_key: &Path,
 ) -> Result<IndexArtifacts, RepoError> {
     std::fs::create_dir_all(output_dir)?;
-    let mut package_files: Vec<_> = walkdir::WalkDir::new(pool)
+    let mut package_files: Vec<_> = sage_core::walkdir::WalkDir::new(pool)
         .follow_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -298,7 +298,7 @@ fn release_version(release: &IndexedRelease) -> sage_core::Version {
 fn sign_file(path: &Path, key: &SigningKey) -> Result<Signature, RepoError> {
     let file = File::open(path)?;
     // SAFETY: the published index is not mutated while the map is alive.
-    let bytes = unsafe { memmap2::Mmap::map(&file)? };
+    let bytes = unsafe { sage_core::Mmap::map(&file)? };
     Ok(key.sign(&bytes))
 }
 
@@ -658,7 +658,7 @@ async fn verify_signature(path: &Path, key_path: &Path, signature: &[u8]) -> Res
     tokio::task::spawn_blocking(move || {
         let file = File::open(path)?;
         // SAFETY: the temporary index is immutable for the lifetime of this map.
-        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes = unsafe { sage_core::Mmap::map(&file)? };
         let key = VerifyingKey::from_bytes(&key).map_err(|_| RepoError::Signature)?;
         key.verify(&bytes, &Signature::from_bytes(&signature))
             .map_err(|_| RepoError::Signature)

@@ -287,7 +287,7 @@ target_root="/"
         std::fs::copy(pool.join("index.mdb"), index).unwrap();
         let cache = root.join("var/cache/sage/packages");
         std::fs::create_dir_all(&cache).unwrap();
-        for entry in walkdir::WalkDir::new(pool)
+        for entry in sage_core::walkdir::WalkDir::new(pool)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)

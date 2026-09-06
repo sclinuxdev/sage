@@ -90,4 +90,69 @@ mod core_tests {
         assert!(hex::decode("abc").is_err()); // Odd length
         assert!(hex::decode("zz").is_err()); // Invalid character
     }
+
+    #[test]
+    fn mmap_reads_file_contents_and_handles_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.bin");
+        let content = b"Hello Sage Mmap zero-copy payload!";
+        std::fs::write(&file_path, content).unwrap();
+
+        let file = std::fs::File::open(&file_path).unwrap();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        assert_eq!(&*mmap, content);
+        assert_eq!(mmap.len(), content.len());
+
+        // Empty file handling
+        let empty_path = dir.path().join("empty.bin");
+        std::fs::write(&empty_path, b"").unwrap();
+        let empty_file = std::fs::File::open(&empty_path).unwrap();
+        let empty_mmap = unsafe { Mmap::map(&empty_file).unwrap() };
+        assert_eq!(&*empty_mmap, b"");
+        assert_eq!(empty_mmap.len(), 0);
+    }
+
+    #[test]
+    fn walkdir_traverses_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("file1.txt"), b"1").unwrap();
+        std::fs::write(sub.join("file2.txt"), b"2").unwrap();
+        std::fs::write(dir.path().join("root.txt"), b"root").unwrap();
+
+        let mut names: Vec<String> = walkdir::WalkDir::new(dir.path())
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert!(names.contains(&"file1.txt".to_string()));
+        assert!(names.contains(&"file2.txt".to_string()));
+        assert!(names.contains(&"root.txt".to_string()));
+    }
+
+    #[test]
+    fn glob_pattern_matching_semantics() {
+        let pat = glob::Pattern::new("usr/lib*/**/*.so").unwrap();
+        assert!(pat.matches_path(std::path::Path::new("usr/lib/libfoo.so")));
+        assert!(pat.matches_path(std::path::Path::new("usr/lib64/sub/libbar.so")));
+        assert!(!pat.matches_path(std::path::Path::new("usr/bin/libfoo.so")));
+        assert!(!pat.matches_path(std::path::Path::new("usr/lib/libfoo.a")));
+
+        let icon_pat = glob::Pattern::new("usr/share/icons/*/**").unwrap();
+        assert!(icon_pat.matches_path(std::path::Path::new("usr/share/icons/hicolor/index.theme")));
+        assert!(!icon_pat.matches_path(std::path::Path::new("usr/share/icons/hicolor")));
+
+        let class_pat = glob::Pattern::new("foo[0-9].txt").unwrap();
+        assert!(class_pat.matches_path(std::path::Path::new("foo3.txt")));
+        assert!(!class_pat.matches_path(std::path::Path::new("fooa.txt")));
+
+        assert!(glob::Pattern::new("unclosed[bracket").is_err());
+    }
 }
