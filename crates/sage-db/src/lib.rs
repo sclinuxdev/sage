@@ -1,7 +1,7 @@
 //! Transactional LMDB state, ownership indexes, and crash journals.
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn};
-use sage_core::{CoreError, Dependency, PackageKey, Version};
+use sage_core::{CoreError, Dependency, PackageKey, Version, hex};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

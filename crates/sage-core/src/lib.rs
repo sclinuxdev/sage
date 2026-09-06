@@ -1,7 +1,7 @@
 //! Core domain models, version algebra, symbol interning, and host locking.
 
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, open, openat};
+use nix::fcntl::{Flock, FlockArg, OFlag, open, openat};
 use nix::sys::stat::{Mode, fchmod, fstat, mkdirat};
 use nix::unistd::{fchown, geteuid};
 use serde::{Deserialize, Serialize};
@@ -588,7 +588,7 @@ impl SymbolTable {
 
 /// RAII guard around a host-wide advisory file lock.
 pub struct HostLock {
-    file: File,
+    _file: Flock<File>,
     path: PathBuf,
 }
 
@@ -602,16 +602,16 @@ impl HostLock {
     fn acquire(path: impl AsRef<Path>, exclusive: bool) -> Result<Self, CoreError> {
         let path = path.as_ref().to_path_buf();
         let file = open_lock_file(&path)?;
-        let result = if exclusive {
-            fs2::FileExt::lock_exclusive(&file)
+        let arg = if exclusive {
+            FlockArg::LockExclusive
         } else {
-            fs2::FileExt::lock_shared(&file)
+            FlockArg::LockShared
         };
-        result.map_err(|source| CoreError::LockFailed {
+        let _file = Flock::lock(file, arg).map_err(|(_, errno)| CoreError::LockFailed {
             path: path.clone(),
-            source,
+            source: std::io::Error::from_raw_os_error(errno as i32),
         })?;
-        Ok(Self { file, path })
+        Ok(Self { _file, path })
     }
 
     pub fn path(&self) -> &Path {
@@ -754,13 +754,61 @@ fn errno_io(error: Errno) -> CoreError {
     CoreError::Io(std::io::Error::from_raw_os_error(error as i32))
 }
 
-impl Drop for HostLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
-    }
-}
-
 /// Resolves a path relative to a target sysroot prefix.
 pub fn under_root(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+/// Minimal, zero-dependency lowercase hexadecimal encoding and decoding.
+pub mod hex {
+    use std::fmt;
+
+    /// Hexadecimal decoding error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FromHexError;
+
+    impl fmt::Display for FromHexError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "invalid hex string")
+        }
+    }
+
+    impl std::error::Error for FromHexError {}
+
+    /// Encodes a byte sequence into a lowercase hexadecimal string.
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        let bytes = bytes.as_ref();
+        let mut string = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            string.push(HEX_CHARS[(byte >> 4) as usize] as char);
+            string.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+        }
+        string
+    }
+
+    /// Decodes a hexadecimal byte sequence or string into a byte vector.
+    pub fn decode(hex: impl AsRef<[u8]>) -> Result<Vec<u8>, FromHexError> {
+        let hex = hex.as_ref();
+        if hex.len() % 2 != 0 {
+            return Err(FromHexError);
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        let (chunks, _) = hex.as_chunks::<2>();
+        for &[c0, c1] in chunks {
+            let high = from_hex_digit(c0).ok_or(FromHexError)?;
+            let low = from_hex_digit(c1).ok_or(FromHexError)?;
+            bytes.push((high << 4) | low);
+        }
+        Ok(bytes)
+    }
+
+    fn from_hex_digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
 }

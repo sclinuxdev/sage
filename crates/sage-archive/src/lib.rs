@@ -3,6 +3,7 @@
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open, openat, renameat};
 use nix::sys::stat::{Mode, fchmod, mkdirat};
+use sage_core::hex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};

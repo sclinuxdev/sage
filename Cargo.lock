@@ -450,16 +450,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,12 +612,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "http"
@@ -1459,7 +1443,6 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
- "hex",
  "indicatif",
  "sage-archive",
  "sage-build",
@@ -1481,7 +1464,6 @@ dependencies = [
 name = "sage-archive"
 version = "0.4.0"
 dependencies = [
- "hex",
  "nix",
  "rayon",
  "sage-core",
@@ -1519,7 +1501,6 @@ dependencies = [
 name = "sage-core"
 version = "0.4.0"
 dependencies = [
- "fs2",
  "nix",
  "serde",
  "spdx",
@@ -1532,7 +1513,6 @@ version = "0.4.0"
 dependencies = [
  "bincode",
  "heed",
- "hex",
  "sage-core",
  "serde",
  "sha2",
@@ -1547,7 +1527,6 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "heed",
- "hex",
  "memmap2",
  "reqwest",
  "sage-archive",
@@ -1580,7 +1559,6 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "glob",
- "hex",
  "sage-archive",
  "sage-core",
  "sage-db",
@@ -1604,7 +1582,6 @@ dependencies = [
  "anyhow",
  "bincode",
  "heed",
- "hex",
  "rand 0.8.8",
  "sage",
  "sage-archive",

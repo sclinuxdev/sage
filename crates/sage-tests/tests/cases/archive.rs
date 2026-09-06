@@ -3,6 +3,7 @@ mod archive_tests {
     use std::collections::BTreeMap;
     use std::fs::{self, File};
     use std::path::PathBuf;
+    use sage_core::hex;
     use sha2::{Digest, Sha256};
 
     #[test]

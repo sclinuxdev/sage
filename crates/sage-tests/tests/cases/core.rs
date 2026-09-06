@@ -74,4 +74,20 @@ mod core_tests {
         assert_eq!(symbols.resolve(first), Some("system"));
         assert_eq!(symbols.len(), 1);
     }
+
+    #[test]
+    fn hex_encode_and_decode_round_trip() {
+        let raw = b"Sage Linux Declarative Packaging \x00\xff\x7f\x80";
+        let encoded = hex::encode(raw);
+        let decoded = hex::decode(&encoded).unwrap();
+        assert_eq!(decoded, raw);
+
+        // Case insensitivity in decode
+        assert_eq!(hex::decode("4142").unwrap(), b"AB");
+        assert_eq!(hex::decode("4142").unwrap(), hex::decode("4142").unwrap());
+
+        // Error cases
+        assert!(hex::decode("abc").is_err()); // Odd length
+        assert!(hex::decode("zz").is_err()); // Invalid character
+    }
 }

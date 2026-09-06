@@ -1,6 +1,7 @@
 mod repo_tests {
     use sage_repo::*;
     use heed::types::{Bytes, Str};
+    use sage_core::hex;
     use sha2::{Digest, Sha256};
     use std::fs::File;
     use std::io::Write;

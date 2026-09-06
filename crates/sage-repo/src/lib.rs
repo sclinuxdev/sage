@@ -5,6 +5,7 @@ use heed::types::{Bytes, Str};
 use heed::{Env, EnvFlags, EnvOpenOptions};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, RANGE};
 use reqwest::{Client, Method, StatusCode};
+use sage_core::hex;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};

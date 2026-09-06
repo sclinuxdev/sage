@@ -1,5 +1,6 @@
 mod sage_tests {
     use sage::*;
+    use sage_core::hex;
     use sha2::{Digest, Sha256};
     use std::path::{Path, PathBuf};
 

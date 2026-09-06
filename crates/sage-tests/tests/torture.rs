@@ -1,3 +1,5 @@
+use sage_core::hex;
+
 #[tokio::test]
 async fn hermetic_release_gate_covers_core_invariants() {
     sage_tests::run_quick().await.unwrap();

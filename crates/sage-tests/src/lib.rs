@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use sage::{Cli, Commands};
-use sage_core::{Dependency, Package, PackageKey, SCHEMA_VERSION, Version};
+use sage_core::{Dependency, Package, PackageKey, SCHEMA_VERSION, Version, hex};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
