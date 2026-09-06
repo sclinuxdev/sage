@@ -66,7 +66,9 @@ pub struct ReconcilePlan {
 }
 
 impl ReconcilePlan {
-    /// Solves desired roots, then computes deterministic install/remove differences.
+    /// Solves desired and policy-retained package identities before computing
+    /// deterministic install/remove differences. Installed versions are preferred
+    /// candidates, not exact pins that prevent compatible dependency movement.
     pub fn compute(
         config: &SystemConfig,
         installed: &[sage_db::InstalledPackage],
@@ -75,15 +77,44 @@ impl ReconcilePlan {
     ) -> Result<Self, SysError> {
         let mut roots = config.package_keys("main/system")?;
         let preferences = config.provider_preferences("main/system")?;
-        roots.extend(preferences.values().cloned());
+        roots.extend(
+            installed
+                .iter()
+                .filter(|package| no_prune || package.key.channel != "main/system")
+                .map(|package| package.key.clone()),
+        );
         roots.sort();
         roots.dedup();
+        // Repository pruning must not erase an installed lock, including a
+        // desired main/system release when no extra roots are being retained.
+        // Reconstruct candidates only; PubGrub still resolves their dependencies
+        // and conflicts together with the newly desired roots.
+        let augmented = installed
+            .iter()
+            .any(|package| universe.release(&package.key, &package.version).is_none())
+            .then(|| {
+                let mut augmented = universe.clone();
+                for package in installed {
+                    if augmented.release(&package.key, &package.version).is_none() {
+                        let mut release = sage_core::Package::from_release(
+                            package.key.clone(),
+                            package.version.clone(),
+                            package.dependencies.clone(),
+                            package.provides.clone(),
+                        );
+                        release.conflicts.clone_from(&package.conflicts);
+                        augmented.insert(release);
+                    }
+                }
+                augmented
+            });
+        let universe = augmented.as_ref().unwrap_or(universe);
         let locks = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
-        let solution = sage_solver::SageSolver::with_locked(universe, locks)
-            .prefer_providers(preferences.clone())
-            .resolve(&roots)?;
+        let (solution, selected_providers) = sage_solver::SageSolver::with_locked(universe, locks)
+            .prefer_providers(preferences)
+            .resolve_with_provider_bindings(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()))
@@ -102,9 +133,14 @@ impl ReconcilePlan {
                 .cloned()
                 .collect()
         };
-        let provider_bindings = preferences
+        let provider_bindings = selected_providers
             .into_iter()
-            .map(|(symbol, key)| (symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(), key))
+            .map(|(symbol, key)| {
+                (
+                    symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
+                    key,
+                )
+            })
             .collect();
         Ok(Self {
             install,
