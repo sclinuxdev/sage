@@ -1,3 +1,7 @@
+use crate as sage_build;
+use sage_core::under_root;
+use sage_repo::{ReleaseLocation, ReleaseSource};
+
 pub async fn mass_rebuild(
     root: &Path,
     recipe_root: &Path,
@@ -339,14 +343,14 @@ fn remove_superseded_pool_artifacts(
     Ok(())
 }
 
-#[derive(Default)]
-struct BuildInvocation {
-    output_dir: Option<PathBuf>,
-    local_pool: Option<PathBuf>,
-    jobs_override: Option<usize>,
+#[derive(Default, Clone)]
+pub struct BuildInvocation {
+    pub output_dir: Option<PathBuf>,
+    pub local_pool: Option<PathBuf>,
+    pub jobs_override: Option<usize>,
 }
 
-async fn build_recipe(
+pub async fn build_recipe(
     root: &Path,
     recipe_dir: &Path,
     requested_features: &[String],
@@ -719,8 +723,8 @@ async fn prepare_package_tree(
     if dependencies.is_empty() {
         return Ok(None);
     }
-    let available = load_available_with_pool(root, architecture, local_pool)?;
-    let channel = canonical_channel(&available, Some(channel))?;
+    let available = sage_sys::load_available_with_pool(root, architecture, local_pool)?;
+    let channel = sage_sys::canonical_channel(&available, Some(channel))?;
     let local_locks = available
         .releases
         .iter()

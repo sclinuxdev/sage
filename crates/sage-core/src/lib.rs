@@ -759,3 +759,8 @@ impl Drop for HostLock {
         let _ = fs2::FileExt::unlock(&self.file);
     }
 }
+
+/// Resolves a path relative to a target sysroot prefix.
+pub fn under_root(root: &Path, path: &Path) -> PathBuf {
+    root.join(path.strip_prefix("/").unwrap_or(path))
+}

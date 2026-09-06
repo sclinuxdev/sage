@@ -1,5 +1,7 @@
 pub use sage_repo::{ReleaseLocation, ReleaseSource};
-async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Result<()> {
+use crate as sage_sys;
+
+pub async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/channels.toml"));
     let config = sage_repo::ChannelsConfig::load(&config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
@@ -99,7 +101,7 @@ fn crash_point(root: &Path, stage: &str) -> Result<()> {
 fn crash_point(_root: &Path, _stage: &str) -> Result<()> {
     Ok(())
 }
-async fn settle_journals(root: &Path) -> Result<()> {
+pub async fn settle_journals(root: &Path) -> Result<()> {
     let path = under_root(root, Path::new("/var/lib/sage"));
     if !path.exists() {
         return Ok(());
@@ -264,7 +266,7 @@ pub fn load_available_with_pool(
     })
 }
 
-fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
+pub fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> Result<String> {
     let selected = selected.unwrap_or("system");
     available
         .aliases
@@ -272,7 +274,7 @@ fn canonical_channel(available: &AvailablePackages, selected: Option<&str>) -> R
         .cloned()
         .with_context(|| format!("channel '{selected}' has no synchronized index"))
 }
-async fn apply_packages(
+pub async fn apply_packages(
     root: &Path,
     names: &[String],
     channel: Option<&str>,
@@ -537,6 +539,24 @@ impl PackageDeclarations {
 /// Validates and orders the complete transaction before creating a durable recovery record.
 /// A rejected archive or ownership conflict has made no filesystem or LMDB
 /// mutation, so it must not become an endlessly retried startup journal.
+pub async fn obtain_release_archive(
+    engine: &sage_repo::DownloadEngine,
+    cache: &Path,
+    source: &ReleaseSource,
+) -> Result<PathBuf> {
+    match &source.location {
+        ReleaseLocation::Local(path) => Ok(path.clone()),
+        ReleaseLocation::Remote(base) => {
+            let archive = cache.join(&source.release.sha256);
+            let url = format!("{}/{}", base.trim_end_matches('/'), source.release.archive);
+            engine
+                .download_url(&url, &archive, &source.release.sha256)
+                .await?;
+            Ok(archive)
+        }
+    }
+}
+
 async fn preflight_packages(
     root: &Path,
     database: &sage_db::SageDatabase,
@@ -931,7 +951,7 @@ async fn resume_install(
     database.finish_journal(&journal.op_id)?;
     Ok(())
 }
-async fn upgrade_packages(
+pub async fn upgrade_packages(
     root: &Path,
     names: &[String],
     channel: Option<&str>,
@@ -960,7 +980,7 @@ async fn upgrade_packages(
     };
     apply_packages(root, &names, Some(&canonical), true, false, dry_run).await
 }
-fn remove_packages(
+pub fn remove_packages(
     root: &Path,
     names: &[String],
     channel: Option<&str>,
@@ -1223,7 +1243,7 @@ fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result
     std::fs::rename(temporary, target)?;
     Ok(())
 }
-async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
+pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Result<()> {
     let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
     let config = sage_sys::SystemConfig::load(&config_path)?;
     let mut desired: Vec<_> = config.packages.iter().cloned().collect();
@@ -1391,7 +1411,7 @@ fn operation_id(kind: &str) -> Result<String> {
         std::process::id()
     ))
 }
-fn list_channels(root: &Path) -> Result<()> {
+pub fn list_channels(root: &Path) -> Result<()> {
     let config =
         sage_repo::ChannelsConfig::load(under_root(root, Path::new("/etc/sage/channels.toml")))?;
     for (name, channel) in config.channels {
@@ -1421,7 +1441,7 @@ fn list_channels(root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
+pub fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
     if channel.is_empty()
         || !channel
             .bytes()
@@ -1467,41 +1487,61 @@ fn use_toolchain(root: &Path, channel: &str, dry_run: bool) -> Result<()> {
     }
     Ok(())
 }
-fn query_state(root: &Path, action: QueryAction) -> Result<()> {
+
+/// Query actions for installed system state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryAction {
+    Installed,
+    Owner { path: PathBuf },
+    Info { package: String, channel: String },
+}
+
+pub fn query_installed(root: &Path) -> Result<()> {
     let db_path = under_root(root, Path::new("/var/lib/sage"));
-    match action {
-        QueryAction::Installed => {
-            for package in sage_db::read_packages(&db_path)? {
-                println!("{}\t{}\t{}", package.key, package.version, package.arch);
-            }
-        }
-        QueryAction::Owner { path } => {
-            let relative = path.strip_prefix(root).unwrap_or(path.as_path());
-            let relative = relative.strip_prefix("/").unwrap_or(relative);
-            for owner in sage_db::read_owners(&db_path, &relative.to_string_lossy())? {
-                println!("{owner}");
-            }
-        }
-        QueryAction::Info { package, channel } => {
-            let channel = if channel.contains('/') {
-                channel
-            } else {
-                format!("main/{channel}")
-            };
-            let key = sage_core::PackageKey::in_channel(channel, &package)?;
-            let record = sage_db::read_packages(&db_path)?
-                .into_iter()
-                .find(|record| record.key == key)
-                .with_context(|| format!("package {key} is not installed"))?;
-            println!("Package: {}", record.key);
-            println!("Version: {}", record.version);
-            println!("Architecture: {}", record.arch);
-            println!("Installed size: {}", record.installed_size);
-            println!("Files: {}", record.files.len());
-            for dependency in record.dependencies {
-                println!("Depends: {}", dependency.name);
-            }
-        }
+    for package in sage_db::read_packages(&db_path)? {
+        println!("{}\t{}\t{}", package.key, package.version, package.arch);
     }
     Ok(())
 }
+
+pub fn query_owner(root: &Path, path: &Path) -> Result<()> {
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative = relative.strip_prefix("/").unwrap_or(relative);
+    for owner in sage_db::read_owners(&db_path, &relative.to_string_lossy())? {
+        println!("{owner}");
+    }
+    Ok(())
+}
+
+pub fn query_info(root: &Path, package: &str, channel: &str) -> Result<()> {
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let channel = if channel.contains('/') {
+        channel.to_string()
+    } else {
+        format!("main/{channel}")
+    };
+    let key = sage_core::PackageKey::in_channel(channel, package)?;
+    let record = sage_db::read_packages(&db_path)?
+        .into_iter()
+        .find(|record| record.key == key)
+        .with_context(|| format!("package {key} is not installed"))?;
+    println!("Package: {}", record.key);
+    println!("Version: {}", record.version);
+    println!("Architecture: {}", record.arch);
+    println!("Installed size: {}", record.installed_size);
+    println!("Files: {}", record.files.len());
+    for dependency in record.dependencies {
+        println!("Depends: {}", dependency.name);
+    }
+    Ok(())
+}
+
+pub fn query_state(root: &Path, action: QueryAction) -> Result<()> {
+    match action {
+        QueryAction::Installed => query_installed(root),
+        QueryAction::Owner { path } => query_owner(root, &path),
+        QueryAction::Info { package, channel } => query_info(root, &package, &channel),
+    }
+}
+

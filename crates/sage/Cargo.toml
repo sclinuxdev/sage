@@ -15,7 +15,8 @@ name = "sage"
 path = "src/main.rs"
 
 [features]
-torture = ["sage-db/torture"]
+torture = ["sage-db/torture", "sage-sys/torture"]
+
 
 [dependencies]
 sage-core = { workspace = true }

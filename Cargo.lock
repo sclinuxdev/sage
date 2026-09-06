@@ -1498,13 +1498,18 @@ dependencies = [
 name = "sage-build"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "glob",
  "goblin",
  "sage-archive",
  "sage-core",
+ "sage-repo",
+ "sage-solver",
+ "sage-sys",
  "serde",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
  "walkdir",
@@ -1573,14 +1578,20 @@ dependencies = [
 name = "sage-sys"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "glob",
+ "hex",
  "sage-archive",
  "sage-core",
  "sage-db",
+ "sage-repo",
  "sage-solver",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
  "walkdir",

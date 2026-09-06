@@ -35,6 +35,9 @@ pub enum SysError {
     Solver(#[from] sage_solver::SolverError),
 }
 
+use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+
 fn validate_schema(version: u32) -> Result<(), SysError> {
     if version == sage_core::SCHEMA_VERSION {
         Ok(())
@@ -46,3 +49,4 @@ fn validate_schema(version: u32) -> Result<(), SysError> {
 include!("triggers.rs");
 include!("services.rs");
 include!("state.rs");
+include!("packages.rs");

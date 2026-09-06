@@ -1,13 +1,23 @@
 //! Main entry point for the Sage package manager CLI.
 //!
 //! Provides fast, pure CLI argument parsing based on `clap` derive,
-//! supporting package installation, atomic upgrades, source builds,
-//! repository index generation, and declarative system reconciliation.
-use anyhow::{bail, Context, Result};
+//! delegating system reconciliation to `sage-sys` and hermetic
+//! builds to `sage-build`.
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+pub use sage_build::{
+    bootstrap_sources, build_recipe, mass_rebuild, stage_declarative_metadata, stage_sysusers,
+    BuildInvocation,
+};
+pub use sage_repo::{ReleaseLocation, ReleaseSource};
+pub use sage_sys::{
+    apply_packages, canonical_channel, load_available_with_pool, rebuild_system, remove_packages,
+    sync_channels, upgrade_packages, AvailablePackages,
+};
+
 #[derive(Parser)]
 #[command(
     name = "sage",
@@ -27,6 +37,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 }
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Solve and install specified packages into system or versioned sub-channel.
@@ -111,6 +122,7 @@ pub enum Commands {
         action: QueryAction,
     },
 }
+
 #[derive(Subcommand)]
 pub enum RepoAction {
     /// Index a pool of *.pkg.tar.zst packages into index.mdb and create signature.
@@ -120,17 +132,20 @@ pub enum RepoAction {
         sign_key: Option<PathBuf>,
     },
 }
+
 #[derive(Subcommand)]
 pub enum ChannelAction {
     /// List configured root channels and subchannels.
     List,
 }
+
 #[derive(Subcommand)]
 pub enum ToolchainAction {
     /// Populate the active profile from a versioned toolchain.
     Use { channel: String },
 }
-#[derive(Subcommand)]
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum QueryAction {
     /// List all installed package instances.
     Installed,
@@ -143,9 +158,11 @@ pub enum QueryAction {
         channel: String,
     },
 }
+
 pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
+
 /// Executes one parsed command through the binary's production interface.
 pub async fn execute(mut cli: Cli) -> Result<()> {
     if cli.verbose {
@@ -159,14 +176,14 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
     );
     cli.root = std::fs::canonicalize(&cli.root)
         .with_context(|| format!("cannot resolve target root {}", cli.root.display()))?;
-    let lock_path = under_root(&cli.root, Path::new("/run/sage/operation.lock"));
+    let lock_path = sage_core::under_root(&cli.root, Path::new("/run/sage/operation.lock"));
     let _lock = if cli.dry_run || read_only {
         sage_core::HostLock::acquire_shared(lock_path)?
     } else {
         sage_core::HostLock::acquire_exclusive(lock_path)?
     };
     if !cli.dry_run && !read_only {
-        settle_journals(&cli.root).await?;
+        sage_sys::settle_journals(&cli.root).await?;
     }
     match cli.command {
         Commands::Install {
@@ -174,7 +191,7 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             channel,
             no_save,
         } => {
-            apply_packages(
+            sage_sys::apply_packages(
                 &cli.root,
                 &packages,
                 channel.as_deref(),
@@ -185,7 +202,7 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             .await?;
         }
         Commands::Remove { packages, channel } => {
-            remove_packages(&cli.root, &packages, channel.as_deref(), true, cli.dry_run)?;
+            sage_sys::remove_packages(&cli.root, &packages, channel.as_deref(), true, cli.dry_run)?;
         }
         Commands::Upgrade {
             packages,
@@ -193,15 +210,16 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             sync,
         } => {
             if sync {
-                sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
+                sage_sys::sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
             }
-            upgrade_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run).await?;
+            sage_sys::upgrade_packages(&cli.root, &packages, channel.as_deref(), cli.dry_run)
+                .await?;
         }
         Commands::Sync { channel } => {
-            sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
+            sage_sys::sync_channels(&cli.root, channel.as_deref(), cli.dry_run).await?;
         }
         Commands::Rebuild { no_prune } => {
-            rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
+            sage_sys::rebuild_system(&cli.root, no_prune, cli.dry_run).await?;
         }
         Commands::Repo { action } => match action {
             RepoAction::Index { dir, sign_key } => {
@@ -223,13 +241,13 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             features,
             no_default_features,
         } => {
-            build_recipe(
+            sage_build::build_recipe(
                 &cli.root,
                 &recipe_dir,
                 &features,
                 !no_default_features,
                 cli.dry_run,
-                BuildInvocation::default(),
+                sage_build::BuildInvocation::default(),
             )
             .await?;
         }
@@ -238,7 +256,7 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             output,
             jobs,
         } => {
-            mass_rebuild(
+            sage_build::mass_rebuild(
                 &cli.root,
                 &recipe_root,
                 output.as_deref(),
@@ -248,17 +266,24 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             .await?;
         }
         Commands::Bootstrap { plan, output, jobs } => {
-            bootstrap_sources(&cli.root, &plan, output.as_deref(), jobs, cli.dry_run).await?;
+            sage_build::bootstrap_sources(&cli.root, &plan, output.as_deref(), jobs, cli.dry_run)
+                .await?;
         }
         Commands::Channel { action } => match action {
-            ChannelAction::List => list_channels(&cli.root)?,
+            ChannelAction::List => sage_sys::list_channels(&cli.root)?,
         },
         Commands::Toolchain { action } => match action {
-            ToolchainAction::Use { channel } => use_toolchain(&cli.root, &channel, cli.dry_run)?,
+            ToolchainAction::Use { channel } => {
+                sage_sys::use_toolchain(&cli.root, &channel, cli.dry_run)?
+            }
         },
-        Commands::Query { action } => query_state(&cli.root, action)?,
+        Commands::Query { action } => match action {
+            QueryAction::Installed => sage_sys::query_installed(&cli.root)?,
+            QueryAction::Owner { path } => sage_sys::query_owner(&cli.root, &path)?,
+            QueryAction::Info { package, channel } => {
+                sage_sys::query_info(&cli.root, &package, &channel)?
+            }
+        },
     }
     Ok(())
 }
-include!("package_ops.rs");
-include!("build_ops.rs");

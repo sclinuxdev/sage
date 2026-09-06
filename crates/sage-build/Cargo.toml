@@ -10,6 +10,9 @@ description = "Hermetic sandbox build runner, rclass executor, payload carver, a
 [dependencies]
 sage-core = { workspace = true }
 sage-archive = { workspace = true }
+sage-sys = { workspace = true }
+sage-repo = { workspace = true }
+sage-solver = { workspace = true }
 goblin = { workspace = true }
 glob = { workspace = true }
 tempfile = { workspace = true }
@@ -18,3 +21,7 @@ toml = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+
