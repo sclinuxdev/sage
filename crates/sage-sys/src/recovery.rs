@@ -100,21 +100,77 @@ pub(crate) fn settle_journal_triggers(
     if journal.stage == "triggers" {
         crash_point(root, "triggers")?;
         TriggerEngine::execute_triggers_for(triggers, modified, root, event)?;
-        journal.advance(
-            if matches!(
-                &journal.action,
-                sage_db::JournalAction::Install {
-                    rebuild: Some(_),
-                    ..
-                }
-            ) {
-                "rebuild-removal-triggers"
-            } else {
-                "complete"
-            },
-        );
+        let next_stage = if matches!(
+            &journal.action,
+            sage_db::JournalAction::Install {
+                rebuild: Some(_),
+                ..
+            }
+        ) {
+            "rebuild-removal-triggers"
+        } else if journal.declaration.is_some() {
+            "declaration"
+        } else {
+            "complete"
+        };
+        journal.advance(next_stage);
         database.write_journal(journal)?;
         crash_point(root, "trigger-complete")?;
+    }
+    Ok(())
+}
+
+/// Applies a journaled declaration mutation after package and provider state
+/// are durable. The current bytes are checked so an administrator edit is
+/// never silently overwritten during recovery.
+fn settle_journal_declaration(
+    root: &Path,
+    database: &sage_db::SageDatabase,
+    journal: &mut sage_db::JournalRecord,
+) -> Result<()> {
+    if journal.stage != "declaration" {
+        return Ok(());
+    }
+    crash_point(root, "declaration")?;
+    if let Some(mutation) = journal.declaration.as_ref() {
+        apply_file_mutation(root, mutation)?;
+    }
+    journal.advance("complete");
+    database.write_journal(journal)?;
+    crash_point(root, "declaration-complete")?;
+    Ok(())
+}
+
+fn apply_file_mutation(root: &Path, mutation: &sage_db::FileMutation) -> Result<()> {
+    let relative = Path::new(&mutation.path);
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("unsafe declaration path {}", mutation.path);
+    }
+    let target = under_root(root, relative);
+    let current = match std::fs::read(&target) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current == mutation.next {
+        return Ok(());
+    }
+    if current != mutation.previous {
+        bail!(
+            "declaration {} changed outside Sage; refusing to overwrite",
+            mutation.path
+        );
+    }
+    match &mutation.next {
+        Some(bytes) => write_atomic_under_root(root, relative, bytes)?,
+        None => remove_file_beneath(root, &target)?,
     }
     Ok(())
 }
@@ -166,6 +222,9 @@ pub async fn settle_journals(root: &Path) -> Result<()> {
             }
             sage_db::JournalAction::Remove { .. } => {
                 resume_remove(root, &database, &mut journal)?;
+            }
+            sage_db::JournalAction::ServiceLifecycle { .. } => {
+                crate::services::resume_service_lifecycle(root, &database, &mut journal)?;
             }
         }
         eprintln!("Recovered operation {}", journal.op_id);
@@ -423,6 +482,7 @@ pub(crate) async fn resume_install(
     if let Some(work) = &rebuild {
         resume_rebuild(root, database, journal, work)?;
     }
+    settle_journal_declaration(root, database, journal)?;
     database.finish_journal(&journal.op_id)?;
     Ok(())
 }
@@ -491,6 +551,7 @@ pub(crate) fn resume_remove(
         &triggers,
         TriggerEvent::PostRemove,
     )?;
+    settle_journal_declaration(root, database, journal)?;
     database.finish_journal(&journal.op_id)?;
     Ok(())
 }
@@ -588,7 +649,11 @@ pub(crate) fn resume_rebuild(
             root,
             TriggerEvent::Rebuild,
         )?;
-        journal.advance("complete");
+        journal.advance(if journal.declaration.is_some() {
+            "declaration"
+        } else {
+            "complete"
+        });
         database.write_journal(journal)?;
         crash_point(root, "rebuild-triggers")?;
     }

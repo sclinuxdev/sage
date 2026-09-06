@@ -87,6 +87,34 @@ fn journals_survive_reopen() {
 }
 
 #[test]
+fn journals_persist_declaration_mutations_with_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = JournalRecord::new(
+        "op-declaration".into(),
+        "packages",
+        JournalAction::Remove {
+            packages: vec![],
+            modified_paths: vec![],
+            trigger_documents: vec![],
+            alternative_documents: vec![],
+        },
+    );
+    record.set_declaration(Some(FileMutation {
+        path: "etc/sage/system.toml".into(),
+        previous: Some(b"before".to_vec()),
+        next: Some(b"after".to_vec()),
+    }));
+    SageDatabase::open(dir.path())
+        .unwrap()
+        .write_journal(&record)
+        .unwrap();
+
+    let reopened = SageDatabase::open(dir.path()).unwrap();
+
+    assert_eq!(reopened.pending_journals().unwrap(), vec![record]);
+}
+
+#[test]
 fn journal_integrity_covers_identity_and_recovery_stage() {
     let action = JournalAction::Install {
         architecture: "amd64".into(),

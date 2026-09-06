@@ -17,7 +17,7 @@
 
 ---
 
-## 2. 外部生态选型表 (No Reinventing Wheels)
+## 2. Workspace 技术选型
 
 | 功能领域 | 选用 Crate / 系统工具 | 性能优势 |
 | :--- | :--- | :--- |
@@ -44,8 +44,8 @@ sage/
     ├── sage-db/                # LMDB/heed 封装 (Packages, Files, Operations)
     ├── sage-archive/           # tar.zst 流式归档与 dirfd 安全解包
     ├── sage-solver/            # PubGrub 适配、内存候选宇宙、多 Slot 求解
-    ├── sage-sys/               # 声明式 TriggerEngine, rclass Init 模板渲染, 多 Python Channel 管理
-    ├── sage-build/             # bwrap 沙箱驱动, rclass 阶段执行, wrapper 溯源
+    ├── sage-sys/               # application-service: 调和、Init 生命周期、Channel 聚合
+    ├── sage-build/             # application-service: bwrap 构建与产物编排
     ├── sage-repo/              # 软件源 LMDB 索引同步, Ed25519 验签, 分块下载
     └── sage/                   # 纯 CLI 二进制命令行入口
 ```
@@ -76,6 +76,12 @@ graph TD
     sage_db --> sage_core
 ```
 
+`sage` remains a thin CLI adapter. The package transaction, provider
+reconciliation, service lifecycle, source-build orchestration, and bootstrap
+flows intentionally live in `sage-sys` and `sage-build`, where they can share
+the transaction and recovery boundaries. This is the application-service layer
+of the workspace; a separate all-encompassing `sage-app` crate is not required.
+
 ---
 
 ## 4. 模块规模参考
@@ -86,8 +92,8 @@ graph TD
 | `sage-db` | ~1,100 | `heed` mmap 点查、Bincode 解码、多 Channel 隔离与前向恢复 |
 | `sage-archive` | ~800 | dirfd 防逃逸、单流 Zstd 解压、`files.idx` 校验 |
 | `sage-solver` | ~900 | PubGrub 适配、架构预筛、provider 回溯、Slot 正交求解 |
-| `sage-sys` | ~1,600 | 声明式 Glob 触发器、`rclass` Init 模板渲染、多 Python Channel 管理、Rebuild 调和 |
-| `sage-build` | ~1,700 | `bwrap` 沙箱、features、临时构建依赖、交叉工具链、产物切分与 ELF 扫描 |
+| `sage-sys` | ~1,600 | 系统 application-service：声明式 Glob 触发器、`rclass` Init 生命周期、多 Python Channel、Rebuild 调和 |
+| `sage-build` | ~1,700 | 构建 application-service：`bwrap` 沙箱、features、临时构建依赖、交叉工具链、产物切分与 ELF 扫描 |
 | `sage-repo` | ~600 | LMDB 索引下载解压与 Ed25519 验签、HTTP Range 多分块并发下载 |
 | `sage` (CLI) | ~500 | `clap` 命令行解析、`indicatif` 进度渲染与输出 |
 | **总计** | — | **全链路 LMDB、零硬编码、紧凑实现、极高性能** |

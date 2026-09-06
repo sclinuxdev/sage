@@ -450,16 +450,51 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             .unwrap()
             .contains("app:1")
     );
+    inject(root.path(), "declaration");
+    assert!(
+        execute(cli(
+            root.path(),
+            Commands::Install {
+                packages: vec!["app:1".into(), "app:2".into()],
+                channel: None,
+                no_save: false,
+            },
+        ))
+        .await
+        .is_err()
+    );
+    assert!(
+        !std::fs::read_to_string(root.path().join("etc/sage/system.toml"))
+            .unwrap()
+            .contains("app:1")
+    );
     execute(cli(
         root.path(),
         Commands::Install {
             packages: vec!["app:1".into(), "app:2".into()],
+            channel: None,
+            no_save: true,
+        },
+    ))
+    .await
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(root.path().join("etc/sage/system.toml"))
+            .unwrap()
+            .contains("app:1")
+    );
+    execute(cli(
+        root.path(),
+        Commands::Install {
+            packages: vec!["app:1".into()],
             channel: None,
             no_save: false,
         },
     ))
     .await
     .unwrap();
+    let toml = std::fs::read_to_string(root.path().join("etc/sage/system.toml")).unwrap();
+    assert_eq!(toml.matches("app:1").count(), 1);
     execute(cli(
         root.path(),
         Commands::Query {

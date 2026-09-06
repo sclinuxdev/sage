@@ -80,8 +80,22 @@ Provider commands must be retry-safe: process termination can occur between an
 external command's success and its durable checkpoint. Static executable checks
 do not prove that an arbitrary compiler, validator, or runtime dependency will
 succeed. A runtime error leaves the journal pending for forward recovery; it does
-not claim that the rebuild completed. No legacy journal or rendered-state
-migration is provided by the 0.4 implementation.
+not claim that the rebuild completed.
+
+Interactive `service enable`, `service disable`, and `service adopt` transitions
+use the same forward-recovery rule. The journal captures the service, active
+generator, and exact before/after bytes for `services.toml` and rendered state
+before the provider is changed. Declaration publication is idempotent, so a
+write failure or interruption after the provider succeeds is completed by the
+next mutating command instead of leaving permanent provider/declaration drift.
+Provider state queries (`is_enabled_cmd`) require an explicitly distinguishable
+disabled result (exit code 1) before skipping disable actions; query failures
+(non-zero error exit codes or execution errors) leave the journal pending to
+guarantee that managed-disabled declarations are never published while external
+service state remains ambiguous or active. Preview operations (`--dry-run`) validate
+this read-only query during `service enable` whenever the existing native definition
+permits it (and unconditionally during `service disable` and `service adopt`),
+ensuring query errors are surfaced before mutating state or persisting journals.
 
 ---
 
@@ -100,7 +114,7 @@ $$\text{Actual Init State} = \text{Sage Managed State} + \text{Administrator Man
    - Sage 负责渲染配置并调用 Init Provider 的 `enable_cmd`，保证开机自启。
 2. **`managed-disabled`**：
    - 在 `/etc/sage/services.toml` 的 `disabled` 中声明，或曾记录在 `var/lib/sage/rendered-services.toml` 的 `enabled` 集合中但在重配置后被移除。
-   - Sage 负责调用 Init Provider 的 `disable_cmd`，保证处于非激活状态。
+   - Sage 负责在显式禁用操作中调用 Init Provider 的 `disable_cmd`。如果管理员随后在 Sage 外部启用它，Sage 报告 `managed-disabled (drift)`，但不会自动撤销管理员状态。
 3. **`unmanaged`**：
    - 从未被 Sage 接管或声明。
    - Sage 绝对不擅自执行 `disable`。若管理员在外部执行了 `systemctl enable`，Sage 在调和时予以保留，绝不破坏管理员的手工操作。
@@ -110,19 +124,23 @@ Init Provider 的 `rclass/init-*.toml` 可声明 `is_enabled_cmd`：
 ```toml
 is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.service"
 ```
-在 `sage rebuild` 时，若发现已安装包中的某服务在底层 Init 中处于 `enabled` 状态，但属于 Sage 的 `unmanaged` 集合，Sage 将输出漂移警告与处理建议（不中断构建也不强制禁用）：
+`is_enabled_cmd` 的退出码语义遵循明确约定：
+- `0`：服务处于启用状态（enabled）；
+- `1`：服务明确处于禁用状态（disabled）；
+- 其他非零退出码或执行异常：表示查询命令内部故障或异常，生命周期事务将挂起 journal，拒绝假定服务已禁用。
+
+在 `sage rebuild` 时，若发现已安装包中的某服务在底层 Init 中处于 `enabled` 状态，但属于 Sage 的 `unmanaged` 或 `managed-disabled` 集合，Sage 将输出漂移警告与处理建议（不中断构建也不强制禁用）：
 ```text
 warning: service 'sshd' is enabled outside Sage
          systemd: enabled
          services.toml: unmanaged
 Hint:
   sage service adopt sshd
-  systemctl disable sshd
+  no automatic provider state change was made
 ```
 
 ### 3.4 交互管理命令 (`sage service`)
 - `sage service enable <svc>`：将服务写入 `services.toml`（`enabled`），并立即调用底层 Init Provider 激活。
 - `sage service disable <svc>`：从 `enabled` 移除并记录入 `disabled`，调用底层 Init Provider 禁用。
 - `sage service adopt <svc>`：将管理员外部手工启用的服务平滑纳管至 Sage 声明式配置中（转为 `managed-enabled`）。
-- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`unmanaged`、`unmanaged (drift)`）。
-
+- `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。对尚未渲染原生单元定义（如刚安装包但尚未 `sage rebuild`）或查询状态不确定的服务，以声明状态与未知/未接管状态安全呈现，不中断只读查询。

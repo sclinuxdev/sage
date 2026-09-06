@@ -2,7 +2,7 @@
 
 - **文件路径**: `/etc/sage/system.toml`
 - **Schema 版本**: `1`
-- **设计目标**: 定义目标 Linux 系统的最终期望状态，作为 `sage rebuild` 状态调和的唯一真相源。
+- **设计目标**: 定义目标 Linux 系统的软件包与 provider 期望状态，作为 `sage rebuild` 包调和的声明源；服务激活状态由独立的 `/etc/sage/services.toml` 定义。
 
 ---
 

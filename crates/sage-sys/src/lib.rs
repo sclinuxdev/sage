@@ -52,6 +52,8 @@ pub(crate) static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 pub enum SysError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("database error: {0}")]
+    Database(#[from] sage_db::DbError),
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
     #[error("unsupported schema version {0}")]
