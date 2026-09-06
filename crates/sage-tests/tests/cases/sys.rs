@@ -403,6 +403,17 @@ fn standard_trigger_library_is_valid_and_unique() {
 }
 
 #[test]
+fn standard_init_rclasses_are_valid() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass");
+    for name in ["init-loom.toml", "init-systemd.toml"] {
+        let path = directory.join(name);
+        let generator = TemplateServiceGenerator::from_rclass(&path).unwrap();
+        assert!(!generator.target_path_template.is_empty());
+        assert!(!generator.template.is_empty());
+    }
+}
+
+#[test]
 fn service_template_renders_atomically() {
     let root = tempfile::tempdir().unwrap();
     let generator = TemplateServiceGenerator {

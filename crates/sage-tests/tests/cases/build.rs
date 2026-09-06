@@ -131,6 +131,8 @@ fn mainstream_rclasses_expand_for_native_builds() {
         "gcc",
         "rust-bin",
         "kernel",
+        "custom",
+        "kmod",
     ] {
         let class = Rclass::load(
             Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../rclass/{name}.toml")),
