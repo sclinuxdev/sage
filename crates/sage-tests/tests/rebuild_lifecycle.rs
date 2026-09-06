@@ -33,7 +33,7 @@ fn provider(name: &str, slot: &str, generation: &str) -> PackageSpec {
     package.files.insert(
         program.clone(),
         format!(
-            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable)\n  test ! -f \"$root/var/lib/sage/fail-enable\"\n  printf enabled > \"$marker\"\n  ;;\nis-enabled) test -f \"$marker\" ;;\ndisable)\n  test ! -f \"$root/var/lib/sage/fail-disable\"\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
+            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable)\n  test ! -f \"$root/var/lib/sage/fail-enable\"\n  printf enabled > \"$marker\"\n  ;;\nis-enabled)\n  if test -f \"$root/var/lib/sage/fail-is-enabled\"; then\n    exit 2\n  fi\n  test -f \"$marker\"\n  ;;\ndisable)\n  test ! -f \"$root/var/lib/sage/fail-disable\"\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
         )
         .into_bytes(),
     );
@@ -1357,6 +1357,76 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
     assert!(!config.enabled.contains("daemon"));
     assert!(config.disabled.contains("daemon"));
     assert!(!lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+}
+
+#[tokio::test]
+async fn state_query_failure_when_disabling_service_leaves_journal_pending_and_preserves_declarations()
+ {
+    let lab = initial_system().await;
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
+
+    let dry_run_error = sage_sys::service_disable(lab.root(), "daemon", true).unwrap_err();
+    assert!(dry_run_error.to_string().contains("exited with"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+
+    let error = sage_sys::service_disable(lab.root(), "daemon", false).unwrap_err();
+    assert!(error.to_string().contains("exited with"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let pending = database.pending_journals().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].stage, "provider");
+    drop(database);
+
+    fs::remove_file(lab.root().join("var/lib/sage/fail-is-enabled")).unwrap();
+
+    sage_sys::settle_journals(lab.root()).await.unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(!config.enabled.contains("daemon"));
+    assert!(config.disabled.contains("daemon"));
+    assert!(!lab.root().join("var/lib/sage/enabled-old-daemon").exists());
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn state_query_failure_when_adopting_service_fails_loudly_without_claiming_not_enabled() {
+    let lab = initial_system().await;
+    let marker = lab.root().join("var/lib/sage/enabled-old-inactive");
+    fs::write(&marker, b"enabled").unwrap();
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+    fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
+
+    let dry_run_error = sage_sys::service_adopt(lab.root(), "inactive", true).unwrap_err();
+    assert!(dry_run_error.to_string().contains("exited with"));
+    assert!(!dry_run_error.to_string().contains("not externally enabled"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    let error = sage_sys::service_adopt(lab.root(), "inactive", false).unwrap_err();
+    assert!(error.to_string().contains("exited with"));
+    assert!(!error.to_string().contains("not externally enabled"));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    drop(database);
+
+    fs::remove_file(lab.root().join("var/lib/sage/fail-is-enabled")).unwrap();
+
+    sage_sys::service_adopt(lab.root(), "inactive", false).unwrap();
+
+    let config = sage_sys::ServicesConfig::load(config_path).unwrap();
+    assert!(config.enabled.contains("inactive"));
+    assert!(!config.disabled.contains("inactive"));
+    assert!(marker.exists());
 }
 
 #[tokio::test]

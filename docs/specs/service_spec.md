@@ -88,6 +88,11 @@ generator, and exact before/after bytes for `services.toml` and rendered state
 before the provider is changed. Declaration publication is idempotent, so a
 write failure or interruption after the provider succeeds is completed by the
 next mutating command instead of leaving permanent provider/declaration drift.
+Provider state queries (`is_enabled_cmd`) require an explicitly distinguishable
+disabled result (exit code 1) before skipping disable actions; query failures
+(non-zero error exit codes or execution errors) leave the journal pending to
+guarantee that managed-disabled declarations are never published while external
+service state remains ambiguous or active.
 
 ---
 
@@ -116,6 +121,11 @@ Init Provider 的 `rclass/init-*.toml` 可声明 `is_enabled_cmd`：
 ```toml
 is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.service"
 ```
+`is_enabled_cmd` 的退出码语义遵循明确约定：
+- `0`：服务处于启用状态（enabled）；
+- `1`：服务明确处于禁用状态（disabled）；
+- 其他非零退出码或执行异常：表示查询命令内部故障或异常，生命周期事务将挂起 journal，拒绝假定服务已禁用。
+
 在 `sage rebuild` 时，若发现已安装包中的某服务在底层 Init 中处于 `enabled` 状态，但属于 Sage 的 `unmanaged` 或 `managed-disabled` 集合，Sage 将输出漂移警告与处理建议（不中断构建也不强制禁用）：
 ```text
 warning: service 'sshd' is enabled outside Sage

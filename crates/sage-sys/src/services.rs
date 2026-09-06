@@ -719,8 +719,12 @@ impl TemplateServiceGenerator {
     }
 
     /// Checks whether a service is enabled in the host init system.
-    /// Returns `Ok(Some(true))` if enabled, `Ok(Some(false))` if disabled,
-    /// or `Ok(None)` if no check command is declared or executable is missing.
+    ///
+    /// Returns `Ok(Some(true))` if the provider reports the service enabled (exit status 0),
+    /// `Ok(Some(false))` if the provider explicitly reports the service disabled (exit status 1),
+    /// or `Ok(None)` if no check command is declared or the executable is missing.
+    /// Any other non-zero exit status or execution error is returned as an error to preserve query
+    /// failures and avoid misinterpreting them as a disabled service state.
     pub fn is_service_enabled(
         &self,
         service: &ServiceSpec,
@@ -735,24 +739,12 @@ impl TemplateServiceGenerator {
         let Some(program_str) = words.next() else {
             return Ok(None);
         };
-        let program = match target_path(sysroot, Path::new(program_str)) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
+        let program = target_path(sysroot, Path::new(program_str))?;
         if !program.exists() {
             return Ok(None);
         }
-        let root = match fs::canonicalize(sysroot) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        let resolved = match fs::canonicalize(&program) {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
-        if !resolved.starts_with(&root) {
-            return Ok(None);
-        }
+        ensure_existing_beneath(sysroot, &program)?;
+        let resolved = fs::canonicalize(&program)?;
         let status = Command::new(&resolved)
             .args(words)
             .env_clear()
@@ -760,10 +752,14 @@ impl TemplateServiceGenerator {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .status();
-        match status {
-            Ok(status) => Ok(Some(status.success())),
-            Err(_) => Ok(None),
+            .status()?;
+        match status.code() {
+            Some(0) => Ok(Some(true)),
+            Some(1) => Ok(Some(false)),
+            _ => Err(SysError::Trigger {
+                name: format!("is-enabled for '{}'", service.name),
+                status,
+            }),
         }
     }
 
@@ -1510,8 +1506,17 @@ pub(crate) fn resume_service_lifecycle(
                 }
             }
             sage_db::ServiceProviderAction::Disable => {
-                if generator.is_service_enabled(&service, root)? != Some(false) {
-                    generator.disable_service(&service, root)?;
+                // When the init provider explicitly reports that the service is disabled
+                // (exit status 1), the provider disable action can be skipped safely.
+                // If the provider query is not available (None) or reports enabled (Some(true)),
+                // execute the retry-safe disable command. Any query error leaves the journal
+                // pending so that we never publish a managed-disabled declaration while the
+                // service may still remain active.
+                match generator.is_service_enabled(&service, root)? {
+                    Some(false) => {}
+                    Some(true) | None => {
+                        generator.disable_service(&service, root)?;
+                    }
                 }
             }
             sage_db::ServiceProviderAction::Adopt => {
