@@ -31,17 +31,17 @@
 
 | Crate | 路径 | 核心职责 | 对应模块文档 |
 | :--- | :--- | :--- | :--- |
-| **`sage`** | `crates/sage` | 极速 CLI 命令行前端 (Clap) | [frontend.md](file:///home/ir/sage/docs/modules/frontend.md) |
-| **`sage-core`** | `crates/sage-core` | 版本代数 (Epoch-Ver-Rel)、Slot 模型、Schema 定义、共享锁 | [core.md](file:///home/ir/sage/docs/modules/core.md) |
-| **`sage-db`** | `crates/sage-db` | LMDB 状态存储、Slot 所有权追踪、事务崩溃恢复日志 | [db.md](file:///home/ir/sage/docs/modules/db.md) |
-| **`sage-archive`** | `crates/sage-archive` | 流式 `tar.zst` 读写、`openat` 安全解包、`reflink` 零拷贝写出 | [archive.md](file:///home/ir/sage/docs/modules/archive.md) |
-| **`sage-solver`** | `crates/sage-solver` | PubGrub 依赖求解器适配、LMDB 索引零拷贝点查、因果诊断 | [solver.md](file:///home/ir/sage/docs/modules/solver.md) |
-| **`sage-sys`** | `crates/sage-sys` | Channel 聚合 (含 Python Channel)、系统调和 (Rebuild)、Init 服务 | [sys.md](file:///home/ir/sage/docs/modules/sys.md) |
-| **`sage-build`** | `crates/sage-build` | `bwrap` 密闭沙箱、`rclass` 阶段执行、工具链审计、ELF 扫描 | [build.md](file:///home/ir/sage/docs/modules/build.md) |
-| **`sage-repo`** | `crates/sage-repo` | 软件源 LMDB 索引同步、Ed25519 签名验证、分块下载 | [repo.md](file:///home/ir/sage/docs/modules/repo.md) |
-| **`sage-tests`** | `crates/sage-tests` | 统一集成测试与 Torture Lab（状态一致性、崩溃恢复、确定性随机压测） | [TORTURE_LAB.md](file:///home/ir/sage/docs/TORTURE_LAB.md) |
+| **`sage`** | `crates/sage` | 极速 CLI 命令行前端 (Clap) | [frontend.md](docs/modules/frontend.md) |
+| **`sage-core`** | `crates/sage-core` | 版本代数 (Epoch-Ver-Rel)、Slot 模型、Schema 定义、共享锁 | [core.md](docs/modules/core.md) |
+| **`sage-db`** | `crates/sage-db` | LMDB 状态存储、Slot 所有权追踪、事务崩溃恢复日志 | [db.md](docs/modules/db.md) |
+| **`sage-archive`** | `crates/sage-archive` | 流式 `tar.zst` 读写、`openat` 安全解包、`reflink` 零拷贝写出 | [archive.md](docs/modules/archive.md) |
+| **`sage-solver`** | `crates/sage-solver` | PubGrub 依赖求解器适配、LMDB 索引零拷贝点查、因果诊断 | [solver.md](docs/modules/solver.md) |
+| **`sage-sys`** | `crates/sage-sys` | Channel 聚合 (含 Python Channel)、系统调和 (Rebuild)、Init 服务 | [sys.md](docs/modules/sys.md) |
+| **`sage-build`** | `crates/sage-build` | `bwrap` 密闭沙箱、`rclass` 阶段执行、工具链审计、ELF 扫描 | [build.md](docs/modules/build.md) |
+| **`sage-repo`** | `crates/sage-repo` | 软件源 LMDB 索引同步、Ed25519 签名验证、分块下载 | [repo.md](docs/modules/repo.md) |
+| **`sage-tests`** | `crates/sage-tests` | 统一集成测试与 Torture Lab（状态一致性、崩溃恢复、确定性随机压测） | [TORTURE_LAB.md](docs/TORTURE_LAB.md) |
 
-架构设计总览：[ARCHITECTURE.md](file:///home/ir/sage/docs/ARCHITECTURE.md)
+架构设计总览：[ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ---
 
@@ -49,19 +49,19 @@
 
 | 规范对象 | 对应文件 / 路径 | 规范文档 |
 | :--- | :--- | :--- |
-| **声明式系统配置** | `/etc/sage/system.toml` | [system_spec.md](file:///home/ir/sage/docs/specs/system_spec.md) |
-| **声明式服务配置** | `/etc/sage/services.toml` | [system_spec.md](file:///home/ir/sage/docs/specs/system_spec.md) |
-| **通道源配置** | `/etc/sage/channels.toml` | [channels_spec.md](file:///home/ir/sage/docs/specs/channels_spec.md) |
-| **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](file:///home/ir/sage/docs/specs/build_config_spec.md) |
-| **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](file:///home/ir/sage/docs/specs/bootstrap_spec.md) |
-| **包配方格式与单配方多包** | `recipes/.../recipe.toml` | [recipe_spec.md](file:///home/ir/sage/docs/specs/recipe_spec.md) |
-| **配方目录树与分类体系** | `recipes/<category>/<pkg>/...` | [recipe_tree_spec.md](file:///home/ir/sage/docs/specs/recipe_tree_spec.md) |
-| **构建类继承规范** | `rclass/*.toml` (如 `cmake.toml`, `cargo.toml`) | [rclass_spec.md](file:///home/ir/sage/docs/specs/rclass_spec.md) |
-| **通用守护进程服务** | `.METADATA/service.toml` | [service_spec.md](file:///home/ir/sage/docs/specs/service_spec.md) |
-| **触发器与替代项** | `.METADATA/triggers.toml` / sysusers / alternatives | [triggers_spec.md](file:///home/ir/sage/docs/specs/triggers_spec.md) |
-| **二进制包归档格式** | `*.pkg.tar.zst` (`manifest.toml`, `files.idx`) | [package_archive_spec.md](file:///home/ir/sage/docs/specs/package_archive_spec.md) |
-| **软件源远端 LMDB 索引** | `index.mdb.zst` & `index.mdb.sig` | [repo_index_spec.md](file:///home/ir/sage/docs/specs/repo_index_spec.md) |
-| **极限压测与状态一致性验证** | `docs/TORTURE_LAB.md` | [TORTURE_LAB.md](file:///home/ir/sage/docs/TORTURE_LAB.md) |
+| **声明式系统配置** | `/etc/sage/system.toml` | [system_spec.md](docs/specs/system_spec.md) |
+| **声明式服务配置** | `/etc/sage/services.toml` | [system_spec.md](docs/specs/system_spec.md) |
+| **通道源配置** | `/etc/sage/channels.toml` | [channels_spec.md](docs/specs/channels_spec.md) |
+| **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](docs/specs/build_config_spec.md) |
+| **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](docs/specs/bootstrap_spec.md) |
+| **包配方格式与单配方多包** | `recipes/.../recipe.toml` | [recipe_spec.md](docs/specs/recipe_spec.md) |
+| **配方目录树与分类体系** | `recipes/<category>/<pkg>/...` | [recipe_tree_spec.md](docs/specs/recipe_tree_spec.md) |
+| **构建类继承规范** | `rclass/*.toml` (如 `cmake.toml`, `cargo.toml`) | [rclass_spec.md](docs/specs/rclass_spec.md) |
+| **通用守护进程服务** | `.METADATA/service.toml` | [service_spec.md](docs/specs/service_spec.md) |
+| **触发器与替代项** | `.METADATA/triggers.toml` / sysusers / alternatives | [triggers_spec.md](docs/specs/triggers_spec.md) |
+| **二进制包归档格式** | `*.pkg.tar.zst` (`manifest.toml`, `files.idx`) | [package_archive_spec.md](docs/specs/package_archive_spec.md) |
+| **软件源远端 LMDB 索引** | `index.mdb.zst` & `index.mdb.sig` | [repo_index_spec.md](docs/specs/repo_index_spec.md) |
+| **极限压测与状态一致性验证** | `docs/TORTURE_LAB.md` | [TORTURE_LAB.md](docs/TORTURE_LAB.md) |
 
 ---
 
