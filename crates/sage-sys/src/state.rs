@@ -1,3 +1,14 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+use serde::{Deserialize, Serialize};
+
+use crate::services::{ensure_directory_beneath, target_path, valid_declaration_name};
+use crate::{SysError, TEMP_ID, validate_schema};
+
 /// Desired system state from `/etc/sage/system.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemConfig {
@@ -54,7 +65,7 @@ impl SystemConfig {
 
 /// Restores a configured or persisted binding key to its solver symbol. Virtual
 /// bindings use short keys in the state table; shared-library symbols stay exact.
-fn provider_symbol(interface: &str) -> String {
+pub fn provider_symbol(interface: &str) -> String {
     if interface.starts_with("virtual/") || interface.starts_with("so:") {
         interface.to_owned()
     } else {

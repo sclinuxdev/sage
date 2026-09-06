@@ -1,3 +1,5 @@
+use super::*;
+
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -293,27 +295,26 @@ impl BuildUnit {
             &recipe.package.name,
             &recipe.package.slot,
         )]);
-        packages.extend(
+        packages.extend(recipe.subpackages.iter().map(|package| {
+            sage_core::PackageKey::new(
+                package
+                    .channel
+                    .as_deref()
+                    .unwrap_or(&recipe.package.channel),
+                &package.name,
+                package.slot.as_deref().unwrap_or(&recipe.package.slot),
+            )
+        }));
+        let mut produces: BTreeSet<_> =
+            packages.iter().cloned().map(BuildSymbol::Package).collect();
+        produces.extend(
             recipe
-                .subpackages
+                .package
+                .provides
                 .iter()
-                .map(|package| {
-                    sage_core::PackageKey::new(
-                        package
-                            .channel
-                            .as_deref()
-                            .unwrap_or(&recipe.package.channel),
-                        &package.name,
-                        package.slot.as_deref().unwrap_or(&recipe.package.slot),
-                    )
-                }),
+                .cloned()
+                .map(BuildSymbol::Provided),
         );
-        let mut produces: BTreeSet<_> = packages
-            .iter()
-            .cloned()
-            .map(BuildSymbol::Package)
-            .collect();
-        produces.extend(recipe.package.provides.iter().cloned().map(BuildSymbol::Provided));
         for package in &recipe.subpackages {
             produces.extend(package.provides.iter().cloned().map(BuildSymbol::Provided));
         }
@@ -394,7 +395,10 @@ fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildS
         BuildSymbol::Package(sage_core::PackageKey::new(
             dependency.channel.as_deref().unwrap_or(channel),
             dependency.name,
-            dependency.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT),
+            dependency
+                .slot
+                .as_deref()
+                .unwrap_or(sage_core::DEFAULT_SLOT),
         ))
     }
 }
@@ -680,8 +684,7 @@ impl RecipeSpec {
             if subpackage.slot.as_deref().is_some_and(|slot| {
                 slot.is_empty()
                     || !slot.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
                     })
             }) {
                 return Err(BuildError::InvalidSpec(
@@ -920,9 +923,9 @@ fn copy_install_entry(source: &Path, target: &Path) -> Result<(), BuildError> {
         if metadata.file_type().is_symlink() {
             let link = fs::read_link(source)?;
             if link.is_absolute()
-                || link.components().any(|component| {
-                    matches!(component, std::path::Component::ParentDir)
-                })
+                || link
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
             {
                 return Err(BuildError::InvalidSpec(format!(
                     "unsafe symlink in declarative copy: {} -> {}",

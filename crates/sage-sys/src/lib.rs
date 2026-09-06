@@ -1,15 +1,25 @@
 //! Declarative triggers, init-template rendering, profiles, and reconciliation models.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use thiserror::Error;
 
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+pub mod channel;
+pub mod query;
+pub mod recovery;
+pub mod services;
+pub mod state;
+pub mod transaction;
+pub mod triggers;
+
+pub use channel::*;
+pub use query::*;
+pub use recovery::*;
+pub use services::*;
+pub use state::*;
+pub use transaction::*;
+pub use triggers::*;
+
+pub(crate) static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// System orchestration failures.
 #[derive(Debug, Error)]
@@ -33,19 +43,10 @@ pub enum SysError {
     Solver(#[from] sage_solver::SolverError),
 }
 
-use anyhow::{Context, Result, bail};
-use sage_core::hex;
-use sha2::{Digest, Sha256};
-
-fn validate_schema(version: u32) -> Result<(), SysError> {
+pub(crate) fn validate_schema(version: u32) -> Result<(), SysError> {
     if version == sage_core::SCHEMA_VERSION {
         Ok(())
     } else {
         Err(SysError::Schema(version))
     }
 }
-
-include!("triggers.rs");
-include!("services.rs");
-include!("state.rs");
-include!("packages.rs");

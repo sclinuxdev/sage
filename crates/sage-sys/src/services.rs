@@ -1,3 +1,14 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{SysError, TEMP_ID, validate_schema};
+
 /// Init-independent daemon declaration carried by a package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,7 +272,7 @@ impl ServiceDocument {
     }
 }
 
-fn valid_declaration_name(name: &str) -> bool {
+pub(crate) fn valid_declaration_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -959,7 +970,7 @@ fn expand_template(
     Ok(output)
 }
 
-fn target_path(sysroot: &Path, declared: &Path) -> Result<PathBuf, SysError> {
+pub(crate) fn target_path(sysroot: &Path, declared: &Path) -> Result<PathBuf, SysError> {
     let mut relative = PathBuf::new();
     for component in declared.components() {
         match component {
@@ -1033,7 +1044,7 @@ fn run_argv_template(
     }
 }
 
-fn ensure_directory_beneath(sysroot: &Path, directory: &Path) -> Result<(), SysError> {
+pub(crate) fn ensure_directory_beneath(sysroot: &Path, directory: &Path) -> Result<(), SysError> {
     let relative = directory
         .strip_prefix(sysroot)
         .map_err(|_| SysError::Invalid(format!("path escapes sysroot: {}", directory.display())))?;
@@ -1061,7 +1072,7 @@ fn ensure_directory_beneath(sysroot: &Path, directory: &Path) -> Result<(), SysE
     Ok(())
 }
 
-fn ensure_existing_beneath(sysroot: &Path, path: &Path) -> Result<(), SysError> {
+pub(crate) fn ensure_existing_beneath(sysroot: &Path, path: &Path) -> Result<(), SysError> {
     let root = fs::canonicalize(sysroot)?;
     let resolved = fs::canonicalize(path)?;
     if resolved.starts_with(root) {

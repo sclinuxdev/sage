@@ -1,3 +1,4 @@
+use super::*;
 use crate as sage_build;
 use sage_core::under_root;
 use sage_repo::ReleaseLocation;
@@ -71,8 +72,10 @@ fn subpackage_channel_slot<'a>(
 ) -> (&'a str, &'a str) {
     let sub = recipe.subpackages.iter().find(|s| s.name == name);
     (
-        sub.and_then(|s| s.channel.as_deref()).unwrap_or(&recipe.package.channel),
-        sub.and_then(|s| s.slot.as_deref()).unwrap_or(&recipe.package.slot),
+        sub.and_then(|s| s.channel.as_deref())
+            .unwrap_or(&recipe.package.channel),
+        sub.and_then(|s| s.slot.as_deref())
+            .unwrap_or(&recipe.package.slot),
     )
 }
 
@@ -262,8 +265,9 @@ async fn execute_source_layers(
                             .join(&inspection.manifest.slot)
                             .join(file_name);
                         if let Some(parent) = target.parent() {
-                            std::fs::create_dir_all(parent)
-                                .with_context(|| format!("failed to create destination {}", parent.display()))?;
+                            std::fs::create_dir_all(parent).with_context(|| {
+                                format!("failed to create destination {}", parent.display())
+                            })?;
                         }
                         std::fs::rename(&artifact, &target)
                             .with_context(|| format!("failed to publish {}", artifact.display()))?;
@@ -286,10 +290,7 @@ async fn execute_source_layers(
         }
     }
     if failure_report.exists() {
-        bail!(
-            "source build failed; review {}",
-            failure_report.display()
-        );
+        bail!("source build failed; review {}", failure_report.display());
     }
     Ok(())
 }
@@ -705,7 +706,8 @@ async fn prepare_package_tree(
         })?;
         for record in &inspection.files {
             if record.path != Path::new("usr/share/info/dir")
-                && let Some(owner) = owned.insert(record.path.clone(), (key.clone(), version.clone()))
+                && let Some(owner) =
+                    owned.insert(record.path.clone(), (key.clone(), version.clone()))
             {
                 bail!(
                     "build dependency file conflict at {} between {} and {}",
@@ -784,9 +786,18 @@ fn build_variables(
         ("BUILD_TRIPLE".into(), config.build.clone()),
         ("CC_FAMILY".into(), sage_build::tool_family(compiler)),
         ("TARGET_TRIPLE".into(), recipe.build.target.clone()),
-        ("TARGET_ARCH".into(), target.map(|t| t.arch.clone()).unwrap_or_default()),
-        ("TARGET_ENDIAN".into(), target.map(|t| t.endian.clone()).unwrap_or_default()),
-        ("GOOS".into(), target.map(|t| t.goos.clone()).unwrap_or_default()),
+        (
+            "TARGET_ARCH".into(),
+            target.map(|t| t.arch.clone()).unwrap_or_default(),
+        ),
+        (
+            "TARGET_ENDIAN".into(),
+            target.map(|t| t.endian.clone()).unwrap_or_default(),
+        ),
+        (
+            "GOOS".into(),
+            target.map(|t| t.goos.clone()).unwrap_or_default(),
+        ),
     ]);
     variables.extend(
         recipe
@@ -814,20 +825,8 @@ fn package_staging(
     std::fs::create_dir(&metadata)?;
     stage_declarative_metadata(recipe_dir, &metadata, &area.name, &recipe.package.name)?;
     let (package_channel, package_slot) = subpackage_channel_slot(recipe, &area.name);
-    stage_alternatives(
-        recipe,
-        &metadata,
-        &area.name,
-        package_channel,
-        package_slot,
-    )?;
-    stage_sysusers(
-        recipe,
-        &metadata,
-        &area.name,
-        package_channel,
-        package_slot,
-    )?;
+    stage_alternatives(recipe, &metadata, &area.name, package_channel, package_slot)?;
+    stage_sysusers(recipe, &metadata, &area.name, package_channel, package_slot)?;
     std::fs::write(
         metadata.join("files.idx"),
         sage_archive::format_file_index(&records),
@@ -882,10 +881,7 @@ fn package_staging(
     )?;
     let output = output_dir.join(format!(
         "{}-{}-{}-{}.pkg.tar.zst",
-        area.name,
-        recipe.package.version,
-        recipe.package.release,
-        recipe.package.arch
+        area.name, recipe.package.version, recipe.package.release, recipe.package.arch
     ));
     if output.exists() {
         bail!(

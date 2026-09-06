@@ -1,3 +1,5 @@
+use super::*;
+
 /// One mutually exclusive package tree carved from a shared DESTDIR.
 pub struct PackageStagingArea {
     pub name: String,
@@ -236,7 +238,10 @@ impl<'a> ElfBinary<'a> {
 
         for i in 0..e_phnum {
             let ph_offset = e_phoff
-                .checked_add(i.checked_mul(e_phentsize).ok_or("overflow in program header offset")?)
+                .checked_add(
+                    i.checked_mul(e_phentsize)
+                        .ok_or("overflow in program header offset")?,
+                )
                 .ok_or("overflow in program header offset")?;
 
             let (p_type, p_offset, p_vaddr, p_filesz) = if is_64 {
@@ -273,7 +278,10 @@ impl<'a> ElfBinary<'a> {
             return Ok(Some(Self::default()));
         };
 
-        if dyn_offset.checked_add(dyn_filesz).is_none_or(|end| end > bytes.len()) {
+        if dyn_offset
+            .checked_add(dyn_filesz)
+            .is_none_or(|end| end > bytes.len())
+        {
             return Err("truncated dynamic section".into());
         }
 

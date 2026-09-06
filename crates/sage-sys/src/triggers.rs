@@ -1,3 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::{Deserialize, Serialize};
+
+use crate::services::{ensure_existing_beneath, target_path, valid_declaration_name};
+use crate::{SysError, validate_schema};
+
 /// One data-driven command activated by changed path globs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerSpec {

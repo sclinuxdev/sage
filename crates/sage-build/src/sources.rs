@@ -1,5 +1,7 @@
+use super::*;
+
 impl SourceSpec {
-    fn validate(&self) -> Result<(), BuildError> {
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
         match self.kind {
             SourceKind::Archive => {
                 if self.sha256.len() != 64
@@ -169,7 +171,7 @@ pub fn export_git_tree(checkout: &Path, destination: &Path) -> Result<(), BuildE
     Ok(())
 }
 
-fn valid_feature_name(name: &str) -> bool {
+pub(crate) fn valid_feature_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
@@ -181,7 +183,7 @@ pub fn source_archive_name(index: usize) -> String {
     format!("{index:03}-source")
 }
 
-fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
+pub(crate) fn validate_source_destination(path: &Path) -> Result<(), BuildError> {
     let valid = !path.as_os_str().is_empty()
         && path.components().all(|component| {
             matches!(

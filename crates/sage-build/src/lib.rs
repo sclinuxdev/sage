@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use thiserror::Error;
 
-const PHASE_ORDER: &[&str] = &[
+pub(crate) const PHASE_ORDER: &[&str] = &[
     "src_unpack",
     "src_prepare",
     "src_configure",
@@ -49,11 +49,25 @@ pub enum BuildError {
     },
 }
 
-use anyhow::{Context, Result, bail};
-use sage_core::{glob, walkdir};
+pub use anyhow::{Context, Result, bail};
+pub use sage_core::{glob, walkdir};
 
-include!("recipe.rs");
-include!("sources.rs");
-include!("execution.rs");
-include!("payload.rs");
-include!("operations.rs");
+pub mod execution;
+pub mod operations;
+pub mod payload;
+pub mod recipe;
+pub mod sources;
+
+pub use execution::*;
+pub use operations::*;
+pub use payload::*;
+pub use recipe::*;
+pub use sources::*;
+
+pub(crate) fn validate_schema(version: u32) -> Result<(), BuildError> {
+    if version == sage_core::SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(BuildError::Schema(version))
+    }
+}

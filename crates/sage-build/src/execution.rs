@@ -1,3 +1,5 @@
+use super::*;
+
 /// Global reproducible-build and sandbox policy.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,14 +228,6 @@ pub fn tool_family(tool: &str) -> String {
     }
 }
 
-fn validate_schema(version: u32) -> Result<(), BuildError> {
-    if version == sage_core::SCHEMA_VERSION {
-        Ok(())
-    } else {
-        Err(BuildError::Schema(version))
-    }
-}
-
 /// Merges inherited classes and emits one fail-fast shell program.
 pub fn compose_runner(
     classes: &[Rclass],
@@ -339,7 +333,7 @@ fn validate_shell_name(value: &str) -> Result<(), BuildError> {
     }
 }
 
-fn validate_tool_name(value: &str) -> Result<(), BuildError> {
+pub(crate) fn validate_tool_name(value: &str) -> Result<(), BuildError> {
     if !value.is_empty()
         && Path::new(value).components().count() == 1
         && !value.contains(['\n', '\r', '\0'])
@@ -411,7 +405,9 @@ impl<'a> SandboxRunner<'a> {
         // system directories needed by ordinary programs are imported from the
         // configured sysroot; build state remains confined to explicit binds.
         command.args(["--tmpfs", "/"]);
-        for directory in ["bin", "etc", "lib", "lib64", "opt", "sbin", "sys", "usr", "var"] {
+        for directory in [
+            "bin", "etc", "lib", "lib64", "opt", "sbin", "sys", "usr", "var",
+        ] {
             let source = self.config.sysroot.join(directory);
             if source.exists() {
                 command
@@ -547,7 +543,13 @@ impl<'a> SandboxRunner<'a> {
         for (name, role, tool, driver, rustc) in [
             (&self.config.cc, "cc", &self.config.cc, true, false),
             (&self.config.cxx, "cxx", &self.config.cxx, true, false),
-            (&self.config.linker, "linker", &self.config.linker, false, false),
+            (
+                &self.config.linker,
+                "linker",
+                &self.config.linker,
+                false,
+                false,
+            ),
             (&self.config.rustc, "rustc", &self.config.rustc, false, true),
         ] {
             self.write_tool_wrapper(&directory.join(name), role, tool, driver, rustc)?;
