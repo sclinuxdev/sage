@@ -304,17 +304,6 @@ impl SageDatabase {
             .map(str::parse)
             .transpose()?)
     }
-    /// Reads all configured interface bindings in one consistent transaction.
-    pub fn system_providers(&self) -> Result<BTreeMap<String, PackageKey>, DbError> {
-        let txn = self.env.read_txn()?;
-        self.system
-            .iter(&txn)?
-            .map(|entry| {
-                let (interface, key) = entry?;
-                Ok((interface.to_owned(), key.parse()?))
-            })
-            .collect()
-    }
     /// Replaces the resolved binding set atomically, including stale removals.
     pub fn replace_system_providers(
         &self,
@@ -383,6 +372,36 @@ pub fn read_packages(path: &Path) -> Result<Vec<InstalledPackage>, DbError> {
     }
     Ok(records)
 }
+/// Reads configured bindings without creating tables or opening a write transaction.
+/// An absent state directory returns an empty map; missing tables, invalid keys,
+/// and LMDB/I/O failures are returned without repairing or modifying the database.
+pub fn read_system_providers(path: &Path) -> Result<BTreeMap<String, PackageKey>, DbError> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let mut options = EnvOpenOptions::new();
+    options.max_dbs(8);
+    // SAFETY: the environment only opens existing tables and keeps LMDB locking.
+    unsafe {
+        options.flags(EnvFlags::READ_ONLY);
+    }
+    let env = unsafe { options.open(path)? };
+    let txn = env.read_txn()?;
+    let system: Database<Str, Str> = env.open_database(&txn, Some("system"))?.ok_or_else(|| {
+        DbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing system table",
+        ))
+    })?;
+    system
+        .iter(&txn)?
+        .map(|entry| {
+            let (interface, key) = entry?;
+            Ok((interface.to_owned(), key.parse()?))
+        })
+        .collect()
+}
+
 /// Reads one file-owner list without opening a write transaction.
 pub fn read_owners(path: &Path, file: &str) -> Result<Vec<PackageKey>, DbError> {
     if !path.exists() {

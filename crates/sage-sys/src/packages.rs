@@ -1109,8 +1109,7 @@ pub fn remove_packages(
     if selected.len() != names.len() {
         bail!("one or more requested packages are not installed in {canonical}");
     }
-    let database = sage_db::SageDatabase::open(&db_path)?;
-    for (interface, provider) in database.system_providers()? {
+    for (interface, provider) in sage_db::read_system_providers(&db_path)? {
         if requested.contains(&provider) {
             bail!(
                 "cannot remove bound provider {provider} for {}; switch providers with rebuild first",
@@ -1118,7 +1117,6 @@ pub fn remove_packages(
             );
         }
     }
-    drop(database);
     for dependent in &installed {
         if selected.iter().any(|removed| {
             dependent.key != removed.key

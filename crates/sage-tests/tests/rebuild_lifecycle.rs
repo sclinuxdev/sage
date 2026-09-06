@@ -1051,3 +1051,32 @@ async fn hierarchy_handoffs_keep_retained_and_preserved_paths_protected() {
         }
     }
 }
+
+#[tokio::test]
+async fn dry_run_removal_reads_bindings_without_writing_the_database() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = initial_system().await;
+    let data = lab.root().join("var/lib/sage/data.mdb");
+    let before = fs::read(&data).unwrap();
+    let permissions = fs::metadata(&data).unwrap().permissions();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o444)).unwrap();
+    let preview = |package: &str| {
+        sage::execute(sage::Cli {
+            verbose: false,
+            dry_run: true,
+            root: lab.root().into(),
+            command: sage::Commands::Remove {
+                packages: vec![package.into()],
+                channel: Some("system".into()),
+            },
+        })
+    };
+    let removable = preview("daemon").await;
+    let bound = preview("loom").await;
+    let after = fs::read(&data).unwrap();
+    fs::set_permissions(&data, permissions).unwrap();
+    removable.unwrap();
+    assert!(bound.unwrap_err().to_string().contains("bound provider"));
+    assert_eq!(after, before);
+    assert_settled(&lab, "loom", "0", "old");
+}
