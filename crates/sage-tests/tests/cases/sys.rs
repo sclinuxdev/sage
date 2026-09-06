@@ -417,6 +417,7 @@ fn service_template_renders_atomically() {
         validate_command: None,
         enable_command: None,
         disable_command: None,
+        is_enabled_command: None,
     };
     let service = ServiceSpec {
         package: String::new(),
@@ -456,6 +457,7 @@ fn target_paths_cannot_escape_sysroot() {
         validate_command: None,
         enable_command: None,
         disable_command: None,
+        is_enabled_command: None,
     };
     let service = ServiceSpec {
         package: String::new(),

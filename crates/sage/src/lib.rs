@@ -121,6 +121,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: QueryAction,
     },
+    /// Manage system services and inspect drift.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -159,6 +164,18 @@ pub enum QueryAction {
     },
 }
 
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ServiceAction {
+    /// Enable a service in Sage and activate it in the init system.
+    Enable { service: String },
+    /// Disable a service in Sage and deactivate it in the init system.
+    Disable { service: String },
+    /// Adopt an externally-enabled service into Sage declarative management.
+    Adopt { service: String },
+    /// List known services and their management status.
+    List,
+}
+
 pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
@@ -173,6 +190,9 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
         Commands::Channel {
             action: ChannelAction::List
         } | Commands::Query { .. }
+            | Commands::Service {
+                action: ServiceAction::List
+            }
     );
     cli.root = std::fs::canonicalize(&cli.root)
         .with_context(|| format!("cannot resolve target root {}", cli.root.display()))?;
@@ -282,6 +302,30 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             QueryAction::Owner { path } => sage_sys::query_owner(&cli.root, &path)?,
             QueryAction::Info { package, channel } => {
                 sage_sys::query_info(&cli.root, &package, &channel)?
+            }
+        },
+        Commands::Service { action } => match action {
+            ServiceAction::Enable { service } => {
+                sage_sys::service_enable(&cli.root, &service, cli.dry_run)?;
+            }
+            ServiceAction::Disable { service } => {
+                sage_sys::service_disable(&cli.root, &service, cli.dry_run)?;
+            }
+            ServiceAction::Adopt { service } => {
+                sage_sys::service_adopt(&cli.root, &service, cli.dry_run)?;
+            }
+            ServiceAction::List => {
+                let services = sage_sys::list_services(&cli.root)?;
+                println!(
+                    "{:<20} {:<20} {:<15} {:<15}",
+                    "SERVICE", "STATUS", "PROVIDER", "PACKAGE"
+                );
+                for s in services {
+                    println!(
+                        "{:<20} {:<20} {:<15} {:<15}",
+                        s.name, s.state, s.provider, s.package
+                    );
+                }
             }
         },
     }

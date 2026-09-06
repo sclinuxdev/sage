@@ -73,9 +73,20 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
     for (interface, key) in &tx_plan.provider_bindings {
         println!("Bind {} to {key}", provider_symbol(interface));
     }
-    // A dry-run remains useful before a new provider has been downloaded or
-    // installed. Solving and binding validation still happen without writes.
     if dry_run {
+        if let Ok((provider_name, generator)) = crate::services::load_active_generator(root) {
+            let services = crate::services::load_available_services(root).unwrap_or_default();
+            let drifts = crate::services::detect_service_drift(
+                root,
+                &generator,
+                &provider_name,
+                &services,
+                &services_config.enabled,
+            );
+            if !drifts.is_empty() {
+                crate::services::warn_service_drift(&drifts, Some(&generator), root);
+            }
+        }
         return Ok(());
     }
     let database = sage_db::SageDatabase::open(&db_path)?;
@@ -128,7 +139,18 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
         },
     );
     database.write_journal(&journal)?;
-    resume_install(root, &database, &available, &mut journal, true).await
+    resume_install(root, &database, &available, &mut journal, true).await?;
+    let drifts = crate::services::detect_service_drift(
+        root,
+        &next.generator,
+        &provider.name,
+        &next.services,
+        &services_config.enabled,
+    );
+    if !drifts.is_empty() {
+        crate::services::warn_service_drift(&drifts, Some(&next.generator), root);
+    }
+    Ok(())
 }
 
 /// Resolves renderer inputs and executables against the final package overlay.

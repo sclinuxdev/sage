@@ -56,6 +56,8 @@ pub struct ServicesConfig {
     pub schema_version: u32,
     #[serde(alias = "services", default)]
     pub enabled: BTreeSet<String>,
+    #[serde(default)]
+    pub disabled: BTreeSet<String>,
 }
 
 impl ServicesConfig {
@@ -66,6 +68,7 @@ impl ServicesConfig {
             return Ok(Self {
                 schema_version: sage_core::SCHEMA_VERSION,
                 enabled: BTreeSet::new(),
+                disabled: BTreeSet::new(),
             });
         }
         let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
@@ -362,6 +365,8 @@ pub struct TemplateServiceGenerator {
     pub enable_command: Option<String>,
     #[serde(alias = "disable_cmd")]
     pub disable_command: Option<String>,
+    #[serde(alias = "is_enabled_cmd", default)]
+    pub is_enabled_command: Option<String>,
 }
 
 impl TemplateServiceGenerator {
@@ -573,6 +578,7 @@ impl TemplateServiceGenerator {
                 ("validate", self.validate_command.as_deref()),
                 ("enable", self.enable_command.as_deref()),
                 ("disable", self.disable_command.as_deref()),
+                ("is-enabled", self.is_enabled_command.as_deref()),
             ] {
                 if let Some(command) = command {
                     self.validate_command_path(kind, command, &variables, sysroot)?;
@@ -678,6 +684,55 @@ impl TemplateServiceGenerator {
             )?;
         }
         Ok(())
+    }
+
+    /// Checks whether a service is enabled in the host init system.
+    /// Returns `Ok(Some(true))` if enabled, `Ok(Some(false))` if disabled,
+    /// or `Ok(None)` if no check command is declared or executable is missing.
+    pub fn is_service_enabled(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+    ) -> Result<Option<bool>, SysError> {
+        let Some(command) = &self.is_enabled_command else {
+            return Ok(None);
+        };
+        let variables = self.service_variables(service, sysroot)?;
+        let expanded = expand_template(command, &variables)?;
+        let mut words = expanded.split_whitespace();
+        let Some(program_str) = words.next() else {
+            return Ok(None);
+        };
+        let program = match target_path(sysroot, Path::new(program_str)) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        if !program.exists() {
+            return Ok(None);
+        }
+        let root = match fs::canonicalize(sysroot) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let resolved = match fs::canonicalize(&program) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        if !resolved.starts_with(&root) {
+            return Ok(None);
+        }
+        let status = Command::new(&resolved)
+            .args(words)
+            .env_clear()
+            .env("PATH", "/usr/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status();
+        match status {
+            Ok(status) => Ok(Some(status.success())),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Resolves the provider-owned native file for a generic service.
@@ -1127,4 +1182,314 @@ pub(crate) fn ensure_existing_beneath(sysroot: &Path, path: &Path) -> Result<(),
             path.display()
         )))
     }
+}
+
+/// Detected drift between actual init state and Sage declarative management.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceDrift {
+    pub service: String,
+    pub provider: String,
+    pub init_state: String,
+    pub sage_state: String,
+}
+
+/// Information about a known service's management status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceStatusInfo {
+    pub name: String,
+    pub package: String,
+    pub state: String,
+    pub provider: String,
+}
+
+/// Scans installed services for drift where a service is enabled in the host init
+/// system but is not managed in `/etc/sage/services.toml`.
+pub fn detect_service_drift(
+    root: &Path,
+    generator: &TemplateServiceGenerator,
+    provider_name: &str,
+    services: &[ServiceSpec],
+    enabled: &BTreeSet<String>,
+) -> Vec<ServiceDrift> {
+    let mut drifts = Vec::new();
+    for service in services {
+        if enabled.contains(&service.name) {
+            continue;
+        }
+        if let Ok(Some(true)) = generator.is_service_enabled(service, root) {
+            drifts.push(ServiceDrift {
+                service: service.name.clone(),
+                provider: provider_name.to_string(),
+                init_state: "enabled".to_string(),
+                sage_state: "unmanaged".to_string(),
+            });
+        }
+    }
+    drifts
+}
+
+/// Emits human-friendly warning and action hint when drift is detected.
+pub fn warn_service_drift(
+    drifts: &[ServiceDrift],
+    generator: Option<&TemplateServiceGenerator>,
+    root: &Path,
+) {
+    for drift in drifts {
+        println!(
+            "warning: service '{}' is enabled outside Sage",
+            drift.service
+        );
+        println!("         {}: {}", drift.provider, drift.init_state);
+        println!("         services.toml: {}", drift.sage_state);
+        println!("Hint:");
+        println!("  sage service adopt {}", drift.service);
+        if drift.provider == "systemd" {
+            println!("  systemctl disable {}", drift.service);
+        } else if let Some(generator_inst) = generator
+            && let Some(cmd) = &generator_inst.disable_command
+        {
+            let hint = cmd
+                .replace("${service.name}", &drift.service)
+                .replace("${SYSROOT}", &root.display().to_string());
+            println!("  {hint}");
+        }
+    }
+}
+
+/// Loads all available service specifications from `/usr/share/sage/services/`
+/// and the active rendered services state.
+pub fn load_available_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError> {
+    let mut services_map = BTreeMap::new();
+    let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+    if rendered_path.exists()
+        && let Ok(rendered) = RenderedServicesState::load(&rendered_path)
+    {
+        for svc in rendered.services {
+            services_map.insert(svc.name.clone(), svc);
+        }
+    }
+    let services_dir = root.join("usr/share/sage/services");
+    if services_dir.exists()
+        && let Ok(entries) = fs::read_dir(&services_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "toml")
+                && let Ok(bytes) = fs::read(&path)
+                && let Ok(doc) = ServiceDocument::parse(&bytes)
+            {
+                for svc in doc.into_services() {
+                    services_map.entry(svc.name.clone()).or_insert(svc);
+                }
+            }
+        }
+    }
+    Ok(services_map.into_values().collect())
+}
+
+/// Loads the active init provider name and generator.
+pub fn load_active_generator(root: &Path) -> Result<(String, TemplateServiceGenerator), SysError> {
+    let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+    if rendered_path.exists()
+        && let Ok(rendered) = RenderedServicesState::load(&rendered_path)
+    {
+        return Ok((rendered.provider.name, rendered.generator));
+    }
+    let system_config_path = root.join("etc/sage/system.toml");
+    let provider_name = if system_config_path.exists() {
+        let content = fs::read_to_string(&system_config_path)?;
+        let toml_val: toml::Value =
+            toml::from_str(&content).map_err(|e| SysError::Invalid(e.to_string()))?;
+        toml_val
+            .get("providers")
+            .and_then(|p| p.get("init"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("systemd")
+            .to_string()
+    } else {
+        "systemd".to_string()
+    };
+    let rclass_path = root.join(format!("usr/share/sage/rclass/init-{provider_name}.toml"));
+    if rclass_path.exists() {
+        let generator = TemplateServiceGenerator::from_rclass(&rclass_path)?;
+        return Ok((provider_name, generator));
+    }
+    let workspace_rclass = Path::new("rclass").join(format!("init-{provider_name}.toml"));
+    if workspace_rclass.exists() {
+        let generator = TemplateServiceGenerator::from_rclass(&workspace_rclass)?;
+        return Ok((provider_name, generator));
+    }
+    Err(SysError::Invalid(format!(
+        "could not find init generator for provider '{provider_name}'"
+    )))
+}
+
+/// Enables a service in `/etc/sage/services.toml` and activates it in the init provider.
+pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
+    let services = load_available_services(root)?;
+    let spec = services
+        .into_iter()
+        .find(|s| s.name == service_name)
+        .ok_or_else(|| {
+            SysError::Invalid(format!(
+                "service '{service_name}' not found in installed packages"
+            ))
+        })?;
+    let config_path = root.join("etc/sage/services.toml");
+    let mut config = ServicesConfig::load(&config_path)?;
+    if config.enabled.contains(service_name) {
+        println!("Service '{service_name}' is already enabled in services.toml");
+    } else if !dry_run {
+        config.enabled.insert(service_name.to_string());
+        config.disabled.remove(service_name);
+        config.save(&config_path)?;
+    }
+
+    if let Ok((_provider, generator)) = load_active_generator(root)
+        && !dry_run
+    {
+        let _ = generator.render_service(&spec, root);
+        generator.enable_service(&spec, root)?;
+        let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+        if rendered_path.exists()
+            && let Ok(mut rendered) = RenderedServicesState::load(&rendered_path)
+        {
+            rendered.enabled.insert(service_name.to_string());
+            if !rendered.services.iter().any(|s| s.name == spec.name) {
+                rendered.services.push(spec);
+            }
+            let _ = fs::write(
+                &rendered_path,
+                toml::to_string_pretty(&rendered).map_err(|e| SysError::Invalid(e.to_string()))?,
+            );
+        }
+    }
+    println!("Enabled service '{service_name}' (managed-enabled)");
+    Ok(())
+}
+
+/// Disables a service in `/etc/sage/services.toml` and deactivates it in the init provider.
+pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
+    let config_path = root.join("etc/sage/services.toml");
+    let mut config = ServicesConfig::load(&config_path)?;
+    if !config.enabled.contains(service_name) && config.disabled.contains(service_name) {
+        println!("Service '{service_name}' was not enabled in services.toml");
+    } else if !dry_run {
+        config.enabled.remove(service_name);
+        config.disabled.insert(service_name.to_string());
+        config.save(&config_path)?;
+    }
+
+    let services = load_available_services(root)?;
+    if let Some(spec) = services.into_iter().find(|s| s.name == service_name)
+        && let Ok((_provider, generator)) = load_active_generator(root)
+        && !dry_run
+    {
+        let _ = generator.disable_service(&spec, root);
+        let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+        if rendered_path.exists()
+            && let Ok(mut rendered) = RenderedServicesState::load(&rendered_path)
+        {
+            rendered.enabled.remove(service_name);
+            let _ = fs::write(
+                &rendered_path,
+                toml::to_string_pretty(&rendered).map_err(|e| SysError::Invalid(e.to_string()))?,
+            );
+        }
+    }
+    println!("Disabled service '{service_name}' (managed-disabled)");
+    Ok(())
+}
+
+/// Adopts an externally enabled service into `/etc/sage/services.toml` without modifying host state.
+pub fn service_adopt(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
+    let services = load_available_services(root)?;
+    let spec = services
+        .into_iter()
+        .find(|s| s.name == service_name)
+        .ok_or_else(|| {
+            SysError::Invalid(format!(
+                "service '{service_name}' not found in installed packages"
+            ))
+        })?;
+    let config_path = root.join("etc/sage/services.toml");
+    let mut config = ServicesConfig::load(&config_path)?;
+    if config.enabled.contains(service_name) {
+        println!("Service '{service_name}' is already managed-enabled in services.toml");
+        return Ok(());
+    }
+    if !dry_run {
+        config.enabled.insert(service_name.to_string());
+        config.disabled.remove(service_name);
+        config.save(&config_path)?;
+        if let Ok((_provider, generator)) = load_active_generator(root) {
+            let _ = generator.render_service(&spec, root);
+            let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+            if rendered_path.exists()
+                && let Ok(mut rendered) = RenderedServicesState::load(&rendered_path)
+            {
+                rendered.enabled.insert(service_name.to_string());
+                if !rendered.services.iter().any(|s| s.name == spec.name) {
+                    rendered.services.push(spec);
+                }
+                let _ = fs::write(
+                    &rendered_path,
+                    toml::to_string_pretty(&rendered)
+                        .map_err(|e| SysError::Invalid(e.to_string()))?,
+                );
+            }
+        }
+    }
+    println!("Adopted service '{service_name}' into Sage declarative management (managed-enabled)");
+    Ok(())
+}
+
+/// Lists all known services and their management lifecycle status.
+pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
+    let services = load_available_services(root)?;
+    let config_path = root.join("etc/sage/services.toml");
+    let config = ServicesConfig::load(&config_path)?;
+    let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+    let previous_rendered = if rendered_path.exists() {
+        RenderedServicesState::load(&rendered_path).ok()
+    } else {
+        None
+    };
+    let active_gen = load_active_generator(root).ok();
+
+    let mut result = Vec::new();
+    for service in services {
+        let (provider_name, is_init_enabled) = if let Some((name, generator)) = &active_gen {
+            let enabled = generator.is_service_enabled(&service, root).unwrap_or(None);
+            (name.clone(), enabled)
+        } else {
+            ("unknown".to_string(), None)
+        };
+
+        let state = if config.enabled.contains(&service.name) {
+            "managed-enabled".to_string()
+        } else if config.disabled.contains(&service.name)
+            || previous_rendered
+                .as_ref()
+                .is_some_and(|r| r.enabled.contains(&service.name))
+        {
+            "managed-disabled".to_string()
+        } else if is_init_enabled == Some(true) {
+            "unmanaged (drift)".to_string()
+        } else {
+            "unmanaged".to_string()
+        };
+
+        result.push(ServiceStatusInfo {
+            name: service.name,
+            package: if service.package.is_empty() {
+                "system".to_string()
+            } else {
+                service.package
+            },
+            state,
+            provider: provider_name,
+        });
+    }
+    Ok(result)
 }

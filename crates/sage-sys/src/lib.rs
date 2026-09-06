@@ -33,7 +33,10 @@ pub use channel::{
 
 // 5. Metadata and configuration specifications
 pub use services::{
-    RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig, TemplateServiceGenerator,
+    RenderedServicesState, ServiceDocument, ServiceDrift, ServiceSpec, ServiceStatusInfo,
+    ServicesConfig, TemplateServiceGenerator, detect_service_drift, list_services,
+    load_active_generator, load_available_services, service_adopt, service_disable, service_enable,
+    warn_service_drift,
 };
 pub use state::{
     Alternative, AlternativeDeclaration, AlternativesDocument, ProfileEngine, ReconcilePlan,

@@ -19,6 +19,7 @@ managed_directory = "/usr/lib/loom/services"
 validate_command = "/usr/lib/loom/loom validate --root ${SYSROOT}"
 enable_cmd = "/usr/bin/loomctl --root ${SYSROOT} enable ${service.name}"
 disable_cmd = "/usr/bin/loomctl --root ${SYSROOT} disable ${service.name}"
+is_enabled_cmd = "/usr/bin/loomctl --root ${SYSROOT} is-enabled ${service.name}"
 
 template = """
 schema_version = 2

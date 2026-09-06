@@ -13,7 +13,7 @@ fn service(name: &str) -> String {
 
 fn renderer(name: &str, generation: &str) -> String {
     format!(
-        "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native-{generation}/${{service.name}}\"\nmode=420\ntemplate=\"{generation}: ${{service.name}}\"\nvalidate_command=\"/usr/bin/{name}ctl ${{SYSROOT}} validate ${{service.name}}\"\nenable_command=\"/usr/bin/{name}ctl ${{SYSROOT}} enable ${{service.name}}\"\ndisable_command=\"/usr/bin/{name}ctl ${{SYSROOT}} disable ${{service.name}}\"\n"
+        "schema_version=1\n[service_generator]\ntarget_path=\"/etc/native-{generation}/${{service.name}}\"\nmode=420\ntemplate=\"{generation}: ${{service.name}}\"\nvalidate_command=\"/usr/bin/{name}ctl ${{SYSROOT}} validate ${{service.name}}\"\nenable_command=\"/usr/bin/{name}ctl ${{SYSROOT}} enable ${{service.name}}\"\ndisable_command=\"/usr/bin/{name}ctl ${{SYSROOT}} disable ${{service.name}}\"\nis_enabled_command=\"/usr/bin/{name}ctl ${{SYSROOT}} is-enabled ${{service.name}}\"\n"
     )
 }
 
@@ -33,7 +33,7 @@ fn provider(name: &str, slot: &str, generation: &str) -> PackageSpec {
     package.files.insert(
         program.clone(),
         format!(
-            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable) printf enabled > \"$marker\" ;;\ndisable)\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
+            "#!/bin/sh\nset -eu\nroot=$1\naction=$2\nservice=$3\nmarker=\"$root/var/lib/sage/enabled-{generation}-$service\"\ncase $action in\nvalidate) test -f \"$root/etc/native-{generation}/$service\" ;;\nenable) printf enabled > \"$marker\" ;;\nis-enabled) test -f \"$marker\" ;;\ndisable)\n  test -f \"$root/etc/native-{generation}/$service\"\n  test -f \"$marker\"\n  /bin/rm \"$marker\"\n  printf '%s\\n' \"{generation}:$service\" >> \"$root/var/lib/sage/disable-log\"\n  ;;\n*) exit 2 ;;\nesac\n"
         )
         .into_bytes(),
     );
@@ -1238,4 +1238,52 @@ async fn native_directory_handoffs_reject_protected_ancestors_before_publication
             assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn unmanaged_manually_enabled_service_survives_rebuild_and_detects_drift() {
+    let lab = initial_system().await;
+    let manual_marker = lab.root().join("var/lib/sage/enabled-old-inactive");
+    assert!(!manual_marker.exists());
+
+    // 1. Simulate administrator manually enabling an unmanaged service outside Sage
+    fs::write(&manual_marker, b"enabled").unwrap();
+    assert!(manual_marker.is_file());
+
+    // 2. Rebuild the system: Sage must NOT revoke/disable the unmanaged service
+    rebuild(&lab, false).await.unwrap();
+    assert!(
+        manual_marker.is_file(),
+        "Sage must not revoke administrator state created outside Sage"
+    );
+
+    // 3. Inspect service list: inactive must be detected as drift
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let inactive = services.iter().find(|s| s.name == "inactive").unwrap();
+    assert_eq!(inactive.state, "unmanaged (drift)");
+    let daemon = services.iter().find(|s| s.name == "daemon").unwrap();
+    assert_eq!(daemon.state, "managed-enabled");
+
+    // 4. Adopt the service into Sage declarative management
+    sage_sys::service_adopt(lab.root(), "inactive", false).unwrap();
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let inactive = services.iter().find(|s| s.name == "inactive").unwrap();
+    assert_eq!(inactive.state, "managed-enabled");
+
+    // 5. Disable the service via Sage: now that Sage manages it, it should be disabled
+    sage_sys::service_disable(lab.root(), "inactive", false).unwrap();
+    assert!(
+        !manual_marker.exists(),
+        "Sage disables managed services upon explicit request"
+    );
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let inactive = services.iter().find(|s| s.name == "inactive").unwrap();
+    assert_eq!(inactive.state, "managed-disabled");
+
+    // 6. Re-enable the service via Sage
+    sage_sys::service_enable(lab.root(), "inactive", false).unwrap();
+    assert!(manual_marker.is_file());
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let inactive = services.iter().find(|s| s.name == "inactive").unwrap();
+    assert_eq!(inactive.state, "managed-enabled");
 }

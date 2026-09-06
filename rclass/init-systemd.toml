@@ -8,6 +8,7 @@ mode = 420
 
 enable_cmd = "/usr/bin/systemctl --root ${SYSROOT} enable ${service.name}.service"
 disable_cmd = "/usr/bin/systemctl --root ${SYSROOT} disable ${service.name}.service"
+is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.service"
 service_dependency_suffix = ".service"
 supported_types = ["simple", "forking", "notify", "oneshot"]
 
