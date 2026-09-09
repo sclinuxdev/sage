@@ -847,3 +847,46 @@ fn kmod_rclass_uses_the_package_slot_as_kernel_release() {
     assert!(runner.contains("/usr/lib/modules/6.12.4/build"));
     assert!(runner.contains("INSTALL_MOD_PATH=\"/dest/usr\""));
 }
+
+#[test]
+fn cgroup_scope_inactive_when_unconstrained() {
+    // When memory_limit is empty and pids_limit is 0, scope must be inactive
+    let scope = CgroupScope::new("", 0).unwrap();
+    assert!(!scope.is_active());
+    assert!(scope.path().is_none());
+    assert!(scope.attach_pid(std::process::id()).is_ok());
+
+    // When memory_limit is "max" and pids_limit is 0, scope must also be inactive
+    let max_scope = CgroupScope::new("max", 0).unwrap();
+    assert!(!max_scope.is_active());
+    assert!(max_scope.path().is_none());
+}
+
+#[test]
+fn cgroup_scope_reports_error_when_creation_fails() {
+    // When limits are configured on an unprivileged host without delegated cgroups,
+    // CgroupScope reports a clear CgroupFailed error rather than silently ignoring it.
+    let result = CgroupScope::new("128M", 32);
+    match result {
+        Ok(scope) => {
+            // If the host environment actually permits cgroup slice creation:
+            assert!(scope.is_active());
+            assert!(scope.path().is_some());
+            let mut probe = std::process::Command::new("/bin/sleep")
+                .arg("0.1")
+                .spawn()
+                .unwrap();
+            let attach_res = scope.attach_pid(probe.id());
+            let _ = probe.kill();
+            let _ = probe.wait();
+            assert!(attach_res.is_ok());
+            // Drops cleanly
+            drop(scope);
+        }
+        Err(BuildError::CgroupFailed(reason)) => {
+            // Expected when unprivileged in CI/non-delegated host
+            assert!(!reason.is_empty());
+        }
+        Err(err) => panic!("unexpected error type: {err:?}"),
+    }
+}

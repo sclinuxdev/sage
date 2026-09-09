@@ -47,6 +47,8 @@ pub enum BuildError {
         operation: String,
         status: ExitStatus,
     },
+    #[error("cgroup resource enforcement failed: {0}")]
+    CgroupFailed(String),
 }
 
 pub use anyhow::{Context, Result, bail};
