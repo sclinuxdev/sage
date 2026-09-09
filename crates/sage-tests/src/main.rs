@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
                     packages: vec![package],
                     channel: Some(channel),
                     no_save: true,
+                    providers: Vec::new(),
                 },
                 "remove" => sage::Commands::Remove {
                     packages: vec![package],

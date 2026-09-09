@@ -253,6 +253,7 @@ target_root="/opt/channels/torture/1"
                 packages: vec![name.into()],
                 channel: Some(channel.into()),
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await

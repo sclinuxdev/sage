@@ -427,6 +427,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["app:1".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -441,6 +442,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             packages: vec!["app:1".into(), "app:2".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -458,6 +460,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["app:1".into(), "app:2".into()],
                 channel: None,
                 no_save: false,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -474,6 +477,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             packages: vec!["app:1".into(), "app:2".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -489,6 +493,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             packages: vec!["app:1".into()],
             channel: None,
             no_save: false,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -513,6 +518,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["foreign".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -558,6 +564,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["app:2".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -571,6 +578,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["app:2".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -584,6 +592,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
                 packages: vec!["app:2".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -595,6 +604,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             packages: vec!["app:2".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -627,6 +637,7 @@ async fn signed_repository_lifecycle_recovers_and_preserves_configuration() {
             packages: vec!["app:2".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -723,6 +734,7 @@ async fn installed_conflicts_cycles_and_canonical_removal_are_safe() {
             packages: vec!["resident".into()],
             channel: None,
             no_save: false,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -734,6 +746,7 @@ async fn installed_conflicts_cycles_and_canonical_removal_are_safe() {
                 packages: vec!["newcomer".into()],
                 channel: None,
                 no_save: true,
+                providers: Vec::new(),
             },
         ))
         .await
@@ -760,6 +773,7 @@ async fn installed_conflicts_cycles_and_canonical_removal_are_safe() {
             packages: vec!["cycle-a".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await
@@ -773,6 +787,7 @@ async fn installed_conflicts_cycles_and_canonical_removal_are_safe() {
             packages: vec!["uses-lib".into(), "lib:1".into()],
             channel: None,
             no_save: true,
+            providers: Vec::new(),
         },
     ))
     .await

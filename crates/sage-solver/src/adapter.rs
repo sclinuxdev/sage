@@ -16,6 +16,7 @@ pub struct SageSolver<'a> {
     universe: &'a PackageUniverse,
     locked: BTreeMap<PackageKey, Version>,
     preferred_providers: BTreeMap<String, PackageKey>,
+    bound_providers: BTreeMap<String, PackageKey>,
 }
 
 impl<'a> SageSolver<'a> {
@@ -24,6 +25,7 @@ impl<'a> SageSolver<'a> {
             universe,
             locked: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
+            bound_providers: BTreeMap::new(),
         }
     }
 
@@ -35,6 +37,7 @@ impl<'a> SageSolver<'a> {
             universe,
             locked: locked.into_iter().collect(),
             preferred_providers: BTreeMap::new(),
+            bound_providers: BTreeMap::new(),
         }
     }
 
@@ -44,6 +47,16 @@ impl<'a> SageSolver<'a> {
         providers: impl IntoIterator<Item = (String, PackageKey)>,
     ) -> Self {
         self.preferred_providers = providers.into_iter().collect();
+        self
+    }
+
+    /// Strictly binds virtual interfaces to exact providers, excluding any alternative
+    /// candidate packages from the resolution universe.
+    pub fn bind_providers(
+        mut self,
+        providers: impl IntoIterator<Item = (String, PackageKey)>,
+    ) -> Self {
+        self.bound_providers = providers.into_iter().collect();
         self
     }
 
@@ -70,10 +83,11 @@ impl<'a> SageSolver<'a> {
             .collect();
         let (solution, choices) = loop {
             let (solution, choices) = self.resolve_root(dependencies.clone())?;
-            let missing: Vec<_> = self
-                .preferred_providers
-                .iter()
-                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| choice == *symbol))
+            let mut all_providers = self.preferred_providers.clone();
+            all_providers.extend(self.bound_providers.clone());
+            let missing: Vec<_> = all_providers
+                .into_iter()
+                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| choice == symbol))
                 .collect();
             if missing.is_empty() {
                 break (solution, choices);
@@ -98,7 +112,9 @@ impl<'a> SageSolver<'a> {
         };
         let mut bindings = BTreeMap::new();
         for (symbol, key) in choices {
-            if !self.preferred_providers.contains_key(&symbol) {
+            if !self.preferred_providers.contains_key(&symbol)
+                && !self.bound_providers.contains_key(&symbol)
+            {
                 continue;
             }
             if let Some(previous) = bindings.insert(symbol.clone(), key.clone())
@@ -157,6 +173,7 @@ impl<'a> SageSolver<'a> {
             self.universe,
             &self.locked,
             &self.preferred_providers,
+            &self.bound_providers,
             root,
             root_version,
             dependencies,
@@ -206,6 +223,7 @@ impl SageProvider {
         universe: &PackageUniverse,
         locked: &BTreeMap<PackageKey, Version>,
         preferred_providers: &BTreeMap<String, PackageKey>,
+        bound_providers: &BTreeMap<String, PackageKey>,
         root: &PackageKey,
         root_version: &Version,
         root_dependencies: DependencyMap,
@@ -267,6 +285,16 @@ impl SageProvider {
                 {
                     continue;
                 }
+                // When a virtual interface is strictly bound to a provider, only that
+                // provider is eligible. All alternative providers are filtered out.
+                if let Some(bound) = bound_providers.get(provider_name) {
+                    if key.channel != bound.channel || key.name != bound.name {
+                        continue;
+                    }
+                    if bound.slot != DEFAULT_SLOT && key.slot != bound.slot {
+                        continue;
+                    }
+                }
                 for (version_index, version) in universe.versions(key).enumerate() {
                     if !dependency_range(&requirement).contains(version)
                         || !universe.release(key, version).is_some_and(|release| {
@@ -278,7 +306,10 @@ impl SageProvider {
                     {
                         continue;
                     }
-                    let preferred = preferred_providers.get(provider_name) == Some(key);
+                    let preferred = preferred_providers.get(provider_name) == Some(key)
+                        || bound_providers
+                            .get(provider_name)
+                            .is_some_and(|b| b.channel == key.channel && b.name == key.name);
                     let exact_lock = locked.get(key) == Some(version);
                     let preference = match (preferred, exact_lock) {
                         (true, true) => 4,

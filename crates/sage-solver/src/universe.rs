@@ -48,4 +48,12 @@ impl PackageUniverse {
     pub fn release(&self, key: &PackageKey, version: &Version) -> Option<&PackageRelease> {
         self.releases.get(key)?.get(version)
     }
+
+    /// Returns all package keys providing the specified virtual or shared-library symbol.
+    pub fn providers_for(&self, symbol: &str) -> &[PackageKey] {
+        self.providers
+            .get(symbol)
+            .map(|keys| keys.as_slice())
+            .unwrap_or(&[])
+    }
 }

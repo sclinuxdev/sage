@@ -284,3 +284,39 @@ fn virtual_conflicts_only_match_releases_and_slots_that_provide_the_symbol() {
             .is_err()
     );
 }
+
+#[test]
+fn bound_virtual_provider_strictly_considers_only_that_provider() {
+    let mut universe = PackageUniverse::default();
+    universe.insert(release("main/system", "base", "1-1", &["virtual/init"]));
+    let mut systemd = release("main/system", "systemd", "1-1", &[]);
+    systemd.provides.push("virtual/init".into());
+    universe.insert(systemd);
+    let mut sysvinit = release("main/system", "sysvinit", "1-1", &[]);
+    sysvinit.provides.push("virtual/init".into());
+    universe.insert(sysvinit);
+
+    let base = PackageKey::new("main/system", "base", "0");
+    let systemd_key = PackageKey::new("main/system", "systemd", "0");
+    let sysvinit_key = PackageKey::new("main/system", "sysvinit", "0");
+
+    // When virtual/init is strictly bound to systemd, only systemd is considered.
+    let solution = SageSolver::new(&universe)
+        .bind_providers([("virtual/init".into(), systemd_key.clone())])
+        .resolve(std::slice::from_ref(&base))
+        .unwrap();
+    assert!(solution.contains_key(&systemd_key));
+    assert!(!solution.contains_key(&sysvinit_key));
+
+    // If an external package conflicts with systemd, resolution MUST fail rather
+    // than silently falling back to sysvinit.
+    let mut blocker = release("main/system", "blocker", "1-1", &[]);
+    blocker.conflicts.push("systemd".into());
+    universe.insert(blocker);
+
+    let error = SageSolver::new(&universe)
+        .bind_providers([("virtual/init".into(), systemd_key.clone())])
+        .resolve(&[base.clone(), PackageKey::new("main/system", "blocker", "0")])
+        .unwrap_err();
+    assert!(matches!(error, SolverError::NoSolution(_)));
+}

@@ -823,3 +823,71 @@ fn live_upgrade_process_audit_scans_proc_safely() {
     let audits = sage_sys::audit_running_processes(root.path());
     sage_sys::print_process_audit(&audits);
 }
+
+#[test]
+fn select_virtual_provider_handles_candidates_and_overrides() {
+    use sage_core::PackageKey;
+
+    let sys = PackageKey::new("main/system", "systemd", "0");
+    let sysv = PackageKey::new("main/system", "sysvinit", "0");
+    let candidates = vec![sys.clone(), sysv.clone()];
+
+    // 1. Explicit CLI override matches candidate
+    let chosen =
+        sage_sys::select_virtual_provider("virtual/init", &candidates, Some("systemd"), false)
+            .unwrap();
+    assert_eq!(chosen, sys);
+
+    let chosen_sysv =
+        sage_sys::select_virtual_provider("virtual/init", &candidates, Some("sysvinit"), false)
+            .unwrap();
+    assert_eq!(chosen_sysv, sysv);
+
+    // 2. Explicit CLI override does not match candidates -> returns error
+    let err =
+        sage_sys::select_virtual_provider("virtual/init", &candidates, Some("nonexistent"), false)
+            .unwrap_err();
+    assert!(err.to_string().contains("does not satisfy virtual/init"));
+
+    // 3. Single candidate is automatically chosen without prompting
+    let single = vec![sys.clone()];
+    let chosen_single =
+        sage_sys::select_virtual_provider("virtual/init", &single, None, false).unwrap();
+    assert_eq!(chosen_single, sys);
+
+    // 4. In non-interactive environment, default candidate is chosen
+    let chosen_default =
+        sage_sys::select_virtual_provider("virtual/init", &candidates, None, false).unwrap();
+    assert_eq!(chosen_default, sys);
+}
+
+#[tokio::test]
+async fn system_config_providers_are_dynamically_bound_for_any_interface() {
+    // Tests that any interface configured in system.toml under [providers]
+    // (e.g. awk = "gawk", cron = "cronie") is dynamically respected and bound
+    // without hardcoding any specific interface in the codebase.
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = root.path().join("etc/sage");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("system.toml"),
+        r#"schema_version = 1
+packages = []
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[providers]
+awk = "gawk"
+cron = "cronie"
+"#,
+    )
+    .unwrap();
+
+    let cfg = sage_sys::SystemConfig::load(config_dir.join("system.toml")).unwrap();
+    let preferences = cfg.provider_preferences("main/system").unwrap();
+    assert_eq!(preferences.len(), 2);
+    assert_eq!(preferences.get("virtual/awk").unwrap().name, "gawk");
+    assert_eq!(preferences.get("virtual/cron").unwrap().name, "cronie");
+}

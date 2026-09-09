@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 pub use sage_build::{
@@ -48,6 +49,9 @@ pub enum Commands {
         channel: Option<String>,
         #[arg(long)]
         no_save: bool,
+        /// Explicit virtual interface provider selection (e.g. --provider init=systemd).
+        #[arg(long = "provider", value_parser = parse_provider_override)]
+        providers: Vec<(String, String)>,
     },
     /// Remove specified packages from system.
     Remove {
@@ -218,11 +222,15 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             packages,
             channel,
             no_save,
+            providers,
         } => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             sage_sys::apply_packages(
                 &cli.root,
                 &packages,
                 channel.as_deref(),
+                &providers,
+                interactive,
                 false,
                 !no_save,
                 cli.dry_run,
@@ -351,4 +359,13 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn parse_provider_override(input: &str) -> std::result::Result<(String, String), String> {
+    input
+        .split_once('=')
+        .map(|(interface, pkg)| (interface.trim().to_string(), pkg.trim().to_string()))
+        .ok_or_else(|| {
+            "provider override must follow format interface=package (e.g. init=systemd)".to_string()
+        })
 }

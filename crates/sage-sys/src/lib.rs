@@ -16,7 +16,8 @@ mod triggers;
 
 // 1. Transaction execution entry points
 pub use transaction::{
-    TransactionPlan, apply_packages, rebuild_system, remove_packages, upgrade_packages,
+    TransactionPlan, apply_packages, rebuild_system, remove_packages, select_virtual_provider,
+    upgrade_packages,
 };
 
 // 2. Recovery
