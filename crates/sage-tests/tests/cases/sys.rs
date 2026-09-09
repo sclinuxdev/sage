@@ -680,3 +680,146 @@ fn alternatives_choose_priority_and_publish_atomically() {
         PathBuf::from("vim")
     );
 }
+
+#[test]
+fn transaction_diff_computes_accurate_preview() {
+    let installed = vec![
+        sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "curl", "0"),
+            version: "8.0.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 1000,
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        },
+        sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "old-tool", "0"),
+            version: "1.0.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 500,
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        },
+    ];
+
+    let plan = sage_sys::TransactionPlan::new(
+        vec![
+            (
+                sage_core::PackageKey::new("main/system", "curl", "0"),
+                "8.5.0-1".parse().unwrap(),
+            ),
+            (
+                sage_core::PackageKey::new("main/system", "new-app", "0"),
+                "2.0.0-1".parse().unwrap(),
+            ),
+        ],
+        vec![
+            installed[1].clone(), // old-tool removed
+        ],
+        BTreeMap::from([(
+            "init".into(),
+            sage_core::PackageKey::new("main/system", "openrc", "0"),
+        )]),
+    );
+
+    let diff = sage_sys::compute_transaction_diff(&plan, &installed, None);
+    assert_eq!(diff.new_installs.len(), 1);
+    assert_eq!(diff.new_installs[0].key.name, "new-app");
+    assert_eq!(diff.upgrades.len(), 1);
+    assert_eq!(diff.upgrades[0].key.name, "curl");
+    assert_eq!(diff.upgrades[0].old_version.to_string(), "8.0.0-1");
+    assert_eq!(diff.upgrades[0].new_version.to_string(), "8.5.0-1");
+    assert_eq!(diff.removals.len(), 1);
+    assert_eq!(diff.removals[0].key.name, "old-tool");
+    assert_eq!(diff.provider_bindings.len(), 1);
+}
+
+#[test]
+fn orphan_detection_identifies_unreferenced_packages() {
+    let installed = vec![
+        sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "root-app", "0"),
+            version: "1.0.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 1000,
+            dependencies: vec!["libfoo".parse().unwrap()],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        },
+        sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "libfoo", "0"),
+            version: "1.0.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 500,
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        },
+        sage_db::InstalledPackage {
+            key: sage_core::PackageKey::new("main/system", "abandoned-lib", "0"),
+            version: "1.0.0-1".parse().unwrap(),
+            arch: "amd64".into(),
+            installed_size: 300,
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            files: vec![],
+            config_hashes: BTreeMap::new(),
+        },
+    ];
+
+    let config = SystemConfig {
+        schema_version: 1,
+        system: SystemMetadata {
+            architecture: "amd64".into(),
+            profile: "default".into(),
+        },
+        providers: BTreeMap::new(),
+        packages: BTreeSet::from(["root-app".into()]),
+    };
+
+    let orphans = sage_sys::find_orphans(&installed, &config);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].key.name, "abandoned-lib");
+}
+
+#[test]
+fn cache_clean_removes_temporary_and_package_files() {
+    let root = tempfile::tempdir().unwrap();
+    let cache_dir = root.path().join("var/cache/sage/channels/system");
+    let lib_dir = root.path().join("var/lib/sage");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&lib_dir).unwrap();
+
+    fs::write(cache_dir.join("temp.sage-tmp-123"), b"garbage").unwrap();
+    fs::write(cache_dir.join("partial.part-0"), b"partial").unwrap();
+    fs::write(cache_dir.join("real.pkg.tar.zst"), b"package data").unwrap();
+    fs::write(lib_dir.join(".services-config-old"), b"old config").unwrap();
+
+    // Cleaning without `all` cleans temporary files only
+    let report1 = sage_sys::clean_cache(root.path(), false).unwrap();
+    assert_eq!(report1.files_removed, 3);
+    assert!(cache_dir.join("real.pkg.tar.zst").exists());
+
+    // Cleaning with `all = true` also cleans cached packages
+    let report2 = sage_sys::clean_cache(root.path(), true).unwrap();
+    assert_eq!(report2.files_removed, 1);
+    assert!(!cache_dir.join("real.pkg.tar.zst").exists());
+}
+
+#[test]
+fn live_upgrade_process_audit_scans_proc_safely() {
+    let root = tempfile::tempdir().unwrap();
+    let audits = sage_sys::audit_running_processes(root.path());
+    sage_sys::print_process_audit(&audits);
+}

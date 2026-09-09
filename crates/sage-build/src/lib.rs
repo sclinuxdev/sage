@@ -52,12 +52,14 @@ pub enum BuildError {
 pub use anyhow::{Context, Result, bail};
 pub use sage_core::{glob, walkdir};
 
+pub mod cgroup;
 pub mod execution;
 pub mod operations;
 pub mod payload;
 pub mod recipe;
 pub mod sources;
 
+pub use cgroup::{CgroupScope, parse_memory_limit};
 pub use execution::*;
 pub use operations::*;
 pub use payload::*;

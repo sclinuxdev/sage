@@ -49,7 +49,7 @@
 | **构建全局策略** | `/etc/sage/build.toml` | [build_config_spec.md](docs/specs/build_config_spec.md) |
 | **全源码构建与自举** | `bootstrap.toml` / recipe tree | [bootstrap_spec.md](docs/specs/bootstrap_spec.md) |
 | **包配方格式与单配方多包** | `recipes/.../recipe.toml` | [recipe_spec.md](docs/specs/recipe_spec.md) |
-| **配方目录树与分类体系** | `recipes/<category>/<pkg>/...` | [recipe_tree_spec.md](docs/specs/recipe_tree_spec.md) |
+| **配方目录树与分类体系** | `recipes/<category>/<pkg>/...` (外部仓库 `sclinux-recipes`) | [recipe_tree_spec.md](docs/specs/recipe_tree_spec.md) |
 | **构建类继承规范** | `rclass/*.toml` (如 `cmake.toml`, `cargo.toml`) | [rclass_spec.md](docs/specs/rclass_spec.md) |
 | **通用守护进程服务** | `.METADATA/service.toml` | [service_spec.md](docs/specs/service_spec.md) |
 | **触发器与替代项** | `.METADATA/triggers.toml` / sysusers / alternatives | [triggers_spec.md](docs/specs/triggers_spec.md) |

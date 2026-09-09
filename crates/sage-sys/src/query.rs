@@ -97,6 +97,31 @@ pub enum QueryAction {
     Owner { path: PathBuf },
     /// Detailed package inspection for a specific coordinate.
     Info { package: String, channel: String },
+    /// Find installed orphan packages.
+    Orphans,
+}
+
+/// Displays installed packages that are no longer referenced by system configuration or its dependencies.
+pub fn query_orphans(root: &Path) -> Result<()> {
+    let db_path = under_root(root, Path::new("/var/lib/sage"));
+    let installed = sage_db::read_packages(&db_path)?;
+    let config_path = under_root(root, Path::new("/etc/sage/system.toml"));
+    let config = SystemConfig::load(&config_path)?;
+    let orphans = crate::gc::find_orphans(&installed, &config);
+    if orphans.is_empty() {
+        println!("No orphan packages found.");
+        return Ok(());
+    }
+    println!("Orphan packages ({}):", orphans.len());
+    for orphan in orphans {
+        println!(
+            "  {}\t{}\t({})",
+            orphan.key,
+            orphan.version,
+            crate::diff::format_bytes(orphan.installed_size as i64)
+        );
+    }
+    Ok(())
 }
 
 /// Displays all packages installed in the target root LMDB state store.
@@ -145,5 +170,6 @@ pub fn query_state(root: &Path, action: QueryAction) -> Result<()> {
         QueryAction::Installed => query_installed(root),
         QueryAction::Owner { path } => query_owner(root, &path),
         QueryAction::Info { package, channel } => query_info(root, &package, &channel),
+        QueryAction::Orphans => query_orphans(root),
     }
 }

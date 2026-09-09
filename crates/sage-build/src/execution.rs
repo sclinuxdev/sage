@@ -503,7 +503,10 @@ impl<'a> SandboxRunner<'a> {
         allow_network: bool,
     ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
         self.prepare_tool_wrappers(paths)?;
-        let status = self.command(paths, allow_network).status()?;
+        let cgroup = CgroupScope::new(&self.config.memory_limit, self.config.pids_limit);
+        let mut child = self.command(paths, allow_network).spawn()?;
+        cgroup.attach_pid(child.id());
+        let status = child.wait()?;
         if !status.success() {
             return Err(BuildError::SandboxFailed(status));
         }

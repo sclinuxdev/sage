@@ -64,15 +64,8 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
         .cloned()
         .collect::<Vec<_>>();
     let tx_plan = TransactionPlan::new(changes, retired, plan.provider_bindings);
-    for (key, version) in &tx_plan.install {
-        println!("Install {key} {version}");
-    }
-    for package in &tx_plan.remove {
-        println!("Remove {} {}", package.key, package.version);
-    }
-    for (interface, key) in &tx_plan.provider_bindings {
-        println!("Bind {} to {key}", provider_symbol(interface));
-    }
+    let diff = crate::diff::compute_transaction_diff(&tx_plan, &installed, Some(&available));
+    diff.print_summary();
     if dry_run {
         // A dry run may inspect a planned provider that is not installed yet,
         // but malformed installed service state must still fail loudly.
@@ -155,6 +148,8 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
     if !drifts.is_empty() {
         crate::services::warn_service_drift(&drifts, Some(&next.generator), root);
     }
+    let audits = crate::process::audit_running_processes(root);
+    crate::process::print_process_audit(&audits);
     Ok(())
 }
 

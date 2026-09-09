@@ -147,3 +147,72 @@ async fn verified_cache_hit_requires_no_network() {
         .await
         .unwrap();
 }
+
+#[test]
+fn repository_index_records_timestamp_and_detects_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = dir.path().join("stage");
+    std::fs::create_dir_all(stage.join(".METADATA")).unwrap();
+    std::fs::create_dir_all(stage.join("data/usr/bin")).unwrap();
+    std::fs::write(stage.join("data/usr/bin/demo"), b"demo").unwrap();
+    let hash = hex::encode(Sha256::digest(b"demo"));
+    std::fs::write(
+        stage.join(".METADATA/files.idx"),
+        format!("usr/bin/demo\t0755\t4\t{hash}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        stage.join(".METADATA/manifest.toml"),
+        r#"schema_version=1
+name="demo"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+installed_size=4
+build_time=1
+"#,
+    )
+    .unwrap();
+    let package = dir.path().join("demo-1.0-1-amd64.pkg.tar.zst");
+    sage_archive::create_package(&stage, &package, 1).unwrap();
+    let key = dir.path().join("key");
+    std::fs::write(&key, [3u8; 32]).unwrap();
+    let output = dir.path().join("repo");
+    let artifacts = build_index(dir.path(), &output, &key).unwrap();
+    let ts = read_index_timestamp(&artifacts.index)
+        .unwrap()
+        .expect("timestamp must exist");
+    assert!(ts > 0);
+}
+
+#[test]
+fn anti_replay_detects_older_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let current_index = dir.path().join("current.mdb");
+    let older_index = dir.path().join("older.mdb");
+
+    for (path, ts) in [(&current_index, 2000u64), (&older_index, 1000u64)] {
+        let mut options = heed::EnvOpenOptions::new();
+        options.max_dbs(8);
+        unsafe {
+            options.flags(heed::EnvFlags::NO_SUB_DIR);
+        }
+        let env = unsafe { options.open(path).unwrap() };
+        let mut txn = env.write_txn().unwrap();
+        let metadata: heed::Database<heed::types::Str, heed::types::Str> =
+            env.create_database(&mut txn, Some("metadata")).unwrap();
+        metadata
+            .put(&mut txn, "timestamp", &ts.to_string())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let cur_ts = read_index_timestamp(&current_index).unwrap().unwrap();
+    let old_ts = read_index_timestamp(&older_index).unwrap().unwrap();
+    assert_eq!(cur_ts, 2000);
+    assert_eq!(old_ts, 1000);
+    assert!(old_ts < cur_ts);
+}

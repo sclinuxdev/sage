@@ -4,6 +4,9 @@ use std::sync::atomic::AtomicU64;
 use thiserror::Error;
 
 mod channel;
+mod diff;
+mod gc;
+mod process;
 mod query;
 mod recovery;
 mod services;
@@ -21,8 +24,8 @@ pub use recovery::settle_journals;
 
 // 3. State query and environment activation
 pub use query::{
-    QueryAction, list_channels, query_info, query_installed, query_owner, query_state,
-    use_toolchain,
+    QueryAction, list_channels, query_info, query_installed, query_orphans, query_owner,
+    query_state, use_toolchain,
 };
 
 // 4. Repository channels and availability pools
@@ -44,6 +47,13 @@ pub use state::{
     provider_symbol,
 };
 pub use triggers::{TriggerEngine, TriggerEvent, TriggerSpec};
+
+// 6. Diff preview, GC & cleanup, process audit
+pub use diff::{
+    InstallDiff, RemoveDiff, TransactionDiff, UpgradeDiff, compute_transaction_diff, format_bytes,
+};
+pub use gc::{CleanReport, clean_cache, find_orphans};
+pub use process::{ProcessAudit, audit_running_processes, print_process_audit};
 
 pub(crate) static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 

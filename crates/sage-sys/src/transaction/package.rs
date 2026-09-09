@@ -64,18 +64,8 @@ pub async fn apply_packages(
         .collect();
     let changes = installation_order(&available, changes)?;
     let plan = TransactionPlan::for_install(changes);
-    for (key, version) in &plan.install {
-        println!(
-            "{} {} {}",
-            if current.contains_key(key) {
-                "Upgrade"
-            } else {
-                "Install"
-            },
-            key,
-            version
-        );
-    }
+    let diff = crate::diff::compute_transaction_diff(&plan, &installed, Some(&available));
+    diff.print_summary();
     if dry_run {
         return Ok(());
     }
@@ -105,6 +95,8 @@ pub async fn apply_packages(
             declaration,
         )
         .await?;
+        let audits = crate::process::audit_running_processes(root);
+        crate::process::print_process_audit(&audits);
     }
     Ok(())
 }
@@ -376,9 +368,8 @@ pub fn remove_packages(
         }
     }
     let plan = TransactionPlan::for_remove(selected);
-    for package in &plan.remove {
-        println!("Remove {} {}", package.key, package.version);
-    }
+    let diff = crate::diff::compute_transaction_diff(&plan, &installed, None);
+    diff.print_summary();
     if dry_run {
         return Ok(());
     }
@@ -418,5 +409,8 @@ pub fn remove_packages(
     );
     journal.set_declaration(declaration);
     database.write_journal(&journal)?;
-    resume_remove(root, &database, &mut journal)
+    let result = resume_remove(root, &database, &mut journal);
+    let audits = crate::process::audit_running_processes(root);
+    crate::process::print_process_audit(&audits);
+    result
 }

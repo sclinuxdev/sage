@@ -126,6 +126,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Clean package caches, temporary files, and obsolete artifacts.
+    Clean {
+        /// Remove all cached package archives rather than only temporary/stale files.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -162,6 +168,8 @@ pub enum QueryAction {
         #[arg(long, default_value = "system")]
         channel: String,
     },
+    /// Find installed orphan packages.
+    Orphans,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -303,7 +311,20 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             QueryAction::Info { package, channel } => {
                 sage_sys::query_info(&cli.root, &package, &channel)?
             }
+            QueryAction::Orphans => sage_sys::query_orphans(&cli.root)?,
         },
+        Commands::Clean { all } => {
+            if cli.dry_run {
+                println!("Would clean Sage cache and temporary files (all: {all})");
+            } else {
+                let report = sage_sys::clean_cache(&cli.root, all)?;
+                println!(
+                    "Cleaned {} files, freed {}",
+                    report.files_removed,
+                    sage_sys::format_bytes(report.bytes_freed as i64)
+                );
+            }
+        }
         Commands::Service { action } => match action {
             ServiceAction::Enable { service } => {
                 sage_sys::service_enable(&cli.root, &service, cli.dry_run)?;
