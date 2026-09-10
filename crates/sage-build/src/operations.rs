@@ -876,6 +876,10 @@ fn package_staging(
     managed_build_tools: &[sage_archive::ManagedBuildTool],
 ) -> Result<()> {
     let data = area.path().join("data");
+    let info_dir = data.join("usr/share/info/dir");
+    if info_dir.exists() {
+        let _ = std::fs::remove_file(info_dir);
+    }
     let records = sage_archive::build_file_index(&data)?;
     let elf = sage_build::ElfScanner::scan(&data)?;
     let metadata = area.path().join(".METADATA");

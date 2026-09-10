@@ -553,7 +553,7 @@ fn trigger_path_variables_execute_once_per_kernel_slot() {
     let recorder = root.path().join("usr/bin/record-slot");
     fs::write(
         &recorder,
-        "#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"$SAGE_SYSROOT/result\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$4\" >> \"$SAGE_SYSROOT/result\"\n",
     )
     .unwrap();
     fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755)).unwrap();
