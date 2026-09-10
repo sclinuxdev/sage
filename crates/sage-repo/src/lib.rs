@@ -13,4 +13,4 @@ pub use index::{
     IndexArtifacts, IndexedRelease, ReleaseLocation, ReleaseSource, RepositoryIndex, build_index,
     decompress, open_index, read_index_timestamp,
 };
-pub use sign::{decode_fixed, sign_file};
+pub use sign::{SigningKey, VerifyingKey, decode_fixed, sign_file};

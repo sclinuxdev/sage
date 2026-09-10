@@ -1,6 +1,7 @@
 //! Cryptographic signature creation and verification for repository indices.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier};
+pub use ed25519_dalek::{SigningKey, VerifyingKey};
 use sage_core::hex;
 use std::fs::File;
 use std::path::Path;
