@@ -70,6 +70,20 @@ ignore_missing_binary = true
 
 `${path}` 展开为匹配的事务相对路径，`${path[N]}` 展开为从零开始的路径组件，`${sysroot}` 展开为事务目标根。引擎不调用 shell、关闭标准输入，并对展开后的完整命令去重；同一事务写入同一内核 Slot 的多个 `.ko` 文件只运行一次 `depmod`，不同 Slot 则各运行一次。
 
+### 示例 5: `initramfs.toml` (`/usr/share/sage/triggers/initramfs.toml`)
+```toml
+schema_version = 1
+name = "initramfs"
+description = "Generate or update initramfs images for kernel releases"
+on_paths = ["usr/lib/modules/*/vmlinuz"]
+exec = ["/usr/lib/sage/initramfs-generator", "${sysroot}", "${path[3]}"]
+priority = 30
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true
+```
+
+同理，`${path[3]}` 展开为当前内核 Slot 版本号。`initramfs` 触发器调用通用的 `/usr/lib/sage/initramfs-generator` 调度器，由调度器发现并执行已注册的生成器插件（如 mkinitcpio、dracut 等），实现包管理器核心与具体 initramfs 生成工具的彻底解耦。
+
 ---
 
 ## 2. 触发器引擎执行流水线 (`TriggerEngine`)

@@ -1,0 +1,8 @@
+schema_version = 1
+name = "initramfs"
+description = "Generate or update initramfs images for kernel releases"
+on_paths = ["usr/lib/modules/*/vmlinuz"]
+exec = ["/usr/lib/sage/initramfs-generator", "${sysroot}", "${path[3]}"]
+priority = 30
+events = ["post-change", "post-remove"]
+ignore_missing_binary = true
