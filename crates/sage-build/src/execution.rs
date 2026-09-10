@@ -809,15 +809,30 @@ impl<'a> SandboxRunner<'a> {
             ("BUILD_DIR".into(), "/build".into()),
             ("DESTDIR".into(), "/dest".into()),
             ("JOBS".into(), self.config.jobs.to_string()),
+            ("FORCE_UNSAFE_CONFIGURE".into(), "1".into()),
             ("TAR_OPTIONS".into(), "--no-same-owner".into()),
             (
                 "SOURCE_DATE_EPOCH".into(),
                 self.config.source_date_epoch.to_string(),
             ),
             ("CC".into(), "/build/.sage-tools/cc".into()),
-            ("CXX".into(), "/build/.sage-tools/cxx".into()),
+            (
+                "CXX".into(),
+                if self.config.cxx.contains("clang") {
+                    "/build/.sage-tools/clang++".into()
+                } else {
+                    "/build/.sage-tools/g++".into()
+                },
+            ),
             ("HOSTCC".into(), "/build/.sage-tools/cc".into()),
-            ("HOSTCXX".into(), "/build/.sage-tools/cxx".into()),
+            (
+                "HOSTCXX".into(),
+                if self.config.cxx.contains("clang") {
+                    "/build/.sage-tools/clang++".into()
+                } else {
+                    "/build/.sage-tools/g++".into()
+                },
+            ),
             ("LD".into(), "/build/.sage-tools/ld".into()),
             ("AR".into(), "ar".into()),
             ("RANLIB".into(), "ranlib".into()),
@@ -849,8 +864,12 @@ impl<'a> SandboxRunner<'a> {
                     "/toolchain/usr/lib/python/site-packages:/usr/lib/python/site-packages".into(),
                 ),
                 (
+                    "PERL5LIB".into(),
+                    perl5lib_paths(paths.toolchain.as_deref()),
+                ),
+                (
                     "LD_LIBRARY_PATH".into(),
-                    "/toolchain/usr/lib:/toolchain/usr/lib64:/usr/lib:/usr/lib64".into(),
+                    "/usr/lib:/usr/lib64:/toolchain/usr/lib:/toolchain/usr/lib64".into(),
                 ),
                 (
                     "LIBRARY_PATH".into(),
@@ -908,4 +927,37 @@ fn flag_parameters<const N: usize>(values: [(&str, &str); N]) -> Vec<String> {
         .filter(|(_, value)| !value.is_empty())
         .map(|(name, value)| format!("{name}={value}"))
         .collect()
+}
+
+/// Discovers Perl module search directories within the toolchain sysroot
+/// dynamically to provide a hermetic PERL5LIB variable across architectures and versions.
+fn perl5lib_paths(toolchain: Option<&Path>) -> String {
+    let mut entries = Vec::new();
+    if let Some(tc) = toolchain {
+        let perl_base = tc.join("usr/lib/perl5");
+        if let Ok(read_dir) = fs::read_dir(&perl_base) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    let sandbox_dir = format!("/toolchain/usr/lib/perl5/{name_str}");
+                    if let Ok(sub_read) = fs::read_dir(&path) {
+                        for sub_entry in sub_read.flatten() {
+                            if sub_entry.path().is_dir() {
+                                let sub_name = sub_entry.file_name();
+                                entries
+                                    .push(format!("{sandbox_dir}/{}", sub_name.to_string_lossy()));
+                            }
+                        }
+                    }
+                    entries.push(sandbox_dir);
+                }
+            }
+        }
+    }
+    entries.push("/toolchain/usr/share/perl5".into());
+    entries.push("/usr/share/perl5".into());
+    entries.push("/usr/lib/perl5".into());
+    entries.join(":")
 }

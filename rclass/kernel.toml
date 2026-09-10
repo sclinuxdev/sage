@@ -6,9 +6,10 @@ implicit_build_dependencies = [
     "system/bc",
     "system/binutils",
     "system/cpio",
-    "system/gettext",
     "system/libelf-dev",
-    "gcc16/gcc-libs:16",
+    "system/gcc-libs:16",
+    "gcc16/gcc:16",
+    "gcc16/gcc-dev:16",
     "system/make",
     "system/openssl",
     "system/openssl-dev",
@@ -107,6 +108,8 @@ if [ -n "${args.hostname}" ]; then
         printf 'CONFIG_DEFAULT_HOSTNAME="%s"\\n' "${args.hostname}" >> "${SRC_DIR}/.config"
     fi
 fi
+sed -i 's/CONFIG_DEBUG_INFO_BTF_MODULES=y/# CONFIG_DEBUG_INFO_BTF_MODULES is not set/' "${SRC_DIR}/.config"
+sed -i 's/CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y/CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y/' "${SRC_DIR}/.config"
 make_kernel olddefconfig
 make_kernel -s kernelrelease > "${SRC_DIR}/version"
 """
@@ -136,7 +139,7 @@ make_kernel \
     INSTALL_MOD_STRIP=1 \
     DEPMOD=/does/not/exist \
     modules_install
-install -Dm644 "$(make_kernel -s image_name)" "$modules_dir/vmlinuz"
+install -Dm644 "${SRC_DIR}/$(make_kernel -s image_name)" "$modules_dir/vmlinuz"
 printf '%s\\n' "${args.package_name}" | install -Dm644 /dev/stdin "$modules_dir/pkgbase"
 
 rm -f "$modules_dir/build" "$modules_dir/source"
@@ -160,10 +163,10 @@ if [ -f "${SRC_DIR}/tools/bpf/bpftool/vmlinux.h" ]; then
     install -Dm644 "${SRC_DIR}/tools/bpf/bpftool/vmlinux.h" "$build_dir/tools/bpf/bpftool/vmlinux.h"
 fi
 
-cp -a "${SRC_DIR}/scripts" "$build_dir/"
-cp -a "${SRC_DIR}/include" "$build_dir/"
+cp -a --no-preserve=ownership "${SRC_DIR}/scripts" "$build_dir/"
+cp -a --no-preserve=ownership "${SRC_DIR}/include" "$build_dir/"
 mkdir -p "$build_dir/arch/${args.kernel_arch}"
-cp -a "${SRC_DIR}/arch/${args.kernel_arch}/include" "$build_dir/arch/${args.kernel_arch}/"
+cp -a --no-preserve=ownership "${SRC_DIR}/arch/${args.kernel_arch}/include" "$build_dir/arch/${args.kernel_arch}/"
 install -Dm644 "${SRC_DIR}/arch/${args.kernel_arch}/Makefile" "$build_dir/arch/${args.kernel_arch}/Makefile"
 if [ -f "${SRC_DIR}/arch/${args.kernel_arch}/kernel/asm-offsets.s" ]; then
     install -Dm644 "${SRC_DIR}/arch/${args.kernel_arch}/kernel/asm-offsets.s" \
@@ -172,7 +175,7 @@ fi
 if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_HAVE_STACK_VALIDATION)" = y ]; then
     install -Dm755 "${SRC_DIR}/tools/objtool/objtool" "$build_dir/tools/objtool/objtool"
 fi
-if [ -x "${SRC_DIR}/scripts/config" ] && [ "$("${SRC_DIR}/scripts/config" -s CONFIG_DEBUG_INFO_BTF_MODULES)" = y ]; then
+if [ -f "${SRC_DIR}/tools/bpf/resolve_btfids/resolve_btfids" ]; then
     install -Dm755 "${SRC_DIR}/tools/bpf/resolve_btfids/resolve_btfids" \
         "$build_dir/tools/bpf/resolve_btfids/resolve_btfids"
 fi

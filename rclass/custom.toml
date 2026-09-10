@@ -43,4 +43,8 @@ if [ -d "${SRC_DIR}/.patches" ]; then
     done
 fi
 """
-src_install = "${args.install_cmd}"
+src_install = """
+cd "${SRC_DIR}"
+${args.install_cmd}
+"""
+

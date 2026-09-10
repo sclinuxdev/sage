@@ -17,7 +17,12 @@ pub async fn mass_rebuild(
         .unwrap_or_else(|| recipe_root.join(".sage-packages"));
     prepare_source_pool(&pool, dry_run)?;
     let mut blocked_symbols = std::collections::BTreeSet::new();
-    execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await
+    execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await?;
+    let failure_report = pool.join("build-failures.log");
+    if failure_report.exists() {
+        bail!("source build failed; review {}", failure_report.display());
+    }
+    Ok(())
 }
 pub async fn bootstrap_sources(
     root: &Path,
@@ -44,6 +49,10 @@ pub async fn bootstrap_sources(
         let units = source_build_units(root, units)?;
         let layers = sage_build::BuildGraph::layers(units)?;
         execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await?;
+    }
+    let failure_report = pool.join("build-failures.log");
+    if failure_report.exists() {
+        bail!("source build failed; review {}", failure_report.display());
     }
     Ok(())
 }
@@ -133,6 +142,46 @@ fn record_failure(report: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks if all binary packages defined by the given recipe specification (including subpackages)
+/// already exist in the target package pool.
+fn unit_already_built(pool: &Path, recipe_path: &Path) -> bool {
+    let Ok(recipe) = sage_build::RecipeSpec::load(recipe_path) else {
+        return false;
+    };
+    let main_target = pool
+        .join(".slots")
+        .join(&recipe.package.channel)
+        .join(&recipe.package.name)
+        .join(&recipe.package.slot)
+        .join(format!(
+            "{}-{}-{}-{}.pkg.tar.zst",
+            recipe.package.name,
+            recipe.package.version,
+            recipe.package.release,
+            recipe.package.arch
+        ));
+    if !main_target.is_file() {
+        return false;
+    }
+    for sub in &recipe.subpackages {
+        let channel = sub.channel.as_deref().unwrap_or(&recipe.package.channel);
+        let slot = sub.slot.as_deref().unwrap_or(&recipe.package.slot);
+        let sub_target = pool
+            .join(".slots")
+            .join(channel)
+            .join(&sub.name)
+            .join(slot)
+            .join(format!(
+                "{}-{}-{}-{}.pkg.tar.zst",
+                sub.name, recipe.package.version, recipe.package.release, recipe.package.arch
+            ));
+        if !sub_target.is_file() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn execute_source_layers(
     root: &Path,
     layers: &[Vec<sage_build::BuildUnit>],
@@ -188,6 +237,10 @@ async fn execute_source_layers(
                     println!("Skip {message}");
                     record_failure(&failure_report, &message)?;
                     blocked_symbols.extend(unit.produced_symbol_ids());
+                    continue;
+                }
+                if unit_already_built(pool, &unit.recipe) {
+                    println!("Skipping {}: already built in package pool", unit.name);
                     continue;
                 }
                 let root = root.to_path_buf();
@@ -288,9 +341,6 @@ async fn execute_source_layers(
                 }
             }
         }
-    }
-    if failure_report.exists() {
-        bail!("source build failed; review {}", failure_report.display());
     }
     Ok(())
 }
@@ -448,7 +498,14 @@ pub async fn build_recipe(
         selected_config.cxx.clone_from(&target.cxx);
         let mut cross_env = BTreeMap::from([
             ("CC".into(), "/build/.sage-tools/cc".into()),
-            ("CXX".into(), "/build/.sage-tools/cxx".into()),
+            (
+                "CXX".into(),
+                if selected_config.cxx.contains("clang") {
+                    "/build/.sage-tools/clang++".into()
+                } else {
+                    "/build/.sage-tools/g++".into()
+                },
+            ),
             ("AR".into(), target.ar.clone()),
             ("STRIP".into(), target.strip.clone()),
             ("GOOS".into(), target.goos.clone()),

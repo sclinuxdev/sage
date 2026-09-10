@@ -393,6 +393,14 @@ impl ElfScanner {
             };
             if let Some(soname) = elf.soname {
                 symbols.provides.insert(format!("so:{soname}"));
+            } else if let Some(file_name) = entry
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| name.ends_with(".so") || name.contains(".so."))
+            {
+                // Fallback for libraries without an explicit DT_SONAME header.
+                symbols.provides.insert(format!("so:{file_name}"));
             }
             symbols
                 .dependencies
@@ -472,11 +480,22 @@ impl ElfScanner {
                 runpaths.insert(origin_path(parent, directory)?);
             }
             let value = runpaths.into_iter().collect::<Vec<_>>().join(":");
-            let output = Command::new(patchelf)
+            let output = match Command::new(patchelf)
                 .arg("--set-rpath")
                 .arg(value)
                 .arg(root.join(&file))
-                .output()?;
+                .output()
+            {
+                Ok(out) => out,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        "patchelf not found; skipping private RUNPATH rewrite for {}",
+                        file.display()
+                    );
+                    return Ok(report);
+                }
+                Err(err) => return Err(err.into()),
+            };
             if !output.status.success() {
                 return Err(BuildError::Patchelf {
                     path: file,

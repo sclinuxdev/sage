@@ -556,7 +556,20 @@ fn dependency_key(
     dependency: &Dependency,
 ) -> PackageKey {
     if is_virtual(dependency) {
-        return virtual_key(&system_channel(&parent.channel), dependency);
+        // Resolve virtual dependencies against provider channels matching the consumer,
+        // falling back to the canonical system channel or first declared provider.
+        let sys_chan = system_channel(&parent.channel);
+        let channel = if let Some(providers) = universe.providers.get(&dependency.name) {
+            providers
+                .iter()
+                .find(|p| p.channel == parent.channel || p.channel == sys_chan)
+                .or_else(|| providers.first())
+                .map(|p| p.channel.as_str())
+                .unwrap_or(sys_chan.as_str())
+        } else {
+            sys_chan.as_str()
+        };
+        return virtual_key(channel, dependency);
     }
     let concrete = PackageKey::new(
         dependency_channel(parent, dependency.channel.as_deref()),
