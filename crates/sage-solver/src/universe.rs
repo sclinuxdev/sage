@@ -59,4 +59,14 @@ impl PackageUniverse {
             .map(|keys| keys.as_slice())
             .unwrap_or(&[])
     }
+
+    /// Returns all known package keys in the universe.
+    pub fn keys(&self) -> impl Iterator<Item = &PackageKey> {
+        self.releases.keys()
+    }
+
+    /// Returns true if the package key has any registered versions.
+    pub fn contains_key(&self, key: &PackageKey) -> bool {
+        self.releases.contains_key(key)
+    }
 }
