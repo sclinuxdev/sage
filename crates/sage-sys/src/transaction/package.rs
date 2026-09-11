@@ -623,7 +623,7 @@ pub fn remove_packages(
                                 .channel
                                 .as_deref()
                                 .is_none_or(|channel| channel == pkg.key.channel)
-                                && pkg.key.channel == removed.key.channel;
+                                && (virtual_dependency || pkg.key.channel == removed.key.channel);
                             provides_ok && slot_ok && channel_ok
                         };
                     let matched = matches_pkg(removed, false);
