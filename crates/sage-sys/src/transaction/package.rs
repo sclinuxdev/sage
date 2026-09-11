@@ -325,7 +325,7 @@ pub async fn apply_packages(
             Some(sage_db::FileMutation {
                 path: "etc/sage/system.toml".into(),
                 previous: Some(fs::read(&config_path)?),
-                next: Some(toml::to_string_pretty(&next)?.into_bytes()),
+                next: Some(next.to_toml_string()?.into_bytes()),
             })
         }
     } else {
@@ -658,7 +658,7 @@ pub fn remove_packages(
             None
         } else {
             let previous = fs::read(&config_path)?;
-            let next = toml::to_string_pretty(&config)?.into_bytes();
+            let next = config.to_toml_string()?.into_bytes();
             Some(sage_db::FileMutation {
                 path: "etc/sage/system.toml".into(),
                 previous: Some(previous),

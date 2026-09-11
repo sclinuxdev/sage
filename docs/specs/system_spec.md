@@ -65,8 +65,11 @@ packages = [
   dracut, or any other generator.
 - **原子状态切换**: 当用户将 `init = "loom"` 修改为 `init = "systemd"` 并执行 `sage rebuild` 时，系统自动计算差集，完成旧包卸载、新包安装以及全量服务配置重编译。
 
-### 2.3 `packages` 与服务管理解耦 (`/etc/sage/services.toml`)
-- `packages`: 系统声明式常驻包列表。
+### 2.3 `packages` 类似 Gentoo `@world` 语义与服务管理解耦
+- `packages`: 系统声明式常驻根软件包集合（置于 `system.toml` 最底部）：
+  - **Gentoo `@world` 语义**：仅记录管理员或系统显式指定的根包（如 `base`、`linux-zen:7.2.4-zen2`、`fastfetch`、开发工具等），**严禁包含传递依赖与子包**（如 `glibc`、`zlib`、`libcap`、`*-libs`、`*-dev` 等）。所有间接依赖由求解器根据图关系自动推导安装，孤立包由 `sage gc` 自动清理。
+  - **内核多版本原生共存**：内核为多版本 Slot 包（如 `linux-zen:7.2.4-zen2`、`linux-lts`），**不应在 `[providers]` 虚拟提供中被唯一锁定**，而应直接声明在 `packages` 列表中，天然允许多个不同版本或不同类型单包内核并存。
+  - **文件排版位置**：`packages = [...]` 统一置于 `system.toml` 最底部，使系统基础元数据 (`[system]`) 与虚拟提供者映射 (`[providers]`) 一目了然置顶。
 - **服务配置解耦**: 服务不存放在 `system.toml` 中，由独立的 `/etc/sage/services.toml` (`ServicesConfig`) 维护，定义 **Sage 声明式管理的服务激活状态 (Sage-managed service activation state)**：
   ```toml
   # /etc/sage/services.toml

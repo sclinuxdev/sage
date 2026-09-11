@@ -11,27 +11,147 @@ use crate::services::{ensure_directory_beneath, target_path, valid_declaration_n
 use crate::{SysError, TEMP_ID, validate_schema};
 
 /// Desired system state from `/etc/sage/system.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemConfig {
     pub schema_version: u32,
     pub system: SystemMetadata,
-    #[serde(default)]
     pub providers: BTreeMap<String, String>,
-    #[serde(default)]
     pub packages: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemMetadata {
     pub architecture: String,
     pub profile: String,
 }
 
+impl Serialize for SystemConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct RawConfig<'a> {
+            schema_version: u32,
+            packages: &'a BTreeSet<String>,
+            system: &'a SystemMetadata,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            providers: &'a BTreeMap<String, String>,
+        }
+        RawConfig {
+            schema_version: self.schema_version,
+            packages: &self.packages,
+            system: &self.system,
+            providers: &self.providers,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = toml::Value::deserialize(deserializer)?;
+        let table = value
+            .as_table_mut()
+            .ok_or_else(|| serde::de::Error::custom("expected table for system config"))?;
+
+        let schema_version = table
+            .get("schema_version")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| serde::de::Error::missing_field("schema_version"))?
+            as u32;
+
+        let system_val = table
+            .get("system")
+            .ok_or_else(|| serde::de::Error::missing_field("system"))?;
+        let system: SystemMetadata = system_val
+            .clone()
+            .try_into()
+            .map_err(serde::de::Error::custom)?;
+
+        let mut packages = BTreeSet::new();
+
+        // 1. Root-level `packages = [...]` before any table headers
+        if let Some(pkg_val) = table.remove("packages") {
+            let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
+            packages.extend(list);
+        }
+
+        let mut providers = BTreeMap::new();
+        if let Some(providers_val) = table.get_mut("providers")
+            && let Some(prov_table) = providers_val.as_table_mut()
+        {
+            // 2. Trailing `packages = [...]` placed at the bottom after [providers]
+            if packages.is_empty()
+                && let Some(pkg_val) = prov_table.remove("packages")
+            {
+                let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
+                packages.extend(list);
+            }
+            for (k, v) in prov_table.iter() {
+                if let Some(s) = v.as_str() {
+                    providers.insert(k.clone(), s.to_string());
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "expected string for provider '{k}', got {v:?}"
+                    )));
+                }
+            }
+        }
+
+        // 3. Trailing `packages = [...]` placed after [system] when no [providers] table exists
+        if packages.is_empty()
+            && let Some(system_val) = table.get_mut("system")
+            && let Some(sys_table) = system_val.as_table_mut()
+            && let Some(pkg_val) = sys_table.remove("packages")
+        {
+            let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
+            packages.extend(list);
+        }
+
+        Ok(SystemConfig {
+            schema_version,
+            system,
+            providers,
+            packages,
+        })
+    }
+}
+
 impl SystemConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SysError> {
-        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        let text = fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&text)?;
         validate_schema(config.schema_version)?;
         Ok(config)
+    }
+
+    /// Formats the declarative system state as a human-readable TOML document,
+    /// with schema and metadata at the top, providers in the middle, and the
+    /// explicit root packages (@world) at the bottom.
+    pub fn to_toml_string(&self) -> Result<String, SysError> {
+        let mut out = format!("schema_version = {}\n\n", self.schema_version);
+        out.push_str("[system]\n");
+        out.push_str(&format!(
+            "architecture = \"{}\"\n",
+            self.system.architecture
+        ));
+        out.push_str(&format!("profile = \"{}\"\n", self.system.profile));
+        if !self.providers.is_empty() {
+            out.push_str("\n[providers]\n");
+            for (interface, provider) in &self.providers {
+                out.push_str(&format!("{interface} = \"{provider}\"\n"));
+            }
+        }
+        out.push_str("\npackages = [\n");
+        for package in &self.packages {
+            out.push_str(&format!("    \"{package}\",\n"));
+        }
+        out.push_str("]\n");
+        Ok(out)
     }
 
     /// Expands declarative `name[:slot]` roots into exact solver identities.
@@ -646,4 +766,110 @@ fn atomic_symlink(sysroot: &Path, declared: &Path, target: &Path) -> Result<(), 
     std::os::unix::fs::symlink(target, &temporary)?;
     fs::rename(temporary, link)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_config_parses_packages_at_bottom() {
+        let text = r#"
+schema_version = 1
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[providers]
+init = "systemd"
+udev = "systemd-udev"
+
+packages = [
+    "base",
+    "fastfetch",
+    "linux-zen:7.2.4-zen2",
+]
+"#;
+        let config: SystemConfig = toml::from_str(text).unwrap();
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.system.architecture, "amd64");
+        assert_eq!(config.system.profile, "default");
+        assert_eq!(config.providers.get("init").unwrap(), "systemd");
+        assert_eq!(config.providers.get("udev").unwrap(), "systemd-udev");
+        assert_eq!(config.providers.len(), 2);
+        assert!(config.packages.contains("base"));
+        assert!(config.packages.contains("fastfetch"));
+        assert!(config.packages.contains("linux-zen:7.2.4-zen2"));
+        assert_eq!(config.packages.len(), 3);
+    }
+
+    #[test]
+    fn system_config_parses_packages_at_top() {
+        let text = r#"
+schema_version = 1
+packages = [
+    "base",
+    "linux-zen",
+]
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[providers]
+init = "loom"
+"#;
+        let config: SystemConfig = toml::from_str(text).unwrap();
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.providers.get("init").unwrap(), "loom");
+        assert_eq!(config.packages.len(), 2);
+    }
+
+    #[test]
+    fn system_config_parses_without_providers_table() {
+        let text = r#"
+schema_version = 1
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+packages = [
+    "base",
+]
+"#;
+        let config: SystemConfig = toml::from_str(text).unwrap();
+        assert_eq!(config.schema_version, 1);
+        assert!(config.providers.is_empty());
+        assert_eq!(config.packages.len(), 1);
+    }
+
+    #[test]
+    fn system_config_roundtrip_formatting() {
+        let mut packages = BTreeSet::new();
+        packages.insert("base".into());
+        packages.insert("linux-zen:7.2.4-zen2".into());
+        let mut providers = BTreeMap::new();
+        providers.insert("init".into(), "systemd".into());
+
+        let original = SystemConfig {
+            schema_version: 1,
+            system: SystemMetadata {
+                architecture: "amd64".into(),
+                profile: "default".into(),
+            },
+            providers,
+            packages,
+        };
+
+        let formatted = original.to_toml_string().unwrap();
+        // Verify packages is at the end of the formatted output
+        let providers_pos = formatted.find("[providers]").unwrap();
+        let packages_pos = formatted.find("packages = [").unwrap();
+        assert!(packages_pos > providers_pos);
+
+        let parsed: SystemConfig = toml::from_str(&formatted).unwrap();
+        assert_eq!(parsed, original);
+    }
 }
