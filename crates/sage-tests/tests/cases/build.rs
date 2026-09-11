@@ -768,6 +768,25 @@ fn carving_assigns_each_file_to_first_matching_package() {
     assert!(!areas[0].path().join("data/usr/lib/libx.so.1").exists());
 }
 
+#[test]
+fn payloads_require_arch_style_usr_merge_compatibility_links() {
+    let dest = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dest.path().join("sbin")).unwrap();
+    fs::write(dest.path().join("sbin/init"), b"legacy").unwrap();
+    let error = validate_usr_merged_payload(dest.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sbin must be a compatibility symlink")
+    );
+
+    fs::remove_dir_all(dest.path().join("sbin")).unwrap();
+    std::os::unix::fs::symlink("usr/bin", dest.path().join("sbin")).unwrap();
+    fs::create_dir_all(dest.path().join("usr/bin")).unwrap();
+    fs::write(dest.path().join("usr/bin/init"), b"merged").unwrap();
+    validate_usr_merged_payload(dest.path()).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn elf_scanner_reads_dynamic_dependencies() {

@@ -65,6 +65,13 @@ if [ -d "${SRC_DIR}/.source-patches" ]; then
         patch -d "$patch_root" -p1 < "$patch_file"
     done
 fi
+case "$(uname -m)" in
+    x86_64)
+        if [ -f "$patch_root/gcc/config/i386/t-linux64" ]; then
+            sed -e '/m64=/s/lib64/lib/' -i "$patch_root/gcc/config/i386/t-linux64"
+        fi
+        ;;
+esac
 """
 
 src_configure = """
@@ -89,4 +96,11 @@ cd "${BUILD_DIR}"
 """
 
 src_compile = "make -C \"${BUILD_DIR}\" -j \"${JOBS}\" ${args.make_args}"
-src_install = "make -C \"${BUILD_DIR}\" DESTDIR=\"${DESTDIR}\" install ${args.install_args}"
+src_install = """
+make -C "${BUILD_DIR}" DESTDIR="${DESTDIR}" install ${args.install_args}
+if [ -d "${DESTDIR}/usr/lib64" ]; then
+    mkdir -p "${DESTDIR}/usr/lib"
+    cp -a "${DESTDIR}/usr/lib64/." "${DESTDIR}/usr/lib/"
+    rm -rf "${DESTDIR}/usr/lib64"
+fi
+"""

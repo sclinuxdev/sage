@@ -1,5 +1,32 @@
 use super::*;
 
+/// Rejects package payload trees that place real content in compatibility paths.
+///
+/// Sage follows the Arch-style merged `/usr` layout: programs live in
+/// `usr/bin`, libraries live in `usr/lib`, and the legacy root and `usr/sbin`
+/// or `usr/lib64` names may only be compatibility symlinks.  Checking the
+/// complete DESTDIR before carving keeps every subpackage in the same namespace
+/// and prevents an unmatched `usr/lib64` runtime from falling into the main
+/// package.
+pub fn validate_usr_merged_payload(destdir: &Path) -> Result<(), BuildError> {
+    const COMPATIBILITY_PATHS: &[&str] = &["bin", "sbin", "lib", "lib64", "usr/sbin", "usr/lib64"];
+
+    for relative in COMPATIBILITY_PATHS {
+        let path = destdir.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {
+                return Err(BuildError::InvalidSpec(format!(
+                    "payload path {relative} must be a compatibility symlink in a usr-merged system"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// One mutually exclusive package tree carved from a shared DESTDIR.
 pub struct PackageStagingArea {
     pub name: String,
@@ -22,6 +49,7 @@ impl PayloadCarver {
         destdir: &Path,
         recipe: &RecipeSpec,
     ) -> Result<Vec<PackageStagingArea>, BuildError> {
+        validate_usr_merged_payload(destdir)?;
         let claims: Vec<_> = recipe
             .subpackages
             .iter()

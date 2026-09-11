@@ -8,6 +8,12 @@
 
 ## 1. 归档内部层级结构
 
+Package payloads use an Arch-style merged `/usr` hierarchy. Executables and
+libraries must be stored under `usr/bin` and `usr/lib`; `bin`, `sbin`, `lib`,
+`lib64`, `usr/sbin`, and `usr/lib64` are reserved for compatibility symlinks
+owned by the filesystem package. The build gate rejects real files or
+directories rooted at any of these compatibility paths.
+
 ```text
 pkgname-1.0.0-1-amd64.pkg.tar.zst
 ├── .METADATA/                    # 严格置于归档最前端
