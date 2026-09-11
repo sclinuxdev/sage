@@ -1,5 +1,5 @@
 use sage_build::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -809,6 +809,19 @@ fn elf_scanner_handles_non_elf_and_corrupt_files() {
     )
     .unwrap();
     assert!(ElfScanner::scan(directory.path()).is_err());
+}
+
+#[test]
+fn scanned_dependencies_exclude_sonames_provided_by_the_same_package() {
+    let elf = ElfSymbols {
+        provides: BTreeSet::from(["so:libgcc_s.so.1".into()]),
+        dependencies: BTreeSet::from(["so:libc.so.6".into(), "so:libgcc_s.so.1".into()]),
+    };
+    let provides = elf.provides.clone();
+    assert_eq!(
+        external_runtime_dependencies(&["virtual/libc".into()], &elf, &provides),
+        BTreeSet::from(["so:libc.so.6".into(), "virtual/libc".into()])
+    );
 }
 
 #[cfg(target_os = "linux")]

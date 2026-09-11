@@ -892,22 +892,20 @@ fn package_staging(
         metadata.join("files.idx"),
         sage_archive::format_file_index(&records),
     )?;
-    let dependencies = area
-        .dependencies
-        .iter()
-        .chain(&elf.dependencies)
-        .map(|value| value.parse::<sage_core::Dependency>())
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?
-        .into_iter()
-        .collect();
     let provides = area
         .provides
         .iter()
         .chain(&elf.provides)
         .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        .collect::<std::collections::BTreeSet<_>>();
+    let dependencies =
+        sage_build::external_runtime_dependencies(&area.dependencies, &elf, &provides)
+            .iter()
+            .map(|value| value.parse::<sage_core::Dependency>())
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+            .into_iter()
+            .collect();
+    let provides = provides.into_iter().collect();
     let subpackage = recipe.subpackages.iter().find(|s| s.name == area.name);
     let manifest = sage_archive::PackageManifest {
         schema_version: sage_core::SCHEMA_VERSION,

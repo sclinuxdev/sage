@@ -174,6 +174,30 @@ pub struct ElfSymbols {
     pub dependencies: BTreeSet<String>,
 }
 
+/// Merges declared and scanned runtime dependencies without retaining SONAMEs
+/// provided by the same output package.
+///
+/// An ELF shared object commonly records a dependency on another object shipped
+/// beside it. Once every object has been scanned, those internal edges are
+/// satisfied by the package payload itself and must not become solver-level
+/// self-dependencies.
+pub fn external_runtime_dependencies(
+    declared: &[String],
+    elf: &ElfSymbols,
+    provides: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    declared
+        .iter()
+        .cloned()
+        .chain(
+            elf.dependencies
+                .iter()
+                .filter(|dependency| !provides.contains(*dependency))
+                .cloned(),
+        )
+        .collect()
+}
+
 /// Parsed dynamic ELF metadata relevant for dependency tracking and RUNPATH rewriting.
 #[derive(Debug, Default)]
 struct ElfBinary<'a> {
