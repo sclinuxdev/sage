@@ -340,6 +340,52 @@ fn retained_cross_channel_consumer_can_switch_its_virtual_provider() {
 }
 
 #[test]
+fn removal_rejects_an_empty_shared_library_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+    let compiler = sage_db::InstalledPackage {
+        key: sage_core::PackageKey::new("main/gcc16", "gcc", "16"),
+        version: "16.2.0-1".parse().unwrap(),
+        arch: "amd64".into(),
+        installed_size: 1,
+        dependencies: vec![],
+        provides: vec!["so:libgcc_s.so.1".into()],
+        conflicts: vec![],
+        files: vec!["usr/lib64/libgcc_s.so.1".into()],
+        config_hashes: BTreeMap::new(),
+    };
+    let mut runtime = sage_db::InstalledPackage {
+        key: sage_core::PackageKey::new("main/system", "gcc-libs", "16"),
+        version: "16.2.0-1".parse().unwrap(),
+        arch: "amd64".into(),
+        installed_size: 0,
+        dependencies: vec!["so:libgcc_s.so.1".parse().unwrap()],
+        provides: vec!["so:libgcc_s.so.1".into()],
+        conflicts: vec![],
+        files: vec![],
+        config_hashes: BTreeMap::new(),
+    };
+    database.install(&compiler, false).unwrap();
+    database.install(&runtime, false).unwrap();
+    drop(database);
+
+    let error =
+        remove_packages(root.path(), &["gcc".into()], Some("gcc16"), false, true).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("required by main/system:gcc-libs:16"),
+        "{error:#}"
+    );
+
+    runtime.files.push("usr/lib/libgcc_s.so.1".into());
+    let database = sage_db::SageDatabase::open(root.path().join("var/lib/sage")).unwrap();
+    database.install(&runtime, false).unwrap();
+    drop(database);
+    remove_packages(root.path(), &["gcc".into()], Some("gcc16"), false, true).unwrap();
+}
+
+#[test]
 fn unconfigured_virtual_and_concrete_fallback_choices_are_not_bindings() {
     use sage_core::PackageKey;
     let mut universe = sage_solver::PackageUniverse::default();

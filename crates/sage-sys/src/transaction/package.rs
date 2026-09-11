@@ -608,9 +608,22 @@ pub fn remove_packages(
                     let matches_pkg =
                         |pkg: &sage_db::InstalledPackage, direct_only_non_virtual: bool| {
                             let direct = dependency.name == pkg.key.name;
-                            let provides_ok = direct
-                                || (!direct_only_non_virtual
-                                    && pkg.provides.contains(&dependency.name));
+                            let declared_provider =
+                                !direct_only_non_virtual && pkg.provides.contains(&dependency.name);
+                            // A shared-library declaration is meaningful only when the
+                            // installed package owns a file bearing that SONAME.  This
+                            // prevents an empty or stale split package from keeping a
+                            // dependency apparently satisfied while removal deletes the
+                            // only package that actually owns the runtime library.
+                            let file_backed_provider =
+                                dependency.name.strip_prefix("so:").is_none_or(|soname| {
+                                    pkg.files.iter().any(|path| {
+                                        Path::new(path).file_name().is_some_and(|file_name| {
+                                            file_name == std::ffi::OsStr::new(soname)
+                                        })
+                                    })
+                                });
+                            let provides_ok = direct || (declared_provider && file_backed_provider);
                             let slot_ok = dependency.slot.as_deref().map_or_else(
                                 || {
                                     virtual_dependency
