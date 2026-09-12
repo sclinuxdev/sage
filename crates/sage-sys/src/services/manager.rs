@@ -305,9 +305,10 @@ fn execute_service_lifecycle(
 /// Enables a service in `/etc/sage/services.toml` and activates it in the init provider.
 ///
 /// If `dry_run` is set to `true`, validates generator compatibility and executes the
-/// provider's read-only state query (`is_enabled_cmd`), including for definitions
-/// that have not been rendered yet. This surfaces query failures (such as non-zero
-/// error exit codes) during preview without modifying declarations or persisting journals.
+/// provider's read-only state query (`is_enabled_cmd`) for an existing native
+/// definition. Missing definitions receive static validation only, since real
+/// enable renders them before querying. Query errors for existing definitions
+/// fail without modifying declarations or persisting journals.
 ///
 /// When `dry_run` is `false`, persists a lifecycle journal, renders the definition,
 /// activates the service in the provider if needed, and publishes declarative mutations.
@@ -329,7 +330,9 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
     if dry_run {
-        let _ = generator.is_service_enabled(&spec, root)?;
+        if generator.rendered_path(&spec, root)?.try_exists()? {
+            let _ = generator.is_service_enabled(&spec, root)?;
+        }
     } else {
         config.enabled.insert(service_name.to_string());
         config.disabled.remove(service_name);
