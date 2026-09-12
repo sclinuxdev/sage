@@ -22,3 +22,10 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Deny Clippy warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Verify cgroup confinement on the Linux kernel
+        timeout-minutes: 2
+        run: |
+          test -f /sys/fs/cgroup/cgroup.controllers
+          printf '+memory +pids\n' | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          test_binary=$(cargo test -p sage-build --lib --no-run --message-format=json | python3 -c 'import json,sys; print(next(row["executable"] for line in sys.stdin if (row := json.loads(line)).get("executable") and row.get("profile", {}).get("test")))')
+          sudo timeout 30s "$test_binary" --exact cgroup::tests::delegated_scope_confines_exec_and_descendants --ignored --nocapture
