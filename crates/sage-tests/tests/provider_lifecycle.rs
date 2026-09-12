@@ -50,6 +50,52 @@ async fn install(
 }
 
 #[tokio::test]
+async fn concrete_slot_resolution_preserves_provider_solving_and_upgrade_unlocks() {
+    for (slots, installed_slot, selector, expected_slot) in [
+        (vec!["0", "1", "2"], None, "codec", "0"),
+        (vec!["1", "2"], None, "codec", "2"),
+        (vec!["1", "2"], Some("1"), "codec", "1"),
+        (vec!["1", "2"], None, "codec:1", "1"),
+    ] {
+        let mut lab = TortureLab::new().unwrap();
+        if let Some(slot) = installed_slot {
+            lab.add_package(package("codec", slot, 1, &[], &[]))
+                .unwrap();
+            lab.publish().unwrap();
+            install(&lab, &format!("codec:{slot}"), &[], false, false)
+                .await
+                .unwrap();
+        }
+        for slot in slots {
+            lab.add_package(package("codec", slot, 2, &[], &["virtual/awk"]))
+                .unwrap();
+        }
+        lab.add_package(package("gawk", "7", 1, &["virtual/awk"], &[]))
+            .unwrap();
+        lab.publish().unwrap();
+        sage_sys::apply_packages(
+            lab.root(),
+            &[selector.into()],
+            None,
+            &[],
+            false,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let after = lab.snapshot().unwrap();
+        assert_eq!(after.packages.len(), 2);
+        assert_eq!(
+            after.packages[&format!("main/system:codec:{expected_slot}")],
+            "2-1"
+        );
+        assert_eq!(after.packages["main/system:gawk:7"], "1-1");
+    }
+}
+
+#[tokio::test]
 async fn virtual_install_validates_provides_and_overrides_before_mutation() {
     let mut lab = TortureLab::new().unwrap();
     lab.add_package(package("gawk", "0", 1, &["virtual/awk"], &[]))

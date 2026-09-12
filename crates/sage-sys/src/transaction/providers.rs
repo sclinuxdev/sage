@@ -105,7 +105,30 @@ pub(super) fn resolve_virtual_selections(
 ) -> Result<VirtualSelections> {
     let requested = names
         .iter()
-        .map(|name| PackageKey::in_channel(channel, name))
+        .map(|name| -> Result<PackageKey> {
+            let default_key = PackageKey::in_channel(channel, name)?;
+            // Resolve omitted concrete slots before building solver roots and
+            // upgrade locks. Explicit slots and virtual requirements retain
+            // their exact meaning and are handled by the solver below.
+            if name.contains(':')
+                || name.starts_with("virtual/")
+                || universe.contains_key(&default_key)
+            {
+                return Ok(default_key);
+            }
+            if let Some(package) = installed
+                .iter()
+                .find(|package| package.key.channel == channel && package.key.name == *name)
+            {
+                return Ok(package.key.clone());
+            }
+            Ok(universe
+                .keys()
+                .filter(|key| key.channel == channel && key.name == *name)
+                .max()
+                .cloned()
+                .unwrap_or(default_key))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     // PackageKey always contains a concrete slot, so retain optional virtual
     // constraints from the original selector before deduplicating exact roots.
