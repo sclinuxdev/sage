@@ -10,6 +10,9 @@ pub type DependencyMap = Map<PackageKey, VersionRange>;
 /// Selected version for each channel/name/slot identity.
 pub type Solution = BTreeMap<PackageKey, Version>;
 
+/// Concrete provider choices keyed by `(resolved channel, virtual symbol)`.
+pub type ProviderBindings = BTreeMap<(String, String), PackageKey>;
+
 /// Solver releases use the canonical package record without a conversion layer.
 pub type PackageRelease = Package;
 

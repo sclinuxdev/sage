@@ -84,11 +84,15 @@ packages = [
 Each configured provider declares a required virtual interface and an exact
 concrete package identity. The binding includes channel and slot and cannot
 backtrack to another implementation or slot. Version selection can still
-backtrack within that identity. During rebuild, an otherwise unused configured interface is
+backtrack within that identity. Bindings apply only to requirements routed to
+the same repository system channel; a `main/system` policy cannot constrain
+`vendor/system` dependencies. During rebuild, an otherwise unused configured interface is
 added as a virtual root so its selected release must actually provide the symbol.
 
 `sage install -P interface=package[:slot]` (or `--provider`) overrides a binding
-for the transaction. `virtual/interface` is accepted as the interface spelling;
+in the requested repository's system channel for the transaction. Only
+`main/system` choices are saved in the system provider table.
+`virtual/interface` is accepted as the interface spelling;
 empty, malformed and duplicate overrides are rejected. Direct `virtual/interface`
 requests are resolved as virtual edges, not unchecked concrete package roots.
 Automatic choices come from a satisfiable dependency graph. Interactive choices

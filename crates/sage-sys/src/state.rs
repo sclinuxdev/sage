@@ -162,7 +162,8 @@ impl ReconcilePlan {
         };
         let provider_bindings = selected_providers
             .into_iter()
-            .map(|(symbol, key)| {
+            .filter(|((channel, _), _)| channel == "main/system")
+            .map(|((_, symbol), key)| {
                 (
                     symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
                     key,

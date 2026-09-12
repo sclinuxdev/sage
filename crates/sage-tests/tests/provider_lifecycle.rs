@@ -382,6 +382,114 @@ fn assert_rebuild_keeps_installed(lab: &TortureLab) {
 }
 
 #[tokio::test]
+async fn foreign_provider_choices_do_not_override_main_policy() {
+    for explicit in [false, true] {
+        let mut lab = TortureLab::new().unwrap();
+        lab.add_package(package("main-app", "0", 1, &[], &["virtual/libc < 2-1"]))
+            .unwrap();
+        let mut app = package("vendor-app", "0", 1, &[], &["virtual/libc >= 2-1"]);
+        app.channel = "runtime".into();
+        lab.add_package(app).unwrap();
+        lab.add_package(package("main-libc", "0", 1, &["virtual/libc"], &[]))
+            .unwrap();
+        lab.add_package(package("vendor-libc", "2", 2, &["virtual/libc"], &[]))
+            .unwrap();
+        lab.add_package(package("extra", "0", 1, &[], &[])).unwrap();
+        lab.publish().unwrap();
+        // Mirror the fixture indexes under another configured repository root.
+        // Loading them through channels.toml exercises canonical identity routing.
+        let channels_path = lab.root().join("etc/sage/channels.toml");
+        let mut channels = fs::read_to_string(&channels_path).unwrap();
+        channels.push_str(
+            r#"
+[channels.vendor]
+url="https://invalid.example/vendor"
+priority=100
+signing_key="/etc/sage/repo.pub"
+[channels.vendor.subchannels.system]
+scope="system"
+target_root="/opt/vendor/system"
+[channels.vendor.subchannels.runtime]
+scope="runtime"
+target_root="/opt/vendor/runtime"
+"#,
+        );
+        fs::write(channels_path, channels).unwrap();
+        for channel in ["system", "runtime"] {
+            let cache = lab.root().join("var/cache/sage/channels");
+            let destination = cache.join("vendor").join(channel);
+            fs::create_dir_all(&destination).unwrap();
+            fs::copy(
+                cache.join("main").join(channel).join("index.mdb"),
+                destination.join("index.mdb"),
+            )
+            .unwrap();
+        }
+        sage_sys::apply_packages(
+            lab.root(),
+            &["main-app".into()],
+            Some("main/system"),
+            &[("libc".into(), "main-libc".into())],
+            false,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let config_path = lab.root().join("etc/sage/system.toml");
+        let config_bytes = fs::read(&config_path).unwrap();
+        let before = lab.snapshot().unwrap();
+        let overrides = if explicit {
+            vec![("libc".into(), "vendor-libc:2".into())]
+        } else {
+            vec![]
+        };
+        for dry_run in [true, false] {
+            sage_sys::apply_packages(
+                lab.root(),
+                &["vendor-app".into()],
+                Some("vendor/runtime"),
+                &overrides,
+                true,
+                false,
+                true,
+                dry_run,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read(&config_path).unwrap(), config_bytes);
+            if dry_run {
+                assert_eq!(lab.snapshot().unwrap(), before);
+            }
+        }
+        let snapshot = lab.snapshot().unwrap();
+        assert_eq!(snapshot.packages["main/system:main-libc:0"], "1-1");
+        assert_eq!(snapshot.packages["vendor/system:vendor-libc:2"], "2-1");
+        assert_eq!(snapshot.packages["vendor/runtime:vendor-app:0"], "1-1");
+        assert_rebuild_keeps_installed(&lab);
+        // A later saved main transaction must retain both dependency graphs and
+        // must not persist a foreign choice under main's unqualified symbol.
+        sage_sys::apply_packages(
+            lab.root(),
+            &["extra".into()],
+            Some("main/system"),
+            &[],
+            false,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        let config = sage_sys::SystemConfig::load(&config_path).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers["libc"], "main-libc:0");
+        assert_rebuild_keeps_installed(&lab);
+    }
+}
+
+#[tokio::test]
 async fn automatic_provider_choices_keep_simultaneous_slots_independent() {
     for interactive in [false, true] {
         let mut lab = TortureLab::new().unwrap();

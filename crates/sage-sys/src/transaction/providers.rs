@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
 use sage_core::{ConstraintOp, DEFAULT_SLOT, Dependency, PackageKey, Version};
-use sage_solver::{PackageUniverse, SageSolver, Solution};
+use sage_solver::{PackageUniverse, ProviderBindings, SageSolver, Solution};
 
 use crate::state::{SystemConfig, provider_symbol};
 
@@ -107,7 +107,11 @@ pub(super) fn resolve_virtual_selections(
         .iter()
         .map(|name| PackageKey::in_channel(channel, name))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut bindings = config.provider_preferences("main/system")?;
+    let mut bindings: ProviderBindings = config
+        .provider_preferences("main/system")?
+        .into_iter()
+        .map(|(symbol, key)| ((key.channel.clone(), symbol), key))
+        .collect();
     let system_channel = channel.rsplit_once('/').map_or_else(
         || "system".to_string(),
         |(root, _)| format!("{root}/system"),
@@ -122,7 +126,7 @@ pub(super) fn resolve_virtual_selections(
         let mut override_config = config.clone();
         override_config.providers = BTreeMap::from([(interface.clone(), selector.clone())]);
         let key = override_config.provider_preferences(&system_channel)?[&symbol].clone();
-        bindings.insert(symbol, key);
+        bindings.insert((system_channel.clone(), symbol), key);
     }
     let mut roots = requested.clone();
     roots.extend(installed.iter().map(|package| package.key.clone()));
@@ -132,7 +136,7 @@ pub(super) fn resolve_virtual_selections(
     roots.extend(
         overridden
             .iter()
-            .map(|symbol| PackageKey::new(&bindings[symbol].channel, symbol, DEFAULT_SLOT)),
+            .map(|symbol| PackageKey::new(&system_channel, symbol, DEFAULT_SLOT)),
     );
     roots.sort();
     roots.dedup();
@@ -144,7 +148,11 @@ pub(super) fn resolve_virtual_selections(
     let mut automatic = BTreeMap::<Dependency, PackageKey>::new();
     let solve = |automatic: &BTreeMap<Dependency, PackageKey>, locks: &[(PackageKey, Version)]| {
         SageSolver::with_locked(universe, locks.iter().cloned())
-            .bind_providers(bindings.clone())
+            .bind_providers(
+                bindings
+                    .iter()
+                    .map(|((_, symbol), key)| (symbol.clone(), key.clone())),
+            )
             .bind_provider_requirements(automatic.clone())
             .resolve_with_provider_choices(&roots)
     };
@@ -158,10 +166,15 @@ pub(super) fn resolve_virtual_selections(
                         == (root.slot != DEFAULT_SLOT).then_some(root.slot.as_str())
             })
     };
+    let is_configured = |requirement: &Dependency| {
+        requirement.channel.as_ref().is_some_and(|channel| {
+            bindings.contains_key(&(channel.clone(), requirement.name.clone()))
+        })
+    };
     loop {
         let (solution, choices) = solve(&automatic, &locks)?;
         let is_bound = |requirement: &Dependency| {
-            bindings.contains_key(&requirement.name) || automatic.contains_key(requirement)
+            is_configured(requirement) || automatic.contains_key(requirement)
         };
         // Bind directly requested providers before unlocking their releases, so
         // another installed provider's lock cannot displace the selected identity.
@@ -185,14 +198,21 @@ pub(super) fn resolve_virtual_selections(
         let Some((requirement, chosen)) = unbound else {
             let mut providers: BTreeMap<String, PackageKey> = BTreeMap::new();
             for (requirement, key) in &choices {
+                // The system provider table belongs to main/system. Foreign
+                // choices remain scoped to their graph and must not overwrite it.
+                if key.channel != "main/system" {
+                    continue;
+                }
                 // The persisted table describes global policy. A slot-specific
                 // edge, or a symbol with different feasible choices, cannot be
                 // promoted to one global binding without narrowing the graph.
-                if bindings.contains_key(&requirement.name)
+                if is_configured(requirement)
                     || (automatic.contains_key(requirement)
                         && requirement.slot.is_none()
                         && choices.iter().all(|(other, selected)| {
-                            other.name != requirement.name || selected == key
+                            other.channel != requirement.channel
+                                || other.name != requirement.name
+                                || selected == key
                         }))
                 {
                     providers.insert(

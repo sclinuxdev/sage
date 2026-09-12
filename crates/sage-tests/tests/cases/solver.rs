@@ -45,6 +45,48 @@ fn subchannel_inherits_system_virtual_provider() {
 }
 
 #[test]
+fn configured_bindings_keep_repository_channels_independent() {
+    for symbol in ["virtual/libc", "so:libc.so.6"] {
+        let mut universe = PackageUniverse::default();
+        for channel in ["main/system", "vendor/system"] {
+            let mut provider = release(channel, "libc", "1-1", &[]);
+            provider.provides.push(symbol.into());
+            universe.insert(provider);
+        }
+        universe.insert(release("vendor/runtime", "app", "1-1", &[symbol]));
+        let app = PackageKey::new("vendor/runtime", "app", "0");
+        let main = PackageKey::new("main/system", "libc", "0");
+        let vendor = PackageKey::new("vendor/system", "libc", "0");
+        for include_vendor_binding in [false, true] {
+            let mut configured = vec![(symbol.into(), main.clone())];
+            if include_vendor_binding {
+                configured.push((symbol.into(), vendor.clone()));
+            }
+            for strict in [false, true] {
+                let solver = SageSolver::new(&universe);
+                let solver = if strict {
+                    solver.bind_providers(configured.clone())
+                } else {
+                    solver.prefer_providers(configured.clone())
+                };
+                // The foreign edge does not satisfy the unused main declaration:
+                // rebuild must add and validate that channel's own virtual root.
+                let (solution, bindings) = solver
+                    .resolve_with_provider_bindings(std::slice::from_ref(&app))
+                    .unwrap();
+                assert!(solution.contains_key(&main));
+                assert!(solution.contains_key(&vendor));
+                assert_eq!(bindings[&("main/system".into(), symbol.into())], main);
+                assert_eq!(bindings.len(), if include_vendor_binding { 2 } else { 1 });
+                if include_vendor_binding {
+                    assert_eq!(bindings[&("vendor/system".into(), symbol.into())], vendor);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn virtual_dependencies_filter_concrete_provider_versions() {
     let mut universe = PackageUniverse::default();
     universe.insert(release(

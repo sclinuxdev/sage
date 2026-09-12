@@ -1,7 +1,7 @@
 //! PubGrub solver adapter, virtual proxy routing, and conflict translation.
 
 use crate::error::SolverError;
-use crate::universe::{DependencyMap, PackageUniverse, Solution, VersionRange};
+use crate::universe::{DependencyMap, PackageUniverse, ProviderBindings, Solution, VersionRange};
 use pubgrub::{
     DefaultStringReporter, Dependencies, DependencyProvider, Map, PackageResolutionStatistics,
     PubGrubError, Reporter, resolve,
@@ -15,8 +15,8 @@ use std::convert::Infallible;
 pub struct SageSolver<'a> {
     universe: &'a PackageUniverse,
     locked: BTreeMap<PackageKey, Version>,
-    preferred_providers: BTreeMap<String, PackageKey>,
-    bound_providers: BTreeMap<String, PackageKey>,
+    preferred_providers: ProviderBindings,
+    bound_providers: ProviderBindings,
     bound_requirements: BTreeMap<Dependency, PackageKey>,
 }
 
@@ -44,22 +44,28 @@ impl<'a> SageSolver<'a> {
         }
     }
 
-    /// Ranks configured providers without preventing PubGrub backtracking.
+    /// Ranks providers within their channel without preventing PubGrub backtracking.
     pub fn prefer_providers(
         mut self,
         providers: impl IntoIterator<Item = (String, PackageKey)>,
     ) -> Self {
-        self.preferred_providers = providers.into_iter().collect();
+        self.preferred_providers = providers
+            .into_iter()
+            .map(|(symbol, key)| ((key.channel.clone(), symbol), key))
+            .collect();
         self
     }
 
-    /// Strictly binds virtual interfaces to exact providers, excluding any alternative
-    /// candidate packages from the resolution universe.
+    /// Strictly binds each interface within the concrete provider's channel.
+    /// Other channels retain independent candidates for the same symbol.
     pub fn bind_providers(
         mut self,
         providers: impl IntoIterator<Item = (String, PackageKey)>,
     ) -> Self {
-        self.bound_providers = providers.into_iter().collect();
+        self.bound_providers = providers
+            .into_iter()
+            .map(|(symbol, key)| ((key.channel.clone(), symbol), key))
+            .collect();
         self
     }
 
@@ -112,11 +118,12 @@ impl<'a> SageSolver<'a> {
             .collect()
     }
 
-    /// Resolves desired roots and the concrete bindings of configured interfaces.
+    /// Resolves desired roots and configured interfaces, returning bindings keyed
+    /// by resolved channel and symbol so independent repositories cannot collide.
     pub fn resolve_with_provider_bindings(
         &self,
         requested: &[PackageKey],
-    ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
+    ) -> Result<(Solution, ProviderBindings), SolverError> {
         let mut dependencies = self.root_dependencies(requested);
         let (solution, choices) = loop {
             let (solution, choices) = self.resolve_root(dependencies.clone())?;
@@ -124,12 +131,16 @@ impl<'a> SageSolver<'a> {
             all_providers.extend(self.bound_providers.clone());
             let missing: Vec<_> = all_providers
                 .into_iter()
-                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| &choice.name == symbol))
+                .filter(|((channel, symbol), _)| {
+                    !choices.iter().any(|(choice, _)| {
+                        &choice.name == symbol && choice.channel.as_ref() == Some(channel)
+                    })
+                })
                 .collect();
             if missing.is_empty() {
                 break (solution, choices);
             }
-            for (symbol, preferred) in missing {
+            for ((_, symbol), preferred) in missing {
                 let key = virtual_key(
                     &preferred.channel,
                     &Dependency {
@@ -150,12 +161,13 @@ impl<'a> SageSolver<'a> {
         let mut bindings = BTreeMap::new();
         for (requirement, key) in choices {
             let symbol = requirement.name;
-            if !self.preferred_providers.contains_key(&symbol)
-                && !self.bound_providers.contains_key(&symbol)
+            let scope = (key.channel.clone(), symbol.clone());
+            if !self.preferred_providers.contains_key(&scope)
+                && !self.bound_providers.contains_key(&scope)
             {
                 continue;
             }
-            if let Some(previous) = bindings.insert(symbol.clone(), key.clone())
+            if let Some(previous) = bindings.insert(scope, key.clone())
                 && previous != key
             {
                 return Err(SolverError::NoSolution(format!(
@@ -344,6 +356,9 @@ impl SageProvider {
             .collect();
         for (target, channel, requirement) in virtuals {
             let provider_name = provider_symbol(&requirement.name);
+            let scope = (channel.clone(), provider_name.to_owned());
+            let bound = bound_providers.get(&scope);
+            let preferred = preferred_providers.get(&scope);
             let mut scoped = requirement.clone();
             scoped.channel = Some(channel.clone());
             let Some(providers) = universe.providers.get(provider_name) else {
@@ -362,9 +377,7 @@ impl SageProvider {
                 }
                 // When a virtual interface is strictly bound to a provider, only that
                 // provider is eligible. All alternative providers are filtered out.
-                if bound_providers
-                    .get(provider_name)
-                    .is_some_and(|bound| bound != key)
+                if bound.is_some_and(|bound| bound != key)
                     || solver
                         .bound_requirements
                         .get(&scoped)
@@ -383,10 +396,7 @@ impl SageProvider {
                     {
                         continue;
                     }
-                    let preferred = preferred_providers.get(provider_name) == Some(key)
-                        || bound_providers
-                            .get(provider_name)
-                            .is_some_and(|bound| bound == key);
+                    let preferred = preferred == Some(key) || bound == Some(key);
                     let exact_lock = locked.get(key) == Some(version);
                     let preference = match (preferred, exact_lock) {
                         (true, true) => 4,

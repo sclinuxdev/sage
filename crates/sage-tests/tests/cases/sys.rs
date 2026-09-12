@@ -52,6 +52,43 @@ fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
 }
 
 #[test]
+fn rebuild_retains_foreign_consumers_without_exporting_their_bindings() {
+    use sage_core::PackageKey;
+    for symbol in ["virtual/libc", "so:libc.so.6"] {
+        let app = release(
+            PackageKey::new("vendor/runtime", "app", "0"),
+            "1-1",
+            &[symbol],
+            &[],
+        );
+        let foreign = release(
+            PackageKey::new("vendor/system", "libc", "2"),
+            "1-1",
+            &[],
+            &[symbol],
+        );
+        let main = PackageKey::new("main/system", "libc", "0");
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(main.clone(), "1-1", &[], &[symbol]));
+        universe.insert(app.clone());
+        universe.insert(foreign.clone());
+        let installed = vec![installed(&app), installed(&foreign)];
+        let desired = config(&[], &[(symbol, "libc")]);
+        let plan = ReconcilePlan::compute(&desired, &installed, &universe, false).unwrap();
+        assert_eq!(plan.install, vec![(main.clone(), "1-1".parse().unwrap())]);
+        assert!(plan.remove.is_empty());
+        assert_eq!(
+            plan.provider_bindings,
+            BTreeMap::from([(
+                symbol.strip_prefix("virtual/").unwrap_or(symbol).into(),
+                main
+            ),])
+        );
+        assert!(find_orphans(&installed, &desired).is_empty());
+    }
+}
+
+#[test]
 fn configured_provider_is_strict_with_and_without_a_consumer() {
     use sage_core::PackageKey;
     for dependency in [vec![], vec!["virtual/libc"]] {

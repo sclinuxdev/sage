@@ -6,4 +6,4 @@ pub mod universe;
 
 pub use adapter::SageSolver;
 pub use error::SolverError;
-pub use universe::{PackageRelease, PackageUniverse, Solution};
+pub use universe::{PackageRelease, PackageUniverse, ProviderBindings, Solution};
