@@ -224,3 +224,45 @@ async fn runtime_virtual_dependencies_use_system_channel_providers() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn provider_selectors_accept_package_and_slot_punctuation() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package("libc++", "abi+debug", 1, &["virtual/libc++"], &[]))
+        .unwrap();
+    lab.add_package(package("unused", "0", 1, &[], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    install(&lab, "unused", &[], false, false).await.unwrap();
+    install(
+        &lab,
+        "virtual/libc++",
+        &[("libc++", "libc++:abi+debug")],
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
+    let key = PackageKey::new("main/system", "libc++", "abi+debug");
+    assert_eq!(
+        config.provider_preferences("main/system").unwrap()["virtual/libc++"],
+        key
+    );
+    let installed = sage_db::read_packages(&lab.root().join("var/lib/sage")).unwrap();
+    let mut universe = sage_solver::PackageUniverse::default();
+    for package in &installed {
+        universe.insert(sage_core::Package::from_release(
+            package.key.clone(),
+            package.version.clone(),
+            package.dependencies.clone(),
+            package.provides.clone(),
+        ));
+    }
+    let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &universe, false).unwrap();
+    assert!(plan.install.is_empty());
+    assert_eq!(plan.provider_bindings["libc++"], key);
+    let orphans = sage_sys::find_orphans(&installed, &config);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].key.name, "unused");
+}

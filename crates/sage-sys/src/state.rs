@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use sage_core::valid_package_component;
 use serde::{Deserialize, Serialize};
 
 use crate::services::{ensure_directory_beneath, target_path, valid_declaration_name};
@@ -55,9 +56,9 @@ impl SystemConfig {
             let name = symbol.strip_prefix("virtual/").unwrap_or(&symbol);
             let key = sage_core::PackageKey::in_channel(channel, selector)
                 .map_err(|error| SysError::Invalid(error.to_string()))?;
-            if (!symbol.starts_with("so:") && !valid_declaration_name(name))
-                || !valid_declaration_name(&key.name)
-                || !valid_declaration_name(&key.slot)
+            if (!symbol.starts_with("so:") && !valid_package_component(name))
+                || !valid_package_component(&key.name)
+                || !valid_package_component(&key.slot)
             {
                 return Err(SysError::Invalid(format!(
                     "invalid provider mapping {interface}={selector}"

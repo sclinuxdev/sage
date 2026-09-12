@@ -19,6 +19,15 @@ fn default_slot() -> String {
     DEFAULT_SLOT.into()
 }
 
+/// Checks the shared alphabet for concrete package names and slots.
+/// Both require non-empty ASCII letters, digits, '.', '_', '+', or '-'.
+pub fn valid_package_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
 impl PackageKey {
     /// Constructs a package key from caller-owned string-like values.
     pub fn new(

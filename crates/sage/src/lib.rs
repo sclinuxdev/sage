@@ -370,15 +370,13 @@ fn parse_provider_override(input: &str) -> std::result::Result<(String, String),
         .strip_prefix("virtual/")
         .unwrap_or(interface.trim());
     let selector = selector.trim();
-    let valid = |value: &str| {
-        !value.is_empty()
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    };
+    use sage_core::valid_package_component;
     let key = sage_core::PackageKey::in_channel("main/system", selector)
         .map_err(|error| error.to_string())?;
-    if !valid(interface) || !valid(&key.name) || !valid(&key.slot) {
+    if !valid_package_component(interface)
+        || !valid_package_component(&key.name)
+        || !valid_package_component(&key.slot)
+    {
         return Err("provider override requires a valid interface and package[:slot]".into());
     }
     Ok((interface.into(), selector.into()))
@@ -391,6 +389,21 @@ mod provider_cli_tests {
     #[test]
     fn provider_flags_accept_slots_and_reject_malformed_mappings() {
         for flag in ["-P", "--provider"] {
+            let cli = Cli::try_parse_from([
+                "sage",
+                "install",
+                "virtual/libc++",
+                flag,
+                "libc++=libc++:abi+debug",
+            ])
+            .unwrap();
+            let Commands::Install { providers, .. } = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(
+                providers,
+                vec![("libc++".into(), "libc++:abi+debug".into())]
+            );
             let cli =
                 Cli::try_parse_from(["sage", "install", "virtual/awk", flag, "virtual/awk=gawk:2"])
                     .unwrap();
