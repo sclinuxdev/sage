@@ -1521,6 +1521,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "clap",
  "heed",
  "sage",
  "sage-archive",

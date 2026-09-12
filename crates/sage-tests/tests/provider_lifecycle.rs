@@ -1,5 +1,6 @@
 //! Provider choices must survive the actual CLI/application transaction boundary.
 
+use clap::Parser;
 use sage_core::PackageKey;
 use sage_tests::{PackageSpec, TortureLab};
 use std::fs;
@@ -265,6 +266,55 @@ async fn provider_selectors_accept_package_and_slot_punctuation() {
     let orphans = sage_sys::find_orphans(&installed, &config);
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].key.name, "unused");
+}
+
+#[tokio::test]
+async fn shared_library_cli_overrides_survive_install_and_rebuild() {
+    for (flag, symbol) in [
+        ("-P", "so:libfoo.so.1"),
+        ("--provider", "so:libC++.so.1@ABI"),
+    ] {
+        let mut lab = TortureLab::new().unwrap();
+        lab.add_package(package("app", "0", 1, &[], &[symbol]))
+            .unwrap();
+        // The concrete package named `so` still uses ordinary name:slot parsing.
+        lab.add_package(package("so", "abi+debug", 1, &[symbol], &[]))
+            .unwrap();
+        lab.add_package(package("alternative", "0", 2, &[symbol], &[]))
+            .unwrap();
+        lab.publish().unwrap();
+        let config_path = lab.root().join("etc/sage/system.toml");
+        let before_config = fs::read(&config_path).unwrap();
+        let before = lab.snapshot().unwrap();
+        for dry_run in [true, false] {
+            let mut cli = sage::Cli::try_parse_from([
+                "sage",
+                "--root",
+                lab.root().to_str().unwrap(),
+                "install",
+                "app",
+                flag,
+                &format!("{symbol}=so:abi+debug"),
+            ])
+            .unwrap();
+            cli.dry_run = dry_run;
+            sage::execute(cli).await.unwrap();
+            if dry_run {
+                assert_eq!(lab.snapshot().unwrap(), before);
+                assert_eq!(fs::read(&config_path).unwrap(), before_config);
+            }
+        }
+        let config = sage_sys::SystemConfig::load(&config_path).unwrap();
+        assert_eq!(config.providers[symbol], "so:abi+debug");
+        assert_eq!(config.packages, ["app".into()].into());
+        let snapshot = lab.snapshot().unwrap();
+        assert_eq!(snapshot.packages.len(), 2);
+        assert_eq!(snapshot.packages["main/system:so:abi+debug"], "1-1");
+        assert_rebuild_keeps_installed(&lab);
+        // Validate the persisted mapping on a later ordinary install as well.
+        install(&lab, "app", &[], true, false).await.unwrap();
+        assert_eq!(lab.snapshot().unwrap(), snapshot);
+    }
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use sage_core::valid_package_component;
+use sage_core::{valid_package_component, valid_provider_symbol};
 use serde::{Deserialize, Serialize};
 
 use crate::services::{ensure_directory_beneath, target_path, valid_declaration_name};
@@ -53,10 +53,9 @@ impl SystemConfig {
         let mut providers = BTreeMap::new();
         for (interface, selector) in &self.providers {
             let symbol = provider_symbol(interface);
-            let name = symbol.strip_prefix("virtual/").unwrap_or(&symbol);
             let key = sage_core::PackageKey::in_channel(channel, selector)
                 .map_err(|error| SysError::Invalid(error.to_string()))?;
-            if (!symbol.starts_with("so:") && !valid_package_component(name))
+            if !valid_provider_symbol(&symbol)
                 || !valid_package_component(&key.name)
                 || !valid_package_component(&key.slot)
             {

@@ -365,21 +365,24 @@ fn parse_provider_override(input: &str) -> std::result::Result<(String, String),
     let (interface, selector) = input.split_once('=').ok_or_else(|| {
         "provider override must follow format interface=package (e.g. init=systemd)".to_string()
     })?;
-    let interface = interface
-        .trim()
-        .strip_prefix("virtual/")
-        .unwrap_or(interface.trim());
+    let interface = interface.trim();
     let selector = selector.trim();
     use sage_core::valid_package_component;
     let key = sage_core::PackageKey::in_channel("main/system", selector)
         .map_err(|error| error.to_string())?;
-    if !valid_package_component(interface)
+    if !sage_core::valid_provider_symbol(interface)
         || !valid_package_component(&key.name)
         || !valid_package_component(&key.slot)
     {
         return Err("provider override requires a valid interface and package[:slot]".into());
     }
-    Ok((interface.into(), selector.into()))
+    Ok((
+        interface
+            .strip_prefix("virtual/")
+            .unwrap_or(interface)
+            .into(),
+        selector.into(),
+    ))
 }
 
 #[cfg(test)]
@@ -411,6 +414,14 @@ mod provider_cli_tests {
                 panic!("wrong command")
             };
             assert_eq!(providers, vec![("awk".into(), "gawk:2".into())]);
+            for symbol in ["so:libfoo.so.1", "so:libC++.so.1@ABI"] {
+                let mapping = format!("{symbol}=so:abi+debug");
+                let cli = Cli::try_parse_from(["sage", "install", "app", flag, &mapping]).unwrap();
+                let Commands::Install { providers, .. } = cli.command else {
+                    panic!("wrong command")
+                };
+                assert_eq!(providers, vec![(symbol.into(), "so:abi+debug".into())]);
+            }
             for input in [
                 "awk",
                 "=gawk",
@@ -419,6 +430,11 @@ mod provider_cli_tests {
                 "awk=gawk=bad",
                 "virtual/=gawk",
                 "awk=a/b",
+                "so:=foo",
+                "so:lib foo.so=foo",
+                "so:lib/foo.so=foo",
+                "so:lib\nfoo.so=foo",
+                "virtual/so:libfoo.so=foo",
             ] {
                 assert!(
                     Cli::try_parse_from(["sage", "install", "app", flag, input]).is_err(),

@@ -28,6 +28,20 @@ pub fn valid_package_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
 }
 
+/// Validates a short virtual interface, `virtual/name`, or an opaque `so:soname`.
+/// Sonames must be non-empty and exclude whitespace, controls, paths, and the
+/// override separator; they are not restricted to the package-name alphabet.
+pub fn valid_provider_symbol(value: &str) -> bool {
+    if let Some(soname) = value.strip_prefix("so:") {
+        !soname.is_empty()
+            && !soname
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '='))
+    } else {
+        valid_package_component(value.strip_prefix("virtual/").unwrap_or(value))
+    }
+}
+
 impl PackageKey {
     /// Constructs a package key from caller-owned string-like values.
     pub fn new(

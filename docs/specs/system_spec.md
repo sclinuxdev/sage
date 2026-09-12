@@ -92,7 +92,8 @@ added as a virtual root so its selected release must actually provide the symbol
 `sage install -P interface=package[:slot]` (or `--provider`) overrides a binding
 in the requested repository's system channel for the transaction. Only
 `main/system` choices are saved in the system provider table.
-`virtual/interface` is accepted as the interface spelling;
+`virtual/interface` and exact shared-library symbols such as
+`so:libfoo.so.1` are accepted as interface spellings;
 empty, malformed and duplicate overrides are rejected. Direct `virtual/interface`
 requests are resolved as virtual edges, not unchecked concrete package roots.
 Automatic choices come from a satisfiable dependency graph. Interactive choices

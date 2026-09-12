@@ -52,6 +52,34 @@ fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
 }
 
 #[test]
+fn provider_symbols_share_cli_and_configuration_validation() {
+    for symbol in ["so:libfoo.so.1", "so:libC++.so.1@ABI"] {
+        let preferences = config(&[], &[(symbol, "so:abi+debug")])
+            .provider_preferences("main/system")
+            .unwrap();
+        assert_eq!(
+            preferences[symbol],
+            sage_core::PackageKey::new("main/system", "so", "abi+debug")
+        );
+    }
+    for symbol in [
+        "so:",
+        "so:lib foo.so",
+        "so:lib/foo.so",
+        "so:lib\nfoo.so",
+        "so:lib=foo.so",
+        "virtual/so:libfoo.so",
+    ] {
+        assert!(
+            config(&[], &[(symbol, "foo")])
+                .provider_preferences("main/system")
+                .is_err(),
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
 fn rebuild_retains_foreign_consumers_without_exporting_their_bindings() {
     use sage_core::PackageKey;
     for symbol in ["virtual/libc", "so:libc.so.6"] {
