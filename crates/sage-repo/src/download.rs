@@ -215,6 +215,10 @@ impl DownloadEngine {
         })?;
         if let Some(current_ts) = read_index_timestamp(destination)? {
             if incoming_ts == current_ts && hash_file(destination)? == hash_file(&uncompressed)? {
+                // An authenticated no-op may still rotate the HTTP validator.
+                if let Some(etag) = etag {
+                    tokio::fs::write(etag_path, etag).await?;
+                }
                 return Ok(false);
             }
             if incoming_ts <= current_ts {

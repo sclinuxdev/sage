@@ -4,7 +4,7 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use heed::types::Str;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 fn index(path: &Path, timestamp: Option<&str>, content: &str) {
@@ -27,6 +27,34 @@ fn index(path: &Path, timestamp: Option<&str>, content: &str) {
     txn.commit().unwrap();
 }
 
+fn accept_request(listener: &TcpListener) -> (TcpStream, Vec<String>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "HTTP fixture timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        if line == "\r\n" {
+            break;
+        }
+        request.push(line.trim_end().to_owned());
+    }
+    (stream, request)
+}
+
 async fn serve_index(
     incoming: &Path,
     destination: &Path,
@@ -45,28 +73,7 @@ async fn serve_index(
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         for body in [signature.to_vec(), compressed] {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "HTTP fixture timed out");
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("{error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                if line == "\r\n" {
-                    break;
-                }
-            }
+            let (mut stream, _) = accept_request(&listener);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: new\r\nConnection: close\r\n\r\n",
@@ -82,6 +89,57 @@ async fn serve_index(
         .await;
     server.join().unwrap();
     result
+}
+
+#[tokio::test]
+async fn identical_refresh_updates_etag_and_next_sync_uses_304() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.mdb");
+    index(&current, Some("20"), "current");
+    let before = std::fs::read(&current).unwrap();
+    let etag_path = current.with_extension("etag");
+    std::fs::write(&etag_path, "\"old\"").unwrap();
+    let key = SigningKey::from_bytes(&[29; 32]);
+    let key_path = current.with_extension("pub");
+    std::fs::write(&key_path, key.verifying_key().to_bytes()).unwrap();
+    let signature = crate::sign_file(&current, &key)
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    let compressed = zstd::encode_all(before.as_slice(), 1).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for (path, validator, status, body) in [
+            ("index.mdb.sig", Some("\"old\""), "200 OK", signature),
+            ("index.mdb.zst", None, "200 OK", compressed),
+            (
+                "index.mdb.sig",
+                Some("\"new\""),
+                "304 Not Modified",
+                Vec::new(),
+            ),
+        ] {
+            let (mut stream, request) = accept_request(&listener);
+            assert_eq!(request[0], format!("GET /{path} HTTP/1.1"));
+            let actual = request.iter().find_map(|header| {
+                let (name, value) = header.split_once(':')?;
+                name.eq_ignore_ascii_case("if-none-match")
+                    .then(|| value.trim())
+            });
+            assert_eq!(actual, validator);
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: \"new\"\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+    let engine = DownloadEngine::new(dir.path().join("cache")).unwrap();
+    assert!(!engine.sync_index(&url, &key_path, &current).await.unwrap());
+    assert_eq!(std::fs::read(&current).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&etag_path).unwrap(), "\"new\"");
+    assert!(!engine.sync_index(&url, &key_path, &current).await.unwrap());
+    server.join().unwrap();
+    assert_eq!(std::fs::read(&current).unwrap(), before);
 }
 
 #[tokio::test]
