@@ -104,56 +104,43 @@ pub fn find_orphans(
     let mut needed = BTreeSet::new();
     let mut worklist = VecDeque::new();
 
-    // 1. Mark all explicitly declared root packages from system.toml as roots
-    for selector in &system_config.packages {
-        let (name, slot) = selector
-            .split_once(':')
-            .map_or((selector.as_str(), sage_core::DEFAULT_SLOT), |(n, s)| {
-                (n, s)
-            });
-
-        for pkg in installed {
-            if pkg.key.name == name
-                && (pkg.key.slot == slot || selector == &pkg.key.name)
-                && needed.insert(pkg.key.clone())
-            {
-                worklist.push_back(pkg.key.clone());
-            }
+    // Rebuild only prunes main/system. Other channels remain independent roots.
+    let (Ok(mut roots), Ok(providers)) = (
+        system_config.package_keys("main/system"),
+        system_config.provider_preferences("main/system"),
+    ) else {
+        // Invalid declarations cannot safely establish that anything is unused.
+        return Vec::new();
+    };
+    roots.extend(providers.into_values());
+    roots.extend(
+        installed
+            .iter()
+            .filter(|pkg| pkg.key.channel != "main/system")
+            .map(|pkg| pkg.key.clone()),
+    );
+    for key in roots {
+        if installed_map.contains_key(&key) && needed.insert(key.clone()) {
+            worklist.push_back(key);
         }
     }
-
-    // 2. Mark configured provider packages as roots (e.g. init provider)
-    for provider_name in system_config.providers.values() {
-        for pkg in installed {
-            if &pkg.key.name == provider_name && needed.insert(pkg.key.clone()) {
-                worklist.push_back(pkg.key.clone());
-            }
-        }
+    let mut universe = sage_solver::PackageUniverse::default();
+    for pkg in installed {
+        universe.insert(sage_core::Package::from_release(
+            pkg.key.clone(),
+            pkg.version.clone(),
+            pkg.dependencies.clone(),
+            pkg.provides.clone(),
+        ));
     }
-
-    // 3. Compute transitive closure of dependencies
+    // All matching virtual providers are retained conservatively because installed
+    // dependency rows do not record which alternative satisfied each edge.
     while let Some(current_key) = worklist.pop_front() {
         if let Some(pkg) = installed_map.get(&current_key) {
             for dep in &pkg.dependencies {
-                for candidate in installed {
-                    let direct = dep.name == candidate.key.name;
-                    let provides_ok = direct || candidate.provides.contains(&dep.name);
-                    let slot_ok = dep
-                        .slot
-                        .as_deref()
-                        .is_none_or(|slot| slot == candidate.key.slot);
-                    let channel_ok = dep
-                        .channel
-                        .as_deref()
-                        .is_none_or(|chan| chan == candidate.key.channel);
-                    let version_ok = dep.op.matches(&candidate.version, dep.version.as_ref());
-                    if provides_ok
-                        && slot_ok
-                        && channel_ok
-                        && version_ok
-                        && needed.insert(candidate.key.clone())
-                    {
-                        worklist.push_back(candidate.key.clone());
+                for key in universe.matching_dependency_keys(&current_key, dep) {
+                    if needed.insert(key.clone()) {
+                        worklist.push_back(key);
                     }
                 }
             }

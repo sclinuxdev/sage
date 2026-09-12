@@ -881,3 +881,60 @@ cron = "cronie"
     assert_eq!(preferences.get("virtual/awk").unwrap().name, "gawk");
     assert_eq!(preferences.get("virtual/cron").unwrap().name, "cronie");
 }
+
+#[test]
+fn orphan_detection_uses_rebuild_channels_slots_and_virtual_routing() {
+    use sage_core::PackageKey;
+    let key = |channel, name, slot| PackageKey::new(channel, name, slot);
+    let packages = vec![
+        release(
+            key("main/system", "app", "0"),
+            "1-1",
+            &["runtime/helper", "lib", "virtual/awk"],
+            &[],
+        ),
+        release(key("main/system", "app", "1"), "1-1", &[], &[]),
+        release(
+            key("main/runtime", "helper", "0"),
+            "1-1",
+            &["virtual/libc"],
+            &[],
+        ),
+        release(key("main/system", "lib", "0"), "1-1", &[], &[]),
+        release(key("main/system", "lib", "2"), "1-1", &[], &[]),
+        release(
+            key("main/system", "libc", "2"),
+            "1-1",
+            &[],
+            &["virtual/libc"],
+        ),
+        release(key("main/system", "awk", "2"), "1-1", &[], &["virtual/awk"]),
+        release(
+            key("main/system", "cron", "3"),
+            "1-1",
+            &[],
+            &["virtual/cron"],
+        ),
+        release(
+            key("main/system", "cron", "0"),
+            "1-1",
+            &[],
+            &["virtual/cron"],
+        ),
+        release(key("main/system", "unused", "0"), "1-1", &[], &[]),
+    ];
+    let installed: Vec<_> = packages.iter().map(installed).collect();
+    let orphans: BTreeSet<_> = find_orphans(&installed, &config(&["app"], &[("cron", "cron:3")]))
+        .into_iter()
+        .map(|package| package.key)
+        .collect();
+    assert_eq!(
+        orphans,
+        BTreeSet::from([
+            key("main/system", "app", "1"),
+            key("main/system", "lib", "2"),
+            key("main/system", "cron", "0"),
+            key("main/system", "unused", "0"),
+        ])
+    );
+}

@@ -235,6 +235,47 @@ impl<'a> SageSolver<'a> {
     }
 }
 
+impl PackageUniverse {
+    /// Finds installed dependency candidates using the resolver's channel, default
+    /// slot, virtual routing, concrete fallback and version semantics.
+    pub fn matching_dependency_keys(
+        &self,
+        parent: &PackageKey,
+        dependency: &Dependency,
+    ) -> Vec<PackageKey> {
+        let target = dependency_key(self, parent, dependency);
+        if let Some((_, channel, requirement)) = virtual_requirement(&target) {
+            let symbol = provider_symbol(&requirement.name);
+            self.providers_for(symbol)
+                .iter()
+                .filter(|key| {
+                    key.channel == channel
+                        && requirement
+                            .slot
+                            .as_ref()
+                            .is_none_or(|slot| &key.slot == slot)
+                        && self.versions(key).any(|version| {
+                            requirement
+                                .op
+                                .matches(version, requirement.version.as_ref())
+                                && self.release(key, version).is_some_and(|release| {
+                                    release.provides.iter().any(|provided| provided == symbol)
+                                })
+                        })
+                })
+                .cloned()
+                .collect()
+        } else if self
+            .versions(&target)
+            .any(|version| dependency.op.matches(version, dependency.version.as_ref()))
+        {
+            vec![target]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) struct SageProvider {
     pub(crate) releases: BTreeMap<PackageKey, BTreeMap<Version, DependencyMap>>,
     pub(crate) locked: BTreeMap<PackageKey, Version>,
