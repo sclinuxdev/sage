@@ -1,8 +1,7 @@
 //! Package deployment, removal, upgrades, and publication operations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -10,6 +9,7 @@ use sage_core::under_root;
 
 use super::plan::TransactionPlan;
 use super::preflight::{declaration_path, preflight_packages, write_atomic_under_root};
+use super::providers::resolve_virtual_selections;
 use crate::channel::{
     AvailablePackages, canonical_channel, load_available_with_pool, qualify_channel,
 };
@@ -20,224 +20,6 @@ use crate::recovery::{
 use crate::services::ServiceDocument;
 use crate::state::{AlternativesDocument, SystemConfig, SysusersDocument, provider_symbol};
 use crate::triggers::TriggerSpec;
-
-/// Prompts the user or selects a provider when multiple providers exist for an unconfigured virtual interface.
-pub fn select_virtual_provider(
-    symbol: &str,
-    candidates: &[sage_core::PackageKey],
-    cli_override: Option<&str>,
-    interactive: bool,
-) -> Result<sage_core::PackageKey> {
-    if candidates.is_empty() {
-        bail!("no provider available in repository for {symbol}");
-    }
-
-    // 1. If explicit CLI override is provided, select it if valid
-    if let Some(override_pkg) = cli_override {
-        if let Some(matched) = candidates.iter().find(|k| k.name == override_pkg) {
-            return Ok(matched.clone());
-        } else {
-            bail!(
-                "specified provider '{override_pkg}' does not satisfy {symbol} (available: {})",
-                candidates
-                    .iter()
-                    .map(|k| k.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-
-    if candidates.len() == 1 {
-        return Ok(candidates[0].clone());
-    }
-
-    // 2. If interactive terminal is attached and requested, prompt the user to choose
-    if interactive && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        use std::io::{self, BufRead, Write};
-
-        println!("\nThere are multiple providers available for {symbol}:");
-        for (i, key) in candidates.iter().enumerate() {
-            println!("  {}) {} ({})", i + 1, key.name, key.channel);
-        }
-        print!("Select a provider [1-{}] (default 1): ", candidates.len());
-        io::stdout().flush().ok();
-
-        let mut line = String::new();
-        let stdin = io::stdin();
-        if stdin.lock().read_line(&mut line).is_ok() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return Ok(candidates[0].clone());
-            }
-            if let Some(idx) = trimmed
-                .parse::<usize>()
-                .ok()
-                .filter(|&idx| idx >= 1 && idx <= candidates.len())
-            {
-                return Ok(candidates[idx - 1].clone());
-            }
-        }
-        println!(
-            "Invalid selection, selecting default provider: {}",
-            candidates[0].name
-        );
-    } else {
-        println!(
-            "Notice: multiple providers available for {symbol}; selecting default provider '{}'",
-            candidates[0].name
-        );
-    }
-
-    Ok(candidates[0].clone())
-}
-
-type VirtualSelections = (
-    Vec<sage_core::PackageKey>,
-    BTreeMap<String, sage_core::PackageKey>,
-    BTreeMap<String, sage_core::PackageKey>,
-    BTreeMap<String, String>,
-);
-
-/// Identifies requested package keys and resolves virtual selections (both direct and transitive).
-fn resolve_virtual_selections(
-    universe: &sage_solver::PackageUniverse,
-    channel: &str,
-    names: &[String],
-    config: &SystemConfig,
-    installed: &[sage_db::InstalledPackage],
-    provider_overrides: &[(String, String)],
-    interactive: bool,
-) -> Result<VirtualSelections> {
-    let mut preferences = config.provider_preferences("main/system")?;
-    let mut bound_providers = BTreeMap::new();
-    let mut new_config_providers = BTreeMap::new();
-
-    // All provider mappings declared in system.toml under [providers] are strictly bound
-    // so the solver adheres to user configuration without backtracking to alternative packages.
-    for (symbol, key) in &preferences {
-        bound_providers.insert(symbol.clone(), key.clone());
-    }
-
-    // Process explicit CLI provider overrides first
-    for (interface, pkg) in provider_overrides {
-        let symbol = provider_symbol(interface);
-        let key = sage_core::PackageKey::in_channel(channel, pkg)?;
-        bound_providers.insert(symbol.clone(), key.clone());
-        preferences.insert(symbol.clone(), key);
-        new_config_providers.insert(interface.clone(), pkg.clone());
-    }
-
-    let mut concrete_requested = Vec::new();
-
-    // Process explicitly requested package names
-    for name in names {
-        if name.starts_with("virtual/") {
-            let symbol = name.as_str();
-            let interface = symbol.strip_prefix("virtual/").unwrap_or(symbol);
-
-            let chosen = if let Some(key) = bound_providers
-                .get(symbol)
-                .or_else(|| preferences.get(symbol))
-            {
-                key.clone()
-            } else {
-                let candidates: Vec<_> = universe
-                    .providers_for(symbol)
-                    .iter()
-                    .filter(|k| k.channel == channel)
-                    .cloned()
-                    .collect();
-
-                let cli_override = provider_overrides
-                    .iter()
-                    .find(|(k, _)| k == interface || k == symbol)
-                    .map(|(_, v)| v.as_str());
-
-                let selected =
-                    select_virtual_provider(symbol, &candidates, cli_override, interactive)?;
-                bound_providers.insert(symbol.to_string(), selected.clone());
-                preferences.insert(symbol.to_string(), selected.clone());
-                new_config_providers.insert(interface.to_string(), selected.name.clone());
-                selected
-            };
-
-            concrete_requested.push(chosen);
-        } else {
-            let key = sage_core::PackageKey::in_channel(channel, name)?;
-            concrete_requested.push(key);
-        }
-    }
-
-    // Inspect direct and transitive virtual dependencies of requested packages
-    let mut visited = BTreeSet::new();
-    let mut queue: Vec<_> = concrete_requested.clone();
-    while let Some(key) = queue.pop() {
-        if !visited.insert(key.clone()) {
-            continue;
-        }
-        for version in universe.versions(&key) {
-            if let Some(release) = universe.release(&key, version) {
-                for dep in &release.dependencies {
-                    if dep.name.starts_with("virtual/") {
-                        let symbol = &dep.name;
-                        let interface = symbol.strip_prefix("virtual/").unwrap_or(symbol);
-                        if preferences.contains_key(symbol) || bound_providers.contains_key(symbol)
-                        {
-                            continue;
-                        }
-                        // Check if an installed package already provides this virtual symbol
-                        let already_provided = installed
-                            .iter()
-                            .any(|pkg| pkg.provides.iter().any(|s| s == symbol));
-                        if already_provided {
-                            continue;
-                        }
-                        let candidates: Vec<_> = universe
-                            .providers_for(symbol)
-                            .iter()
-                            .filter(|k| k.channel == channel)
-                            .cloned()
-                            .collect();
-                        if candidates.len() > 1 {
-                            let cli_override = provider_overrides
-                                .iter()
-                                .find(|(k, _)| k == interface || k == symbol)
-                                .map(|(_, v)| v.as_str());
-                            let selected = select_virtual_provider(
-                                symbol,
-                                &candidates,
-                                cli_override,
-                                interactive,
-                            )?;
-                            bound_providers.insert(symbol.clone(), selected.clone());
-                            preferences.insert(symbol.clone(), selected.clone());
-                            new_config_providers
-                                .insert(interface.to_string(), selected.name.clone());
-                        }
-                    } else {
-                        let dep_channel = dep.channel.as_deref().unwrap_or(channel);
-                        let target_key = sage_core::PackageKey::new(
-                            dep_channel,
-                            &dep.name,
-                            dep.slot.as_deref().unwrap_or(sage_core::DEFAULT_SLOT),
-                        );
-                        if !visited.contains(&target_key) {
-                            queue.push(target_key);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((
-        concrete_requested,
-        bound_providers,
-        preferences,
-        new_config_providers,
-    ))
-}
 
 /// Resolves dependencies and applies packages to the sysroot transactionally.
 #[allow(clippy::too_many_arguments)]
@@ -258,41 +40,27 @@ pub async fn apply_packages(
     let db_path = under_root(root, Path::new("/var/lib/sage"));
     let installed = installed_packages(&db_path, dry_run)?;
     available.register_installed(&installed);
-    let (requested, bound_providers, provider_preferences, new_config_providers) =
-        resolve_virtual_selections(
-            &available.universe,
-            &channel,
-            names,
-            &config,
-            &installed,
-            provider_overrides,
-            interactive,
-        )?;
-    let mut roots: Vec<_> = requested
-        .iter()
-        .cloned()
-        .chain(installed.iter().map(|package| package.key.clone()))
-        .collect();
-    roots.sort();
-    roots.dedup();
-    let locks = installed
-        .iter()
-        .filter(|package| !prefer_latest || !requested.contains(&package.key))
-        .map(|package| (package.key.clone(), package.version.clone()));
-    let solution = sage_solver::SageSolver::with_locked(&available.universe, locks)
-        .bind_providers(bound_providers)
-        .prefer_providers(provider_preferences)
-        .resolve(&roots)?;
+    let selections = resolve_virtual_selections(
+        &available.universe,
+        &channel,
+        names,
+        &config,
+        &installed,
+        provider_overrides,
+        interactive,
+        prefer_latest,
+    )?;
     let current: BTreeMap<_, _> = installed
         .iter()
         .map(|package| (package.key.clone(), package.version.clone()))
         .collect();
-    let changes = solution
+    let changes = selections
+        .solution
         .into_iter()
         .filter(|(key, version)| current.get(key) != Some(version))
         .collect();
     let changes = installation_order(&available, changes)?;
-    let plan = TransactionPlan::for_install(changes);
+    let plan = TransactionPlan::new(changes, Vec::new(), selections.providers);
     let diff = crate::diff::compute_transaction_diff(&plan, &installed, Some(&available));
     diff.print_summary();
     if dry_run {
@@ -305,7 +73,12 @@ pub async fn apply_packages(
                 next.packages.insert(name.clone());
             }
         }
-        for (iface, prov) in new_config_providers {
+        for key in selections.package_roots {
+            next.packages.insert(format!("{}:{}", key.name, key.slot));
+        }
+        for (iface, prov) in selections.declarations {
+            // Canonicalize aliases so a later rebuild sees exactly one binding.
+            next.providers.remove(&format!("virtual/{iface}"));
             next.providers.insert(iface, prov);
         }
         if next.packages == config.packages && next.providers == config.providers {
@@ -320,7 +93,7 @@ pub async fn apply_packages(
     } else {
         None
     };
-    if !plan.is_empty() || declaration.is_some() {
+    if !plan.install.is_empty() || declaration.is_some() {
         let database = sage_db::SageDatabase::open(&db_path)?;
         publish_packages(
             root,

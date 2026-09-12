@@ -93,8 +93,8 @@ disabled result (exit code 1) before skipping disable actions; query failures
 (non-zero error exit codes or execution errors) leave the journal pending to
 guarantee that managed-disabled declarations are never published while external
 service state remains ambiguous or active. Preview operations (`--dry-run`) validate
-this read-only query during `service enable` whenever the existing native definition
-permits it (and unconditionally during `service disable` and `service adopt`),
+this read-only query during `service enable` when the native definition exists
+(and unconditionally during `service disable` and `service adopt`),
 ensuring query errors are surfaced before mutating state or persisting journals.
 
 ---
@@ -144,3 +144,10 @@ Hint:
 - `sage service disable <svc>`：从 `enabled` 移除并记录入 `disabled`，调用底层 Init Provider 禁用。
 - `sage service adopt <svc>`：将管理员外部手工启用的服务平滑纳管至 Sage 声明式配置中（转为 `managed-enabled`）。
 - `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。对尚未渲染原生单元定义（如刚安装包但尚未 `sage rebuild`）或查询状态不确定的服务，以声明状态与未知/未接管状态安全呈现，不中断只读查询。
+
+Before the first native render, enable previews validate the service, renderer,
+templates, and command paths without executing the provider state query. Real
+enable renders the unit before querying, so a missing unit must not be queried
+against the pre-render state (systemd reports that state as exit 4). This preview
+cannot predict runtime query failures that occur after rendering; queries for
+existing definitions still propagate every error.

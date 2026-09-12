@@ -5,6 +5,96 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+#[tokio::test]
+async fn systemd_enable_preview_before_first_render_skips_state_query() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = TortureLab::new().unwrap();
+    configure(&lab, &[], "systemd", &[]);
+    for directory in [
+        "usr/share/sage/services",
+        "usr/share/sage/rclass",
+        "usr/bin",
+        "var/lib/sage",
+    ] {
+        fs::create_dir_all(lab.root().join(directory)).unwrap();
+    }
+    fs::write(
+        lab.root().join("usr/share/sage/services/daemon.toml"),
+        service("daemon"),
+    )
+    .unwrap();
+    fs::write(
+        lab.root().join("usr/share/sage/rclass/init-systemd.toml"),
+        include_str!("../../../rclass/init-systemd.toml"),
+    )
+    .unwrap();
+    // Match the systemctl states relevant to enable: absent=4, disabled=1, enabled=0.
+    let program = lab.root().join("usr/bin/systemctl");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+test "$1" = --root
+root=$2
+action=$3
+unit=$4
+case $action in
+is-enabled)
+  printf queried > "$root/var/lib/sage/query-log"
+  if test -f "$root/var/lib/sage/fail-query"; then exit 4; fi
+  test -f "$root/usr/lib/systemd/system/$unit" || exit 4
+  test -f "$root/var/lib/sage/enabled-$unit"
+  ;;
+enable)
+  test -f "$root/usr/lib/systemd/system/$unit"
+  printf enabled > "$root/var/lib/sage/enabled-$unit"
+  ;;
+*) exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let config = fs::read(&config_path).unwrap();
+    let native = lab.root().join("usr/lib/systemd/system/daemon.service");
+    let rendered_state = lab.root().join("var/lib/sage/rendered-services.toml");
+    let query_log = lab.root().join("var/lib/sage/query-log");
+    assert!(!native.exists() && !rendered_state.exists());
+    sage_sys::service_enable(lab.root(), "daemon", true).unwrap();
+    assert!(!native.exists() && !rendered_state.exists() && !query_log.exists());
+    assert_eq!(fs::read(&config_path).unwrap(), config);
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/enabled-daemon.service")
+            .exists()
+    );
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    drop(database);
+
+    sage_sys::service_enable(lab.root(), "daemon", false).unwrap();
+    assert!(native.is_file() && query_log.is_file());
+    assert!(
+        lab.root()
+            .join("var/lib/sage/enabled-daemon.service")
+            .is_file()
+    );
+    assert!(
+        sage_sys::ServicesConfig::load(&config_path)
+            .unwrap()
+            .enabled
+            .contains("daemon")
+    );
+    // Once the definition exists, the same error status must propagate.
+    fs::write(lab.root().join("var/lib/sage/fail-query"), b"fail").unwrap();
+    let before = fs::read(&config_path).unwrap();
+    assert!(sage_sys::service_enable(lab.root(), "daemon", true).is_err());
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
 fn service(name: &str) -> String {
     format!(
         "schema_version=1\n[service]\nname={name:?}\ndescription=\"Fixture daemon\"\ncommand=[\"/usr/bin/daemon\"]\nuser=\"root\"\ngroup=\"root\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n"
@@ -212,8 +302,13 @@ async fn renderer_uses_the_solver_resolved_provider_and_full_slot_identity() {
     selector.conflicts.push("loom:0".into());
     lab.add_package(selector).unwrap();
     lab.publish().unwrap();
-    // The requested name has no slot; dependency/conflict solving selects slot 1.
+    // Omitting a slot binds slot 0; a conflicting root must not silently switch it.
     configure(&lab, &["daemon", "select-new-init"], "loom", &["daemon"]);
+    let before = lifecycle_snapshot(&lab);
+    assert!(rebuild(&lab, true).await.is_err());
+    assert!(rebuild(&lab, false).await.is_err());
+    assert_eq!(lifecycle_snapshot(&lab), before);
+    configure(&lab, &["daemon", "select-new-init"], "loom:1", &["daemon"]);
     rebuild(&lab, false).await.unwrap();
     assert_settled(&lab, "loom", "1", "new");
     assert!(
@@ -1360,8 +1455,7 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
 }
 
 #[tokio::test]
-async fn state_query_failure_when_enabling_service_leaves_journal_pending_and_fails_preview_if_definition_exists()
- {
+async fn enable_preview_queries_only_existing_definitions_and_propagates_errors() {
     let lab = initial_system().await;
     let config_path = lab.root().join("etc/sage/services.toml");
     let before = fs::read(&config_path).unwrap();
@@ -1403,11 +1497,15 @@ async fn state_query_failure_when_enabling_service_leaves_journal_pending_and_fa
     assert!(database.pending_journals().unwrap().is_empty());
     drop(database);
 
-    // If the native definition does not exist on disk yet, preview skips the query.
+    // Missing definitions cannot be queried before the real render step. The
+    // preview validates statically and leaves the target and journal untouched.
     fs::remove_file(lab.root().join("etc/native-old/inactive")).unwrap();
     fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
 
-    assert!(sage_sys::service_enable(lab.root(), "inactive", true).is_ok());
+    let before = lab.snapshot().unwrap();
+    sage_sys::service_enable(lab.root(), "inactive", true).unwrap();
+    assert_eq!(lab.snapshot().unwrap(), before);
+    assert!(!lab.root().join("etc/native-old/inactive").exists());
 
     // A real enable on "inactive" will render the file and then fail the query,
     // leaving a provider-stage journal pending.
@@ -1758,4 +1856,19 @@ async fn absent_native_definition_or_indeterminate_query_does_not_abort_service_
     let unconfigured_lab = TortureLab::new().unwrap();
     let unconfigured_services = sage_sys::list_services(unconfigured_lab.root()).unwrap();
     assert!(unconfigured_services.is_empty());
+}
+
+#[tokio::test]
+async fn generator_fallback_accepts_persisted_provider_slot_before_first_render() {
+    let lab = initial_system().await;
+    fs::remove_file(lab.root().join("var/lib/sage/rendered-services.toml")).unwrap();
+    configure(&lab, &["daemon"], "loom:0", &["daemon"]);
+    let (name, _) = sage_sys::load_active_generator(lab.root()).unwrap();
+    assert_eq!(name, "loom");
+    sage_sys::service_enable(lab.root(), "inactive", true).unwrap();
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/rendered-services.toml")
+            .exists()
+    );
 }

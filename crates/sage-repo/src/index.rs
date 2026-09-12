@@ -106,7 +106,16 @@ pub fn build_index(
     for versions in releases.values_mut() {
         versions.sort_by_key(release_version);
     }
-    let temporary = temporary_path(&output_dir.join("index.mdb"));
+    let index = output_dir.join("index.mdb");
+    // Publications in the same second (or after a clock rollback) still need a
+    // strictly increasing signed timestamp. Never silently wrap at u64::MAX.
+    let previous = read_index_timestamp(&index)?.unwrap_or(0);
+    let timestamp = unix_timestamp()?.max(
+        previous
+            .checked_add(1)
+            .ok_or_else(|| RepoError::InvalidConfig("repository timestamp overflow".into()))?,
+    );
+    let temporary = temporary_path(&index);
     {
         let mut options = EnvOpenOptions::new();
         options.map_size(1024 * 1024 * 1024).max_dbs(8);
@@ -139,7 +148,7 @@ pub fn build_index(
             "schema_version",
             &sage_core::SCHEMA_VERSION.to_string(),
         )?;
-        metadata.put(&mut txn, "timestamp", &unix_timestamp()?.to_string())?;
+        metadata.put(&mut txn, "timestamp", &timestamp.to_string())?;
         txn.commit()?;
         env.force_sync()?;
     }
@@ -211,16 +220,19 @@ pub fn read_index_timestamp(path: &Path) -> Result<Option<u64>, RepoError> {
     if !path.exists() {
         return Ok(None);
     }
-    let env = match open_index(path) {
-        Ok(env) => env,
-        Err(_) => return Ok(None),
-    };
+    let env = open_index(path)?;
     let txn = env.read_txn()?;
     let metadata: Option<heed::Database<Str, Str>> = env.open_database(&txn, Some("metadata"))?;
     if let Some(db) = metadata
         && let Some(ts_str) = db.get(&txn, "timestamp")?
-        && let Ok(ts) = ts_str.parse::<u64>()
     {
+        let ts = ts_str
+            .parse::<u64>()
+            .ok()
+            .filter(|ts| *ts > 0)
+            .ok_or_else(|| {
+                RepoError::InvalidConfig("index timestamp must be a positive integer".into())
+            })?;
         return Ok(Some(ts));
     }
     Ok(None)

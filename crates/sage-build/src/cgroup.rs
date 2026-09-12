@@ -2,7 +2,10 @@
 
 use crate::BuildError;
 use std::fs;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static CGROUP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -24,6 +27,14 @@ impl CgroupScope {
     /// Any failure during creation or limit application is reported as an error.
     pub fn new(memory_limit: &str, pids_limit: u32) -> Result<Self, BuildError> {
         let mem_bytes = parse_memory_limit(memory_limit);
+        if mem_bytes.is_none()
+            && !memory_limit.trim().is_empty()
+            && !memory_limit.trim().eq_ignore_ascii_case("max")
+        {
+            return Err(BuildError::CgroupFailed(format!(
+                "invalid memory limit: {memory_limit}"
+            )));
+        }
         if mem_bytes.is_none() && pids_limit == 0 {
             return Ok(Self { scope_path: None });
         }
@@ -188,7 +199,7 @@ impl CgroupScope {
     ) -> Result<(), BuildError> {
         if let Some(bytes) = mem_bytes {
             let memory_file = dir.join("memory.max");
-            fs::write(&memory_file, bytes.to_string()).map_err(|err| {
+            write_limit(&memory_file, &bytes.to_string()).map_err(|err| {
                 BuildError::CgroupFailed(format!(
                     "failed writing memory limit ({bytes} bytes) to {}: {err}",
                     memory_file.display()
@@ -198,7 +209,7 @@ impl CgroupScope {
 
         if pids_limit > 0 {
             let pids_file = dir.join("pids.max");
-            fs::write(&pids_file, pids_limit.to_string()).map_err(|err| {
+            write_limit(&pids_file, &pids_limit.to_string()).map_err(|err| {
                 BuildError::CgroupFailed(format!(
                     "failed writing pids limit ({pids_limit}) to {}: {err}",
                     pids_file.display()
@@ -207,6 +218,40 @@ impl CgroupScope {
         }
 
         Ok(())
+    }
+
+    /// Spawns a command after the child has joined this scope, or fails before exec.
+    pub fn spawn(&self, mut command: Command) -> Result<Child, BuildError> {
+        if let Some(dir) = &self.scope_path {
+            // Open in the parent, without O_CREAT: a missing controller is an error.
+            let procs = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("cgroup.procs"))?;
+            // SAFETY: after fork the closure only calls write and inspects errno.
+            // Writing "0" moves the calling process. No parent/child handshake is
+            // needed: Command::spawn waits for exec, so waiting for the parent here
+            // would deadlock. The owned file keeps the descriptor valid until exec.
+            unsafe {
+                command.pre_exec(move || {
+                    loop {
+                        let written = nix::libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1);
+                        if written == 1 {
+                            return Ok(());
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if written < 0 && error.raw_os_error() == Some(nix::libc::EINTR) {
+                            continue;
+                        }
+                        return Err(if written < 0 {
+                            error
+                        } else {
+                            std::io::Error::from_raw_os_error(nix::libc::EIO)
+                        });
+                    }
+                });
+            }
+        }
+        Ok(command.spawn()?)
     }
 
     /// Attaches the target process PID to the cgroup scope.
@@ -225,6 +270,14 @@ impl CgroupScope {
         }
         Ok(())
     }
+}
+
+fn write_limit(path: &Path, value: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .write_all(value.as_bytes())
 }
 
 impl Drop for CgroupScope {
@@ -265,7 +318,7 @@ pub fn parse_memory_limit(s: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
-        .map(|val| val.saturating_mul(multiplier))
+        .and_then(|val| val.checked_mul(multiplier))
 }
 
 #[cfg(test)]
@@ -281,5 +334,112 @@ mod tests {
         assert_eq!(parse_memory_limit("16K"), Some(16 * 1024));
         assert_eq!(parse_memory_limit("512M"), Some(512 * 1024 * 1024));
         assert_eq!(parse_memory_limit("4G"), Some(4 * 1024 * 1024 * 1024));
+    }
+    #[test]
+    fn rejects_invalid_limits_and_missing_controllers() {
+        for value in ["oops", "4GB", "18446744073709551615T"] {
+            assert!(CgroupScope::new(value, 0).is_err());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert!(CgroupScope::configure_limits(directory.path(), Some(1024), 0).is_err());
+        assert!(!directory.path().join("memory.max").exists());
+        assert!(CgroupScope::configure_limits(directory.path(), None, 8).is_err());
+        assert!(!directory.path().join("pids.max").exists());
+    }
+
+    #[test]
+    fn spawn_confines_before_exec_and_fails_closed_without_deadlock() {
+        // A subprocess deadline turns a pre-exec regression into a test failure
+        // instead of hanging the entire test runner indefinitely.
+        const CHILD: &str = "SAGE_CGROUP_SPAWN_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cgroup::tests::spawn_confines_before_exec_and_fails_closed_without_deadlock",
+                ])
+                .env(CHILD, "1")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(child.id() as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    )
+                    .unwrap();
+                    child.wait().unwrap();
+                    panic!("cgroup spawn failed to return before its deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let procs = directory.path().join("cgroup.procs");
+        fs::write(&procs, b"").unwrap();
+        let scope = CgroupScope {
+            scope_path: Some(directory.path().into()),
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "test \"$(cat \"$1\")\" = 0", "sh"])
+            .arg(&procs);
+        assert!(scope.spawn(command).unwrap().wait().unwrap().success());
+        assert_eq!(fs::read(&procs).unwrap(), b"0");
+        assert!(
+            scope
+                .spawn(Command::new("/sage-test-missing-executable"))
+                .is_err()
+        );
+        fs::remove_file(&procs).unwrap();
+        std::os::unix::fs::symlink("/dev/full", &procs).unwrap();
+        let marker = directory.path().join("escaped");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "touch \"$1\"", "sh"]).arg(&marker);
+        assert!(scope.spawn(command).is_err());
+        assert!(!marker.exists());
+        fs::remove_file(&procs).unwrap();
+        assert!(scope.spawn(Command::new("/bin/true")).is_err());
+    }
+    #[test]
+    #[ignore = "requires writable cgroup v2 memory and pids controllers; exercised by Linux CI"]
+    fn delegated_scope_confines_exec_and_descendants() {
+        let scope = CgroupScope::new("32M", 16).unwrap();
+        let path = scope.path().unwrap().to_path_buf();
+        assert_eq!(
+            fs::read_to_string(path.join("memory.max")).unwrap().trim(),
+            "33554432"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("pids.max")).unwrap().trim(),
+            "16"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let membership = directory.path().join("membership");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "cat /proc/self/cgroup > \"$1\"; /bin/sh -c 'cat /proc/self/cgroup' >> \"$1\"",
+                "sh",
+            ])
+            .arg(&membership);
+        assert!(scope.spawn(command).unwrap().wait().unwrap().success());
+        let lines = fs::read_to_string(&membership).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            lines
+                .lines()
+                .all(|line| line.starts_with("0::") && line.ends_with(name))
+        );
+        drop(scope);
+        assert!(!path.exists());
     }
 }

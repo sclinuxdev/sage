@@ -45,6 +45,48 @@ fn subchannel_inherits_system_virtual_provider() {
 }
 
 #[test]
+fn configured_bindings_keep_repository_channels_independent() {
+    for symbol in ["virtual/libc", "so:libc.so.6"] {
+        let mut universe = PackageUniverse::default();
+        for channel in ["main/system", "vendor/system"] {
+            let mut provider = release(channel, "libc", "1-1", &[]);
+            provider.provides.push(symbol.into());
+            universe.insert(provider);
+        }
+        universe.insert(release("vendor/runtime", "app", "1-1", &[symbol]));
+        let app = PackageKey::new("vendor/runtime", "app", "0");
+        let main = PackageKey::new("main/system", "libc", "0");
+        let vendor = PackageKey::new("vendor/system", "libc", "0");
+        for include_vendor_binding in [false, true] {
+            let mut configured = vec![(symbol.into(), main.clone())];
+            if include_vendor_binding {
+                configured.push((symbol.into(), vendor.clone()));
+            }
+            for strict in [false, true] {
+                let solver = SageSolver::new(&universe);
+                let solver = if strict {
+                    solver.bind_providers(configured.clone())
+                } else {
+                    solver.prefer_providers(configured.clone())
+                };
+                // The foreign edge does not satisfy the unused main declaration:
+                // rebuild must add and validate that channel's own virtual root.
+                let (solution, bindings) = solver
+                    .resolve_with_provider_bindings(std::slice::from_ref(&app))
+                    .unwrap();
+                assert!(solution.contains_key(&main));
+                assert!(solution.contains_key(&vendor));
+                assert_eq!(bindings[&("main/system".into(), symbol.into())], main);
+                assert_eq!(bindings.len(), if include_vendor_binding { 2 } else { 1 });
+                if include_vendor_binding {
+                    assert_eq!(bindings[&("vendor/system".into(), symbol.into())], vendor);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn virtual_dependencies_filter_concrete_provider_versions() {
     let mut universe = PackageUniverse::default();
     universe.insert(release(
@@ -319,4 +361,87 @@ fn bound_virtual_provider_strictly_considers_only_that_provider() {
         .resolve(&[base.clone(), PackageKey::new("main/system", "blocker", "0")])
         .unwrap_err();
     assert!(matches!(error, SolverError::NoSolution(_)));
+}
+
+#[test]
+fn bound_provider_slot_zero_is_exact_and_direct_virtual_roots_are_verified() {
+    let mut universe = PackageUniverse::default();
+    let mut provider = release("main/system", "provider", "1-1", &[]);
+    provider.slot = "2".into();
+    provider.provides.push("virtual/awk".into());
+    universe.insert(provider);
+    let root = PackageKey::new("main/system", "virtual/awk", "0");
+    assert!(
+        SageSolver::new(&universe)
+            .bind_providers([(
+                "virtual/awk".into(),
+                PackageKey::new("main/system", "provider", "0")
+            ),])
+            .resolve(std::slice::from_ref(&root))
+            .is_err()
+    );
+    assert!(
+        SageSolver::new(&universe)
+            .bind_providers([(
+                "virtual/awk".into(),
+                PackageKey::new("main/system", "provider", "2")
+            ),])
+            .resolve(&[root])
+            .is_err()
+    );
+    assert!(
+        SageSolver::new(&universe)
+            .bind_providers([(
+                "virtual/awk".into(),
+                PackageKey::new("main/system", "provider", "2")
+            )])
+            .resolve_dependencies("main/system", &["virtual/awk".parse().unwrap()])
+            .is_ok()
+    );
+}
+
+#[test]
+fn exact_default_slot_roots_remain_distinct_from_unqualified_requirements() {
+    for symbol in ["virtual/codec", "so:libcodec.so.1"] {
+        let mut universe = PackageUniverse::default();
+        let mut provider = release("main/system", "codec", "1-1", &[]);
+        provider.slot = "1".into();
+        provider.provides.push(symbol.into());
+        universe.insert(provider.clone());
+        let exact = PackageKey::new("main/runtime", symbol, "0");
+        // An exact root cannot fall back to slot 1 when slot 0 is absent.
+        assert!(
+            SageSolver::new(&universe)
+                .resolve(std::slice::from_ref(&exact))
+                .is_err()
+        );
+        let unqualified: sage_core::Dependency = symbol.parse().unwrap();
+        let mut zero = unqualified.clone();
+        zero.slot = Some("0".into());
+        assert!(
+            SageSolver::new(&universe)
+                .resolve_dependencies("main/runtime", std::slice::from_ref(&unqualified))
+                .is_ok()
+        );
+        provider.slot = "0".into();
+        universe.insert(provider);
+        let solver = SageSolver::new(&universe);
+        let solution = solver.resolve(&[exact]).unwrap();
+        assert_eq!(solution.len(), 1);
+        assert!(solution.contains_key(&PackageKey::new("main/system", "codec", "0")));
+        let (_, choices) = solver
+            .resolve_with_root_requirements(&[], "main/runtime", &[unqualified, zero])
+            .unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(
+            choices
+                .iter()
+                .any(|(requirement, _)| requirement.slot.is_none())
+        );
+        let (_, chosen) = choices
+            .iter()
+            .find(|(requirement, _)| requirement.slot.as_deref() == Some("0"))
+            .unwrap();
+        assert_eq!(chosen, &PackageKey::new("main/system", "codec", "0"));
+    }
 }

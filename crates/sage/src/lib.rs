@@ -50,7 +50,7 @@ pub enum Commands {
         #[arg(long)]
         no_save: bool,
         /// Explicit virtual interface provider selection (e.g. --provider init=systemd).
-        #[arg(long = "provider", value_parser = parse_provider_override)]
+        #[arg(short = 'P', long = "provider", value_parser = parse_provider_override)]
         providers: Vec<(String, String)>,
     },
     /// Remove specified packages from system.
@@ -362,10 +362,85 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
 }
 
 fn parse_provider_override(input: &str) -> std::result::Result<(String, String), String> {
-    input
-        .split_once('=')
-        .map(|(interface, pkg)| (interface.trim().to_string(), pkg.trim().to_string()))
-        .ok_or_else(|| {
-            "provider override must follow format interface=package (e.g. init=systemd)".to_string()
-        })
+    let (interface, selector) = input.split_once('=').ok_or_else(|| {
+        "provider override must follow format interface=package (e.g. init=systemd)".to_string()
+    })?;
+    let interface = interface.trim();
+    let selector = selector.trim();
+    use sage_core::valid_package_component;
+    let key = sage_core::PackageKey::in_channel("main/system", selector)
+        .map_err(|error| error.to_string())?;
+    if !sage_core::valid_provider_symbol(interface)
+        || !valid_package_component(&key.name)
+        || !valid_package_component(&key.slot)
+    {
+        return Err("provider override requires a valid interface and package[:slot]".into());
+    }
+    Ok((
+        interface
+            .strip_prefix("virtual/")
+            .unwrap_or(interface)
+            .into(),
+        selector.into(),
+    ))
+}
+
+#[cfg(test)]
+mod provider_cli_tests {
+    use super::*;
+
+    #[test]
+    fn provider_flags_accept_slots_and_reject_malformed_mappings() {
+        for flag in ["-P", "--provider"] {
+            let cli = Cli::try_parse_from([
+                "sage",
+                "install",
+                "virtual/libc++",
+                flag,
+                "libc++=libc++:abi+debug",
+            ])
+            .unwrap();
+            let Commands::Install { providers, .. } = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(
+                providers,
+                vec![("libc++".into(), "libc++:abi+debug".into())]
+            );
+            let cli =
+                Cli::try_parse_from(["sage", "install", "virtual/awk", flag, "virtual/awk=gawk:2"])
+                    .unwrap();
+            let Commands::Install { providers, .. } = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(providers, vec![("awk".into(), "gawk:2".into())]);
+            for symbol in ["so:libfoo.so.1", "so:libC++.so.1@ABI"] {
+                let mapping = format!("{symbol}=so:abi+debug");
+                let cli = Cli::try_parse_from(["sage", "install", "app", flag, &mapping]).unwrap();
+                let Commands::Install { providers, .. } = cli.command else {
+                    panic!("wrong command")
+                };
+                assert_eq!(providers, vec![(symbol.into(), "so:abi+debug".into())]);
+            }
+            for input in [
+                "awk",
+                "=gawk",
+                "awk=",
+                "awk=gawk:",
+                "awk=gawk=bad",
+                "virtual/=gawk",
+                "awk=a/b",
+                "so:=foo",
+                "so:lib foo.so=foo",
+                "so:lib/foo.so=foo",
+                "so:lib\nfoo.so=foo",
+                "virtual/so:libfoo.so=foo",
+            ] {
+                assert!(
+                    Cli::try_parse_from(["sage", "install", "app", flag, input]).is_err(),
+                    "{input}"
+                );
+            }
+        }
+    }
 }

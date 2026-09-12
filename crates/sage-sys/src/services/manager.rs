@@ -6,9 +6,7 @@ use std::path::Path;
 
 use super::drift::ServiceStatusInfo;
 use super::generator::TemplateServiceGenerator;
-use super::spec::{
-    RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig, valid_declaration_name,
-};
+use super::spec::{RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig};
 use crate::SysError;
 use crate::recovery::{crash_point, operation_id};
 
@@ -74,15 +72,11 @@ pub fn load_active_generator(root: &Path) -> Result<(String, TemplateServiceGene
             "no active init provider is known; run sage rebuild first".into(),
         ));
     }
-    let content = fs::read_to_string(&system_config_path)?;
-    let toml_val: toml::Value =
-        toml::from_str(&content).map_err(|e| SysError::Invalid(e.to_string()))?;
-    let provider_name = toml_val
-        .get("providers")
-        .and_then(|providers| providers.get("init"))
-        .and_then(toml::Value::as_str)
-        .filter(|name| valid_declaration_name(name))
-        .map(str::to_owned)
+    let config = crate::state::SystemConfig::load(&system_config_path)?;
+    let provider_name = config
+        .provider_preferences("main/system")?
+        .remove("virtual/init")
+        .map(|key| key.name)
         .ok_or_else(|| {
             SysError::Invalid("no active init provider is known; run sage rebuild first".into())
         })?;
@@ -311,9 +305,10 @@ fn execute_service_lifecycle(
 /// Enables a service in `/etc/sage/services.toml` and activates it in the init provider.
 ///
 /// If `dry_run` is set to `true`, validates generator compatibility and executes the
-/// provider's read-only state query (`is_enabled_cmd`) whenever the rendered service
-/// definition already exists on disk. This surfaces query failures (such as non-zero
-/// error exit codes) during preview without modifying declarations or persisting journals.
+/// provider's read-only state query (`is_enabled_cmd`) for an existing native
+/// definition. Missing definitions receive static validation only, since real
+/// enable renders them before querying. Query errors for existing definitions
+/// fail without modifying declarations or persisting journals.
 ///
 /// When `dry_run` is `false`, persists a lifecycle journal, renders the definition,
 /// activates the service in the provider if needed, and publishes declarative mutations.
@@ -335,8 +330,7 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
     if dry_run {
-        let rendered = generator.rendered_path(&spec, root)?;
-        if rendered.is_file() {
+        if generator.rendered_path(&spec, root)?.try_exists()? {
             let _ = generator.is_service_enabled(&spec, root)?;
         }
     } else {

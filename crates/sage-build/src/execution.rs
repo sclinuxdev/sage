@@ -504,61 +504,8 @@ impl<'a> SandboxRunner<'a> {
     ) -> Result<Vec<sage_archive::ManagedBuildTool>, BuildError> {
         self.prepare_tool_wrappers(paths)?;
         let cgroup = CgroupScope::new(&self.config.memory_limit, self.config.pids_limit)?;
-        let mut command = self.command(paths, allow_network);
-
-        let status = if cgroup.is_active() {
-            use std::io::Write;
-            use std::os::unix::io::AsRawFd;
-            use std::os::unix::net::UnixStream;
-            use std::os::unix::process::CommandExt;
-
-            // Create bidirectional pre-exec synchronization stream.
-            // The child blocks inside pre_exec until the parent confirms that the
-            // child PID has been successfully attached to the cgroup v2 scope.
-            // This prevents rapid forks or high-memory allocations from escaping resource limits.
-            let (mut parent_sock, child_sock) = UnixStream::pair()?;
-            let child_fd = child_sock.as_raw_fd();
-
-            unsafe {
-                command.pre_exec(move || {
-                    let mut ack = [0u8; 1];
-                    let bytes_read =
-                        nix::libc::read(child_fd, ack.as_mut_ptr() as *mut nix::libc::c_void, 1);
-                    if bytes_read != 1 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionReset,
-                            "cgroup synchronization barrier failed before exec",
-                        ));
-                    }
-                    Ok(())
-                });
-            }
-
-            let mut child = command.spawn()?;
-            drop(child_sock);
-
-            // Confine child PID into the active cgroup v2 scope
-            if let Err(err) = cgroup.attach_pid(child.id()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
-            }
-
-            // Release the child from pre_exec barrier so it can call execve
-            if let Err(err) = parent_sock.write_all(&[1]) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(BuildError::CgroupFailed(format!(
-                    "failed to unblock child sandbox process: {err}"
-                )));
-            }
-            drop(parent_sock);
-
-            child.wait()?
-        } else {
-            let mut child = command.spawn()?;
-            child.wait()?
-        };
+        let command = self.command(paths, allow_network);
+        let status = cgroup.spawn(command)?.wait()?;
 
         if !status.success() {
             return Err(BuildError::SandboxFailed(status));

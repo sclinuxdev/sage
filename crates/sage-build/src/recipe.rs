@@ -1,4 +1,5 @@
 use super::*;
+use sage_core::valid_package_component;
 
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
@@ -580,18 +581,14 @@ impl RecipeSpec {
         let path = path.as_ref();
         let recipe: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(recipe.schema_version)?;
-        if !valid_package_name(&recipe.package.name) || recipe.package.arch.is_empty() {
+        if !valid_package_component(&recipe.package.name) || recipe.package.arch.is_empty() {
             return Err(BuildError::InvalidSpec(
                 "package name and architecture are required".into(),
             ));
         }
         sage_core::validate_spdx_expression(&recipe.package.license)
             .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;
-        if recipe.package.slot.is_empty()
-            || !recipe.package.slot.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
-            })
-        {
+        if !valid_package_component(&recipe.package.slot) {
             return Err(BuildError::InvalidSpec(
                 "package slot must contain only ASCII letters, digits, '.', '_', '+', or '-'"
                     .into(),
@@ -610,7 +607,7 @@ impl RecipeSpec {
             user.validate()?;
         }
         for alternative in &recipe.alternatives {
-            if (!alternative.package.is_empty() && !valid_package_name(&alternative.package))
+            if (!alternative.package.is_empty() && !valid_package_component(&alternative.package))
                 || alternative.link.as_os_str().is_empty()
                 || alternative.link.is_absolute()
                 || alternative.target.as_os_str().is_empty()
@@ -653,7 +650,7 @@ impl RecipeSpec {
         reject_lifecycle_scripts(path.parent().unwrap_or_else(|| Path::new(".")))?;
         let mut names = BTreeSet::from([recipe.package.name.as_str()]);
         if recipe.subpackages.iter().any(|subpackage| {
-            !valid_package_name(&subpackage.name) || !names.insert(&subpackage.name)
+            !valid_package_component(&subpackage.name) || !names.insert(&subpackage.name)
         }) {
             return Err(BuildError::InvalidSpec(
                 "subpackage names must be unique".into(),
@@ -681,12 +678,11 @@ impl RecipeSpec {
                     "subpackage channel must not be empty".into(),
                 ));
             }
-            if subpackage.slot.as_deref().is_some_and(|slot| {
-                slot.is_empty()
-                    || !slot.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
-                    })
-            }) {
+            if subpackage
+                .slot
+                .as_deref()
+                .is_some_and(|slot| !valid_package_component(slot))
+            {
                 return Err(BuildError::InvalidSpec(
                     "subpackage slot must contain only ASCII letters, digits, '.', '_', '+', or '-'"
                         .into(),
@@ -974,7 +970,7 @@ pub fn merge_build_arguments(
 
 impl SysuserSpec {
     fn validate(&self) -> Result<(), BuildError> {
-        if (!self.package.is_empty() && !valid_package_name(&self.package))
+        if (!self.package.is_empty() && !valid_package_component(&self.package))
             || !matches!(self.kind.as_str(), "user" | "group")
             || self.name.is_empty()
             || !self
@@ -997,13 +993,6 @@ impl SysuserSpec {
         }
         Ok(())
     }
-}
-
-fn valid_package_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
 }
 
 fn reject_lifecycle_scripts(recipe_dir: &Path) -> Result<(), BuildError> {

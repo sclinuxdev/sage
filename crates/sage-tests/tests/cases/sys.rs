@@ -52,7 +52,72 @@ fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
 }
 
 #[test]
-fn configured_provider_backtracks_with_and_without_a_consumer() {
+fn provider_symbols_share_cli_and_configuration_validation() {
+    for symbol in ["so:libfoo.so.1", "so:libC++.so.1@ABI"] {
+        let preferences = config(&[], &[(symbol, "so:abi+debug")])
+            .provider_preferences("main/system")
+            .unwrap();
+        assert_eq!(
+            preferences[symbol],
+            sage_core::PackageKey::new("main/system", "so", "abi+debug")
+        );
+    }
+    for symbol in [
+        "so:",
+        "so:lib foo.so",
+        "so:lib/foo.so",
+        "so:lib\nfoo.so",
+        "so:lib=foo.so",
+        "virtual/so:libfoo.so",
+    ] {
+        assert!(
+            config(&[], &[(symbol, "foo")])
+                .provider_preferences("main/system")
+                .is_err(),
+            "{symbol}"
+        );
+    }
+}
+
+#[test]
+fn rebuild_retains_foreign_consumers_without_exporting_their_bindings() {
+    use sage_core::PackageKey;
+    for symbol in ["virtual/libc", "so:libc.so.6"] {
+        let app = release(
+            PackageKey::new("vendor/runtime", "app", "0"),
+            "1-1",
+            &[symbol],
+            &[],
+        );
+        let foreign = release(
+            PackageKey::new("vendor/system", "libc", "2"),
+            "1-1",
+            &[],
+            &[symbol],
+        );
+        let main = PackageKey::new("main/system", "libc", "0");
+        let mut universe = sage_solver::PackageUniverse::default();
+        universe.insert(release(main.clone(), "1-1", &[], &[symbol]));
+        universe.insert(app.clone());
+        universe.insert(foreign.clone());
+        let installed = vec![installed(&app), installed(&foreign)];
+        let desired = config(&[], &[(symbol, "libc")]);
+        let plan = ReconcilePlan::compute(&desired, &installed, &universe, false).unwrap();
+        assert_eq!(plan.install, vec![(main.clone(), "1-1".parse().unwrap())]);
+        assert!(plan.remove.is_empty());
+        assert_eq!(
+            plan.provider_bindings,
+            BTreeMap::from([(
+                symbol.strip_prefix("virtual/").unwrap_or(symbol).into(),
+                main
+            ),])
+        );
+        assert!(find_orphans(&installed, &desired).is_empty());
+    }
+}
+
+#[test]
+fn configured_provider_is_strict_with_and_without_a_consumer() {
     use sage_core::PackageKey;
     for dependency in [vec![], vec!["virtual/libc"]] {
         let mut universe = sage_solver::PackageUniverse::default();
@@ -72,29 +137,14 @@ fn configured_provider_backtracks_with_and_without_a_consumer() {
                 &["virtual/libc"],
             ));
         }
-        let plan = ReconcilePlan::compute(
-            &config(&["guard"], &[("libc", "musl")]),
-            &[],
-            &universe,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.provider_bindings,
-            BTreeMap::from([("libc".into(), PackageKey::new("main/system", "glibc", "0"))])
-        );
-        assert_eq!(
-            plan.install,
-            vec![
-                (
-                    PackageKey::new("main/system", "glibc", "0"),
-                    "1-1".parse().unwrap()
-                ),
-                (
-                    PackageKey::new("main/system", "guard", "0"),
-                    "1-1".parse().unwrap()
-                ),
-            ]
+        assert!(
+            ReconcilePlan::compute(
+                &config(&["guard"], &[("libc", "musl")]),
+                &[],
+                &universe,
+                false,
+            )
+            .is_err()
         );
     }
 }
@@ -125,8 +175,17 @@ fn configured_binding_comes_from_the_constrained_virtual_choice() {
     ] {
         universe.insert(package);
     }
+    assert!(
+        ReconcilePlan::compute(
+            &config(&["app", "preferred:1"], &[("libc", "preferred:1")]),
+            &[],
+            &universe,
+            false,
+        )
+        .is_err()
+    );
     let plan = ReconcilePlan::compute(
-        &config(&["app", "preferred:1"], &[("libc", "preferred:1")]),
+        &config(&["app", "preferred:1"], &[("libc", "selected:2")]),
         &[],
         &universe,
         false,
@@ -136,10 +195,6 @@ fn configured_binding_comes_from_the_constrained_virtual_choice() {
         plan.provider_bindings["libc"],
         PackageKey::new("main/system", "selected", "2")
     );
-    assert!(plan.install.contains(&(
-        PackageKey::new("main/system", "selected", "2"),
-        "2-1".parse().unwrap()
-    )));
 }
 
 #[test]
@@ -890,4 +945,76 @@ cron = "cronie"
     assert_eq!(preferences.len(), 2);
     assert_eq!(preferences.get("virtual/awk").unwrap().name, "gawk");
     assert_eq!(preferences.get("virtual/cron").unwrap().name, "cronie");
+}
+
+#[test]
+fn orphan_detection_uses_rebuild_channels_slots_and_virtual_routing() {
+    use sage_core::PackageKey;
+    let key = |channel, name, slot| PackageKey::new(channel, name, slot);
+    let packages = vec![
+        release(
+            key("main/system", "app", "0"),
+            "1-1",
+            &["runtime/helper", "lib", "virtual/awk"],
+            &[],
+        ),
+        release(key("main/system", "app", "1"), "1-1", &[], &[]),
+        release(
+            key("main/runtime", "helper", "0"),
+            "1-1",
+            &["virtual/libc"],
+            &[],
+        ),
+        release(key("main/system", "lib", "0"), "1-1", &[], &[]),
+        release(key("main/system", "lib", "2"), "1-1", &[], &[]),
+        release(
+            key("main/system", "libc", "2"),
+            "1-1",
+            &[],
+            &["virtual/libc"],
+        ),
+        release(key("main/system", "awk", "2"), "1-1", &[], &["virtual/awk"]),
+        release(
+            key("main/system", "cron", "3"),
+            "1-1",
+            &[],
+            &["virtual/cron"],
+        ),
+        release(
+            key("main/system", "cron", "0"),
+            "1-1",
+            &[],
+            &["virtual/cron"],
+        ),
+        release(key("main/system", "unused", "0"), "1-1", &[], &[]),
+    ];
+    let installed: Vec<_> = packages.iter().map(installed).collect();
+    let orphans: BTreeSet<_> = find_orphans(&installed, &config(&["app"], &[("cron", "cron:3")]))
+        .into_iter()
+        .map(|package| package.key)
+        .collect();
+    assert_eq!(
+        orphans,
+        BTreeSet::from([
+            key("main/system", "app", "1"),
+            key("main/system", "lib", "2"),
+            key("main/system", "cron", "0"),
+            key("main/system", "unused", "0"),
+        ])
+    );
+}
+
+#[test]
+fn transaction_preview_reports_binding_only_changes() {
+    let key = sage_core::PackageKey::new("main/system", "gawk", "2");
+    let plan = TransactionPlan::new(
+        vec![],
+        vec![],
+        BTreeMap::from([("awk".into(), key.clone())]),
+    );
+    let diff = compute_transaction_diff(&plan, &[], None);
+    let summary = diff.render_summary();
+    assert!(summary.contains(&format!("awk -> {key}")));
+    assert!(!summary.contains("No packages"));
+    assert!(!summary.contains("virtual:so:"));
 }

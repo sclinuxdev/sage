@@ -17,6 +17,7 @@ pub use lock::{HostLock, under_root};
 pub use mmap::Mmap;
 pub use package::{
     ConstraintOp, Dependency, ManagedBuildTool, Package, PackageCoordinate, PackageKey,
+    valid_package_component, valid_provider_symbol,
 };
 pub use symbol::{SymbolId, SymbolTable};
 pub use version::Version;

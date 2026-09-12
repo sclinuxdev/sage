@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use sage_core::{valid_package_component, valid_provider_symbol};
 use serde::{Deserialize, Serialize};
 
 use crate::services::{ensure_directory_beneath, target_path, valid_declaration_name};
@@ -49,15 +50,26 @@ impl SystemConfig {
         &self,
         channel: &str,
     ) -> Result<BTreeMap<String, sage_core::PackageKey>, SysError> {
-        self.providers
-            .iter()
-            .map(|(interface, selector)| {
-                let symbol = provider_symbol(interface);
-                sage_core::PackageKey::in_channel(channel, selector)
-                    .map(|key| (symbol, key))
-                    .map_err(|error| SysError::Invalid(error.to_string()))
-            })
-            .collect()
+        let mut providers = BTreeMap::new();
+        for (interface, selector) in &self.providers {
+            let symbol = provider_symbol(interface);
+            let key = sage_core::PackageKey::in_channel(channel, selector)
+                .map_err(|error| SysError::Invalid(error.to_string()))?;
+            if !valid_provider_symbol(&symbol)
+                || !valid_package_component(&key.name)
+                || !valid_package_component(&key.slot)
+            {
+                return Err(SysError::Invalid(format!(
+                    "invalid provider mapping {interface}={selector}"
+                )));
+            }
+            if providers.insert(symbol.clone(), key).is_some() {
+                return Err(SysError::Invalid(format!(
+                    "duplicate provider mapping for {symbol}"
+                )));
+            }
+        }
+        Ok(providers)
     }
 }
 
@@ -127,7 +139,7 @@ impl ReconcilePlan {
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
         let (solution, selected_providers) = sage_solver::SageSolver::with_locked(universe, locks)
-            .prefer_providers(preferences)
+            .bind_providers(preferences)
             .resolve_with_provider_bindings(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()
@@ -149,7 +161,8 @@ impl ReconcilePlan {
         };
         let provider_bindings = selected_providers
             .into_iter()
-            .map(|(symbol, key)| {
+            .filter(|((channel, _), _)| channel == "main/system")
+            .map(|((_, symbol), key)| {
                 (
                     symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
                     key,
