@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
-use sage_core::{DEFAULT_SLOT, PackageKey};
+use sage_core::{DEFAULT_SLOT, PackageKey, Version};
 use sage_solver::{PackageUniverse, SageSolver, Solution};
 
 use crate::state::{SystemConfig, provider_symbol};
@@ -135,21 +135,42 @@ pub(super) fn resolve_virtual_selections(
     );
     roots.sort();
     roots.dedup();
-    let locks: Vec<_> = installed
+    let mut locks: Vec<_> = installed
         .iter()
         .filter(|package| !prefer_latest || !requested.contains(&package.key))
         .map(|package| (package.key.clone(), package.version.clone()))
         .collect();
-    let solve = |bindings: &BTreeMap<String, PackageKey>| {
-        SageSolver::with_locked(universe, locks.clone())
+    let solve = |bindings: &BTreeMap<String, PackageKey>, locks: &[(PackageKey, Version)]| {
+        SageSolver::with_locked(universe, locks.iter().cloned())
             .bind_providers(bindings.clone())
             .resolve_with_provider_choices(&roots)
     };
     loop {
-        let (solution, choices) = solve(&bindings)?;
+        let (solution, choices) = solve(&bindings, &locks)?;
+        let is_upgrade_root = |symbol: &str, key: &PackageKey| {
+            prefer_latest
+                && key.channel == system_channel
+                && requested.iter().any(|root| {
+                    root.name == symbol && (root.slot == DEFAULT_SLOT || root.slot == key.slot)
+                })
+        };
+        // Bind directly requested providers before unlocking their releases, so
+        // another installed provider's lock cannot displace the selected identity.
+        // Re-solve before binding transitive choices: the upgraded release may
+        // require different providers than the old release did.
+        let previous_locks = locks.len();
+        locks.retain(|(key, _)| {
+            !choices.iter().any(|(symbol, chosen)| {
+                key == chosen && bindings.contains_key(symbol) && is_upgrade_root(symbol, key)
+            })
+        });
+        if locks.len() != previous_locks {
+            continue;
+        }
         let unbound = choices
             .iter()
-            .find(|(symbol, _)| symbol.starts_with("virtual/") && !bindings.contains_key(symbol));
+            .filter(|(symbol, _)| symbol.starts_with("virtual/") && !bindings.contains_key(symbol))
+            .min_by_key(|(symbol, key)| !is_upgrade_root(symbol, key));
         let Some((symbol, chosen)) = unbound else {
             let mut providers: BTreeMap<String, PackageKey> = BTreeMap::new();
             for (symbol, key) in choices {
@@ -179,7 +200,7 @@ pub(super) fn resolve_virtual_selections(
                 }
                 let mut trial = bindings.clone();
                 trial.insert(symbol.clone(), candidate.clone());
-                if solve(&trial).is_ok() {
+                if solve(&trial, &locks).is_ok() {
                     candidates.push(candidate.clone());
                 }
             }

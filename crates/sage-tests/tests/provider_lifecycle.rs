@@ -266,3 +266,100 @@ async fn provider_selectors_accept_package_and_slot_punctuation() {
     assert_eq!(orphans.len(), 1);
     assert_eq!(orphans[0].key.name, "unused");
 }
+
+#[tokio::test]
+async fn virtual_upgrade_updates_only_the_selected_provider() {
+    for save in [true, false] {
+        let mut lab = TortureLab::new().unwrap();
+        lab.add_package(package("gawk", "0", 1, &["virtual/awk"], &["virtual/libc"]))
+            .unwrap();
+        lab.add_package(package("libc", "0", 1, &["virtual/libc"], &[]))
+            .unwrap();
+        lab.publish().unwrap();
+        install(&lab, "virtual/awk", &[], save, false)
+            .await
+            .unwrap();
+        lab.add_package(package("gawk", "0", 2, &["virtual/awk"], &["virtual/libc"]))
+            .unwrap();
+        lab.add_package(package("libc", "0", 2, &["virtual/libc"], &[]))
+            .unwrap();
+        lab.publish().unwrap();
+        let before = lab.snapshot().unwrap();
+        let config_path = lab.root().join("etc/sage/system.toml");
+        let config = fs::read(&config_path).unwrap();
+        sage_sys::upgrade_packages(lab.root(), &["virtual/awk".into()], None, true)
+            .await
+            .unwrap();
+        assert_eq!(lab.snapshot().unwrap(), before);
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+        lab.upgrade("virtual/awk", "system").await.unwrap();
+        let after = lab.snapshot().unwrap();
+        assert_eq!(after.packages["main/system:gawk:0"], "2-1");
+        assert_eq!(after.packages["main/system:libc:0"], "1-1");
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+    }
+}
+
+#[tokio::test]
+async fn virtual_upgrade_preserves_other_provider_slots_and_channels() {
+    let mut lab = TortureLab::new().unwrap();
+    for slot in ["0", "2"] {
+        lab.add_package(package("gawk", slot, 1, &["virtual/awk"], &[]))
+            .unwrap();
+    }
+    let mut runtime = package("gawk", "2", 1, &["virtual/awk"], &[]);
+    runtime.channel = "runtime".into();
+    lab.add_package(runtime.clone()).unwrap();
+    lab.publish().unwrap();
+    install(&lab, "gawk", &[], false, false).await.unwrap();
+    lab.install("gawk:2", "runtime").await.unwrap();
+    install(&lab, "virtual/awk:2", &[("awk", "gawk:2")], true, false)
+        .await
+        .unwrap();
+    for slot in ["0", "2"] {
+        lab.add_package(package("gawk", slot, 2, &["virtual/awk"], &[]))
+            .unwrap();
+    }
+    runtime.version = 2;
+    lab.add_package(runtime).unwrap();
+    lab.publish().unwrap();
+    lab.upgrade("virtual/awk:2", "runtime").await.unwrap();
+    let after = lab.snapshot().unwrap();
+    assert_eq!(after.packages["main/system:gawk:2"], "2-1");
+    assert_eq!(after.packages["main/system:gawk:0"], "1-1");
+    assert_eq!(after.packages["main/runtime:gawk:2"], "1-1");
+}
+
+#[tokio::test]
+async fn virtual_upgrade_selects_dependencies_of_the_new_release() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package(
+        "gawk",
+        "0",
+        1,
+        &["virtual/awk"],
+        &["virtual/codec = 1-1"],
+    ))
+    .unwrap();
+    lab.add_package(package("codec-old", "0", 1, &["virtual/codec"], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    install(&lab, "virtual/awk", &[], false, false)
+        .await
+        .unwrap();
+    lab.add_package(package(
+        "gawk",
+        "0",
+        2,
+        &["virtual/awk"],
+        &["virtual/codec >= 2-1"],
+    ))
+    .unwrap();
+    lab.add_package(package("codec-new", "0", 2, &["virtual/codec"], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    lab.upgrade("virtual/awk", "system").await.unwrap();
+    let after = lab.snapshot().unwrap();
+    assert_eq!(after.packages["main/system:gawk:0"], "2-1");
+    assert_eq!(after.packages["main/system:codec-new:0"], "2-1");
+}
