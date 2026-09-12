@@ -1360,8 +1360,7 @@ async fn provider_disable_failure_does_not_publish_managed_disabled_state() {
 }
 
 #[tokio::test]
-async fn state_query_failure_when_enabling_service_leaves_journal_pending_and_fails_preview_if_definition_exists()
- {
+async fn state_query_failure_when_enabling_service_fails_preview_with_or_without_definition() {
     let lab = initial_system().await;
     let config_path = lab.root().join("etc/sage/services.toml");
     let before = fs::read(&config_path).unwrap();
@@ -1403,11 +1402,15 @@ async fn state_query_failure_when_enabling_service_leaves_journal_pending_and_fa
     assert!(database.pending_journals().unwrap().is_empty());
     drop(database);
 
-    // If the native definition does not exist on disk yet, preview skips the query.
+    // Missing native definitions must not hide provider query errors during preview.
     fs::remove_file(lab.root().join("etc/native-old/inactive")).unwrap();
     fs::write(lab.root().join("var/lib/sage/fail-is-enabled"), b"fail").unwrap();
 
-    assert!(sage_sys::service_enable(lab.root(), "inactive", true).is_ok());
+    let before = lab.snapshot().unwrap();
+    let error = sage_sys::service_enable(lab.root(), "inactive", true).unwrap_err();
+    assert!(error.to_string().contains("exited with"));
+    assert_eq!(lab.snapshot().unwrap(), before);
+    assert!(!lab.root().join("etc/native-old/inactive").exists());
 
     // A real enable on "inactive" will render the file and then fail the query,
     // leaving a provider-stage journal pending.
