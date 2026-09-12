@@ -3,6 +3,7 @@
 use sage_core::{PackageKey, Version};
 use sage_db::InstalledPackage;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use crate::channel::AvailablePackages;
 use crate::transaction::TransactionPlan;
@@ -113,66 +114,90 @@ pub fn compute_transaction_diff(
 }
 
 impl TransactionDiff {
-    /// Pretty prints the transaction preview to stdout.
-    pub fn print_summary(&self) {
-        if self.new_installs.is_empty() && self.upgrades.is_empty() && self.removals.is_empty() {
-            println!("No packages to install, upgrade, or remove.");
-            return;
+    /// Renders the complete transaction preview for terminals and callers.
+    pub fn render_summary(&self) -> String {
+        let mut output = String::new();
+        if self.new_installs.is_empty()
+            && self.upgrades.is_empty()
+            && self.removals.is_empty()
+            && self.provider_bindings.is_empty()
+        {
+            writeln!(output, "No packages to install, upgrade, or remove.")
+                .expect("writing to a String cannot fail");
+            return output;
         }
 
-        println!("Transaction Preview:");
+        writeln!(output, "Transaction Preview:").expect("writing to a String cannot fail");
         if !self.new_installs.is_empty() {
-            println!("  Install ({} packages):", self.new_installs.len());
+            writeln!(output, "  Install ({} packages):", self.new_installs.len())
+                .expect("writing to a String cannot fail");
             for item in &self.new_installs {
-                println!(
+                writeln!(
+                    output,
                     "    [+] {} {} ({})",
                     item.key,
                     item.version,
                     format_bytes(item.size as i64)
-                );
+                )
+                .expect("writing to a String cannot fail");
             }
         }
 
         if !self.upgrades.is_empty() {
-            println!("  Upgrade ({} packages):", self.upgrades.len());
+            writeln!(output, "  Upgrade ({} packages):", self.upgrades.len())
+                .expect("writing to a String cannot fail");
             for item in &self.upgrades {
                 let sign = if item.size_delta >= 0 { "+" } else { "" };
-                println!(
+                writeln!(
+                    output,
                     "    [^] {} {} -> {} ({}{})",
                     item.key,
                     item.old_version,
                     item.new_version,
                     sign,
                     format_bytes(item.size_delta)
-                );
+                )
+                .expect("writing to a String cannot fail");
             }
         }
 
         if !self.removals.is_empty() {
-            println!("  Remove ({} packages):", self.removals.len());
+            writeln!(output, "  Remove ({} packages):", self.removals.len())
+                .expect("writing to a String cannot fail");
             for item in &self.removals {
-                println!(
+                writeln!(
+                    output,
                     "    [-] {} {} (-{})",
                     item.key,
                     item.version,
                     format_bytes(item.size as i64)
-                );
+                )
+                .expect("writing to a String cannot fail");
             }
         }
 
         if !self.provider_bindings.is_empty() {
-            println!("  Provider Bindings:");
+            writeln!(output, "  Provider Bindings:").expect("writing to a String cannot fail");
             for (iface, key) in &self.provider_bindings {
-                println!("    [*] virtual:{iface} -> {key}");
+                writeln!(output, "    [*] {iface} -> {key}")
+                    .expect("writing to a String cannot fail");
             }
         }
 
         let net_sign = if self.net_size_bytes >= 0 { "+" } else { "" };
-        println!(
+        writeln!(
+            output,
             "\nNet disk space change: {}{}",
             net_sign,
             format_bytes(self.net_size_bytes)
-        );
+        )
+        .expect("writing to a String cannot fail");
+        output
+    }
+
+    /// Prints every planned change, including transactions with only bindings.
+    pub fn print_summary(&self) {
+        print!("{}", self.render_summary());
     }
 }
 

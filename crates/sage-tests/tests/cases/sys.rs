@@ -938,3 +938,18 @@ fn orphan_detection_uses_rebuild_channels_slots_and_virtual_routing() {
         ])
     );
 }
+
+#[test]
+fn transaction_preview_reports_binding_only_changes() {
+    let key = sage_core::PackageKey::new("main/system", "gawk", "2");
+    let plan = TransactionPlan::new(
+        vec![],
+        vec![],
+        BTreeMap::from([("awk".into(), key.clone())]),
+    );
+    let diff = compute_transaction_diff(&plan, &[], None);
+    let summary = diff.render_summary();
+    assert!(summary.contains(&format!("awk -> {key}")));
+    assert!(!summary.contains("No packages"));
+    assert!(!summary.contains("virtual:so:"));
+}
