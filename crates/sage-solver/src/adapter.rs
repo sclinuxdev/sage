@@ -80,7 +80,8 @@ impl<'a> SageSolver<'a> {
         self
     }
 
-    /// Resolves all requested roots together so shared dependencies cannot diverge.
+    /// Resolves exact root identities together, including an explicit slot `0`.
+    /// Use root requirements when a virtual interface has no slot restriction.
     pub fn resolve(&self, requested: &[PackageKey]) -> Result<Solution, SolverError> {
         self.resolve_with_provider_choices(requested)
             .map(|(solution, _)| solution)
@@ -104,7 +105,7 @@ impl<'a> SageSolver<'a> {
                         &system_channel(&key.channel),
                         &Dependency {
                             name: key.name.clone(),
-                            slot: (key.slot != DEFAULT_SLOT).then(|| key.slot.clone()),
+                            slot: Some(key.slot.clone()),
                             channel: None,
                             op: ConstraintOp::Any,
                             version: None,
@@ -184,11 +185,23 @@ impl<'a> SageSolver<'a> {
         channel: &str,
         requested: &[Dependency],
     ) -> Result<Solution, SolverError> {
-        let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
-        let root_version = Version::new(0, "0", 0);
+        self.resolve_with_root_requirements(&[], channel, requested)
+            .map(|(solution, _)| solution)
+    }
+
+    /// Solves exact package roots together with optional-slot/version requirements
+    /// interpreted in `channel`, returning the actual virtual choices. Keeping
+    /// requirements separate from identities preserves `None` versus `Some("0")`
+    /// and avoids merging an unqualified virtual root with an explicit slot `0`.
+    pub fn resolve_with_root_requirements(
+        &self,
+        requested: &[PackageKey],
+        channel: &str,
+        requirements: &[Dependency],
+    ) -> Result<(Solution, Vec<(Dependency, PackageKey)>), SolverError> {
         let parent = PackageKey::new(channel, "__build", DEFAULT_SLOT);
-        let mut dependencies = DependencyMap::default();
-        for dependency in requested {
+        let mut dependencies = self.root_dependencies(requested);
+        for dependency in requirements {
             let key = dependency_key(self.universe, &parent, dependency);
             let range = if is_proxy_key(&key) {
                 VersionRange::full()
@@ -200,8 +213,7 @@ impl<'a> SageSolver<'a> {
                 .and_modify(|current| *current = current.intersection(&range))
                 .or_insert(range);
         }
-        self.resolve_root_with(&root, &root_version, dependencies)
-            .map(|(solution, _)| solution)
+        self.resolve_root(dependencies)
     }
 
     fn resolve_root(
@@ -602,7 +614,16 @@ fn provider_symbol(name: &str) -> &str {
 }
 
 fn virtual_key(channel: &str, dependency: &Dependency) -> PackageKey {
-    PackageKey::new("__sage", format!("{channel}/{dependency}"), DEFAULT_SLOT)
+    // Sonames are opaque, so appending a slot to their textual spelling would
+    // change the symbol. Store the optional constraint in the synthetic key's
+    // slot instead: empty means None, and a leading ':' identifies Some(slot).
+    // The prefix also distinguishes a malformed empty slot from an absent one.
+    let mut requirement = dependency.clone();
+    let slot = requirement
+        .slot
+        .take()
+        .map_or_else(String::new, |slot| format!(":{slot}"));
+    PackageKey::new("__sage", format!("{channel}/{requirement}"), slot)
 }
 
 fn virtual_requirement(key: &PackageKey) -> Option<(PackageKey, String, Dependency)> {
@@ -612,11 +633,9 @@ fn virtual_requirement(key: &PackageKey) -> Option<(PackageKey, String, Dependen
         .find("/virtual/")
         .or_else(|| key.name.find("/so:"))?;
     let (channel, dependency) = key.name.split_at(boundary);
-    Some((
-        key.clone(),
-        channel.into(),
-        dependency.strip_prefix('/')?.parse().ok()?,
-    ))
+    let mut requirement: Dependency = dependency.strip_prefix('/')?.parse().ok()?;
+    requirement.slot = key.slot.strip_prefix(':').map(str::to_owned);
+    Some((key.clone(), channel.into(), requirement))
 }
 
 fn system_channel(channel: &str) -> String {

@@ -617,14 +617,18 @@ async fn saved_slot_specific_choices_do_not_constrain_later_installs() {
 #[tokio::test]
 async fn direct_scoped_virtual_requests_persist_independent_package_roots() {
     let mut lab = TortureLab::new().unwrap();
-    for slot in ["1", "2"] {
+    for slot in ["0", "1", "2"] {
         lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
             .unwrap();
     }
     lab.publish().unwrap();
     sage_sys::apply_packages(
         lab.root(),
-        &["virtual/codec:1".into(), "virtual/codec:2".into()],
+        &[
+            "virtual/codec:0".into(),
+            "virtual/codec:1".into(),
+            "virtual/codec:2".into(),
+        ],
         None,
         &[],
         false,
@@ -636,6 +640,127 @@ async fn direct_scoped_virtual_requests_persist_independent_package_roots() {
     .unwrap();
     let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
     assert!(config.providers.is_empty());
-    assert_eq!(config.packages, ["codec:1".into(), "codec:2".into()].into());
+    assert_eq!(
+        config.packages,
+        ["codec:0".into(), "codec:1".into(), "codec:2".into()].into()
+    );
     assert_rebuild_keeps_installed(&lab);
+}
+
+#[tokio::test]
+async fn explicit_default_virtual_slot_is_installed_and_saved_exactly() {
+    for save in [false, true] {
+        let mut lab = TortureLab::new().unwrap();
+        for slot in ["0", "1"] {
+            lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
+                .unwrap();
+        }
+        lab.publish().unwrap();
+        let path = lab.root().join("etc/sage/system.toml");
+        let config = fs::read(&path).unwrap();
+        let before = lab.snapshot().unwrap();
+        install(&lab, "virtual/codec:0", &[], save, true)
+            .await
+            .unwrap();
+        assert_eq!(lab.snapshot().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), config);
+        install(&lab, "virtual/codec:0", &[], save, false)
+            .await
+            .unwrap();
+        let after = lab.snapshot().unwrap();
+        assert_eq!(after.packages.len(), 1);
+        assert_eq!(after.packages["main/system:codec:0"], "1-1");
+        if save {
+            let config = sage_sys::SystemConfig::load(&path).unwrap();
+            assert_eq!(config.packages, ["codec:0".into()].into());
+            assert!(config.providers.is_empty());
+            assert_rebuild_keeps_installed(&lab);
+        } else {
+            assert_eq!(fs::read(&path).unwrap(), config);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_default_virtual_slot_rejects_missing_or_overridden_providers() {
+    for has_default_slot in [false, true] {
+        let mut lab = TortureLab::new().unwrap();
+        lab.add_package(package("codec", "1", 1, &["virtual/codec"], &[]))
+            .unwrap();
+        if has_default_slot {
+            lab.add_package(package("codec", "0", 1, &["virtual/codec"], &[]))
+                .unwrap();
+        }
+        lab.publish().unwrap();
+        let before = lab.snapshot().unwrap();
+        let path = lab.root().join("etc/sage/system.toml");
+        let config = fs::read(&path).unwrap();
+        let overrides = if has_default_slot {
+            vec![("codec", "codec:1")]
+        } else {
+            vec![]
+        };
+        for dry_run in [true, false] {
+            assert!(
+                install(&lab, "virtual/codec:0", &overrides, true, dry_run)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(lab.snapshot().unwrap(), before);
+            assert_eq!(fs::read(&path).unwrap(), config);
+        }
+        // Omitting a slot remains compatible with an explicitly selected slot 1.
+        install(&lab, "virtual/codec", &[("codec", "codec:1")], true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            lab.snapshot().unwrap().packages["main/system:codec:1"],
+            "1-1"
+        );
+        for dry_run in [true, false] {
+            let before = lab.snapshot().unwrap();
+            let config = fs::read(&path).unwrap();
+            assert!(
+                install(&lab, "virtual/codec:0", &[], true, dry_run)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(lab.snapshot().unwrap(), before);
+            assert_eq!(fs::read(&path).unwrap(), config);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_default_virtual_upgrade_keeps_other_slots_locked() {
+    for channel in ["system", "runtime"] {
+        let mut lab = TortureLab::new().unwrap();
+        for slot in ["0", "1"] {
+            lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
+                .unwrap();
+        }
+        lab.publish().unwrap();
+        for selector in ["codec:0", "codec:1"] {
+            install(&lab, selector, &[], true, false).await.unwrap();
+        }
+        for slot in ["0", "1"] {
+            lab.add_package(package("codec", slot, 2, &["virtual/codec"], &[]))
+                .unwrap();
+        }
+        lab.publish().unwrap();
+        let before = lab.snapshot().unwrap();
+        let path = lab.root().join("etc/sage/system.toml");
+        let config = fs::read(&path).unwrap();
+        sage_sys::upgrade_packages(lab.root(), &["virtual/codec:0".into()], Some(channel), true)
+            .await
+            .unwrap();
+        assert_eq!(lab.snapshot().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), config);
+        lab.upgrade("virtual/codec:0", channel).await.unwrap();
+        let after = lab.snapshot().unwrap();
+        assert_eq!(after.packages["main/system:codec:0"], "2-1");
+        assert_eq!(after.packages["main/system:codec:1"], "1-1");
+        assert_eq!(fs::read(&path).unwrap(), config);
+        assert_rebuild_keeps_installed(&lab);
+    }
 }

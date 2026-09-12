@@ -96,6 +96,9 @@ in the requested repository's system channel for the transaction. Only
 `so:libfoo.so.1` are accepted as interface spellings;
 empty, malformed and duplicate overrides are rejected. Direct `virtual/interface`
 requests are resolved as virtual edges, not unchecked concrete package roots.
+An omitted virtual slot allows any compatible provider slot; an explicit `:0`
+restricts selection to slot `0`, just like any other explicit slot. Installation,
+upgrade, and saved concrete roots preserve that distinction.
 Automatic choices come from a satisfiable dependency graph. Interactive choices
 are restricted to providers that can satisfy the entire graph; absent a terminal,
 the solver's feasible choice is used. Automatic bindings retain the full

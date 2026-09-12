@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
-use sage_core::{ConstraintOp, DEFAULT_SLOT, Dependency, PackageKey, Version};
+use sage_core::{ConstraintOp, Dependency, PackageKey, Version};
 use sage_solver::{PackageUniverse, ProviderBindings, SageSolver, Solution};
 
 use crate::state::{SystemConfig, provider_symbol};
@@ -107,6 +107,20 @@ pub(super) fn resolve_virtual_selections(
         .iter()
         .map(|name| PackageKey::in_channel(channel, name))
         .collect::<Result<Vec<_>, _>>()?;
+    // PackageKey always contains a concrete slot, so retain optional virtual
+    // constraints from the original selector before deduplicating exact roots.
+    let requested_virtuals: Vec<_> = requested
+        .iter()
+        .zip(names)
+        .filter(|(key, _)| key.name.starts_with("virtual/"))
+        .map(|(key, selector)| Dependency {
+            name: key.name.clone(),
+            slot: selector.split_once(':').map(|(_, slot)| slot.into()),
+            channel: None,
+            op: ConstraintOp::Any,
+            version: None,
+        })
+        .collect();
     let mut bindings: ProviderBindings = config
         .provider_preferences("main/system")?
         .into_iter()
@@ -128,16 +142,23 @@ pub(super) fn resolve_virtual_selections(
         let key = override_config.provider_preferences(&system_channel)?[&symbol].clone();
         bindings.insert((system_channel.clone(), symbol), key);
     }
-    let mut roots = requested.clone();
+    let mut roots: Vec<_> = requested
+        .iter()
+        .filter(|key| !key.name.starts_with("virtual/"))
+        .cloned()
+        .collect();
     roots.extend(installed.iter().map(|package| package.key.clone()));
     // Explicit overrides must be validated even without a consumer. Existing
     // declarations constrain reached edges; only rebuild converges all declared
     // roots, so an unrelated install cannot resurrect a retired provider.
-    roots.extend(
-        overridden
-            .iter()
-            .map(|symbol| PackageKey::new(&system_channel, symbol, DEFAULT_SLOT)),
-    );
+    let mut requirements = requested_virtuals.clone();
+    requirements.extend(overridden.iter().map(|symbol| Dependency {
+        name: symbol.clone(),
+        slot: None,
+        channel: None,
+        op: ConstraintOp::Any,
+        version: None,
+    }));
     roots.sort();
     roots.dedup();
     let mut locks: Vec<_> = installed
@@ -154,17 +175,15 @@ pub(super) fn resolve_virtual_selections(
                     .map(|((_, symbol), key)| (symbol.clone(), key.clone())),
             )
             .bind_provider_requirements(automatic.clone())
-            .resolve_with_provider_choices(&roots)
+            .resolve_with_root_requirements(&roots, channel, &requirements)
     };
     let is_requested = |requirement: &Dependency| {
         requirement.channel.as_deref() == Some(&system_channel)
             && requirement.op == ConstraintOp::Any
             && requirement.version.is_none()
-            && requested.iter().any(|root| {
-                root.name == requirement.name
-                    && requirement.slot.as_deref()
-                        == (root.slot != DEFAULT_SLOT).then_some(root.slot.as_str())
-            })
+            && requested_virtuals
+                .iter()
+                .any(|root| root.name == requirement.name && root.slot == requirement.slot)
     };
     let is_configured = |requirement: &Dependency| {
         requirement.channel.as_ref().is_some_and(|channel| {
