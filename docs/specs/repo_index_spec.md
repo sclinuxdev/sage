@@ -31,3 +31,16 @@
    - 验签通过后，客户端通过 `heed::EnvOpenOptions` 以 **只读内存映射 (`MDB_RDONLY | MDB_NOLOCK`)** 模式打开。
 3. **当前求解器消费 (`sage-solver`)**:
    - CLI 有序扫描启用索引，解码 release 记录，过滤不兼容架构后构建内存候选集合。按需 LMDB 展开需要未来的基准与实现支持。
+
+## Publication freshness
+
+The signed metadata timestamp must be a positive integer. Clients reject missing
+or malformed incoming timestamps, including on first sync. Once a timestamped
+index is installed, an incoming index must be newer; an equal timestamp is only
+accepted as an unchanged refresh when the entire signed index has the same hash.
+Validation failure preserves both the current index and its ETag. A legacy local
+index without a timestamp may be upgraded to a valid timestamped index.
+
+Index generation advances the timestamp beyond the previous publication even
+within one wall-clock second or after a clock rollback. Publishers must retain the
+previous index when rebuilding a repository to preserve this ordering.

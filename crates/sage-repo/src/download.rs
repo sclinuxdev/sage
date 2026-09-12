@@ -208,18 +208,19 @@ impl DownloadEngine {
         tokio::fs::remove_file(&compressed).await?;
         verify_signature(&uncompressed, signing_key, &signature).await?;
 
-        // Anti-replay & downgrade verification:
-        // Prevent an attacker or compromised mirror from rolling back the index
-        // to an older version with known security vulnerabilities.
-        if destination.exists() {
-            let current_ts = read_index_timestamp(destination)?;
-            let incoming_ts = read_index_timestamp(&uncompressed)?;
-            if let (Some(cur), Some(inc)) = (current_ts, incoming_ts)
-                && inc < cur
-            {
+        // Require signed freshness metadata even on first sync. Legacy local
+        // indexes may be upgraded, but incoming indexes may never omit it.
+        let incoming_ts = read_index_timestamp(&uncompressed)?.ok_or_else(|| {
+            RepoError::InvalidConfig("incoming index has no publication timestamp".into())
+        })?;
+        if let Some(current_ts) = read_index_timestamp(destination)? {
+            if incoming_ts == current_ts && hash_file(destination)? == hash_file(&uncompressed)? {
+                return Ok(false);
+            }
+            if incoming_ts <= current_ts {
                 return Err(RepoError::ReplayAttack {
-                    current: cur,
-                    incoming: inc,
+                    current: current_ts,
+                    incoming: incoming_ts,
                 });
             }
         }
@@ -360,3 +361,6 @@ impl Drop for TempFiles {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

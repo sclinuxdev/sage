@@ -1477,6 +1477,7 @@ dependencies = [
  "sage-db",
  "serde",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",
