@@ -135,20 +135,21 @@ impl SystemConfig {
     pub fn to_toml_string(&self) -> Result<String, SysError> {
         let mut out = format!("schema_version = {}\n\n", self.schema_version);
         out.push_str("[system]\n");
-        out.push_str(&format!(
-            "architecture = \"{}\"\n",
-            self.system.architecture
-        ));
-        out.push_str(&format!("profile = \"{}\"\n", self.system.profile));
+        out.push_str(
+            &toml::to_string(&self.system).map_err(|error| SysError::Invalid(error.to_string()))?,
+        );
         if !self.providers.is_empty() {
             out.push_str("\n[providers]\n");
-            for (interface, provider) in &self.providers {
-                out.push_str(&format!("{interface} = \"{provider}\"\n"));
-            }
+            // Provider symbols may contain punctuation requiring quoted TOML
+            // keys. Use the serializer for escaping while retaining section order.
+            out.push_str(
+                &toml::to_string(&self.providers)
+                    .map_err(|error| SysError::Invalid(error.to_string()))?,
+            );
         }
         out.push_str("\npackages = [\n");
         for package in &self.packages {
-            out.push_str(&format!("    \"{package}\",\n"));
+            out.push_str(&format!("    {},\n", toml::Value::String(package.clone())));
         }
         out.push_str("]\n");
         Ok(out)
