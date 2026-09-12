@@ -17,6 +17,7 @@ pub struct SageSolver<'a> {
     locked: BTreeMap<PackageKey, Version>,
     preferred_providers: BTreeMap<String, PackageKey>,
     bound_providers: BTreeMap<String, PackageKey>,
+    bound_requirements: BTreeMap<Dependency, PackageKey>,
 }
 
 impl<'a> SageSolver<'a> {
@@ -26,6 +27,7 @@ impl<'a> SageSolver<'a> {
             locked: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
             bound_providers: BTreeMap::new(),
+            bound_requirements: BTreeMap::new(),
         }
     }
 
@@ -38,6 +40,7 @@ impl<'a> SageSolver<'a> {
             locked: locked.into_iter().collect(),
             preferred_providers: BTreeMap::new(),
             bound_providers: BTreeMap::new(),
+            bound_requirements: BTreeMap::new(),
         }
     }
 
@@ -60,17 +63,29 @@ impl<'a> SageSolver<'a> {
         self
     }
 
+    /// Binds transaction-local choices to their exact virtual requirements.
+    /// The dependency channel is the resolved provider channel; slot and version
+    /// constraints remain distinct so one automatic choice cannot constrain other edges.
+    pub fn bind_provider_requirements(
+        mut self,
+        bindings: impl IntoIterator<Item = (Dependency, PackageKey)>,
+    ) -> Self {
+        self.bound_requirements = bindings.into_iter().collect();
+        self
+    }
+
     /// Resolves all requested roots together so shared dependencies cannot diverge.
     pub fn resolve(&self, requested: &[PackageKey]) -> Result<Solution, SolverError> {
         self.resolve_with_provider_choices(requested)
             .map(|(solution, _)| solution)
     }
 
-    /// Returns actual virtual choices from the solved graph, including unconfigured interfaces.
+    /// Returns actual virtual requirements and choices from the solved graph.
+    /// Each requirement carries its resolved provider channel and original constraints.
     pub fn resolve_with_provider_choices(
         &self,
         requested: &[PackageKey],
-    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
+    ) -> Result<(Solution, Vec<(Dependency, PackageKey)>), SolverError> {
         self.resolve_root(self.root_dependencies(requested))
     }
 
@@ -109,7 +124,7 @@ impl<'a> SageSolver<'a> {
             all_providers.extend(self.bound_providers.clone());
             let missing: Vec<_> = all_providers
                 .into_iter()
-                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| choice == symbol))
+                .filter(|(symbol, _)| !choices.iter().any(|(choice, _)| &choice.name == symbol))
                 .collect();
             if missing.is_empty() {
                 break (solution, choices);
@@ -133,7 +148,8 @@ impl<'a> SageSolver<'a> {
             }
         };
         let mut bindings = BTreeMap::new();
-        for (symbol, key) in choices {
+        for (requirement, key) in choices {
+            let symbol = requirement.name;
             if !self.preferred_providers.contains_key(&symbol)
                 && !self.bound_providers.contains_key(&symbol)
             {
@@ -179,7 +195,7 @@ impl<'a> SageSolver<'a> {
     fn resolve_root(
         &self,
         dependencies: DependencyMap,
-    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
+    ) -> Result<(Solution, Vec<(Dependency, PackageKey)>), SolverError> {
         let root = PackageKey::new("__sage", "root", DEFAULT_SLOT);
         let root_version = Version::new(0, "0", 0);
         self.resolve_root_with(&root, &root_version, dependencies)
@@ -190,21 +206,13 @@ impl<'a> SageSolver<'a> {
         root: &PackageKey,
         root_version: &Version,
         dependencies: DependencyMap,
-    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
-        let provider = SageProvider::build(
-            self.universe,
-            &self.locked,
-            &self.preferred_providers,
-            &self.bound_providers,
-            root,
-            root_version,
-            dependencies,
-        )?;
+    ) -> Result<(Solution, Vec<(Dependency, PackageKey)>), SolverError> {
+        let provider = SageProvider::build(self, root, root_version, dependencies)?;
         match resolve(&provider, root.clone(), root_version.clone()) {
             Ok(selected) => {
                 let mut choices = Vec::new();
                 for (key, version) in &selected {
-                    let Some((_, _, requirement)) = virtual_requirement(key) else {
+                    let Some((_, channel, mut requirement)) = virtual_requirement(key) else {
                         continue;
                     };
                     if requirement.name.starts_with("virtual/provider/") {
@@ -214,7 +222,8 @@ impl<'a> SageSolver<'a> {
                         .keys()
                         .find(|candidate| !is_proxy_key(candidate))
                         .expect("a virtual proxy depends on one concrete release");
-                    choices.push((requirement.name, concrete.clone()));
+                    requirement.channel = Some(channel);
+                    choices.push((requirement, concrete.clone()));
                 }
                 Ok((
                     selected
@@ -282,15 +291,16 @@ pub(crate) struct SageProvider {
 }
 
 impl SageProvider {
-    pub(crate) fn build(
-        universe: &PackageUniverse,
-        locked: &BTreeMap<PackageKey, Version>,
-        preferred_providers: &BTreeMap<String, PackageKey>,
-        bound_providers: &BTreeMap<String, PackageKey>,
+    fn build(
+        solver: &SageSolver<'_>,
         root: &PackageKey,
         root_version: &Version,
         root_dependencies: DependencyMap,
     ) -> Result<Self, SolverError> {
+        let universe = solver.universe;
+        let locked = &solver.locked;
+        let preferred_providers = &solver.preferred_providers;
+        let bound_providers = &solver.bound_providers;
         let mut releases = BTreeMap::new();
         let mut conflicts = Vec::new();
         for (key, versions) in &universe.releases {
@@ -334,6 +344,8 @@ impl SageProvider {
             .collect();
         for (target, channel, requirement) in virtuals {
             let provider_name = provider_symbol(&requirement.name);
+            let mut scoped = requirement.clone();
+            scoped.channel = Some(channel.clone());
             let Some(providers) = universe.providers.get(provider_name) else {
                 continue;
             };
@@ -353,6 +365,10 @@ impl SageProvider {
                 if bound_providers
                     .get(provider_name)
                     .is_some_and(|bound| bound != key)
+                    || solver
+                        .bound_requirements
+                        .get(&scoped)
+                        .is_some_and(|bound| bound != key)
                 {
                     continue;
                 }

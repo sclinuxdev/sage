@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
-use sage_core::{DEFAULT_SLOT, PackageKey, Version};
+use sage_core::{ConstraintOp, DEFAULT_SLOT, Dependency, PackageKey, Version};
 use sage_solver::{PackageUniverse, SageSolver, Solution};
 
 use crate::state::{SystemConfig, provider_symbol};
@@ -86,6 +86,7 @@ pub(super) struct VirtualSelections {
     pub solution: Solution,
     pub providers: BTreeMap<String, PackageKey>,
     pub declarations: BTreeMap<String, String>,
+    pub package_roots: BTreeSet<PackageKey>,
 }
 
 /// Solves before prompting so abandoned releases and incompatible providers never
@@ -140,19 +141,27 @@ pub(super) fn resolve_virtual_selections(
         .filter(|package| !prefer_latest || !requested.contains(&package.key))
         .map(|package| (package.key.clone(), package.version.clone()))
         .collect();
-    let solve = |bindings: &BTreeMap<String, PackageKey>, locks: &[(PackageKey, Version)]| {
+    let mut automatic = BTreeMap::<Dependency, PackageKey>::new();
+    let solve = |automatic: &BTreeMap<Dependency, PackageKey>, locks: &[(PackageKey, Version)]| {
         SageSolver::with_locked(universe, locks.iter().cloned())
             .bind_providers(bindings.clone())
+            .bind_provider_requirements(automatic.clone())
             .resolve_with_provider_choices(&roots)
     };
+    let is_requested = |requirement: &Dependency| {
+        requirement.channel.as_deref() == Some(&system_channel)
+            && requirement.op == ConstraintOp::Any
+            && requirement.version.is_none()
+            && requested.iter().any(|root| {
+                root.name == requirement.name
+                    && requirement.slot.as_deref()
+                        == (root.slot != DEFAULT_SLOT).then_some(root.slot.as_str())
+            })
+    };
     loop {
-        let (solution, choices) = solve(&bindings, &locks)?;
-        let is_upgrade_root = |symbol: &str, key: &PackageKey| {
-            prefer_latest
-                && key.channel == system_channel
-                && requested.iter().any(|root| {
-                    root.name == symbol && (root.slot == DEFAULT_SLOT || root.slot == key.slot)
-                })
+        let (solution, choices) = solve(&automatic, &locks)?;
+        let is_bound = |requirement: &Dependency| {
+            bindings.contains_key(&requirement.name) || automatic.contains_key(requirement)
         };
         // Bind directly requested providers before unlocking their releases, so
         // another installed provider's lock cannot displace the selected identity.
@@ -160,8 +169,8 @@ pub(super) fn resolve_virtual_selections(
         // require different providers than the old release did.
         let previous_locks = locks.len();
         locks.retain(|(key, _)| {
-            !choices.iter().any(|(symbol, chosen)| {
-                key == chosen && bindings.contains_key(symbol) && is_upgrade_root(symbol, key)
+            !choices.iter().any(|(requirement, chosen)| {
+                prefer_latest && key == chosen && is_bound(requirement) && is_requested(requirement)
             })
         });
         if locks.len() != previous_locks {
@@ -169,47 +178,79 @@ pub(super) fn resolve_virtual_selections(
         }
         let unbound = choices
             .iter()
-            .filter(|(symbol, _)| symbol.starts_with("virtual/") && !bindings.contains_key(symbol))
-            .min_by_key(|(symbol, key)| !is_upgrade_root(symbol, key));
-        let Some((symbol, chosen)) = unbound else {
+            .filter(|(requirement, _)| {
+                requirement.name.starts_with("virtual/") && !is_bound(requirement)
+            })
+            .min_by_key(|(requirement, _)| !(prefer_latest && is_requested(requirement)));
+        let Some((requirement, chosen)) = unbound else {
             let mut providers: BTreeMap<String, PackageKey> = BTreeMap::new();
-            for (symbol, key) in choices {
-                if bindings.contains_key(&symbol) {
+            for (requirement, key) in &choices {
+                // The persisted table describes global policy. A slot-specific
+                // edge, or a symbol with different feasible choices, cannot be
+                // promoted to one global binding without narrowing the graph.
+                if bindings.contains_key(&requirement.name)
+                    || (automatic.contains_key(requirement)
+                        && requirement.slot.is_none()
+                        && choices.iter().all(|(other, selected)| {
+                            other.name != requirement.name || selected == key
+                        }))
+                {
                     providers.insert(
-                        symbol.strip_prefix("virtual/").unwrap_or(&symbol).into(),
-                        key,
+                        requirement
+                            .name
+                            .strip_prefix("virtual/")
+                            .unwrap_or(&requirement.name)
+                            .into(),
+                        key.clone(),
                     );
                 }
             }
-            let declarations = providers
+            let declarations: BTreeMap<_, _> = providers
                 .iter()
                 .filter(|(_, key)| key.channel == "main/system")
                 .map(|(interface, key)| (interface.clone(), format!("{}:{}", key.name, key.slot)))
+                .collect();
+            // Direct scoped virtual requests still need declarative roots even
+            // when their choices cannot be represented by the global table.
+            let package_roots = choices
+                .iter()
+                .filter(|(requirement, key)| {
+                    is_requested(requirement)
+                        && key.channel == "main/system"
+                        && !declarations.contains_key(
+                            requirement
+                                .name
+                                .strip_prefix("virtual/")
+                                .unwrap_or(&requirement.name),
+                        )
+                })
+                .map(|(_, key)| key.clone())
                 .collect();
             return Ok(VirtualSelections {
                 solution,
                 providers,
                 declarations,
+                package_roots,
             });
         };
         let selected = if interactive {
             let mut candidates = Vec::new();
-            for candidate in universe.providers_for(symbol) {
+            for candidate in universe.providers_for(&requirement.name) {
                 if candidate.channel != chosen.channel {
                     continue;
                 }
-                let mut trial = bindings.clone();
-                trial.insert(symbol.clone(), candidate.clone());
+                let mut trial = automatic.clone();
+                trial.insert(requirement.clone(), candidate.clone());
                 if solve(&trial, &locks).is_ok() {
                     candidates.push(candidate.clone());
                 }
             }
             // The current solution is the default, preserving installed choices.
             candidates.sort_by_key(|key| (key != chosen, key.clone()));
-            select_virtual_provider(symbol, &candidates, None, true)?
+            select_virtual_provider(&requirement.to_string(), &candidates, None, true)?
         } else {
             chosen.clone()
         };
-        bindings.insert(symbol.clone(), selected);
+        automatic.insert(requirement.clone(), selected);
     }
 }

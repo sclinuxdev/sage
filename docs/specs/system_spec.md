@@ -93,8 +93,13 @@ empty, malformed and duplicate overrides are rejected. Direct `virtual/interface
 requests are resolved as virtual edges, not unchecked concrete package roots.
 Automatic choices come from a satisfiable dependency graph. Interactive choices
 are restricted to providers that can satisfy the entire graph; absent a terminal,
-the solver's feasible choice is used. Only selected interfaces are saved, with
-their exact slots, in successful main/system installs unless `--no-save` is set.
+the solver's feasible choice is used. Automatic bindings retain the full
+requirement, including channel, slot, and version constraints. Only unqualified interfaces with one consistent provider
+choice are saved as global policy in successful main/system installs unless
+`--no-save` is set. Slot-specific dependency choices remain local to the solved
+graph; directly requested scoped virtual packages are saved as concrete
+`name:slot` package roots so a later rebuild retains them without imposing a
+global binding on other slots.
 `--dry-run` reports the choices without modifying declarations. Installing a
 provider changes the package/declaration; `sage rebuild` activates system provider
 bindings and renders services transactionally.

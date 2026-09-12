@@ -73,6 +73,9 @@ pub async fn apply_packages(
                 next.packages.insert(name.clone());
             }
         }
+        for key in selections.package_roots {
+            next.packages.insert(format!("{}:{}", key.name, key.slot));
+        }
         for (iface, prov) in selections.declarations {
             // Canonicalize aliases so a later rebuild sees exactly one binding.
             next.providers.remove(&format!("virtual/{iface}"));

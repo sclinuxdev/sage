@@ -363,3 +363,121 @@ async fn virtual_upgrade_selects_dependencies_of_the_new_release() {
     assert_eq!(after.packages["main/system:gawk:0"], "2-1");
     assert_eq!(after.packages["main/system:codec-new:0"], "2-1");
 }
+
+fn assert_rebuild_keeps_installed(lab: &TortureLab) {
+    let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
+    let installed = sage_db::read_packages(&lab.root().join("var/lib/sage")).unwrap();
+    let mut universe = sage_solver::PackageUniverse::default();
+    for package in &installed {
+        universe.insert(sage_core::Package::from_release(
+            package.key.clone(),
+            package.version.clone(),
+            package.dependencies.clone(),
+            package.provides.clone(),
+        ));
+    }
+    let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &universe, false).unwrap();
+    assert!(plan.install.is_empty() && plan.remove.is_empty());
+    assert!(sage_sys::find_orphans(&installed, &config).is_empty());
+}
+
+#[tokio::test]
+async fn automatic_provider_choices_keep_simultaneous_slots_independent() {
+    for interactive in [false, true] {
+        let mut lab = TortureLab::new().unwrap();
+        for slot in ["1", "2"] {
+            lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
+                .unwrap();
+        }
+        lab.add_package(package(
+            "app",
+            "0",
+            1,
+            &[],
+            &["virtual/codec:1", "virtual/codec:2"],
+        ))
+        .unwrap();
+        lab.publish().unwrap();
+        let before = lab.snapshot().unwrap();
+        let path = lab.root().join("etc/sage/system.toml");
+        let config = fs::read(&path).unwrap();
+        for dry_run in [true, false] {
+            sage_sys::apply_packages(
+                lab.root(),
+                &["app".into()],
+                None,
+                &[],
+                interactive,
+                false,
+                true,
+                dry_run,
+            )
+            .await
+            .unwrap();
+            if dry_run {
+                assert_eq!(lab.snapshot().unwrap(), before);
+                assert_eq!(fs::read(&path).unwrap(), config);
+            }
+        }
+        let after = lab.snapshot().unwrap();
+        assert_eq!(after.packages["main/system:codec:1"], "1-1");
+        assert_eq!(after.packages["main/system:codec:2"], "1-1");
+        assert!(
+            sage_sys::SystemConfig::load(&path)
+                .unwrap()
+                .providers
+                .is_empty()
+        );
+        assert_rebuild_keeps_installed(&lab);
+    }
+}
+
+#[tokio::test]
+async fn saved_slot_specific_choices_do_not_constrain_later_installs() {
+    let mut lab = TortureLab::new().unwrap();
+    for slot in ["1", "2"] {
+        lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
+            .unwrap();
+        lab.add_package(package(
+            &format!("app{slot}"),
+            "0",
+            1,
+            &[],
+            &[&format!("virtual/codec:{slot}")],
+        ))
+        .unwrap();
+    }
+    lab.publish().unwrap();
+    for app in ["app1", "app2"] {
+        install(&lab, app, &[], true, false).await.unwrap();
+        let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
+        assert!(config.providers.is_empty());
+    }
+    assert_rebuild_keeps_installed(&lab);
+}
+
+#[tokio::test]
+async fn direct_scoped_virtual_requests_persist_independent_package_roots() {
+    let mut lab = TortureLab::new().unwrap();
+    for slot in ["1", "2"] {
+        lab.add_package(package("codec", slot, 1, &["virtual/codec"], &[]))
+            .unwrap();
+    }
+    lab.publish().unwrap();
+    sage_sys::apply_packages(
+        lab.root(),
+        &["virtual/codec:1".into(), "virtual/codec:2".into()],
+        None,
+        &[],
+        false,
+        false,
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
+    assert!(config.providers.is_empty());
+    assert_eq!(config.packages, ["codec:1".into(), "codec:2".into()].into());
+    assert_rebuild_keeps_installed(&lab);
+}
