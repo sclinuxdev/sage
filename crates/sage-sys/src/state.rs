@@ -49,15 +49,27 @@ impl SystemConfig {
         &self,
         channel: &str,
     ) -> Result<BTreeMap<String, sage_core::PackageKey>, SysError> {
-        self.providers
-            .iter()
-            .map(|(interface, selector)| {
-                let symbol = provider_symbol(interface);
-                sage_core::PackageKey::in_channel(channel, selector)
-                    .map(|key| (symbol, key))
-                    .map_err(|error| SysError::Invalid(error.to_string()))
-            })
-            .collect()
+        let mut providers = BTreeMap::new();
+        for (interface, selector) in &self.providers {
+            let symbol = provider_symbol(interface);
+            let name = symbol.strip_prefix("virtual/").unwrap_or(&symbol);
+            let key = sage_core::PackageKey::in_channel(channel, selector)
+                .map_err(|error| SysError::Invalid(error.to_string()))?;
+            if (!symbol.starts_with("so:") && !valid_declaration_name(name))
+                || !valid_declaration_name(&key.name)
+                || !valid_declaration_name(&key.slot)
+            {
+                return Err(SysError::Invalid(format!(
+                    "invalid provider mapping {interface}={selector}"
+                )));
+            }
+            if providers.insert(symbol.clone(), key).is_some() {
+                return Err(SysError::Invalid(format!(
+                    "duplicate provider mapping for {symbol}"
+                )));
+            }
+        }
+        Ok(providers)
     }
 }
 
@@ -127,7 +139,7 @@ impl ReconcilePlan {
             .iter()
             .map(|package| (package.key.clone(), package.version.clone()));
         let (solution, selected_providers) = sage_solver::SageSolver::with_locked(universe, locks)
-            .prefer_providers(preferences)
+            .bind_providers(preferences)
             .resolve_with_provider_bindings(&roots)?;
         let current: BTreeMap<_, _> = installed
             .iter()

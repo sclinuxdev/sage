@@ -50,7 +50,7 @@ pub enum Commands {
         #[arg(long)]
         no_save: bool,
         /// Explicit virtual interface provider selection (e.g. --provider init=systemd).
-        #[arg(long = "provider", value_parser = parse_provider_override)]
+        #[arg(short = 'P', long = "provider", value_parser = parse_provider_override)]
         providers: Vec<(String, String)>,
     },
     /// Remove specified packages from system.
@@ -362,10 +362,56 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
 }
 
 fn parse_provider_override(input: &str) -> std::result::Result<(String, String), String> {
-    input
-        .split_once('=')
-        .map(|(interface, pkg)| (interface.trim().to_string(), pkg.trim().to_string()))
-        .ok_or_else(|| {
-            "provider override must follow format interface=package (e.g. init=systemd)".to_string()
-        })
+    let (interface, selector) = input.split_once('=').ok_or_else(|| {
+        "provider override must follow format interface=package (e.g. init=systemd)".to_string()
+    })?;
+    let interface = interface
+        .trim()
+        .strip_prefix("virtual/")
+        .unwrap_or(interface.trim());
+    let selector = selector.trim();
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let key = sage_core::PackageKey::in_channel("main/system", selector)
+        .map_err(|error| error.to_string())?;
+    if !valid(interface) || !valid(&key.name) || !valid(&key.slot) {
+        return Err("provider override requires a valid interface and package[:slot]".into());
+    }
+    Ok((interface.into(), selector.into()))
+}
+
+#[cfg(test)]
+mod provider_cli_tests {
+    use super::*;
+
+    #[test]
+    fn provider_flags_accept_slots_and_reject_malformed_mappings() {
+        for flag in ["-P", "--provider"] {
+            let cli =
+                Cli::try_parse_from(["sage", "install", "virtual/awk", flag, "virtual/awk=gawk:2"])
+                    .unwrap();
+            let Commands::Install { providers, .. } = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(providers, vec![("awk".into(), "gawk:2".into())]);
+            for input in [
+                "awk",
+                "=gawk",
+                "awk=",
+                "awk=gawk:",
+                "awk=gawk=bad",
+                "virtual/=gawk",
+                "awk=a/b",
+            ] {
+                assert!(
+                    Cli::try_parse_from(["sage", "install", "app", flag, input]).is_err(),
+                    "{input}"
+                );
+            }
+        }
+    }
 }

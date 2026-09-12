@@ -320,3 +320,31 @@ fn bound_virtual_provider_strictly_considers_only_that_provider() {
         .unwrap_err();
     assert!(matches!(error, SolverError::NoSolution(_)));
 }
+
+#[test]
+fn bound_provider_slot_zero_is_exact_and_direct_virtual_roots_are_verified() {
+    let mut universe = PackageUniverse::default();
+    let mut provider = release("main/system", "provider", "1-1", &[]);
+    provider.slot = "2".into();
+    provider.provides.push("virtual/awk".into());
+    universe.insert(provider);
+    let root = PackageKey::new("main/system", "virtual/awk", "0");
+    assert!(
+        SageSolver::new(&universe)
+            .bind_providers([(
+                "virtual/awk".into(),
+                PackageKey::new("main/system", "provider", "0")
+            ),])
+            .resolve(std::slice::from_ref(&root))
+            .is_err()
+    );
+    assert!(
+        SageSolver::new(&universe)
+            .bind_providers([(
+                "virtual/awk".into(),
+                PackageKey::new("main/system", "provider", "2")
+            ),])
+            .resolve(&[root])
+            .is_ok()
+    );
+}

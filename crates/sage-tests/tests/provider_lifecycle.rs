@@ -1,0 +1,226 @@
+//! Provider choices must survive the actual CLI/application transaction boundary.
+
+use sage_core::PackageKey;
+use sage_tests::{PackageSpec, TortureLab};
+use std::fs;
+
+fn package(
+    name: &str,
+    slot: &str,
+    version: u32,
+    provides: &[&str],
+    dependencies: &[&str],
+) -> PackageSpec {
+    let mut package = PackageSpec::new(
+        "system",
+        name,
+        version,
+        &format!("usr/share/{name}-{slot}"),
+        name,
+    );
+    package.slot = slot.into();
+    package.provides = provides.iter().map(|value| (*value).into()).collect();
+    package.dependencies = dependencies.iter().map(|value| (*value).into()).collect();
+    package
+}
+
+async fn install(
+    lab: &TortureLab,
+    name: &str,
+    overrides: &[(&str, &str)],
+    save: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    sage::execute(sage::Cli {
+        verbose: false,
+        dry_run,
+        root: lab.root().into(),
+        command: sage::Commands::Install {
+            packages: vec![name.into()],
+            channel: None,
+            no_save: !save,
+            providers: overrides
+                .iter()
+                .map(|(symbol, key)| ((*symbol).into(), (*key).into()))
+                .collect(),
+        },
+    })
+    .await
+}
+
+#[tokio::test]
+async fn virtual_install_validates_provides_and_overrides_before_mutation() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package("gawk", "0", 1, &["virtual/awk"], &[]))
+        .unwrap();
+    lab.add_package(package("impostor", "0", 1, &[], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    let before = lab.snapshot().unwrap();
+    let config = fs::read(lab.root().join("etc/sage/system.toml")).unwrap();
+    for dry_run in [true, false] {
+        for overrides in [
+            vec![("awk", "impostor")],
+            vec![("awk", "gawk"), ("virtual/awk", "gawk")],
+            vec![("", "gawk")],
+        ] {
+            assert!(
+                install(&lab, "virtual/awk", &overrides, true, dry_run)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(lab.snapshot().unwrap(), before);
+            assert_eq!(
+                fs::read(lab.root().join("etc/sage/system.toml")).unwrap(),
+                config
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn virtual_install_preserves_slots_and_selected_provider_transitive_dependencies() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package("gawk", "2", 1, &["virtual/awk"], &["virtual/libc"]))
+        .unwrap();
+    lab.add_package(package("libc", "3", 1, &["virtual/libc"], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    let before = lab.snapshot().unwrap();
+    let config_path = lab.root().join("etc/sage/system.toml");
+    let before_config = fs::read(&config_path).unwrap();
+    install(
+        &lab,
+        "virtual/awk",
+        &[("virtual/awk", "gawk:2")],
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(lab.snapshot().unwrap(), before);
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
+    install(
+        &lab,
+        "virtual/awk",
+        &[("virtual/awk", "gawk:2")],
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    let config = sage_sys::SystemConfig::load(&config_path).unwrap();
+    assert_eq!(config.providers["awk"], "gawk:2");
+    assert_eq!(config.providers["libc"], "libc:3");
+    assert!(!config.providers.contains_key("virtual/awk"));
+    let db = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(
+        db.package(&PackageKey::new("main/system", "gawk", "2"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.package(&PackageKey::new("main/system", "libc", "3"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(db.pending_journals().unwrap().is_empty());
+    let installed = db.packages().unwrap();
+    let mut universe = sage_solver::PackageUniverse::default();
+    for installed in &installed {
+        universe.insert(sage_core::Package::from_release(
+            installed.key.clone(),
+            installed.version.clone(),
+            installed.dependencies.clone(),
+            installed.provides.clone(),
+        ));
+    }
+    let plan = sage_sys::ReconcilePlan::compute(&config, &installed, &universe, false).unwrap();
+    assert!(plan.install.is_empty() && plan.remove.is_empty());
+    assert_eq!(
+        plan.provider_bindings["awk"],
+        PackageKey::new("main/system", "gawk", "2")
+    );
+}
+
+#[tokio::test]
+async fn abandoned_versions_do_not_select_or_persist_unneeded_providers() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package("app", "0", 2, &[], &["virtual/missing"]))
+        .unwrap();
+    lab.add_package(package("app", "0", 1, &[], &[])).unwrap();
+    lab.publish().unwrap();
+    install(&lab, "app", &[], true, false).await.unwrap();
+    let config = sage_sys::SystemConfig::load(lab.root().join("etc/sage/system.toml")).unwrap();
+    assert!(config.providers.is_empty());
+    let db = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert_eq!(
+        db.package(&PackageKey::new("main/system", "app", "0"))
+            .unwrap()
+            .unwrap()
+            .version
+            .upstream,
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn automatic_choice_respects_versions_conflicts_and_no_save() {
+    let mut lab = TortureLab::new().unwrap();
+    lab.add_package(package("app", "0", 1, &[], &["virtual/awk >= 2-1"]))
+        .unwrap();
+    lab.add_package(package("a-incompatible", "0", 1, &["virtual/awk"], &[]))
+        .unwrap();
+    let mut conflicting = package("z-conflicting", "0", 3, &["virtual/awk"], &[]);
+    conflicting.conflicts.push("app".into());
+    lab.add_package(conflicting).unwrap();
+    lab.add_package(package("gawk", "2", 2, &["virtual/awk"], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    let config_path = lab.root().join("etc/sage/system.toml");
+    let before = fs::read(&config_path).unwrap();
+    install(&lab, "app", &[], false, false).await.unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    let db = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    let keys: Vec<_> = db
+        .packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| package.key.name)
+        .collect();
+    assert_eq!(keys, vec!["app", "gawk"]);
+}
+
+#[tokio::test]
+async fn runtime_virtual_dependencies_use_system_channel_providers() {
+    let mut lab = TortureLab::new().unwrap();
+    let mut app = package("app", "0", 1, &[], &["virtual/awk"]);
+    app.channel = "runtime".into();
+    lab.add_package(app).unwrap();
+    lab.add_package(package("gawk", "2", 1, &["virtual/awk"], &[]))
+        .unwrap();
+    lab.publish().unwrap();
+    sage_sys::apply_packages(
+        lab.root(),
+        &["app".into()],
+        Some("runtime"),
+        &[("awk".into(), "gawk:2".into())],
+        false,
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let db = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(
+        db.package(&PackageKey::new("main/runtime", "app", "0"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db.package(&PackageKey::new("main/system", "gawk", "2"))
+            .unwrap()
+            .is_some()
+    );
+}

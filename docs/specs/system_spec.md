@@ -58,7 +58,7 @@ packages = [
 ### 2.2 `[providers]` (动态虚拟接口提供者映射)
 - **零硬编码接口**: 系统不硬编码固定的虚拟接口枚举，`[providers]` 表现为动态的 `HashMap<String, String>`（`interface -> provider_pkg`）。
 - **非 providers 范围**: 诸如 Shell（`/bin/sh`、`bash`、`zsh`）等基础命令为标准独立软件包，由常规包依赖或 `alternatives` 机制管理，不通过 `[providers]` 进行互斥锁定。
-- **求解器优先权**: 当求解器在依赖图中遇到 `virtual/<interface>` 符号时，自动以最高权重（+1000）选取 `[providers]` 中指定的提供者包。
+- **Provider binding**: A configured provider is a required, exact `name[:slot]` binding in `main/system`; an omitted slot means `0`. Both install and rebuild reject incompatible bindings instead of switching implementations.
 - **initramfs provider**: `initramfs-generator` is optional system policy. The
   selected provider package must carry its own package trigger with the
   provider-specific command-line interface; Sage does not assume mkinitcpio,
@@ -81,16 +81,23 @@ packages = [
 
 ### 2.4 Provider selection and retained packages
 
-Each configured provider declares a required virtual interface and a preferred
-concrete package, including its channel and slot. The preference may backtrack
-to another compatible provider. An interface already required by the solved
-dependency graph uses that constrained virtual choice; an otherwise unused
-configured interface is added as a virtual root, never as an unconditional
-concrete package root. Only configured interfaces are persisted as bindings,
-using the exact concrete key selected by the solver. Conflicting concrete
-choices for one configured interface make planning fail before publication.
-Concrete-name provider fallbacks and unconfigured virtual interfaces do not
-create persistent configured bindings.
+Each configured provider declares a required virtual interface and an exact
+concrete package identity. The binding includes channel and slot and cannot
+backtrack to another implementation or slot. Version selection can still
+backtrack within that identity. During rebuild, an otherwise unused configured interface is
+added as a virtual root so its selected release must actually provide the symbol.
+
+`sage install -P interface=package[:slot]` (or `--provider`) overrides a binding
+for the transaction. `virtual/interface` is accepted as the interface spelling;
+empty, malformed and duplicate overrides are rejected. Direct `virtual/interface`
+requests are resolved as virtual edges, not unchecked concrete package roots.
+Automatic choices come from a satisfiable dependency graph. Interactive choices
+are restricted to providers that can satisfy the entire graph; absent a terminal,
+the solver's feasible choice is used. Only selected interfaces are saved, with
+their exact slots, in successful main/system installs unless `--no-save` is set.
+`--dry-run` reports the choices without modifying declarations. Installing a
+provider changes the package/declaration; `sage rebuild` activates system provider
+bindings and renders services transactionally.
 
 Normal rebuilds retain installed packages outside `main/system`; `--no-prune`
 retains all installed package identities. Retention preserves channel/name/slot

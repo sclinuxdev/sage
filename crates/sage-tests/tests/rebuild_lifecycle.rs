@@ -212,8 +212,13 @@ async fn renderer_uses_the_solver_resolved_provider_and_full_slot_identity() {
     selector.conflicts.push("loom:0".into());
     lab.add_package(selector).unwrap();
     lab.publish().unwrap();
-    // The requested name has no slot; dependency/conflict solving selects slot 1.
+    // Omitting a slot binds slot 0; a conflicting root must not silently switch it.
     configure(&lab, &["daemon", "select-new-init"], "loom", &["daemon"]);
+    let before = lifecycle_snapshot(&lab);
+    assert!(rebuild(&lab, true).await.is_err());
+    assert!(rebuild(&lab, false).await.is_err());
+    assert_eq!(lifecycle_snapshot(&lab), before);
+    configure(&lab, &["daemon", "select-new-init"], "loom:1", &["daemon"]);
     rebuild(&lab, false).await.unwrap();
     assert_settled(&lab, "loom", "1", "new");
     assert!(
@@ -1761,4 +1766,19 @@ async fn absent_native_definition_or_indeterminate_query_does_not_abort_service_
     let unconfigured_lab = TortureLab::new().unwrap();
     let unconfigured_services = sage_sys::list_services(unconfigured_lab.root()).unwrap();
     assert!(unconfigured_services.is_empty());
+}
+
+#[tokio::test]
+async fn generator_fallback_accepts_persisted_provider_slot_before_first_render() {
+    let lab = initial_system().await;
+    fs::remove_file(lab.root().join("var/lib/sage/rendered-services.toml")).unwrap();
+    configure(&lab, &["daemon"], "loom:0", &["daemon"]);
+    let (name, _) = sage_sys::load_active_generator(lab.root()).unwrap();
+    assert_eq!(name, "loom");
+    sage_sys::service_enable(lab.root(), "inactive", true).unwrap();
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/rendered-services.toml")
+            .exists()
+    );
 }

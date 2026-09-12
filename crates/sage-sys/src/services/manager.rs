@@ -6,9 +6,7 @@ use std::path::Path;
 
 use super::drift::ServiceStatusInfo;
 use super::generator::TemplateServiceGenerator;
-use super::spec::{
-    RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig, valid_declaration_name,
-};
+use super::spec::{RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig};
 use crate::SysError;
 use crate::recovery::{crash_point, operation_id};
 
@@ -74,15 +72,11 @@ pub fn load_active_generator(root: &Path) -> Result<(String, TemplateServiceGene
             "no active init provider is known; run sage rebuild first".into(),
         ));
     }
-    let content = fs::read_to_string(&system_config_path)?;
-    let toml_val: toml::Value =
-        toml::from_str(&content).map_err(|e| SysError::Invalid(e.to_string()))?;
-    let provider_name = toml_val
-        .get("providers")
-        .and_then(|providers| providers.get("init"))
-        .and_then(toml::Value::as_str)
-        .filter(|name| valid_declaration_name(name))
-        .map(str::to_owned)
+    let config = crate::state::SystemConfig::load(&system_config_path)?;
+    let provider_name = config
+        .provider_preferences("main/system")?
+        .remove("virtual/init")
+        .map(|key| key.name)
         .ok_or_else(|| {
             SysError::Invalid("no active init provider is known; run sage rebuild first".into())
         })?;

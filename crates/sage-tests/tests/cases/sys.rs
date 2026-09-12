@@ -52,7 +52,7 @@ fn config(packages: &[&str], providers: &[(&str, &str)]) -> SystemConfig {
 }
 
 #[test]
-fn configured_provider_backtracks_with_and_without_a_consumer() {
+fn configured_provider_is_strict_with_and_without_a_consumer() {
     use sage_core::PackageKey;
     for dependency in [vec![], vec!["virtual/libc"]] {
         let mut universe = sage_solver::PackageUniverse::default();
@@ -72,29 +72,14 @@ fn configured_provider_backtracks_with_and_without_a_consumer() {
                 &["virtual/libc"],
             ));
         }
-        let plan = ReconcilePlan::compute(
-            &config(&["guard"], &[("libc", "musl")]),
-            &[],
-            &universe,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.provider_bindings,
-            BTreeMap::from([("libc".into(), PackageKey::new("main/system", "glibc", "0"))])
-        );
-        assert_eq!(
-            plan.install,
-            vec![
-                (
-                    PackageKey::new("main/system", "glibc", "0"),
-                    "1-1".parse().unwrap()
-                ),
-                (
-                    PackageKey::new("main/system", "guard", "0"),
-                    "1-1".parse().unwrap()
-                ),
-            ]
+        assert!(
+            ReconcilePlan::compute(
+                &config(&["guard"], &[("libc", "musl")]),
+                &[],
+                &universe,
+                false,
+            )
+            .is_err()
         );
     }
 }
@@ -125,8 +110,17 @@ fn configured_binding_comes_from_the_constrained_virtual_choice() {
     ] {
         universe.insert(package);
     }
+    assert!(
+        ReconcilePlan::compute(
+            &config(&["app", "preferred:1"], &[("libc", "preferred:1")]),
+            &[],
+            &universe,
+            false,
+        )
+        .is_err()
+    );
     let plan = ReconcilePlan::compute(
-        &config(&["app", "preferred:1"], &[("libc", "preferred:1")]),
+        &config(&["app", "preferred:1"], &[("libc", "selected:2")]),
         &[],
         &universe,
         false,
@@ -136,10 +130,6 @@ fn configured_binding_comes_from_the_constrained_virtual_choice() {
         plan.provider_bindings["libc"],
         PackageKey::new("main/system", "selected", "2")
     );
-    assert!(plan.install.contains(&(
-        PackageKey::new("main/system", "selected", "2"),
-        "2-1".parse().unwrap()
-    )));
 }
 
 #[test]

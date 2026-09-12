@@ -62,13 +62,39 @@ impl<'a> SageSolver<'a> {
 
     /// Resolves all requested roots together so shared dependencies cannot diverge.
     pub fn resolve(&self, requested: &[PackageKey]) -> Result<Solution, SolverError> {
-        let dependencies = requested
-            .iter()
-            .cloned()
-            .map(|key| (key, VersionRange::full()))
-            .collect();
-        self.resolve_root(dependencies)
+        self.resolve_with_provider_choices(requested)
             .map(|(solution, _)| solution)
+    }
+
+    /// Returns actual virtual choices from the solved graph, including unconfigured interfaces.
+    pub fn resolve_with_provider_choices(
+        &self,
+        requested: &[PackageKey],
+    ) -> Result<(Solution, Vec<(String, PackageKey)>), SolverError> {
+        self.resolve_root(self.root_dependencies(requested))
+    }
+
+    fn root_dependencies(&self, requested: &[PackageKey]) -> DependencyMap {
+        requested
+            .iter()
+            .map(|key| {
+                let target = if key.name.starts_with("virtual/") || key.name.starts_with("so:") {
+                    virtual_key(
+                        &system_channel(&key.channel),
+                        &Dependency {
+                            name: key.name.clone(),
+                            slot: (key.slot != DEFAULT_SLOT).then(|| key.slot.clone()),
+                            channel: None,
+                            op: ConstraintOp::Any,
+                            version: None,
+                        },
+                    )
+                } else {
+                    key.clone()
+                };
+                (target, VersionRange::full())
+            })
+            .collect()
     }
 
     /// Resolves desired roots and the concrete bindings of configured interfaces.
@@ -76,11 +102,7 @@ impl<'a> SageSolver<'a> {
         &self,
         requested: &[PackageKey],
     ) -> Result<(Solution, BTreeMap<String, PackageKey>), SolverError> {
-        let mut dependencies: DependencyMap = requested
-            .iter()
-            .cloned()
-            .map(|key| (key, VersionRange::full()))
-            .collect();
+        let mut dependencies = self.root_dependencies(requested);
         let (solution, choices) = loop {
             let (solution, choices) = self.resolve_root(dependencies.clone())?;
             let mut all_providers = self.preferred_providers.clone();
@@ -287,13 +309,11 @@ impl SageProvider {
                 }
                 // When a virtual interface is strictly bound to a provider, only that
                 // provider is eligible. All alternative providers are filtered out.
-                if let Some(bound) = bound_providers.get(provider_name) {
-                    if key.channel != bound.channel || key.name != bound.name {
-                        continue;
-                    }
-                    if bound.slot != DEFAULT_SLOT && key.slot != bound.slot {
-                        continue;
-                    }
+                if bound_providers
+                    .get(provider_name)
+                    .is_some_and(|bound| bound != key)
+                {
+                    continue;
                 }
                 for (version_index, version) in universe.versions(key).enumerate() {
                     if !dependency_range(&requirement).contains(version)
@@ -309,7 +329,7 @@ impl SageProvider {
                     let preferred = preferred_providers.get(provider_name) == Some(key)
                         || bound_providers
                             .get(provider_name)
-                            .is_some_and(|b| b.channel == key.channel && b.name == key.name);
+                            .is_some_and(|bound| bound == key);
                     let exact_lock = locked.get(key) == Some(version);
                     let preference = match (preferred, exact_lock) {
                         (true, true) => 4,
