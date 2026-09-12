@@ -556,13 +556,15 @@ fn dependency_key(
     dependency: &Dependency,
 ) -> PackageKey {
     if is_virtual(dependency) {
-        // Resolve virtual dependencies against provider channels matching the consumer,
-        // falling back to the canonical system channel or first declared provider.
+        // Prefer the repository's system policy even when a runtime channel
+        // also provides the symbol. This keeps virtual root upgrade locks and
+        // configured provider bindings scoped to the same system channel.
         let sys_chan = system_channel(&parent.channel);
         let channel = if let Some(providers) = universe.providers.get(&dependency.name) {
             providers
                 .iter()
-                .find(|p| p.channel == parent.channel || p.channel == sys_chan)
+                .find(|p| p.channel == sys_chan)
+                .or_else(|| providers.iter().find(|p| p.channel == parent.channel))
                 .or_else(|| providers.first())
                 .map(|p| p.channel.as_str())
                 .unwrap_or(sys_chan.as_str())
