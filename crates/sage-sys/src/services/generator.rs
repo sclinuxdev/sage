@@ -224,7 +224,7 @@ impl TemplateServiceGenerator {
     }
 
     /// Renders a complete provider generation and validates it before keeping
-    /// the new tree. Managed directories are swapped and rolled back as a unit.
+    /// the new tree. Managed directories and activation artifacts are swapped and rolled back as an atomic unit.
     pub fn render_service_set(
         &self,
         services: &[ServiceSpec],
@@ -258,7 +258,10 @@ impl TemplateServiceGenerator {
             std::process::id()
         ));
         fs::create_dir(&staging)?;
-        let staged = (|| {
+
+        // Phase 1: Stage primary managed services and all activation artifacts.
+        let mut staged_artifacts = Vec::new();
+        let staged = (|| -> Result<(), SysError> {
             for service in services {
                 service.validate()?;
                 self.validate_service_type(service)?;
@@ -278,42 +281,156 @@ impl TemplateServiceGenerator {
                         SysError::Invalid("rendered service target has no filename".into())
                     })?),
                 )?;
+                self.stage_activation_artifacts(
+                    service,
+                    sysroot,
+                    generation,
+                    &mut staged_artifacts,
+                )?;
             }
-            Ok::<_, SysError>(())
+            Ok(())
         })();
         if let Err(error) = staged {
             let _ = fs::remove_dir_all(&staging);
+            for (staged_file, _) in staged_artifacts {
+                let _ = fs::remove_file(staged_file);
+            }
             return Err(error);
         }
+
+        // Phase 2: Atomic commit with rollback guard covering both managed tree and artifacts.
+        struct CommitGuard {
+            target_directory: PathBuf,
+            backup_directory: PathBuf,
+            had_previous: bool,
+            dir_swapped: bool,
+            parent: PathBuf,
+            leaf: String,
+            generation: u64,
+            artifact_backups: Vec<(PathBuf, Option<PathBuf>)>,
+            staged_artifacts: Vec<PathBuf>,
+            committed: bool,
+        }
+
+        impl Drop for CommitGuard {
+            fn drop(&mut self) {
+                if self.committed {
+                    if self.had_previous {
+                        let _ = fs::remove_dir_all(&self.backup_directory);
+                    }
+                    for (_, backup_path) in &self.artifact_backups {
+                        if let Some(backup) = backup_path {
+                            let _ = fs::remove_file(backup);
+                        }
+                    }
+                } else {
+                    if self.dir_swapped {
+                        let rejected = self.parent.join(format!(
+                            ".{}.sage-rejected-{}-{}",
+                            self.leaf,
+                            std::process::id(),
+                            self.generation
+                        ));
+                        let _ = fs::rename(&self.target_directory, &rejected);
+                        if self.had_previous {
+                            let _ = fs::rename(&self.backup_directory, &self.target_directory);
+                        }
+                        let _ = fs::remove_dir_all(rejected);
+                    }
+                    for (target, backup_path) in self.artifact_backups.iter().rev() {
+                        if let Some(backup) = backup_path {
+                            let _ = fs::rename(backup, target);
+                        } else {
+                            let _ = fs::remove_file(target);
+                        }
+                    }
+                    for staged in &self.staged_artifacts {
+                        let _ = fs::remove_file(staged);
+                    }
+                }
+            }
+        }
+
         let had_previous = target_directory.exists();
+        let mut guard = CommitGuard {
+            target_directory: target_directory.clone(),
+            backup_directory: backup.clone(),
+            had_previous,
+            dir_swapped: false,
+            parent: parent.to_path_buf(),
+            leaf: leaf.to_string(),
+            generation,
+            artifact_backups: Vec::new(),
+            staged_artifacts: staged_artifacts.iter().map(|(s, _)| s.clone()).collect(),
+            committed: false,
+        };
+
+        // Commit activation artifacts
+        for (idx, (stage_file, target_file)) in staged_artifacts.into_iter().enumerate() {
+            if target_file.exists() {
+                let art_parent = target_file.parent().unwrap_or(parent);
+                let art_backup = art_parent.join(format!(
+                    ".sage-art-backup-{}-{generation}-{idx}",
+                    std::process::id()
+                ));
+                fs::rename(&target_file, &art_backup)?;
+                guard
+                    .artifact_backups
+                    .push((target_file.clone(), Some(art_backup)));
+            } else {
+                guard.artifact_backups.push((target_file.clone(), None));
+            }
+            fs::rename(&stage_file, &target_file)?;
+        }
+
+        // Commit managed directory
         if had_previous {
             fs::rename(&target_directory, &backup)?;
         }
-        if let Err(error) = fs::rename(&staging, &target_directory) {
-            if had_previous {
-                let _ = fs::rename(&backup, &target_directory);
-            }
-            return Err(error.into());
+        fs::rename(&staging, &target_directory)?;
+        guard.dir_swapped = true;
+
+        // Whole-tree validation pass
+        if let Some(service) = services.first() {
+            self.validate_rendered_services(service, sysroot)?;
         }
-        for service in services {
-            self.render_activation_artifacts(service, sysroot)?;
-        }
-        if let Some(service) = services.first()
-            && let Err(error) = self.validate_rendered_services(service, sysroot)
-        {
-            let rejected = parent.join(format!(
-                ".{leaf}.sage-rejected-{}-{generation}",
-                std::process::id()
+
+        guard.committed = true;
+        Ok(())
+    }
+
+    fn stage_activation_artifacts(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+        generation: u64,
+        out: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), SysError> {
+        let Some(adapter) = self.activation_adapter(service)? else {
+            return Ok(());
+        };
+        let variables = self.service_variables(service, sysroot)?;
+        for (idx, artifact) in adapter.artifacts.iter().enumerate() {
+            let target = self.artifact_path(artifact, &variables, sysroot)?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| SysError::Invalid("artifact target has no parent".into()))?;
+            ensure_directory_beneath(sysroot, parent)?;
+            let staging_artifact = parent.join(format!(
+                ".sage-art-stage-{}-{generation}-{}-{idx}",
+                std::process::id(),
+                service.name
             ));
-            let _ = fs::rename(&target_directory, &rejected);
-            if had_previous {
-                let _ = fs::rename(&backup, &target_directory);
-            }
-            let _ = fs::remove_dir_all(rejected);
-            return Err(error);
-        }
-        if had_previous {
-            fs::remove_dir_all(backup)?;
+            let rendered = expand_template(&artifact.template, &variables)?;
+            self.publish_rendered(
+                service,
+                sysroot,
+                &staging_artifact,
+                &rendered,
+                artifact.mode,
+                None,
+            )?;
+            out.push((staging_artifact, target));
         }
         Ok(())
     }
@@ -570,21 +687,7 @@ impl TemplateServiceGenerator {
     /// Removes all previously rendered provider files without following links.
     pub fn remove_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
         for path in self.rendered_paths(service, sysroot)? {
-            match fs::symlink_metadata(&path) {
-                Ok(metadata)
-                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
-                {
-                    fs::remove_file(path)?;
-                }
-                Ok(_) => {
-                    return Err(SysError::Invalid(format!(
-                        "rendered service target is not a file: {}",
-                        path.display()
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            crate::fs::unlink_beneath(sysroot, &path)?;
         }
         Ok(())
     }
@@ -1090,30 +1193,9 @@ fn run_argv_template(
 }
 
 pub(crate) fn ensure_directory_beneath(sysroot: &Path, directory: &Path) -> Result<(), SysError> {
-    let relative = directory
-        .strip_prefix(sysroot)
-        .map_err(|_| SysError::Invalid(format!("path escapes sysroot: {}", directory.display())))?;
-    let mut current = sysroot.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(value) = component else {
-            return Err(SysError::Invalid(format!(
-                "unsafe path {}",
-                directory.display()
-            )));
-        };
-        current.push(value);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(SysError::Invalid(format!(
-                    "unsafe directory {}",
-                    current.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&current)?,
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let clean = crate::fs::clean_relative_path(sysroot, directory)?;
+    let root_fd = crate::fs::open_root(sysroot)?;
+    crate::fs::ensure_dir_beneath(&root_fd, &clean)?;
     Ok(())
 }
 

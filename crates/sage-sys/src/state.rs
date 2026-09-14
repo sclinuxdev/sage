@@ -20,6 +20,7 @@ pub struct SystemConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemMetadata {
     pub architecture: String,
     pub profile: String,
@@ -66,7 +67,7 @@ impl<'de> Deserialize<'de> for SystemConfig {
             .ok_or_else(|| serde::de::Error::custom("expected table for system config"))?;
 
         let schema_integer = table
-            .get("schema_version")
+            .remove("schema_version")
             .and_then(|v| v.as_integer())
             .ok_or_else(|| serde::de::Error::missing_field("schema_version"))?;
         let schema_version = u32::try_from(schema_integer).map_err(|_| {
@@ -76,7 +77,7 @@ impl<'de> Deserialize<'de> for SystemConfig {
         })?;
 
         let system_val = table
-            .get("system")
+            .remove("system")
             .ok_or_else(|| serde::de::Error::missing_field("system"))?;
         if system_val
             .as_table()
@@ -122,9 +123,10 @@ impl<'de> Deserialize<'de> for SystemConfig {
         };
 
         let mut providers = BTreeMap::new();
-        if let Some(providers_val) = table.get_mut("providers")
-            && let Some(prov_table) = providers_val.as_table_mut()
-        {
+        if let Some(providers_val) = table.remove("providers") {
+            let prov_table = providers_val
+                .as_table()
+                .ok_or_else(|| serde::de::Error::custom("expected table for [providers]"))?;
             for (k, v) in prov_table.iter() {
                 if let Some(s) = v.as_str() {
                     providers.insert(k.clone(), s.to_string());
@@ -134,6 +136,13 @@ impl<'de> Deserialize<'de> for SystemConfig {
                     )));
                 }
             }
+        }
+
+        if !table.is_empty() {
+            let unknown = table.keys().cloned().collect::<Vec<_>>().join(", ");
+            return Err(serde::de::Error::custom(format!(
+                "unknown fields in system config: {unknown}"
+            )));
         }
 
         Ok(SystemConfig {

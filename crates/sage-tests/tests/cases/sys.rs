@@ -678,6 +678,144 @@ fn loom_compiler_receives_portable_activation_contracts() {
 }
 
 #[test]
+fn sclinux_recipes_service_contracts_render_on_systemd_and_loom() {
+    let recipes_dir = Path::new("/home/ir/sclinux-recipes");
+    if !recipes_dir.exists() {
+        return;
+    }
+
+    let rclass_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass");
+    let systemd_gen =
+        TemplateServiceGenerator::from_rclass(&rclass_dir.join("init-systemd.toml")).unwrap();
+    let loom_gen =
+        TemplateServiceGenerator::from_rclass(&rclass_dir.join("init-loom.toml")).unwrap();
+
+    let service_paths = [
+        recipes_dir.join("recipes/system/dbus/amd64/dbus-1.16.2-2/service.toml"),
+        recipes_dir.join("recipes/security/polkit/amd64/polkit-127-2/service.toml"),
+        recipes_dir.join("recipes/system/seatd/amd64/seatd-0.9.3-2/service.toml"),
+        recipes_dir.join("recipes/system/eudev/amd64/eudev-3.2.14-2/service.toml"),
+        recipes_dir.join("recipes/net/dhcpcd/amd64/dhcpcd-10.5.2-2/service.toml"),
+        recipes_dir.join("templates/service.template.toml"),
+    ];
+
+    for path in &service_paths {
+        let docs = ServiceDocument::load(path).unwrap().into_services();
+        assert!(
+            !docs.is_empty(),
+            "failed to load service from {}",
+            path.display()
+        );
+        for service in docs {
+            // 1. Systemd rendering test
+            let sys_root = tempfile::tempdir().unwrap();
+            systemd_gen
+                .render_service_unvalidated(&service, sys_root.path())
+                .unwrap();
+            let primary = systemd_gen
+                .rendered_path(&service, sys_root.path())
+                .unwrap();
+            assert!(primary.is_file());
+
+            if service.name == "dbus" {
+                let socket_unit = sys_root.path().join("usr/lib/systemd/system/dbus.socket");
+                assert!(socket_unit.is_file());
+                let content = fs::read_to_string(&socket_unit).unwrap();
+                assert!(content.contains("ListenStream=/run/dbus/system_bus_socket"));
+                assert!(!systemd_gen.is_automatic(&service).unwrap());
+            } else if service.name == "polkit" {
+                let dbus_act = sys_root
+                    .path()
+                    .join("usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service");
+                assert!(dbus_act.is_file());
+                let content = fs::read_to_string(&dbus_act).unwrap();
+                assert!(content.contains("Name=org.freedesktop.PolicyKit1"));
+                assert!(content.contains("User=root"));
+                assert!(systemd_gen.is_automatic(&service).unwrap());
+            }
+
+            // 2. Loom rendering test (mock loom compiler)
+            let loom_root = tempfile::tempdir().unwrap();
+            let compiler = loom_root.path().join("usr/lib/loom/loom");
+            fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+            fs::write(
+                &compiler,
+                "#!/bin/sh\ncase \"$1\" in\ncompile-service) cp \"$3\" \"$5\" ;;\nvalidate) exit 0 ;;\n*) exit 2 ;;\nesac\n",
+            )
+            .unwrap();
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+
+            loom_gen
+                .render_service_unvalidated(&service, loom_root.path())
+                .unwrap();
+            let primary_loom = loom_gen.rendered_path(&service, loom_root.path()).unwrap();
+            assert!(primary_loom.is_file());
+
+            let compiled_text = fs::read_to_string(&primary_loom).unwrap();
+            if service.name == "dbus" {
+                assert!(compiled_text.contains("kind = \"socket\""));
+                assert!(compiled_text.contains("listen_stream = \"/run/dbus/system_bus_socket\""));
+                assert!(compiled_text.contains("fd_protocol = \"sd-listen-fds\""));
+            } else if service.name == "polkit" {
+                assert!(compiled_text.contains("kind = \"dbus\""));
+                assert!(compiled_text.contains("name = \"org.freedesktop.PolicyKit1\""));
+                let dbus_act = loom_root
+                    .path()
+                    .join("usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service");
+                assert!(dbus_act.is_file());
+                let content = fs::read_to_string(&dbus_act).unwrap();
+                assert!(content.contains("Name=org.freedesktop.PolicyKit1"));
+            }
+        }
+    }
+}
+
+#[test]
+fn loom_render_rolls_back_atomically_on_validation_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let compiler = root.path().join("usr/lib/loom/loom");
+    fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+    // A compiler that compiles successfully but fails validation!
+    fs::write(
+        &compiler,
+        "#!/bin/sh\ncase \"$1\" in\ncompile-service) cp \"$3\" \"$5\" ;;\nvalidate) exit 1 ;;\n*) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let generator = TemplateServiceGenerator::from_rclass(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/init-loom.toml"),
+    )
+    .unwrap();
+
+    let dbus = activation_service(
+        "dbus-demo",
+        "[service.activation]\nkind=\"dbus\"\nname=\"org.example.Demo\"\nbus=\"system\"\nuser=\"root\"",
+    );
+
+    // Initial state: pre-existing safe activation file
+    let dbus_act_file = root
+        .path()
+        .join("usr/share/dbus-1/system-services/org.example.Demo.service");
+    fs::create_dir_all(dbus_act_file.parent().unwrap()).unwrap();
+    fs::write(&dbus_act_file, b"existing safe activation").unwrap();
+
+    let res = generator.render_service_set(&[dbus], root.path());
+    assert!(res.is_err());
+
+    // Verify atomic rollback: managed directory has no compiled artifact
+    let compiled = root.path().join("usr/lib/loom/services/dbus-demo.toml");
+    assert!(!compiled.exists());
+
+    // Verify pre-existing activation artifact was restored!
+    assert!(dbus_act_file.exists());
+    assert_eq!(
+        fs::read(&dbus_act_file).unwrap(),
+        b"existing safe activation"
+    );
+}
+
+#[test]
 fn service_template_renders_atomically() {
     let root = tempfile::tempdir().unwrap();
     let generator = TemplateServiceGenerator {
@@ -1230,4 +1368,161 @@ fn transaction_preview_reports_binding_only_changes() {
     assert!(summary.contains(&format!("awk -> {key}")));
     assert!(!summary.contains("No packages"));
     assert!(!summary.contains("virtual:so:"));
+}
+
+#[test]
+fn clean_cache_does_not_traverse_symlinks_escaping_sysroot() {
+    let sysroot = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim_file = outside.path().join("victim.txt");
+    fs::write(&victim_file, b"important host file").unwrap();
+
+    let cache_dir = sysroot.path().join("var/cache/sage/main/pkg");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a symlink inside cache pointing to the external directory
+    let escape_link = cache_dir.join("external_link");
+    std::os::unix::fs::symlink(outside.path(), &escape_link).unwrap();
+
+    // Create a regular cache file that should be cleaned
+    let cache_file = cache_dir.join("old.pkg.tar.zst");
+    fs::write(&cache_file, b"stale cache").unwrap();
+
+    // Run clean_cache with all = true
+    let report = clean_cache(sysroot.path(), true).unwrap();
+    assert!(report.files_removed > 0);
+
+    // The victim file outside sysroot MUST NOT be touched
+    assert!(victim_file.exists());
+    assert_eq!(fs::read(&victim_file).unwrap(), b"important host file");
+}
+
+#[test]
+fn system_config_deserialization_fails_closed_on_invalid_providers_or_unknown_fields() {
+    // Valid configuration
+    let valid_toml = r#"
+        schema_version = 1
+        packages = ["curl"]
+
+        [system]
+        architecture = "x86_64"
+        profile = "default"
+
+        [providers]
+        "virtual/editor" = "main/system:nano:0"
+    "#;
+    let config: Result<SystemConfig, _> = toml::from_str(valid_toml);
+    assert!(
+        config.is_ok(),
+        "failed to parse valid config: {:?}",
+        config.err()
+    );
+
+    // Fail-closed on non-table [providers]
+    let invalid_providers = r#"
+        schema_version = 1
+        packages = ["curl"]
+        providers = "malformed_string"
+
+        [system]
+        architecture = "x86_64"
+        profile = "default"
+    "#;
+    let config: Result<SystemConfig, _> = toml::from_str(invalid_providers);
+    assert!(config.is_err());
+
+    // Fail-closed on unknown root keys
+    let unknown_field = r#"
+        schema_version = 1
+        packages = ["curl"]
+        unexpected_field = true
+
+        [system]
+        architecture = "x86_64"
+        profile = "default"
+    "#;
+    let config: Result<SystemConfig, _> = toml::from_str(unknown_field);
+    assert!(config.is_err());
+}
+
+#[test]
+fn services_config_rejects_unknown_fields() {
+    // Typo: `enable` instead of `enabled`
+    let typo_toml = r#"
+        schema_version = 1
+        enable = ["sshd"]
+    "#;
+    let config: Result<ServicesConfig, _> = toml::from_str(typo_toml);
+    assert!(config.is_err());
+
+    let valid_toml = r#"
+        schema_version = 1
+        enabled = ["sshd"]
+    "#;
+    let config: Result<ServicesConfig, _> = toml::from_str(valid_toml);
+    assert!(config.is_ok());
+}
+
+#[test]
+fn available_services_prefers_installed_spec_over_rendered_history() {
+    let sysroot = tempfile::tempdir().unwrap();
+
+    // Installed service definition from package
+    let installed_dir = sysroot.path().join("usr/share/sage/services");
+    fs::create_dir_all(&installed_dir).unwrap();
+    let installed_doc = r#"
+        schema_version = 1
+        [service]
+        name = "demo"
+        description = "newly installed package version"
+        command = ["/usr/bin/demo"]
+        user = "root"
+        group = "root"
+        working_dir = "/"
+        restart = "always"
+        type = "simple"
+    "#;
+    fs::write(installed_dir.join("demo.toml"), installed_doc).unwrap();
+
+    // Historical rendered services document
+    let lib_dir = sysroot.path().join("var/lib/sage");
+    fs::create_dir_all(&lib_dir).unwrap();
+    let old_service = ServiceSpec {
+        package: String::new(),
+        name: "demo".into(),
+        description: "old historical rendered spec".into(),
+        command: vec!["/usr/bin/demo-old".into()],
+        stop_command: vec![],
+        reload_command: vec![],
+        user: "root".into(),
+        group: "root".into(),
+        working_dir: "/".into(),
+        pid_file: String::new(),
+        restart: "always".into(),
+        service_type: "simple".into(),
+        after: vec![],
+        before: vec![],
+        runtime: String::new(),
+        activation: ServiceActivation::Service,
+    };
+    let generator = TemplateServiceGenerator::from_rclass(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/init-systemd.toml"),
+    )
+    .unwrap();
+    let rendered_state = RenderedServicesState {
+        schema_version: 1,
+        provider: sage_core::PackageKey::new("main/system", "systemd", "0"),
+        generator,
+        services: vec![old_service],
+        enabled: BTreeSet::new(),
+    };
+    let rendered_doc = toml::to_string_pretty(&rendered_state).unwrap();
+    fs::write(lib_dir.join("rendered-services.toml"), rendered_doc).unwrap();
+
+    let services = load_available_services(sysroot.path()).unwrap();
+    let demo = services
+        .iter()
+        .find(|s| s.name == "demo")
+        .expect("demo found");
+    assert_eq!(demo.description, "newly installed package version");
 }

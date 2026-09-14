@@ -1501,6 +1501,7 @@ name = "sage-sys"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "nix",
  "sage-archive",
  "sage-core",
  "sage-db",

@@ -165,6 +165,7 @@ pub struct ServiceDocument {
 
 /// Desired service enablement state from `/etc/sage/services.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServicesConfig {
     pub schema_version: u32,
     #[serde(alias = "services", default)]

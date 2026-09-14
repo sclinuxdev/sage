@@ -145,6 +145,80 @@ content = "{content}"
     assert_ne!(second, first);
 }
 
+#[tokio::test]
+async fn bootstrap_sources_resumes_existing_release_while_mass_rebuild_forces_it() {
+    let root = tempfile::tempdir().unwrap();
+    let recipes = tempfile::tempdir().unwrap();
+    let pool = tempfile::tempdir().unwrap();
+    configure_root(root.path());
+    let recipe_dir = recipes.path().join("demo");
+    let recipe_path = recipe_dir.join("recipe.toml");
+    std::fs::create_dir(&recipe_dir).unwrap();
+    let write_recipe = |content: &str| {
+        std::fs::write(
+            &recipe_path,
+            format!(
+                r#"schema_version = 1
+
+[package]
+name = "demo"
+version = "1"
+release = 1
+description = "demo"
+license = "MIT"
+channel = "system"
+arch = "noarch"
+
+[[install.files]]
+path = "usr/share/demo/value"
+content = "{content}"
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    let plan_path = recipes.path().join("bootstrap.toml");
+    std::fs::write(
+        &plan_path,
+        r#"schema_version = 1
+name = "bootstrap"
+
+[[stages]]
+name = "base"
+recipes = ["demo"]
+"#,
+    )
+    .unwrap();
+
+    // 1. Initial build via bootstrap
+    write_recipe("first");
+    bootstrap_sources(root.path(), &plan_path, Some(pool.path()), 1, false)
+        .await
+        .unwrap();
+    let artifact = pool
+        .path()
+        .join(".slots/system/demo/0/demo-1-1-noarch.pkg.tar.zst");
+    let first = std::fs::read(&artifact).unwrap();
+
+    // 2. Modify recipe content without bumping version. Re-run bootstrap.
+    // Bootstrap must skip the existing unit and preserve the original artifact.
+    write_recipe("second");
+    bootstrap_sources(root.path(), &plan_path, Some(pool.path()), 1, false)
+        .await
+        .unwrap();
+    let after_bootstrap = std::fs::read(&artifact).unwrap();
+    assert_eq!(after_bootstrap, first);
+
+    // 3. Re-run mass_rebuild on the same pool.
+    // Mass rebuild must force a rebuild and replace the artifact.
+    mass_rebuild(root.path(), recipes.path(), Some(pool.path()), 1, false)
+        .await
+        .unwrap();
+    let after_mass_rebuild = std::fs::read(&artifact).unwrap();
+    assert_ne!(after_mass_rebuild, first);
+}
+
 #[test]
 fn source_pool_overlays_local_artifacts_into_solver_universe() {
     let root = tempfile::tempdir().unwrap();

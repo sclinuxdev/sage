@@ -1,5 +1,10 @@
 use super::*;
+use nix::fcntl::{AtFlags, OFlag, openat, readlinkat};
+use nix::sys::stat::{Mode, fchmod, fstatat, mkdirat};
+use nix::unistd::{UnlinkatFlags, symlinkat, unlinkat};
 use sage_core::valid_package_component;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::Component;
 
 /// Schema-v1 source input.
 #[derive(Debug, Clone, Deserialize)]
@@ -284,7 +289,7 @@ pub struct BuildUnit {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum BuildSymbol {
     Package(sage_core::PackageKey),
-    Provided(String),
+    Provided { channel: String, name: String },
 }
 
 impl BuildUnit {
@@ -308,16 +313,23 @@ impl BuildUnit {
         }));
         let mut produces: BTreeSet<_> =
             packages.iter().cloned().map(BuildSymbol::Package).collect();
-        produces.extend(
-            recipe
-                .package
-                .provides
-                .iter()
-                .cloned()
-                .map(BuildSymbol::Provided),
-        );
+        for provide in &recipe.package.provides {
+            produces.insert(BuildSymbol::Provided {
+                channel: recipe.package.channel.clone(),
+                name: provide.clone(),
+            });
+        }
         for package in &recipe.subpackages {
-            produces.extend(package.provides.iter().cloned().map(BuildSymbol::Provided));
+            let channel = package
+                .channel
+                .as_deref()
+                .unwrap_or(&recipe.package.channel);
+            for provide in &package.provides {
+                produces.insert(BuildSymbol::Provided {
+                    channel: channel.to_string(),
+                    name: provide.clone(),
+                });
+            }
         }
         let mut declarations: Vec<String> = recipe
             .package
@@ -385,16 +397,20 @@ impl BuildUnit {
 fn symbol_id(symbol: &BuildSymbol) -> String {
     match symbol {
         BuildSymbol::Package(key) => format!("package:{key}"),
-        BuildSymbol::Provided(name) => format!("provided:{name}"),
+        BuildSymbol::Provided { channel, name } => format!("provided:{channel}:{name}"),
     }
 }
 
 fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildSymbol {
+    let resolved_channel = dependency.channel.as_deref().unwrap_or(channel);
     if dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:") {
-        BuildSymbol::Provided(dependency.name)
+        BuildSymbol::Provided {
+            channel: resolved_channel.to_string(),
+            name: dependency.name,
+        }
     } else {
         BuildSymbol::Package(sage_core::PackageKey::new(
-            dependency.channel.as_deref().unwrap_or(channel),
+            resolved_channel,
             dependency.name,
             dependency
                 .slot
@@ -478,7 +494,10 @@ impl BuildGraph {
                 if let BuildSymbol::Package(key) = symbol
                     && !producers.contains_key(symbol)
                 {
-                    let provider = BuildSymbol::Provided(key.name.clone());
+                    let provider = BuildSymbol::Provided {
+                        channel: key.channel.clone(),
+                        name: key.name.clone(),
+                    };
                     if producers.contains_key(&provider) {
                         resolved.insert(provider);
                         continue;
@@ -581,19 +600,10 @@ impl RecipeSpec {
         let path = path.as_ref();
         let recipe: Self = toml::from_str(&fs::read_to_string(path)?)?;
         validate_schema(recipe.schema_version)?;
-        if !valid_package_component(&recipe.package.name) || recipe.package.arch.is_empty() {
-            return Err(BuildError::InvalidSpec(
-                "package name and architecture are required".into(),
-            ));
-        }
-        sage_core::validate_spdx_expression(&recipe.package.license)
+        recipe
+            .package
+            .validate()
             .map_err(|error| BuildError::InvalidSpec(error.to_string()))?;
-        if !valid_package_component(&recipe.package.slot) {
-            return Err(BuildError::InvalidSpec(
-                "package slot must contain only ASCII letters, digits, '.', '_', '+', or '-'"
-                    .into(),
-            ));
-        }
         if recipe.source.is_some() && !recipe.sources.is_empty() {
             return Err(BuildError::InvalidSpec(
                 "use either [source] or [[sources]], not both".into(),
@@ -673,9 +683,11 @@ impl RecipeSpec {
             ));
         }
         for subpackage in &recipe.subpackages {
-            if subpackage.channel.as_deref().is_some_and(str::is_empty) {
+            if let Some(channel) = &subpackage.channel
+                && !sage_core::valid_channel_name(channel)
+            {
                 return Err(BuildError::InvalidSpec(
-                    "subpackage channel must not be empty".into(),
+                    "subpackage channel must contain only valid coordinate characters and no path escapes".into(),
                 ));
             }
             if subpackage
@@ -841,102 +853,273 @@ fn validate_install_path(path: &Path) -> Result<(), BuildError> {
 
 /// Materializes a validated declarative payload into DESTDIR without invoking
 /// a shell or allowing a recipe path to escape the staging root.
+///
+/// Uses dirfd-anchored operations and O_NOFOLLOW to strictly prevent DESTDIR
+/// escapes via pre-existing symlinks or symlinked ancestors in source directories.
 pub fn stage_declarative_install(
     root: &Path,
     source_root: &Path,
     recipe: &RecipeSpec,
 ) -> Result<(), BuildError> {
     recipe.install.validate()?;
+    fs::create_dir_all(root)?;
+    let dest_root_fd = sage_sys::fs::open_root(root)?;
+
     for entry in &recipe.install.directories {
-        let path = root.join(&entry.path);
-        fs::create_dir_all(&path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
+        let clean = sage_sys::fs::clean_relative_path(root, &entry.path)?;
+        let dir_fd = sage_sys::fs::ensure_dir_beneath(&dest_root_fd, &clean)?;
+        fchmod(dir_fd.as_raw_fd(), Mode::from_bits_truncate(entry.mode))?;
     }
+
     for entry in &recipe.install.files {
-        let path = root.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, entry.content.as_bytes())?;
-        fs::set_permissions(path, fs::Permissions::from_mode(entry.mode))?;
-    }
-    for entry in &recipe.install.symlinks {
-        let path = root.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::symlink_metadata(&path) {
-            Ok(_) => fs::remove_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        std::os::unix::fs::symlink(&entry.target, path)?;
-    }
-    for entry in &recipe.install.copies {
-        let source = source_root.join(&entry.source);
-        let metadata = fs::symlink_metadata(&source).map_err(|error| {
-            BuildError::InvalidSpec(format!(
-                "declarative copy source {} is unavailable: {error}",
-                entry.source.display()
-            ))
+        let clean = sage_sys::fs::clean_relative_path(root, &entry.path)?;
+        let parent = clean.parent().unwrap_or_else(|| Path::new(""));
+        let file_name = clean.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            BuildError::InvalidSpec(format!("invalid file path: {}", entry.path.display()))
         })?;
-        if metadata.is_dir() {
-            if !entry.recursive {
-                return Err(BuildError::InvalidSpec(format!(
-                    "declarative directory copy {} requires recursive = true",
-                    entry.source.display()
-                )));
-            }
-            for child in walkdir::WalkDir::new(&source).follow_links(false) {
-                let child = child?;
-                let relative = child.path().strip_prefix(&source).map_err(|_| {
-                    BuildError::InvalidSpec("declarative copy escaped its source root".into())
+        let parent_fd = sage_sys::fs::ensure_dir_beneath(&dest_root_fd, parent)?;
+        let _ = unlinkat(
+            Some(parent_fd.as_raw_fd()),
+            file_name,
+            UnlinkatFlags::NoRemoveDir,
+        );
+        let raw_fd = openat(
+            Some(parent_fd.as_raw_fd()),
+            file_name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(entry.mode),
+        )?;
+        let file_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        use std::io::Write as _;
+        let mut file = std::fs::File::from(file_fd);
+        file.write_all(entry.content.as_bytes())?;
+    }
+
+    for entry in &recipe.install.symlinks {
+        let clean = sage_sys::fs::clean_relative_path(root, &entry.path)?;
+        let parent = clean.parent().unwrap_or_else(|| Path::new(""));
+        let link_name = clean.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            BuildError::InvalidSpec(format!("invalid symlink path: {}", entry.path.display()))
+        })?;
+        let parent_fd = sage_sys::fs::ensure_dir_beneath(&dest_root_fd, parent)?;
+        let _ = unlinkat(
+            Some(parent_fd.as_raw_fd()),
+            link_name,
+            UnlinkatFlags::NoRemoveDir,
+        );
+        symlinkat(&entry.target, Some(parent_fd.as_raw_fd()), link_name)?;
+    }
+
+    if !recipe.install.copies.is_empty() {
+        let src_root_fd = sage_sys::fs::open_root(source_root)?;
+        for entry in &recipe.install.copies {
+            let clean_src = sage_sys::fs::clean_relative_path(source_root, &entry.source)?;
+            let clean_dst = sage_sys::fs::clean_relative_path(root, &entry.path)?;
+
+            let src_parent = clean_src.parent().unwrap_or_else(|| Path::new(""));
+            let src_leaf = clean_src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    BuildError::InvalidSpec(format!(
+                        "invalid copy source: {}",
+                        entry.source.display()
+                    ))
                 })?;
-                copy_install_entry(child.path(), &root.join(&entry.path).join(relative))?;
-            }
-        } else {
-            if entry.recursive {
-                return Err(BuildError::InvalidSpec(format!(
-                    "recursive declarative copy source {} is not a directory",
+            let src_parent_fd = sage_sys::fs::open_dir_beneath(&src_root_fd, src_parent)?;
+            let stat = fstatat(
+                Some(src_parent_fd.as_raw_fd()),
+                src_leaf,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| {
+                BuildError::InvalidSpec(format!(
+                    "declarative copy source {} is unavailable: {error}",
                     entry.source.display()
-                )));
+                ))
+            })?;
+            let file_type = stat.st_mode & nix::libc::S_IFMT;
+            if file_type == nix::libc::S_IFDIR {
+                if !entry.recursive {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "declarative directory copy {} requires recursive = true",
+                        entry.source.display()
+                    )));
+                }
+                let src_dir_raw = openat(
+                    Some(src_parent_fd.as_raw_fd()),
+                    src_leaf,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                    Mode::empty(),
+                )?;
+                let src_dir_fd = unsafe { OwnedFd::from_raw_fd(src_dir_raw) };
+                let dst_dir_fd = sage_sys::fs::ensure_dir_beneath(&dest_root_fd, &clean_dst)?;
+                let _ = fchmod(
+                    dst_dir_fd.as_raw_fd(),
+                    Mode::from_bits_truncate(stat.st_mode & 0o7777),
+                );
+                copy_dir_entries_beneath(&src_dir_fd, &dst_dir_fd)?;
+            } else {
+                if entry.recursive {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "recursive declarative copy source {} is not a directory",
+                        entry.source.display()
+                    )));
+                }
+                let dst_parent = clean_dst.parent().unwrap_or_else(|| Path::new(""));
+                let dst_leaf = clean_dst
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        BuildError::InvalidSpec(format!(
+                            "invalid copy destination: {}",
+                            entry.path.display()
+                        ))
+                    })?;
+                let dst_parent_fd = sage_sys::fs::ensure_dir_beneath(&dest_root_fd, dst_parent)?;
+                if file_type == nix::libc::S_IFREG {
+                    let src_file_raw = openat(
+                        Some(src_parent_fd.as_raw_fd()),
+                        src_leaf,
+                        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                        Mode::empty(),
+                    )?;
+                    let src_file_fd = unsafe { OwnedFd::from_raw_fd(src_file_raw) };
+                    let _ = unlinkat(
+                        Some(dst_parent_fd.as_raw_fd()),
+                        dst_leaf,
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                    let dst_file_raw = openat(
+                        Some(dst_parent_fd.as_raw_fd()),
+                        dst_leaf,
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
+                        Mode::from_bits_truncate(stat.st_mode & 0o7777),
+                    )?;
+                    let dst_file_fd = unsafe { OwnedFd::from_raw_fd(dst_file_raw) };
+                    let mut src_file = std::fs::File::from(src_file_fd);
+                    let mut dst_file = std::fs::File::from(dst_file_fd);
+                    std::io::copy(&mut src_file, &mut dst_file)?;
+                } else if file_type == nix::libc::S_IFLNK {
+                    let link = readlinkat(Some(src_parent_fd.as_raw_fd()), src_leaf)?;
+                    let link_path = PathBuf::from(link);
+                    if link_path.is_absolute()
+                        || link_path
+                            .components()
+                            .any(|c| matches!(c, Component::ParentDir))
+                    {
+                        return Err(BuildError::InvalidSpec(format!(
+                            "unsafe symlink in declarative copy: {} -> {}",
+                            entry.source.display(),
+                            link_path.display()
+                        )));
+                    }
+                    let _ = unlinkat(
+                        Some(dst_parent_fd.as_raw_fd()),
+                        dst_leaf,
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                    symlinkat(&link_path, Some(dst_parent_fd.as_raw_fd()), dst_leaf)?;
+                } else {
+                    return Err(BuildError::InvalidSpec(format!(
+                        "unsupported declarative copy input {}",
+                        entry.source.display()
+                    )));
+                }
             }
-            copy_install_entry(&source, &root.join(&entry.path))?;
         }
     }
     Ok(())
 }
 
-fn copy_install_entry(source: &Path, target: &Path) -> Result<(), BuildError> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.is_dir() {
-        fs::create_dir_all(target)?;
-        fs::set_permissions(target, metadata.permissions())?;
-    } else {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+fn copy_dir_entries_beneath(src_fd: &OwnedFd, dst_fd: &OwnedFd) -> Result<(), BuildError> {
+    let dup_raw = openat(
+        Some(src_fd.as_raw_fd()),
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut dir = nix::dir::Dir::from_fd(dup_raw)?;
+    for entry in dir.iter() {
+        let entry = entry?;
+        let name_c = entry.file_name();
+        let name_bytes = name_c.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
         }
-        if metadata.file_type().is_symlink() {
-            let link = fs::read_link(source)?;
-            if link.is_absolute()
-                || link
+        let name_str = std::str::from_utf8(name_bytes)
+            .map_err(|_| BuildError::InvalidSpec("non-UTF8 filename in declarative copy".into()))?;
+        let stat = fstatat(
+            Some(src_fd.as_raw_fd()),
+            name_c,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let file_type = stat.st_mode & nix::libc::S_IFMT;
+        if file_type == nix::libc::S_IFDIR {
+            match mkdirat(
+                Some(dst_fd.as_raw_fd()),
+                name_c,
+                Mode::from_bits_truncate(stat.st_mode & 0o7777),
+            ) {
+                Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+                Err(err) => return Err(err.into()),
+            }
+            let src_child_raw = openat(
+                Some(src_fd.as_raw_fd()),
+                name_c,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let src_child_fd = unsafe { OwnedFd::from_raw_fd(src_child_raw) };
+            let dst_child_raw = openat(
+                Some(dst_fd.as_raw_fd()),
+                name_c,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let dst_child_fd = unsafe { OwnedFd::from_raw_fd(dst_child_raw) };
+            let _ = fchmod(
+                dst_child_fd.as_raw_fd(),
+                Mode::from_bits_truncate(stat.st_mode & 0o7777),
+            );
+            copy_dir_entries_beneath(&src_child_fd, &dst_child_fd)?;
+        } else if file_type == nix::libc::S_IFREG {
+            let src_file_raw = openat(
+                Some(src_fd.as_raw_fd()),
+                name_c,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let src_file_fd = unsafe { OwnedFd::from_raw_fd(src_file_raw) };
+            let _ = unlinkat(Some(dst_fd.as_raw_fd()), name_c, UnlinkatFlags::NoRemoveDir);
+            let dst_file_raw = openat(
+                Some(dst_fd.as_raw_fd()),
+                name_c,
+                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(stat.st_mode & 0o7777),
+            )?;
+            let dst_file_fd = unsafe { OwnedFd::from_raw_fd(dst_file_raw) };
+            let mut src_file = std::fs::File::from(src_file_fd);
+            let mut dst_file = std::fs::File::from(dst_file_fd);
+            std::io::copy(&mut src_file, &mut dst_file)?;
+        } else if file_type == nix::libc::S_IFLNK {
+            let link = readlinkat(Some(src_fd.as_raw_fd()), name_c)?;
+            let link_path = PathBuf::from(link);
+            if link_path.is_absolute()
+                || link_path
                     .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                    .any(|c| matches!(c, Component::ParentDir))
             {
                 return Err(BuildError::InvalidSpec(format!(
-                    "unsafe symlink in declarative copy: {} -> {}",
-                    source.display(),
-                    link.display()
+                    "unsafe symlink in declarative copy: {name_str} -> {}",
+                    link_path.display()
                 )));
             }
-            std::os::unix::fs::symlink(link, target)?;
-        } else if metadata.is_file() {
-            fs::copy(source, target)?;
-            fs::set_permissions(target, metadata.permissions())?;
+            let _ = unlinkat(Some(dst_fd.as_raw_fd()), name_c, UnlinkatFlags::NoRemoveDir);
+            symlinkat(&link_path, Some(dst_fd.as_raw_fd()), name_c)?;
         } else {
             return Err(BuildError::InvalidSpec(format!(
-                "unsupported declarative copy input {}",
-                source.display()
+                "unsupported declarative copy input {name_str}"
             )));
         }
     }

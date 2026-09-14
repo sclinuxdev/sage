@@ -1,7 +1,6 @@
 //! Garbage collection: cache cleaning and orphan package detection.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
 use std::path::Path;
 
 use sage_core::PackageKey;
@@ -18,79 +17,10 @@ pub struct CleanReport {
 }
 
 /// Cleans temporary files, obsolete downloads, and optionally all cached packages.
+/// Anchored to directory descriptors with O_NOFOLLOW to guarantee that crafted
+/// symlinks within the cache cannot escape the target sysroot.
 pub fn clean_cache(root: &Path, all: bool) -> Result<CleanReport, SysError> {
-    let mut report = CleanReport::default();
-    let cache_dir = root.join("var/cache/sage");
-    if cache_dir.is_dir() {
-        clean_dir_recursive(&cache_dir, all, &mut report)?;
-    }
-
-    // Clean ephemeral temporary files in /var/lib/sage
-    let lib_dir = root.join("var/lib/sage");
-    if lib_dir.is_dir() {
-        clean_temp_files(&lib_dir, &mut report)?;
-    }
-
-    Ok(report)
-}
-
-fn clean_dir_recursive(dir: &Path, all: bool, report: &mut CleanReport) -> Result<(), SysError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            clean_dir_recursive(&path, all, report)?;
-            // Remove empty subdirectories
-            let _ = fs::remove_dir(&path);
-        } else if path.is_file() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let is_temp = name.contains("sage-tmp")
-                || name.contains(".part-")
-                || name.starts_with(".services-config-")
-                || name.starts_with(".rendered-services-");
-
-            let is_package = name.ends_with(".pkg.tar.zst");
-
-            if is_temp || (all && is_package) {
-                if let Ok(meta) = fs::metadata(&path) {
-                    report.bytes_freed += meta.len();
-                }
-                if fs::remove_file(&path).is_ok() {
-                    report.files_removed += 1;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn clean_temp_files(dir: &Path, report: &mut CleanReport) -> Result<(), SysError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with(".services-config-") || name.starts_with(".rendered-services-") {
-                if let Ok(meta) = fs::metadata(&path) {
-                    report.bytes_freed += meta.len();
-                }
-                if fs::remove_file(&path).is_ok() {
-                    report.files_removed += 1;
-                }
-            }
-        }
-    }
-
-    Ok(())
+    crate::fs::clean_cache_beneath(root, all)
 }
 
 /// Computes the list of installed packages that are not roots and not required transitively.

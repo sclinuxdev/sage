@@ -19,13 +19,42 @@ fn default_slot() -> String {
     DEFAULT_SLOT.into()
 }
 
-/// Checks the shared alphabet for concrete package names and slots.
-/// Both require non-empty ASCII letters, digits, '.', '_', '+', or '-'.
+/// Checks the shared alphabet for concrete package coordinates: channel, name, slot, arch.
+/// Both require non-empty ASCII letters, digits, '.', '_', '+', or '-', and forbid '.' and '..'
+/// path traversal components.
 pub fn valid_package_component(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// Checks the alphabet for upstream version strings.
+/// Requires non-empty ASCII alphanumeric characters, '.', '_', '+', '-', or '~',
+/// must start with an ASCII alphanumeric character, and forbids '.' and '..'
+/// path traversal components.
+pub fn valid_version_string(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains("..")
+        && value.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-' | b'~')
+        })
+}
+
+/// Validates a channel coordinate component, which may be hierarchical
+/// (e.g. `main/system`, `vendor/system`, or `system`).
+/// Each segment must be non-empty and satisfy `valid_package_component`.
+pub fn valid_channel_name(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("//")
+        && value.split('/').all(valid_package_component)
 }
 
 /// Validates a short virtual interface, `virtual/name`, or an opaque `so:soname`.
@@ -283,6 +312,43 @@ pub struct Package {
 }
 
 impl Package {
+    /// Validates all coordinate fields (channel, name, slot, arch, version, and license).
+    /// Enforces the shared alphabet and prevents directory traversal or path injection.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if !valid_channel_name(&self.channel) {
+            return Err(CoreError::InvalidPackageKey(format!(
+                "invalid channel: '{}'",
+                self.channel
+            )));
+        }
+        if !valid_package_component(&self.name) {
+            return Err(CoreError::InvalidPackageKey(format!(
+                "invalid package name: '{}'",
+                self.name
+            )));
+        }
+        if !valid_package_component(&self.slot) {
+            return Err(CoreError::InvalidPackageKey(format!(
+                "invalid slot: '{}'",
+                self.slot
+            )));
+        }
+        if !valid_package_component(&self.arch) {
+            return Err(CoreError::InvalidPackageKey(format!(
+                "invalid arch: '{}'",
+                self.arch
+            )));
+        }
+        if !valid_version_string(&self.version) {
+            return Err(CoreError::InvalidVersion(format!(
+                "invalid version string: '{}'",
+                self.version
+            )));
+        }
+        crate::error::validate_spdx_expression(&self.license)?;
+        Ok(())
+    }
+
     /// Returns the package identity and ordered version represented by the record.
     pub fn coordinate(&self) -> PackageCoordinate {
         PackageCoordinate::new(

@@ -922,3 +922,224 @@ fn cgroup_scope_reports_error_when_creation_fails() {
         Err(err) => panic!("unexpected error type: {err:?}"),
     }
 }
+
+#[test]
+fn declarative_install_rejects_destdir_symlink_penetration() {
+    let dest_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    fs::write(&victim, b"untouched host file").unwrap();
+
+    // Create a symlink inside DESTDIR pointing outside to host directory
+    let symlink_in_dest = dest_dir.path().join("host_escape");
+    std::os::unix::fs::symlink(outside.path(), &symlink_in_dest).unwrap();
+
+    let recipe_toml = r#"
+        schema_version = 1
+        [package]
+        name = "test"
+        version = "1.0"
+        release = 1
+        description = "test"
+        license = "MIT"
+        channel = "main/system"
+        arch = "x86_64"
+
+        [[install.files]]
+        path = "host_escape/victim.txt"
+        content = "attacker overwrite"
+    "#;
+    let recipe_file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(recipe_file.path(), recipe_toml).unwrap();
+    let recipe = RecipeSpec::load(recipe_file.path()).unwrap();
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let result = stage_declarative_install(dest_dir.path(), source_dir.path(), &recipe);
+    // Must fail and NOT overwrite victim
+    assert!(result.is_err());
+    assert_eq!(fs::read(&victim).unwrap(), b"untouched host file");
+}
+
+#[test]
+fn declarative_install_rejects_source_symlink_escaping_root() {
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    // Create unsafe symlink in source directory pointing outside
+    let escape_link = source_dir.path().join("escape_link");
+    std::os::unix::fs::symlink(outside.path(), &escape_link).unwrap();
+
+    let recipe_toml = r#"
+        schema_version = 1
+        [package]
+        name = "test"
+        version = "1.0"
+        release = 1
+        description = "test"
+        license = "MIT"
+        channel = "main/system"
+        arch = "x86_64"
+
+        [[install.copies]]
+        source = "escape_link"
+        path = "installed_escape"
+        recursive = true
+    "#;
+    let recipe_file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(recipe_file.path(), recipe_toml).unwrap();
+    let recipe = RecipeSpec::load(recipe_file.path()).unwrap();
+
+    let result = stage_declarative_install(dest_dir.path(), source_dir.path(), &recipe);
+    assert!(result.is_err());
+}
+
+#[test]
+fn build_graph_channel_aware_provides_and_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipe_main = dir.path().join("main_provider.toml");
+    fs::write(
+        &recipe_main,
+        r#"
+        schema_version = 1
+        [package]
+        name = "rust-bin"
+        version = "1.80"
+        release = 1
+        description = "Rust"
+        license = "MIT"
+        channel = "main/system"
+        arch = "x86_64"
+        provides = ["virtual/rust"]
+        "#,
+    )
+    .unwrap();
+
+    let recipe_edge = dir.path().join("edge_provider.toml");
+    fs::write(
+        &recipe_edge,
+        r#"
+        schema_version = 1
+        [package]
+        name = "rust-git"
+        version = "1.81"
+        release = 1
+        description = "Rust"
+        license = "MIT"
+        channel = "edge/system"
+        arch = "x86_64"
+        provides = ["virtual/rust"]
+        "#,
+    )
+    .unwrap();
+
+    let recipe_consumer = dir.path().join("consumer.toml");
+    fs::write(
+        &recipe_consumer,
+        r#"
+        schema_version = 1
+        [package]
+        name = "app"
+        version = "1.0"
+        release = 1
+        description = "App"
+        license = "MIT"
+        channel = "main/system"
+        arch = "x86_64"
+        dependencies = ["virtual/rust"]
+        "#,
+    )
+    .unwrap();
+
+    let unit_main = BuildUnit::from_recipe(
+        recipe_main.clone(),
+        &RecipeSpec::load(&recipe_main).unwrap(),
+    )
+    .unwrap();
+    let unit_edge = BuildUnit::from_recipe(
+        recipe_edge.clone(),
+        &RecipeSpec::load(&recipe_edge).unwrap(),
+    )
+    .unwrap();
+    let unit_app = BuildUnit::from_recipe(
+        recipe_consumer.clone(),
+        &RecipeSpec::load(&recipe_consumer).unwrap(),
+    )
+    .unwrap();
+
+    // Verify consumed symbol ID for app is channel-qualified to main/system
+    assert!(
+        unit_app
+            .consumed_symbol_ids()
+            .contains("provided:main/system:virtual/rust")
+    );
+    assert!(
+        !unit_app
+            .consumed_symbol_ids()
+            .contains("provided:edge/system:virtual/rust")
+    );
+
+    // Verify produced symbol IDs
+    assert!(
+        unit_main
+            .produced_symbol_ids()
+            .contains("provided:main/system:virtual/rust")
+    );
+    assert!(
+        unit_edge
+            .produced_symbol_ids()
+            .contains("provided:edge/system:virtual/rust")
+    );
+
+    // Compute layers
+    let layers = BuildGraph::layers(vec![unit_main, unit_edge, unit_app]).unwrap();
+    assert_eq!(layers.len(), 2);
+    let layer1_names: BTreeSet<_> = layers[0].iter().map(|u| u.name.as_str()).collect();
+    assert!(layer1_names.contains("rust-bin"));
+    assert!(layer1_names.contains("rust-git"));
+    assert_eq!(layers[1][0].name, "app");
+}
+
+#[test]
+fn recipe_spec_load_rejects_unsafe_channel_or_coordinates() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_channel_recipe = dir.path().join("bad_channel.toml");
+    fs::write(
+        &bad_channel_recipe,
+        r#"
+        schema_version = 1
+        [package]
+        name = "pkg"
+        version = "1.0"
+        release = 1
+        description = "pkg"
+        license = "MIT"
+        channel = "/etc"
+        arch = "x86_64"
+        "#,
+    )
+    .unwrap();
+    assert!(RecipeSpec::load(&bad_channel_recipe).is_err());
+
+    let bad_subpackage_channel = dir.path().join("bad_subpkg.toml");
+    fs::write(
+        &bad_subpackage_channel,
+        r#"
+        schema_version = 1
+        [package]
+        name = "pkg"
+        version = "1.0"
+        release = 1
+        description = "pkg"
+        license = "MIT"
+        channel = "main/system"
+        arch = "x86_64"
+
+        [[subpackages]]
+        name = "sub"
+        channel = "../escape"
+        "#,
+    )
+    .unwrap();
+    assert!(RecipeSpec::load(&bad_subpackage_channel).is_err());
+}

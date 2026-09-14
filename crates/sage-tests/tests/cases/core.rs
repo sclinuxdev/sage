@@ -149,3 +149,95 @@ fn glob_pattern_matching_semantics() {
 
     assert!(glob::Pattern::new("unclosed[bracket").is_err());
 }
+
+#[test]
+fn coordinate_components_reject_traversals_and_invalid_chars() {
+    // Component validation
+    assert!(valid_package_component("ripgrep"));
+    assert!(valid_package_component("libfoo_bar+1-2"));
+    assert!(!valid_package_component(""));
+    assert!(!valid_package_component("."));
+    assert!(!valid_package_component(".."));
+    assert!(!valid_package_component("../etc"));
+    assert!(!valid_package_component("/etc"));
+    assert!(!valid_package_component("foo/bar"));
+
+    // Version string validation
+    assert!(valid_version_string("1.0.0"));
+    assert!(valid_version_string("0.4.0~rc1"));
+    assert!(!valid_version_string(""));
+    assert!(!valid_version_string("."));
+    assert!(!valid_version_string(".."));
+    assert!(!valid_version_string("1.0/2"));
+    assert!(!valid_version_string("1.0..2"));
+    assert!(!valid_version_string("-1.0"));
+
+    // Channel validation
+    assert!(valid_channel_name("main/system"));
+    assert!(valid_channel_name("system"));
+    assert!(valid_channel_name("vendor/edge/desktop"));
+    assert!(!valid_channel_name(""));
+    assert!(!valid_channel_name("."));
+    assert!(!valid_channel_name(".."));
+    assert!(!valid_channel_name("/etc"));
+    assert!(!valid_channel_name("../etc"));
+    assert!(!valid_channel_name("main//system"));
+    assert!(!valid_channel_name("main/system/"));
+}
+
+#[test]
+fn package_coordinate_validation_fails_closed() {
+    let mut pkg = Package {
+        schema_version: 1,
+        name: "test-pkg".into(),
+        channel: "main/system".into(),
+        slot: "0".into(),
+        arch: "x86_64".into(),
+        epoch: 0,
+        version: "1.0.0".into(),
+        release: 1,
+        description: "description".into(),
+        license: "MIT".into(),
+        dependencies: vec![],
+        conflicts: vec![],
+        provides: vec![],
+        features: vec![],
+        installed_size: 0,
+        build_time: 0,
+        managed_build_tools: vec![],
+    };
+    assert!(pkg.validate().is_ok());
+
+    // Unsafe channel
+    pkg.channel = "../etc".into();
+    assert!(pkg.validate().is_err());
+    pkg.channel = "/etc".into();
+    assert!(pkg.validate().is_err());
+    pkg.channel = "main/system".into();
+
+    // Unsafe name
+    pkg.name = "..".into();
+    assert!(pkg.validate().is_err());
+    pkg.name = "test-pkg".into();
+
+    // Unsafe slot
+    pkg.slot = "../0".into();
+    assert!(pkg.validate().is_err());
+    pkg.slot = "0".into();
+
+    // Unsafe version
+    pkg.version = "..".into();
+    assert!(pkg.validate().is_err());
+    pkg.version = "1.0/attack".into();
+    assert!(pkg.validate().is_err());
+    pkg.version = "1.0.0".into();
+
+    // Empty arch
+    pkg.arch = "".into();
+    assert!(pkg.validate().is_err());
+    pkg.arch = "x86_64".into();
+
+    // Invalid license
+    pkg.license = "Invalid License With Syntax Error ((((".into();
+    assert!(pkg.validate().is_err());
+}

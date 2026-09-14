@@ -234,6 +234,41 @@ async fn execute_source_layers(
         eprintln!("Build failed: {message}");
         record_failure(&failure_report, message)
     };
+
+    // Index all candidate producers per symbol across layers so multi-producer
+    // provided symbols are not incorrectly blocked when only one candidate fails.
+    let mut symbol_producers: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<PathBuf>,
+    > = std::collections::BTreeMap::new();
+    for layer in layers {
+        for unit in layer {
+            for symbol in unit.produced_symbol_ids() {
+                symbol_producers
+                    .entry(symbol)
+                    .or_default()
+                    .insert(unit.recipe.clone());
+            }
+        }
+    }
+    let mut failed_units: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+    let is_symbol_blocked = |symbol: &str,
+                             blocked: &std::collections::BTreeSet<String>,
+                             failed: &std::collections::BTreeSet<PathBuf>|
+     -> bool {
+        if blocked.contains(symbol) {
+            return true;
+        }
+        if let Some(producers) = symbol_producers.get(symbol)
+            && !producers.is_empty()
+            && producers.iter().all(|p| failed.contains(p))
+        {
+            return true;
+        }
+        false
+    };
+
     for (layer_index, layer) in layers.iter().enumerate() {
         let concurrency = if requested_jobs == 0 {
             config.jobs.min(layer.len()).max(1)
@@ -251,7 +286,7 @@ async fn execute_source_layers(
                 if unit
                     .consumed_symbol_ids()
                     .iter()
-                    .any(|symbol| blocked_symbols.contains(symbol))
+                    .any(|symbol| is_symbol_blocked(symbol, blocked_symbols, &failed_units))
                 {
                     let message = format!(
                         "{}: blocked by a failed dependency; not scheduled",
@@ -259,7 +294,7 @@ async fn execute_source_layers(
                     );
                     println!("Skip {message}");
                     record_failure(&failure_report, &message)?;
-                    blocked_symbols.extend(unit.produced_symbol_ids());
+                    failed_units.insert(unit.recipe.clone());
                     continue;
                 }
                 // Bootstrap stages deliberately resume from completed outputs,
@@ -291,18 +326,18 @@ async fn execute_source_layers(
                     )
                     .await
                     .map(|_| output);
-                    (unit_name, produced_symbols, result)
+                    (unit_name, recipe, produced_symbols, result)
                 });
             }
             let mut completed = Vec::new();
             while let Some(result) = tasks.join_next().await {
                 match result {
-                    Ok((unit_name, produced_symbols, Ok(output))) => {
-                        completed.push((unit_name, produced_symbols, output));
+                    Ok((unit_name, recipe, _produced_symbols, Ok(output))) => {
+                        completed.push((unit_name, recipe, output));
                     }
-                    Ok((unit_name, produced_symbols, Err(error))) => {
+                    Ok((unit_name, recipe, _produced_symbols, Err(error))) => {
                         log_failure(&format!("{unit_name}: {error:#}"))?;
-                        blocked_symbols.extend(produced_symbols);
+                        failed_units.insert(recipe);
                     }
                     Err(error) => {
                         // A task that does not return its unit metadata cannot
@@ -316,7 +351,7 @@ async fn execute_source_layers(
                 }
             }
             completed.sort_by(|left, right| left.2.cmp(&right.2));
-            for (unit_name, produced_symbols, directory) in completed {
+            for (unit_name, recipe, directory) in completed {
                 let artifacts = match std::fs::read_dir(&directory) {
                     Ok(entries) => {
                         let mut artifacts: Vec<_> = entries
@@ -331,7 +366,7 @@ async fn execute_source_layers(
                             "{unit_name}: failed to read build output {}: {error}",
                             directory.display()
                         ))?;
-                        blocked_symbols.extend(produced_symbols);
+                        failed_units.insert(recipe);
                         continue;
                     }
                 };
@@ -340,15 +375,32 @@ async fn execute_source_layers(
                     let publish = (|| -> Result<PathBuf> {
                         let inspection = sage_archive::inspect_package(&artifact)
                             .with_context(|| format!("failed to inspect {}", artifact.display()))?;
+                        inspection
+                            .manifest
+                            .validate()
+                            .context("manifest coordinates are invalid for publishing")?;
                         let file_name = artifact
                             .file_name()
                             .context("build output has no filename")?;
-                        let target = pool
-                            .join(".slots")
+                        let file_name_str = file_name
+                            .to_str()
+                            .context("build output filename is not UTF-8")?;
+                        if file_name_str.contains('/')
+                            || file_name_str.contains('\\')
+                            || file_name_str == ".."
+                            || file_name_str == "."
+                        {
+                            bail!("build output filename is unsafe: {file_name_str}");
+                        }
+                        let slots_dir = pool.join(".slots");
+                        let target = slots_dir
                             .join(&inspection.manifest.channel)
                             .join(&inspection.manifest.name)
                             .join(&inspection.manifest.slot)
                             .join(file_name);
+                        if !target.starts_with(&slots_dir) {
+                            bail!("publishing target escapes pool: {}", target.display());
+                        }
                         if let Some(parent) = target.parent() {
                             std::fs::create_dir_all(parent).with_context(|| {
                                 format!("failed to create destination {}", parent.display())
@@ -369,9 +421,15 @@ async fn execute_source_layers(
                     }
                 }
                 if publish_failed {
-                    blocked_symbols.extend(produced_symbols);
+                    failed_units.insert(recipe);
                 }
             }
+        }
+    }
+    // Propagate all symbols whose candidate producers entirely failed to the caller.
+    for (symbol, producers) in &symbol_producers {
+        if !producers.is_empty() && producers.iter().all(|p| failed_units.contains(p)) {
+            blocked_symbols.insert(symbol.clone());
         }
     }
     Ok(())

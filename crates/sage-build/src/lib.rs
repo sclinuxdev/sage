@@ -49,6 +49,14 @@ pub enum BuildError {
     },
     #[error("cgroup resource enforcement failed: {0}")]
     CgroupFailed(String),
+    #[error("system error: {0}")]
+    Sys(#[from] sage_sys::SysError),
+}
+
+impl From<nix::errno::Errno> for BuildError {
+    fn from(err: nix::errno::Errno) -> Self {
+        Self::Io(std::io::Error::from(err))
+    }
 }
 
 pub use anyhow::{Context, Result, bail};

@@ -10,22 +10,9 @@ use super::spec::{RenderedServicesState, ServiceDocument, ServiceSpec, ServicesC
 use crate::SysError;
 use crate::recovery::{crash_point, operation_id};
 
-/// Loads all available service specifications from `/usr/share/sage/services/`
-/// and the active rendered services state.
-pub fn load_available_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError> {
+/// Loads currently installed service specifications from `/usr/share/sage/services/`.
+pub fn load_installed_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError> {
     let mut services_map = BTreeMap::new();
-    let rendered_path = root.join("var/lib/sage/rendered-services.toml");
-    if rendered_path.exists() {
-        let rendered = RenderedServicesState::load(&rendered_path).map_err(|error| {
-            SysError::Invalid(format!(
-                "invalid rendered services state {}: {error}",
-                rendered_path.display()
-            ))
-        })?;
-        for svc in rendered.services {
-            services_map.insert(svc.name.clone(), svc);
-        }
-    }
     let services_dir = root.join("usr/share/sage/services");
     if services_dir.exists() {
         let mut installed_names = BTreeSet::new();
@@ -51,10 +38,39 @@ pub fn load_available_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError
                             svc.name
                         )));
                     }
-                    services_map.entry(svc.name.clone()).or_insert(svc);
+                    services_map.insert(svc.name.clone(), svc);
                 }
             }
         }
+    }
+    Ok(services_map.into_values().collect())
+}
+
+/// Loads the historical rendered services recorded in `/var/lib/sage/rendered-services.toml`.
+pub fn load_rendered_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError> {
+    let rendered_path = root.join("var/lib/sage/rendered-services.toml");
+    if rendered_path.exists() {
+        let rendered = RenderedServicesState::load(&rendered_path).map_err(|error| {
+            SysError::Invalid(format!(
+                "invalid rendered services state {}: {error}",
+                rendered_path.display()
+            ))
+        })?;
+        Ok(rendered.services)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Loads all available service specifications, giving precedence to currently installed
+/// package definitions while retaining uninstalled historical definitions for status/cleanup.
+pub fn load_available_services(root: &Path) -> Result<Vec<ServiceSpec>, SysError> {
+    let mut services_map = BTreeMap::new();
+    for svc in load_rendered_services(root)? {
+        services_map.insert(svc.name.clone(), svc);
+    }
+    for svc in load_installed_services(root)? {
+        services_map.insert(svc.name.clone(), svc);
     }
     Ok(services_map.into_values().collect())
 }
@@ -313,7 +329,7 @@ fn execute_service_lifecycle(
 /// When `dry_run` is `false`, persists a lifecycle journal, renders the definition,
 /// activates the service in the provider if needed, and publishes declarative mutations.
 pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
-    let services = load_available_services(root)?;
+    let services = load_installed_services(root)?;
     let spec = services
         .into_iter()
         .find(|s| s.name == service_name)
@@ -352,15 +368,20 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
 
 /// Disables a service in `/etc/sage/services.toml` and deactivates it in the init provider.
 pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
-    let services = load_available_services(root)?;
-    let spec = services
-        .into_iter()
-        .find(|service| service.name == service_name)
-        .ok_or_else(|| {
-            SysError::Invalid(format!(
-                "service '{service_name}' not found in installed packages"
-            ))
-        })?;
+    let installed = load_installed_services(root)?;
+    let spec = if let Some(spec) = installed.into_iter().find(|s| s.name == service_name) {
+        spec
+    } else {
+        let rendered = load_rendered_services(root)?;
+        rendered
+            .into_iter()
+            .find(|service| service.name == service_name)
+            .ok_or_else(|| {
+                SysError::Invalid(format!(
+                    "service '{service_name}' not found in installed packages or rendered state"
+                ))
+            })?
+    };
     let config_path = root.join("etc/sage/services.toml");
     let mut config = ServicesConfig::load(&config_path)?;
     if !config.enabled.contains(service_name) && config.disabled.contains(service_name) {
@@ -389,7 +410,7 @@ pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result
 
 /// Adopts an externally enabled service into `/etc/sage/services.toml` without modifying host state.
 pub fn service_adopt(root: &Path, service_name: &str, dry_run: bool) -> Result<(), SysError> {
-    let services = load_available_services(root)?;
+    let services = load_installed_services(root)?;
     let spec = services
         .into_iter()
         .find(|s| s.name == service_name)

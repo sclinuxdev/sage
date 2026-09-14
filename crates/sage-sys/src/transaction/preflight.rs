@@ -17,34 +17,9 @@ pub(crate) fn declaration_path(dir: &str, key: &sage_core::PackageKey) -> PathBu
     PathBuf::from(dir).join(format!("{digest}.toml"))
 }
 
-/// Atomically writes content to a target path beneath sysroot using tempfile and rename.
+/// Atomically writes content to a target path beneath sysroot using fd-anchored operations.
 pub(crate) fn write_atomic_under_root(root: &Path, relative: &Path, bytes: &[u8]) -> Result<()> {
-    if relative.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::RootDir
-        )
-    }) {
-        bail!("unsafe state path {}", relative.display());
-    }
-    let target = root.join(relative);
-    let parent = target.parent().context("state path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let canonical_root = std::fs::canonicalize(root)?;
-    let canonical_parent = std::fs::canonicalize(parent)?;
-    if !canonical_parent.starts_with(canonical_root) {
-        bail!("state path escapes sysroot: {}", target.display());
-    }
-    let temporary = parent.join(format!(".sage-state-{}", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    use std::io::Write as _;
-    options
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?
-        .write_all(bytes)?;
-    std::fs::rename(temporary, target)?;
-    Ok(())
+    crate::fs::write_atomic_under_root(root, relative, bytes).map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Preflights candidates, inspecting archives, verifying checksums, and catching file conflicts.

@@ -5,6 +5,7 @@ use thiserror::Error;
 
 mod channel;
 mod diff;
+pub mod fs;
 mod gc;
 mod process;
 mod query;
@@ -40,7 +41,8 @@ pub use services::{
     RenderedServicesState, ServiceActivation, ServiceDocument, ServiceDrift, ServiceSpec,
     ServiceStatusInfo, ServicesConfig, TemplateActivationAdapter, TemplateArtifact,
     TemplateServiceGenerator, detect_service_drift, list_services, load_active_generator,
-    load_available_services, service_adopt, service_disable, service_enable, warn_service_drift,
+    load_available_services, load_installed_services, load_rendered_services, service_adopt,
+    service_disable, service_enable, warn_service_drift,
 };
 pub use state::{
     Alternative, AlternativeDeclaration, AlternativesDocument, ProfileEngine, ReconcilePlan,
@@ -80,6 +82,12 @@ pub enum SysError {
     UnknownVariable(String),
     #[error("dependency solver failed: {0}")]
     Solver(#[from] sage_solver::SolverError),
+}
+
+impl From<nix::errno::Errno> for SysError {
+    fn from(err: nix::errno::Errno) -> Self {
+        Self::Io(std::io::Error::from(err))
+    }
 }
 
 pub(crate) fn validate_schema(version: u32) -> Result<(), SysError> {
