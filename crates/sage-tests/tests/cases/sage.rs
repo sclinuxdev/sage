@@ -94,6 +94,57 @@ recipes=["app/recipe.toml"]
     assert!(!recipes.path().join(".sage-bootstrap").exists());
 }
 
+#[tokio::test]
+async fn mass_rebuild_replaces_an_existing_release_with_the_same_filename() {
+    let root = tempfile::tempdir().unwrap();
+    let recipes = tempfile::tempdir().unwrap();
+    let pool = tempfile::tempdir().unwrap();
+    configure_root(root.path());
+    let recipe_dir = recipes.path().join("demo");
+    let recipe_path = recipe_dir.join("recipe.toml");
+    std::fs::create_dir(&recipe_dir).unwrap();
+    let write_recipe = |content: &str| {
+        std::fs::write(
+            &recipe_path,
+            format!(
+                r#"schema_version = 1
+
+[package]
+name = "demo"
+version = "1"
+release = 1
+description = "demo"
+license = "MIT"
+channel = "system"
+arch = "noarch"
+
+[[install.files]]
+path = "usr/share/demo/value"
+content = "{content}"
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    write_recipe("first");
+    mass_rebuild(root.path(), recipes.path(), Some(pool.path()), 1, false)
+        .await
+        .unwrap();
+    let artifact = pool
+        .path()
+        .join(".slots/system/demo/0/demo-1-1-noarch.pkg.tar.zst");
+    let first = std::fs::read(&artifact).unwrap();
+
+    write_recipe("second");
+    mass_rebuild(root.path(), recipes.path(), Some(pool.path()), 1, false)
+        .await
+        .unwrap();
+    let second = std::fs::read(&artifact).unwrap();
+
+    assert_ne!(second, first);
+}
+
 #[test]
 fn source_pool_overlays_local_artifacts_into_solver_universe() {
     let root = tempfile::tempdir().unwrap();

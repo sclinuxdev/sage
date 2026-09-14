@@ -17,7 +17,16 @@ pub async fn mass_rebuild(
         .unwrap_or_else(|| recipe_root.join(".sage-packages"));
     prepare_source_pool(&pool, dry_run)?;
     let mut blocked_symbols = std::collections::BTreeSet::new();
-    execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await?;
+    execute_source_layers(
+        root,
+        &layers,
+        &pool,
+        jobs,
+        dry_run,
+        false,
+        &mut blocked_symbols,
+    )
+    .await?;
     let failure_report = pool.join("build-failures.log");
     if failure_report.exists() {
         bail!("source build failed; review {}", failure_report.display());
@@ -48,7 +57,16 @@ pub async fn bootstrap_sources(
         }
         let units = source_build_units(root, units)?;
         let layers = sage_build::BuildGraph::layers(units)?;
-        execute_source_layers(root, &layers, &pool, jobs, dry_run, &mut blocked_symbols).await?;
+        execute_source_layers(
+            root,
+            &layers,
+            &pool,
+            jobs,
+            dry_run,
+            true,
+            &mut blocked_symbols,
+        )
+        .await?;
     }
     let failure_report = pool.join("build-failures.log");
     if failure_report.exists() {
@@ -182,12 +200,17 @@ fn unit_already_built(pool: &Path, recipe_path: &Path) -> bool {
     true
 }
 
+fn should_skip_existing_unit(resume_existing: bool, pool: &Path, recipe_path: &Path) -> bool {
+    resume_existing && unit_already_built(pool, recipe_path)
+}
+
 async fn execute_source_layers(
     root: &Path,
     layers: &[Vec<sage_build::BuildUnit>],
     pool: &Path,
     requested_jobs: usize,
     dry_run: bool,
+    resume_existing: bool,
     blocked_symbols: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     if dry_run {
@@ -239,7 +262,10 @@ async fn execute_source_layers(
                     blocked_symbols.extend(unit.produced_symbol_ids());
                     continue;
                 }
-                if unit_already_built(pool, &unit.recipe) {
+                // Bootstrap stages deliberately resume from completed outputs,
+                // but mass rebuild must replace every discovered unit even when
+                // its versioned filename is unchanged.
+                if should_skip_existing_unit(resume_existing, pool, &unit.recipe) {
                     println!("Skipping {}: already built in package pool", unit.name);
                     continue;
                 }
@@ -1041,4 +1067,46 @@ pub fn stage_declarative_metadata(
         std::fs::copy(triggers, metadata.join("triggers.toml"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_resume_mode_skips_an_existing_source_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe_path = directory.path().join("recipe.toml");
+        std::fs::write(
+            &recipe_path,
+            format!(
+                r#"schema_version = 1
+
+[package]
+name = "demo"
+version = "1"
+release = 1
+description = "demo"
+license = "MIT"
+channel = "system"
+arch = "any"
+
+[source]
+url = "https://example.invalid/demo.tar"
+sha256 = "{}"
+"#,
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+        let pool = directory.path().join("pool");
+        let artifact = pool
+            .join(".slots/system/demo/0")
+            .join("demo-1-1-any.pkg.tar.zst");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, []).unwrap();
+
+        assert!(should_skip_existing_unit(true, &pool, &recipe_path));
+        assert!(!should_skip_existing_unit(false, &pool, &recipe_path));
+    }
 }
