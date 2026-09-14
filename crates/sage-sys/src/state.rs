@@ -31,18 +31,25 @@ impl Serialize for SystemConfig {
         S: serde::Serializer,
     {
         #[derive(Serialize)]
+        struct World<'a> {
+            packages: &'a BTreeSet<String>,
+        }
+
+        #[derive(Serialize)]
         struct RawConfig<'a> {
             schema_version: u32,
-            packages: &'a BTreeSet<String>,
             system: &'a SystemMetadata,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             providers: &'a BTreeMap<String, String>,
+            world: World<'a>,
         }
         RawConfig {
             schema_version: self.schema_version,
-            packages: &self.packages,
             system: &self.system,
             providers: &self.providers,
+            world: World {
+                packages: &self.packages,
+            },
         }
         .serialize(serializer)
     }
@@ -58,39 +65,66 @@ impl<'de> Deserialize<'de> for SystemConfig {
             .as_table_mut()
             .ok_or_else(|| serde::de::Error::custom("expected table for system config"))?;
 
-        let schema_version = table
+        let schema_integer = table
             .get("schema_version")
             .and_then(|v| v.as_integer())
-            .ok_or_else(|| serde::de::Error::missing_field("schema_version"))?
-            as u32;
+            .ok_or_else(|| serde::de::Error::missing_field("schema_version"))?;
+        let schema_version = u32::try_from(schema_integer).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "schema_version must be an unsigned 32-bit integer, got {schema_integer}"
+            ))
+        })?;
 
         let system_val = table
             .get("system")
             .ok_or_else(|| serde::de::Error::missing_field("system"))?;
+        if system_val
+            .as_table()
+            .is_some_and(|system| system.contains_key("packages"))
+        {
+            return Err(serde::de::Error::custom(
+                "packages must be declared at the document root or in [world], not in [system]",
+            ));
+        }
         let system: SystemMetadata = system_val
             .clone()
             .try_into()
             .map_err(serde::de::Error::custom)?;
 
-        let mut packages = BTreeSet::new();
-
-        // 1. Root-level `packages = [...]` before any table headers
-        if let Some(pkg_val) = table.remove("packages") {
-            let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
-            packages.extend(list);
+        // Schema v1 originally documented a root-level list. Continue reading
+        // that valid TOML layout while writing the canonical bottom `[world]`
+        // table below.
+        let root_packages = table.remove("packages");
+        let world_packages = table
+            .remove("world")
+            .map(|world| {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct World {
+                    packages: BTreeSet<String>,
+                }
+                world
+                    .try_into()
+                    .map(|world: World| world.packages)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()?;
+        if root_packages.is_some() && world_packages.is_some() {
+            return Err(serde::de::Error::custom(
+                "packages must be declared either at the document root or in [world], not both",
+            ));
         }
+        let packages = match (root_packages, world_packages) {
+            (Some(value), None) => value.try_into().map_err(serde::de::Error::custom)?,
+            (None, Some(packages)) => packages,
+            (None, None) => BTreeSet::new(),
+            (Some(_), Some(_)) => unreachable!(),
+        };
 
         let mut providers = BTreeMap::new();
         if let Some(providers_val) = table.get_mut("providers")
             && let Some(prov_table) = providers_val.as_table_mut()
         {
-            // 2. Trailing `packages = [...]` placed at the bottom after [providers]
-            if packages.is_empty()
-                && let Some(pkg_val) = prov_table.remove("packages")
-            {
-                let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
-                packages.extend(list);
-            }
             for (k, v) in prov_table.iter() {
                 if let Some(s) = v.as_str() {
                     providers.insert(k.clone(), s.to_string());
@@ -100,16 +134,6 @@ impl<'de> Deserialize<'de> for SystemConfig {
                     )));
                 }
             }
-        }
-
-        // 3. Trailing `packages = [...]` placed after [system] when no [providers] table exists
-        if packages.is_empty()
-            && let Some(system_val) = table.get_mut("system")
-            && let Some(sys_table) = system_val.as_table_mut()
-            && let Some(pkg_val) = sys_table.remove("packages")
-        {
-            let list: Vec<String> = pkg_val.try_into().map_err(serde::de::Error::custom)?;
-            packages.extend(list);
         }
 
         Ok(SystemConfig {
@@ -131,7 +155,7 @@ impl SystemConfig {
 
     /// Formats the declarative system state as a human-readable TOML document,
     /// with schema and metadata at the top, providers in the middle, and the
-    /// explicit root packages (@world) at the bottom.
+    /// explicit root packages in a valid `[world]` table at the bottom.
     pub fn to_toml_string(&self) -> Result<String, SysError> {
         let mut out = format!("schema_version = {}\n\n", self.schema_version);
         out.push_str("[system]\n");
@@ -147,7 +171,7 @@ impl SystemConfig {
                     .map_err(|error| SysError::Invalid(error.to_string()))?,
             );
         }
-        out.push_str("\npackages = [\n");
+        out.push_str("\n[world]\npackages = [\n");
         for package in &self.packages {
             out.push_str(&format!("    {},\n", toml::Value::String(package.clone())));
         }
@@ -774,7 +798,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_config_parses_packages_at_bottom() {
+    fn system_config_parses_world_packages_at_bottom() {
         let text = r#"
 schema_version = 1
 
@@ -786,6 +810,7 @@ profile = "default"
 init = "systemd"
 udev = "systemd-udev"
 
+[world]
 packages = [
     "base",
     "fastfetch",
@@ -836,6 +861,7 @@ schema_version = 1
 architecture = "amd64"
 profile = "default"
 
+[world]
 packages = [
     "base",
 ]
@@ -865,12 +891,89 @@ packages = [
         };
 
         let formatted = original.to_toml_string().unwrap();
-        // Verify packages is at the end of the formatted output
+        // Verify the standards-compliant world table is at the end.
         let providers_pos = formatted.find("[providers]").unwrap();
+        let world_pos = formatted.find("[world]").unwrap();
         let packages_pos = formatted.find("packages = [").unwrap();
-        assert!(packages_pos > providers_pos);
+        assert!(world_pos > providers_pos);
+        assert!(packages_pos > world_pos);
 
         let parsed: SystemConfig = toml::from_str(&formatted).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn provider_named_packages_does_not_collide_with_world_packages() {
+        let text = r#"
+schema_version = 1
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[providers]
+packages = "package-provider"
+
+[world]
+packages = ["base"]
+"#;
+        let config: SystemConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            config.providers.get("packages").map(String::as_str),
+            Some("package-provider")
+        );
+        assert_eq!(config.packages, BTreeSet::from(["base".to_string()]));
+
+        for formatted in [
+            config.to_toml_string().unwrap(),
+            toml::to_string(&config).unwrap(),
+        ] {
+            let reparsed: SystemConfig = toml::from_str(&formatted).unwrap();
+            assert_eq!(reparsed, config);
+        }
+    }
+
+    #[test]
+    fn system_config_rejects_out_of_range_schema_versions() {
+        for schema_version in ["-1", "4294967297"] {
+            let text = format!(
+                r#"schema_version = {schema_version}
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[world]
+packages = []
+"#
+            );
+            assert!(toml::from_str::<SystemConfig>(&text).is_err());
+        }
+    }
+
+    #[test]
+    fn system_config_rejects_packages_scoped_under_another_table() {
+        for text in [
+            r#"
+schema_version = 1
+
+[system]
+architecture = "amd64"
+profile = "default"
+
+[providers]
+packages = ["base"]
+"#,
+            r#"
+schema_version = 1
+
+[system]
+architecture = "amd64"
+profile = "default"
+packages = ["base"]
+"#,
+        ] {
+            assert!(toml::from_str::<SystemConfig>(text).is_err());
+        }
     }
 }
