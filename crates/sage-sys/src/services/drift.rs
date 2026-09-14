@@ -23,6 +23,7 @@ pub struct ServiceStatusInfo {
     pub name: String,
     pub package: String,
     pub state: String,
+    pub activation: String,
     pub provider: String,
 }
 
@@ -39,6 +40,9 @@ pub fn detect_service_drift(
 ) -> Vec<ServiceDrift> {
     let mut drifts = Vec::new();
     for service in services {
+        if service.activation.is_automatic() {
+            continue;
+        }
         if enabled.contains(&service.name) {
             continue;
         }

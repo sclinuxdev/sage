@@ -39,3 +39,68 @@ restart = "${service.restart}"
 after = ${service.after_json}
 before = ${service.before_json}
 """
+
+[service_generator.activations.socket]
+automatic = false
+service_template = """
+schema_version = 2
+
+[service]
+name = "${service.name}"
+description = ${service.description_json}
+command = ${service.command_json}
+${service.stop_input_toml}
+${service.reload_input_toml}
+user = ${service.user_json}
+group = ${service.group_json}
+type = "${service.process_type}"
+readiness = "${service.readiness}"
+working_directory = ${service.working_dir_json}
+restart = "${service.restart}"
+after = ${service.after_json}
+before = ${service.before_json}
+
+[activation]
+kind = "socket"
+listen_stream = ${activation.listen_stream_json}
+accept = ${activation.accept}
+mode = ${activation.socket_mode_int}
+fd_protocol = "sd-listen-fds"
+"""
+
+[service_generator.activations.dbus]
+automatic = true
+service_template = """
+schema_version = 2
+
+[service]
+name = "${service.name}"
+description = ${service.description_json}
+command = ${service.command_json}
+${service.stop_input_toml}
+${service.reload_input_toml}
+user = ${service.user_json}
+group = ${service.group_json}
+type = "${service.process_type}"
+readiness = "${service.readiness}"
+working_directory = ${service.working_dir_json}
+restart = "${service.restart}"
+after = ${service.after_json}
+before = ${service.before_json}
+
+[activation]
+kind = "dbus"
+bus = ${activation.dbus_bus_json}
+name = ${activation.dbus_name_json}
+automatic = true
+"""
+
+[[service_generator.activations.dbus.artifacts]]
+target_path = "/usr/share/dbus-1/system-services/${activation.dbus_name}.service"
+mode = 420
+template = """
+[D-BUS Service]
+Name=${activation.dbus_name}
+Exec=${service.command_quoted}
+User=${activation.dbus_user}
+"""

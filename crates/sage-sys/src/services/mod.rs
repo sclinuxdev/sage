@@ -6,7 +6,7 @@ pub mod manager;
 pub mod spec;
 
 pub use drift::{ServiceDrift, ServiceStatusInfo, detect_service_drift, warn_service_drift};
-pub use generator::TemplateServiceGenerator;
+pub use generator::{TemplateActivationAdapter, TemplateArtifact, TemplateServiceGenerator};
 pub(crate) use generator::{ensure_directory_beneath, ensure_existing_beneath, target_path};
 pub(crate) use manager::resume_service_lifecycle;
 pub use manager::{
@@ -14,4 +14,6 @@ pub use manager::{
     service_enable,
 };
 pub(crate) use spec::valid_declaration_name;
-pub use spec::{RenderedServicesState, ServiceDocument, ServiceSpec, ServicesConfig};
+pub use spec::{
+    RenderedServicesState, ServiceActivation, ServiceDocument, ServiceSpec, ServicesConfig,
+};

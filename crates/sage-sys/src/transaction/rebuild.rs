@@ -105,7 +105,7 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
     };
     let next = plan_services(
         root,
-        &services_config.enabled,
+        &services_config,
         &provider,
         &available,
         &changes,
@@ -157,7 +157,7 @@ pub async fn rebuild_system(root: &Path, no_prune: bool, dry_run: bool) -> Resul
 /// Files owned by replaced or retired releases cannot masquerade as replacements.
 pub(crate) async fn plan_services(
     root: &Path,
-    enabled_services: &BTreeSet<String>,
+    services_config: &ServicesConfig,
     provider: &sage_core::PackageKey,
     available: &AvailablePackages,
     changes: &[(sage_core::PackageKey, sage_core::Version)],
@@ -246,8 +246,24 @@ pub(crate) async fn plan_services(
     if names.len() != services.len() {
         bail!("duplicate installed service names");
     }
-    if let Some(name) = enabled_services.iter().find(|name| !names.contains(name)) {
+    if let Some(name) = services_config
+        .enabled
+        .iter()
+        .find(|name| !names.contains(name))
+    {
         bail!("enabled service '{name}' has no planned declaration");
+    }
+    for service in &services {
+        if service.activation.is_automatic()
+            && (services_config.enabled.contains(&service.name)
+                || services_config.disabled.contains(&service.name))
+        {
+            bail!(
+                "automatic {} service '{}' cannot appear in services.toml",
+                service.activation.kind(),
+                service.name
+            );
+        }
     }
     generator.validate_service_set(&services, root)?;
     // Removed package ownership does not imply physical removal: administrator
@@ -275,26 +291,27 @@ pub(crate) async fn plan_services(
         .collect::<BTreeSet<_>>();
     let mut targets = BTreeSet::<PathBuf>::new();
     for service in &services {
-        let target = generator.rendered_path(service, root)?;
-        let relative = target.strip_prefix(root)?;
-        // Native output must not replace a package's command, data, or parent
-        // directory. This checks the final overlay, before any old cleanup.
-        if protected_paths
-            .iter()
-            .any(|path| path.starts_with(relative) || relative.starts_with(path))
-        {
-            bail!(
-                "native service output conflicts with an existing or planned file: {}",
-                target.display()
-            );
+        for target in generator.rendered_paths(service, root)? {
+            let relative = target.strip_prefix(root)?;
+            // Native output must not replace a package's command, data, or parent
+            // directory. This checks the final overlay, before any old cleanup.
+            if protected_paths
+                .iter()
+                .any(|path| path.starts_with(relative) || relative.starts_with(path))
+            {
+                bail!(
+                    "native service output conflicts with an existing or planned file: {}",
+                    target.display()
+                );
+            }
+            if targets
+                .iter()
+                .any(|path| path.starts_with(&target) || target.starts_with(path))
+            {
+                bail!("native service outputs overlap: {}", target.display());
+            }
+            targets.insert(target);
         }
-        if targets
-            .iter()
-            .any(|path| path.starts_with(&target) || target.starts_with(path))
-        {
-            bail!("native service outputs overlap: {}", target.display());
-        }
-        targets.insert(target);
     }
     let managed_directory = generator
         .managed_directory
@@ -350,7 +367,7 @@ pub(crate) async fn plan_services(
             }
         }
     }
-    for program in generator.required_programs(&services, enabled_services, root)? {
+    for program in generator.required_programs(&services, &services_config.enabled, root)? {
         let resolved = validate_planned_program(root, &program, &payloads, &removed)?;
         if targets.contains(&resolved)
             || managed_directory
@@ -413,7 +430,7 @@ pub(crate) async fn plan_services(
         provider: provider.clone(),
         generator,
         services,
-        enabled: enabled_services.clone(),
+        enabled: services_config.enabled.clone(),
     })
 }
 
@@ -433,11 +450,7 @@ pub(crate) fn cleanup_services(
         || previous.provider != next.provider
         || previous.generator != next.generator;
     for service in previous.services.clone() {
-        let stale = replace
-            || !next
-                .services
-                .iter()
-                .any(|candidate| candidate.name == service.name);
+        let stale = replace || !next.services.iter().any(|candidate| candidate == &service);
         if previous.enabled.contains(&service.name)
             && (stale || !next.enabled.contains(&service.name))
         {

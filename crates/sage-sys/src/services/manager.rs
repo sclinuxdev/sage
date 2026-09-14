@@ -329,8 +329,9 @@ pub fn service_enable(root: &Path, service_name: &str, dry_run: bool) -> Result<
     }
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
+    reject_automatic_lifecycle(&generator, &spec, "enable")?;
     if dry_run {
-        if generator.rendered_path(&spec, root)?.try_exists()? {
+        if generator.is_rendered(&spec, root)? {
             let _ = generator.is_service_enabled(&spec, root)?;
         }
     } else {
@@ -367,6 +368,7 @@ pub fn service_disable(root: &Path, service_name: &str, dry_run: bool) -> Result
     }
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
+    reject_automatic_lifecycle(&generator, &spec, "disable")?;
     if dry_run {
         let _ = generator.is_service_enabled(&spec, root)?;
     } else {
@@ -404,6 +406,7 @@ pub fn service_adopt(root: &Path, service_name: &str, dry_run: bool) -> Result<(
     }
     let (_provider, generator) = load_active_generator(root)?;
     generator.validate_service_set(std::slice::from_ref(&spec), root)?;
+    reject_automatic_lifecycle(&generator, &spec, "adopt")?;
     match generator.is_service_enabled(&spec, root)? {
         Some(true) => {}
         Some(false) => {
@@ -449,9 +452,16 @@ pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
 
     let mut result = Vec::new();
     for service in services {
+        let automatic = active_gen
+            .as_ref()
+            .and_then(|(_, generator)| generator.is_automatic(&service).ok())
+            .unwrap_or_else(|| service.activation.is_automatic());
+        let is_rendered = active_gen
+            .as_ref()
+            .and_then(|(_, generator)| generator.is_rendered(&service, root).ok())
+            .unwrap_or(false);
         let is_init_enabled = active_gen.as_ref().and_then(|(_, generator)| {
-            let rendered = generator.rendered_path(&service, root).ok()?;
-            if rendered.is_file() {
+            if is_rendered {
                 generator.is_service_enabled(&service, root).ok().flatten()
             } else {
                 None
@@ -461,7 +471,13 @@ pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
             || previous_rendered
                 .as_ref()
                 .is_some_and(|rendered| rendered.enabled.contains(&service.name));
-        let state = if config.enabled.contains(&service.name) {
+        let state = if automatic {
+            if is_rendered {
+                "automatic".to_string()
+            } else {
+                "automatic (pending rebuild)".to_string()
+            }
+        } else if config.enabled.contains(&service.name) {
             "managed-enabled".to_string()
         } else if managed_disabled {
             if is_init_enabled == Some(true) {
@@ -483,8 +499,24 @@ pub fn list_services(root: &Path) -> Result<Vec<ServiceStatusInfo>, SysError> {
                 service.package
             },
             state,
+            activation: service.activation.kind().to_string(),
             provider: provider_name.to_string(),
         });
     }
     Ok(result)
+}
+
+fn reject_automatic_lifecycle(
+    generator: &TemplateServiceGenerator,
+    service: &ServiceSpec,
+    action: &str,
+) -> Result<(), SysError> {
+    if generator.is_automatic(service)? {
+        return Err(SysError::Invalid(format!(
+            "service '{}' uses automatic {} activation; boot-policy action '{action}' is not applicable",
+            service.name,
+            service.activation.kind()
+        )));
+    }
+    Ok(())
 }

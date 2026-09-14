@@ -115,6 +115,25 @@ WantedBy=multi-user.target
 [service_generator.dependency_aliases]
 network = "network.target"
 syslog = "syslog.target"
+
+[service_generator.activations.socket]
+automatic = false
+enable_cmd = "/usr/bin/systemctl --root ${SYSROOT} enable ${service.name}.socket"
+disable_cmd = "/usr/bin/systemctl --root ${SYSROOT} disable ${service.name}.socket"
+is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.socket"
+
+[[service_generator.activations.socket.artifacts]]
+target_path = "/usr/lib/systemd/system/${service.name}.socket"
+mode = 420
+template = """
+[Socket]
+ListenStream=${activation.listen_stream}
+Accept=${activation.accept}
+SocketMode=${activation.socket_mode}
+
+[Install]
+WantedBy=sockets.target
+"""
 ```
 
 ### 示例 4: `rclass/init-loom.toml`
@@ -142,7 +161,35 @@ depends_on = ${service.after_json}
 before = ${service.before_json}
 runtime = ${service.runtime_json}
 """
+
+[service_generator.activations.socket]
+automatic = false
+service_template = """
+# The full Loom service definition is repeated here and adds:
+[activation]
+kind = "socket"
+listen_stream = ${activation.listen_stream_json}
+accept = ${activation.accept}
+mode = ${activation.socket_mode_int}
+fd_protocol = "sd-listen-fds"
+"""
 ```
+
+### 3.1 Activation adapters
+
+`[service_generator.activations.<kind>]` is selected from
+`service.activation.kind`. An adapter may contain:
+
+| Field | Meaning |
+| :--- | :--- |
+| `automatic` | Must be `true` for D-Bus and `false` for socket activation; mismatches fail validation |
+| `service_template` | Optional replacement for the primary provider definition |
+| `enable_cmd`, `disable_cmd`, `is_enabled_cmd` | Optional lifecycle overrides; omitted fields inherit the main generator commands |
+| `artifacts` | Additional atomically written files, each with `target_path`, `mode`, and `template` |
+
+Every provider-owned path is expanded and collision-checked before package
+publication. Provider switching and stale-service cleanup remove both the primary
+definition and all activation artifacts recorded in the previous rendered state.
 
 ---
 
@@ -168,6 +215,13 @@ runtime = ${service.runtime_json}
 | `${service.pid_file}` | PID 文件路径 |
 | `${service.restart}` | 重启策略 (`always`, `on-failure`, `no`) |
 | `${service.runtime}` / `${service.runtime_json}` | 可选运行时约束 |
+| `${activation.kind}` / `${activation.kind_json}` | `service`, `socket`, or `dbus` |
+| `${activation.listen_stream}` / `${activation.listen_stream_json}` | UNIX stream path for socket activation |
+| `${activation.accept}` | Boolean socket accept policy |
+| `${activation.socket_mode}` / `${activation.socket_mode_int}` | Octal provider text and decimal integer forms of the listener permissions |
+| `${activation.dbus_name}` / `${activation.dbus_name_json}` | Well-known system-bus name |
+| `${activation.dbus_bus}` / `${activation.dbus_bus_json}` | D-Bus scope; currently `system` |
+| `${activation.dbus_user}` / `${activation.dbus_user_json}` | User used by the D-Bus launch helper |
 | `${SYSROOT}` | 目标系统的根文件系统挂载点 |
 
 `dependency_aliases` and `service_dependency_suffix` belong to the init rclass,

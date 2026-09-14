@@ -40,3 +40,73 @@ local-fs = "local-fs.target"
 network = "network.target"
 network-online = "network-online.target"
 syslog = "syslog.target"
+
+[service_generator.activations.socket]
+automatic = false
+enable_cmd = "/usr/bin/systemctl --root ${SYSROOT} enable ${service.name}.socket"
+disable_cmd = "/usr/bin/systemctl --root ${SYSROOT} disable ${service.name}.socket"
+is_enabled_cmd = "/usr/bin/systemctl --root ${SYSROOT} is-enabled ${service.name}.socket"
+service_template = """
+[Unit]
+Description=${service.description}
+Requires=${service.name}.socket
+After=${service.name}.socket ${service.after_space}
+Before=${service.before_space}
+
+[Service]
+Type=${service.type}
+ExecStart=${service.command_quoted}
+ExecStop=${service.stop_command_quoted}
+ExecReload=${service.reload_command_quoted}
+User=${service.user}
+Group=${service.group}
+WorkingDirectory=${service.working_dir}
+PIDFile=${service.pid_file}
+Restart=${service.restart}
+"""
+
+[[service_generator.activations.socket.artifacts]]
+target_path = "/usr/lib/systemd/system/${service.name}.socket"
+mode = 420
+template = """
+[Unit]
+Description=${service.description} socket
+
+[Socket]
+ListenStream=${activation.listen_stream}
+Accept=${activation.accept}
+SocketMode=${activation.socket_mode}
+
+[Install]
+WantedBy=sockets.target
+"""
+
+[service_generator.activations.dbus]
+automatic = true
+service_template = """
+[Unit]
+Description=${service.description}
+After=${service.after_space}
+Before=${service.before_space}
+
+[Service]
+Type=${service.type}
+ExecStart=${service.command_quoted}
+ExecStop=${service.stop_command_quoted}
+ExecReload=${service.reload_command_quoted}
+User=${service.user}
+Group=${service.group}
+WorkingDirectory=${service.working_dir}
+PIDFile=${service.pid_file}
+Restart=${service.restart}
+"""
+
+[[service_generator.activations.dbus.artifacts]]
+target_path = "/usr/share/dbus-1/system-services/${activation.dbus_name}.service"
+mode = 420
+template = """
+[D-BUS Service]
+Name=${activation.dbus_name}
+Exec=${service.command_quoted}
+User=${activation.dbus_user}
+"""

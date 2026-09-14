@@ -75,12 +75,18 @@ packages = [
   # /etc/sage/services.toml
   schema_version = 1
   enabled = [
+      "dbus",
       "sshd",
-      "udev",
       "dhcpcd"
   ]
   ```
   在执行 `sage rebuild` 时，系统加载 `system.toml` 获得声明式软件包与 provider，并加载 `services.toml` 获得需激活的服务列表，由对应 Init rclass 模板引擎编译生成服务配置。未声明的服务属于 `unmanaged` 状态，遵循**“Sage 只撤销自己创建的状态，不擅自撤销管理员在 Sage 外部创建的状态”**的不变量。详见 [service_spec.md](service_spec.md)。
+
+  `enabled` and `disabled` contain logical service names, not native unit names.
+  For socket-activated services the selected init adapter applies the transition
+  to its listener (`dbus.socket` under systemd, the corresponding Loom graph node
+  under Loom). D-Bus-activated services are automatically available while their
+  packages are installed and are rejected from both arrays.
 
 ### 2.4 Provider selection and retained packages
 

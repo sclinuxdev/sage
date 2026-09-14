@@ -514,6 +514,169 @@ fn standard_init_rclasses_are_valid() {
     }
 }
 
+fn activation_service(name: &str, activation: &str) -> ServiceSpec {
+    let document = format!(
+        "schema_version=1\n[service]\nname={name:?}\ndescription=\"Demo daemon\"\ncommand=[\"/usr/bin/demo\",\"--run\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"on-failure\"\ntype=\"notify\"\n{activation}\n"
+    );
+    ServiceDocument::parse(document.as_bytes())
+        .unwrap()
+        .into_services()
+        .remove(0)
+}
+
+#[test]
+fn unsupported_activation_contracts_fail_closed() {
+    let per_connection = "schema_version=1\n[service]\nname=\"demo\"\ndescription=\"Demo\"\ncommand=[\"/usr/bin/demo\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n[service.activation]\nkind=\"socket\"\nlisten_stream=\"/run/demo.sock\"\naccept=true\n";
+    let session_bus = "schema_version=1\n[service]\nname=\"demo\"\ndescription=\"Demo\"\ncommand=[\"/usr/bin/demo\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n[service.activation]\nkind=\"dbus\"\nname=\"org.example.Demo\"\nbus=\"session\"\n";
+    let invalid_socket_mode = "schema_version=1\n[service]\nname=\"demo\"\ndescription=\"Demo\"\ncommand=[\"/usr/bin/demo\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n[service.activation]\nkind=\"socket\"\nlisten_stream=\"/run/demo.sock\"\nmode=4095\n";
+    let invalid_dbus_name = "schema_version=1\n[service]\nname=\"demo\"\ndescription=\"Demo\"\ncommand=[\"/usr/bin/demo\"]\nuser=\"daemon\"\ngroup=\"daemon\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n[service.activation]\nkind=\"dbus\"\nname=\"org.7zip.Demo\"\n";
+
+    assert!(
+        ServiceDocument::parse(per_connection.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("per-connection socket activation")
+    );
+    assert!(
+        ServiceDocument::parse(session_bus.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("only supports system D-Bus activation")
+    );
+    assert!(
+        ServiceDocument::parse(invalid_socket_mode.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("permission bits only")
+    );
+    assert!(
+        ServiceDocument::parse(invalid_dbus_name.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid D-Bus name")
+    );
+}
+
+#[test]
+fn systemd_renders_socket_and_dbus_activation_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    let generator = TemplateServiceGenerator::from_rclass(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/init-systemd.toml"),
+    )
+    .unwrap();
+    let socket = activation_service(
+        "socket-demo",
+        "[service.activation]\nkind=\"socket\"\nlisten_stream=\"/run/demo.sock\"\naccept=false",
+    );
+    let dbus = activation_service(
+        "dbus-demo",
+        "[service.activation]\nkind=\"dbus\"\nname=\"org.example.Demo\"\nbus=\"system\"\nuser=\"root\"",
+    );
+
+    generator
+        .render_service_set(&[socket.clone(), dbus.clone()], root.path())
+        .unwrap();
+
+    let service_unit = fs::read_to_string(
+        root.path()
+            .join("usr/lib/systemd/system/socket-demo.service"),
+    )
+    .unwrap();
+    let socket_unit = fs::read_to_string(
+        root.path()
+            .join("usr/lib/systemd/system/socket-demo.socket"),
+    )
+    .unwrap();
+    assert!(service_unit.contains("Requires=socket-demo.socket"));
+    assert!(socket_unit.contains("ListenStream=/run/demo.sock"));
+    assert!(socket_unit.contains("SocketMode=0666"));
+    assert!(socket_unit.contains("WantedBy=sockets.target"));
+    assert!(!generator.is_automatic(&socket).unwrap());
+
+    let activation = fs::read_to_string(
+        root.path()
+            .join("usr/share/dbus-1/system-services/org.example.Demo.service"),
+    )
+    .unwrap();
+    assert!(activation.contains("Name=org.example.Demo"));
+    assert!(activation.contains("Exec=\"/usr/bin/demo\" \"--run\""));
+    assert!(activation.contains("User=root"));
+    assert!(generator.is_automatic(&dbus).unwrap());
+    generator.remove_service(&socket, root.path()).unwrap();
+    generator.remove_service(&dbus, root.path()).unwrap();
+    assert!(
+        !root
+            .path()
+            .join("usr/lib/systemd/system/socket-demo.service")
+            .exists()
+    );
+    assert!(
+        !root
+            .path()
+            .join("usr/lib/systemd/system/socket-demo.socket")
+            .exists()
+    );
+    assert!(
+        !root
+            .path()
+            .join("usr/lib/systemd/system/dbus-demo.service")
+            .exists()
+    );
+    assert!(
+        !root
+            .path()
+            .join("usr/share/dbus-1/system-services/org.example.Demo.service")
+            .exists()
+    );
+}
+
+#[test]
+fn loom_compiler_receives_portable_activation_contracts() {
+    let root = tempfile::tempdir().unwrap();
+    let compiler = root.path().join("usr/lib/loom/loom");
+    fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+    fs::write(
+        &compiler,
+        "#!/bin/sh\ncase \"$1\" in\ncompile-service) cp \"$3\" \"$5\" ;;\nvalidate) exit 0 ;;\n*) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+    let generator = TemplateServiceGenerator::from_rclass(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rclass/init-loom.toml"),
+    )
+    .unwrap();
+    let socket = activation_service(
+        "socket-demo",
+        "[service.activation]\nkind=\"socket\"\nlisten_stream=\"/run/demo.sock\"\naccept=false",
+    );
+    let dbus = activation_service(
+        "dbus-demo",
+        "[service.activation]\nkind=\"dbus\"\nname=\"org.example.Demo\"\nbus=\"system\"\nuser=\"root\"",
+    );
+
+    generator
+        .render_service_set(&[socket, dbus], root.path())
+        .unwrap();
+
+    let compiled =
+        fs::read_to_string(root.path().join("usr/lib/loom/services/socket-demo.toml")).unwrap();
+    assert!(compiled.contains("kind = \"socket\""));
+    assert!(compiled.contains("listen_stream = \"/run/demo.sock\""));
+    assert!(compiled.contains("mode = 438"));
+    assert!(compiled.contains("fd_protocol = \"sd-listen-fds\""));
+
+    let compiled =
+        fs::read_to_string(root.path().join("usr/lib/loom/services/dbus-demo.toml")).unwrap();
+    let descriptor = fs::read_to_string(
+        root.path()
+            .join("usr/share/dbus-1/system-services/org.example.Demo.service"),
+    )
+    .unwrap();
+    assert!(compiled.contains("kind = \"dbus\""));
+    assert!(compiled.contains("automatic = true"));
+    assert!(descriptor.contains("Name=org.example.Demo"));
+}
+
 #[test]
 fn service_template_renders_atomically() {
     let root = tempfile::tempdir().unwrap();
@@ -530,6 +693,7 @@ fn service_template_renders_atomically() {
         enable_command: None,
         disable_command: None,
         is_enabled_command: None,
+        activations: BTreeMap::new(),
     };
     let service = ServiceSpec {
         package: String::new(),
@@ -547,6 +711,7 @@ fn service_template_renders_atomically() {
         after: vec![],
         before: vec![],
         runtime: String::new(),
+        activation: sage_sys::ServiceActivation::Service,
     };
     let path = generator.render_service(&service, root.path()).unwrap();
     assert_eq!(
@@ -570,6 +735,7 @@ fn target_paths_cannot_escape_sysroot() {
         enable_command: None,
         disable_command: None,
         is_enabled_command: None,
+        activations: BTreeMap::new(),
     };
     let service = ServiceSpec {
         package: String::new(),
@@ -587,6 +753,7 @@ fn target_paths_cannot_escape_sysroot() {
         after: vec![],
         before: vec![],
         runtime: String::new(),
+        activation: sage_sys::ServiceActivation::Service,
     };
     let root = tempfile::tempdir().unwrap();
     assert!(generator.render_service(&service, root.path()).is_err());

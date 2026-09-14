@@ -95,6 +95,123 @@ esac
     assert!(database.pending_journals().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn systemd_socket_activation_lifecycle_targets_the_listener_unit() {
+    use std::os::unix::fs::PermissionsExt;
+    let lab = TortureLab::new().unwrap();
+    configure(&lab, &[], "systemd", &[]);
+    for directory in [
+        "usr/share/sage/services",
+        "usr/share/sage/rclass",
+        "usr/bin",
+        "var/lib/sage",
+    ] {
+        fs::create_dir_all(lab.root().join(directory)).unwrap();
+    }
+    fs::write(
+        lab.root().join("usr/share/sage/services/dbus.toml"),
+        "schema_version=1\n[service]\nname=\"dbus\"\ndescription=\"System bus\"\ncommand=[\"/usr/bin/dbus-daemon\",\"--system\",\"--address=systemd:\"]\nuser=\"dbus\"\ngroup=\"dbus\"\nworking_dir=\"/\"\nrestart=\"on-failure\"\ntype=\"notify\"\n[service.activation]\nkind=\"socket\"\nlisten_stream=\"/run/dbus/system_bus_socket\"\n",
+    )
+    .unwrap();
+    fs::write(
+        lab.root().join("usr/share/sage/rclass/init-systemd.toml"),
+        include_str!("../../../rclass/init-systemd.toml"),
+    )
+    .unwrap();
+    let program = lab.root().join("usr/bin/systemctl");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+test "$1" = --root
+root=$2
+action=$3
+unit=$4
+marker="$root/var/lib/sage/enabled-$unit"
+case $action in
+is-enabled) test -f "$marker" ;;
+enable)
+  test "$unit" = dbus.socket
+  test -f "$root/usr/lib/systemd/system/dbus.socket"
+  printf enabled > "$marker"
+  ;;
+disable)
+  test "$unit" = dbus.socket
+  /bin/rm -f "$marker"
+  ;;
+*) exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+    sage_sys::service_enable(lab.root(), "dbus", false).unwrap();
+
+    assert!(
+        lab.root()
+            .join("usr/lib/systemd/system/dbus.service")
+            .is_file()
+    );
+    assert!(
+        lab.root()
+            .join("usr/lib/systemd/system/dbus.socket")
+            .is_file()
+    );
+    assert!(
+        lab.root()
+            .join("var/lib/sage/enabled-dbus.socket")
+            .is_file()
+    );
+    assert!(
+        !lab.root()
+            .join("var/lib/sage/enabled-dbus.service")
+            .exists()
+    );
+    let status = sage_sys::list_services(lab.root()).unwrap();
+    assert_eq!(status[0].activation, "socket");
+    assert_eq!(status[0].state, "managed-enabled");
+
+    sage_sys::service_disable(lab.root(), "dbus", false).unwrap();
+
+    assert!(!lab.root().join("var/lib/sage/enabled-dbus.socket").exists());
+}
+
+#[tokio::test]
+async fn automatic_dbus_services_reject_boot_policy_transitions() {
+    let lab = TortureLab::new().unwrap();
+    configure(&lab, &[], "systemd", &[]);
+    for directory in ["usr/share/sage/services", "usr/share/sage/rclass"] {
+        fs::create_dir_all(lab.root().join(directory)).unwrap();
+    }
+    fs::write(
+        lab.root().join("usr/share/sage/services/polkit.toml"),
+        "schema_version=1\n[service]\nname=\"polkit\"\ndescription=\"Authorization manager\"\ncommand=[\"/usr/lib/polkit-1/polkitd\",\"--no-debug\"]\nuser=\"polkitd\"\ngroup=\"polkitd\"\nworking_dir=\"/\"\nrestart=\"on-failure\"\ntype=\"notify\"\n[service.activation]\nkind=\"dbus\"\nname=\"org.freedesktop.PolicyKit1\"\nuser=\"root\"\n",
+    )
+    .unwrap();
+    fs::write(
+        lab.root().join("usr/share/sage/rclass/init-systemd.toml"),
+        include_str!("../../../rclass/init-systemd.toml"),
+    )
+    .unwrap();
+    let config_path = lab.root().join("etc/sage/services.toml");
+    let before = fs::read(&config_path).unwrap();
+
+    for error in [
+        sage_sys::service_enable(lab.root(), "polkit", false).unwrap_err(),
+        sage_sys::service_disable(lab.root(), "polkit", false).unwrap_err(),
+        sage_sys::service_adopt(lab.root(), "polkit", false).unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("automatic dbus activation"));
+    }
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    let status = sage_sys::list_services(lab.root()).unwrap();
+    assert_eq!(status[0].activation, "dbus");
+    assert_eq!(status[0].state, "automatic (pending rebuild)");
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+}
+
 fn service(name: &str) -> String {
     format!(
         "schema_version=1\n[service]\nname={name:?}\ndescription=\"Fixture daemon\"\ncommand=[\"/usr/bin/daemon\"]\nuser=\"root\"\ngroup=\"root\"\nworking_dir=\"/\"\nrestart=\"no\"\ntype=\"simple\"\n"
@@ -128,6 +245,17 @@ fn provider(name: &str, slot: &str, generation: &str) -> PackageSpec {
         .into_bytes(),
     );
     package.executable_files.insert(program);
+    package
+}
+
+fn activation_provider(name: &str, slot: &str, generation: &str) -> PackageSpec {
+    let mut package = provider(name, slot, generation);
+    let path = format!("usr/share/sage/rclass/init-{name}.toml");
+    let mut definition = renderer(name, generation);
+    definition.push_str(
+        "[service_generator.activations.dbus]\nautomatic=true\n[[service_generator.activations.dbus.artifacts]]\ntarget_path=\"/etc/dbus-services/${activation.dbus_name}\"\nmode=420\ntemplate=\"${activation.dbus_name}\"\n",
+    );
+    package.files.insert(path, definition.into_bytes());
     package
 }
 
@@ -194,6 +322,61 @@ async fn initial_system() -> TortureLab {
             .exists()
     );
     lab
+}
+
+#[tokio::test]
+async fn rebuild_renders_and_retires_automatic_activation_artifacts() {
+    let mut lab = TortureLab::new().unwrap();
+    add_daemons(&mut lab);
+    lab.add_package(activation_provider("loom", "0", "old"))
+        .unwrap();
+    let mut policy = PackageSpec::new(
+        "system",
+        "policy",
+        1,
+        "usr/share/sage/services/polkit.toml",
+        "schema_version=1\n[service]\nname=\"polkit\"\ndescription=\"Authorization manager\"\ncommand=[\"/usr/bin/polkitd\"]\nuser=\"polkitd\"\ngroup=\"polkitd\"\nworking_dir=\"/\"\nrestart=\"on-failure\"\ntype=\"notify\"\n[service.activation]\nkind=\"dbus\"\nname=\"org.example.Policy\"\nuser=\"root\"\n",
+    );
+    policy
+        .files
+        .insert("usr/bin/polkitd".into(), b"#!/bin/sh\nexit 0\n".to_vec());
+    policy.executable_files.insert("usr/bin/polkitd".into());
+    lab.add_package(policy).unwrap();
+    lab.publish().unwrap();
+    configure(
+        &lab,
+        &["loom", "daemon", "policy"],
+        "loom",
+        &["daemon", "polkit"],
+    );
+    let error = rebuild(&lab, false).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("automatic dbus service 'polkit' cannot appear in services.toml")
+    );
+    let database = sage_db::SageDatabase::open(lab.root().join("var/lib/sage")).unwrap();
+    assert!(database.pending_journals().unwrap().is_empty());
+    assert!(database.packages().unwrap().is_empty());
+    drop(database);
+    configure(&lab, &["loom", "daemon", "policy"], "loom", &["daemon"]);
+
+    rebuild(&lab, false).await.unwrap();
+
+    let descriptor = lab.root().join("etc/dbus-services/org.example.Policy");
+    assert_eq!(fs::read(&descriptor).unwrap(), b"org.example.Policy");
+    let services = sage_sys::list_services(lab.root()).unwrap();
+    let polkit = services
+        .iter()
+        .find(|service| service.name == "polkit")
+        .unwrap();
+    assert_eq!(polkit.state, "automatic");
+    assert_eq!(polkit.activation, "dbus");
+
+    configure(&lab, &["loom", "daemon"], "loom", &["daemon"]);
+    rebuild(&lab, false).await.unwrap();
+
+    assert!(!descriptor.exists());
 }
 
 fn assert_settled(lab: &TortureLab, name: &str, slot: &str, generation: &str) {

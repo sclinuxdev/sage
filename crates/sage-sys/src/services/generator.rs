@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use super::spec::ServiceSpec;
+use super::spec::{ServiceActivation, ServiceSpec};
 use crate::{SysError, TEMP_ID, validate_schema};
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +53,51 @@ pub struct TemplateServiceGenerator {
     pub disable_command: Option<String>,
     #[serde(alias = "is_enabled_cmd", default)]
     pub is_enabled_command: Option<String>,
+    /// Provider-specific adapters for non-direct activation contracts. The
+    /// engine selects by the generic activation kind and otherwise remains
+    /// unaware of systemd, Loom, or any future init format.
+    #[serde(default)]
+    pub activations: BTreeMap<String, TemplateActivationAdapter>,
+}
+
+/// Provider rendering and lifecycle overrides for one activation kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateActivationAdapter {
+    /// Automatically available activations, such as D-Bus service files, are
+    /// rendered but cannot be placed in the boot enablement policy.
+    #[serde(default)]
+    pub automatic: bool,
+    /// Optional replacement for the primary native service definition.
+    #[serde(default)]
+    pub service_template: Option<String>,
+    /// Additional provider-owned files, for example a systemd `.socket` unit
+    /// or a D-Bus activation descriptor.
+    #[serde(default)]
+    pub artifacts: Vec<TemplateArtifact>,
+    #[serde(default, alias = "enable_cmd")]
+    pub enable_command: Option<String>,
+    #[serde(default, alias = "disable_cmd")]
+    pub disable_command: Option<String>,
+    #[serde(default, alias = "is_enabled_cmd")]
+    pub is_enabled_command: Option<String>,
+}
+
+/// One extra file emitted alongside the primary native service definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateArtifact {
+    #[serde(rename = "target_path")]
+    pub target_path_template: String,
+    pub mode: u32,
+    pub template: String,
+}
+
+#[derive(Clone, Copy)]
+enum LifecycleCommand {
+    Enable,
+    Disable,
+    IsEnabled,
 }
 
 impl TemplateServiceGenerator {
@@ -90,19 +135,57 @@ impl TemplateServiceGenerator {
     ) -> Result<PathBuf, SysError> {
         service.validate()?;
         self.validate_service_type(service)?;
+        self.activation_adapter(service)?;
         let target = self.rendered_path(service, sysroot)?;
-        self.render_service_to(service, sysroot, &target)?;
+        self.render_primary_to(service, sysroot, &target)?;
+        self.render_activation_artifacts(service, sysroot)?;
         Ok(target)
     }
 
-    fn render_service_to(
+    fn render_primary_to(
         &self,
         service: &ServiceSpec,
         sysroot: &Path,
         target: &Path,
     ) -> Result<(), SysError> {
         let variables = self.service_variables(service, sysroot)?;
-        let rendered = expand_template(&self.template, &variables)?;
+        let rendered = expand_template(self.service_template(service)?, &variables)?;
+        self.publish_rendered(
+            service,
+            sysroot,
+            target,
+            &rendered,
+            self.mode,
+            Some(&variables),
+        )
+    }
+
+    fn render_activation_artifacts(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+    ) -> Result<(), SysError> {
+        let Some(adapter) = self.activation_adapter(service)? else {
+            return Ok(());
+        };
+        let variables = self.service_variables(service, sysroot)?;
+        for artifact in &adapter.artifacts {
+            let target = self.artifact_path(artifact, &variables, sysroot)?;
+            let rendered = expand_template(&artifact.template, &variables)?;
+            self.publish_rendered(service, sysroot, &target, &rendered, artifact.mode, None)?;
+        }
+        Ok(())
+    }
+
+    fn publish_rendered(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+        target: &Path,
+        rendered: &str,
+        mode: u32,
+        compile_variables: Option<&BTreeMap<String, String>>,
+    ) -> Result<(), SysError> {
         let parent = target
             .parent()
             .ok_or_else(|| SysError::Invalid("service target has no parent".into()))?;
@@ -113,14 +196,12 @@ impl TemplateServiceGenerator {
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        if self.compile_command.is_empty() {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            std::io::Write::write_all(&mut options.open(&temporary)?, rendered.as_bytes())?;
-        } else {
+        if let Some(compile_variables) =
+            compile_variables.filter(|_| !self.compile_command.is_empty())
+        {
             let input = temporary.with_extension("input.toml");
             fs::write(&input, rendered)?;
-            let mut compile_variables = variables.clone();
+            let mut compile_variables = compile_variables.clone();
             compile_variables.insert("INPUT".into(), input.display().to_string());
             compile_variables.insert("OUTPUT".into(), temporary.display().to_string());
             let result = run_argv_template(&self.compile_command, &compile_variables, sysroot);
@@ -132,8 +213,12 @@ impl TemplateServiceGenerator {
                     temporary.display()
                 )));
             }
+        } else {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            std::io::Write::write_all(&mut options.open(&temporary)?, rendered.as_bytes())?;
         }
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(self.mode))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
         fs::rename(&temporary, target)?;
         Ok(())
     }
@@ -177,6 +262,7 @@ impl TemplateServiceGenerator {
             for service in services {
                 service.validate()?;
                 self.validate_service_type(service)?;
+                self.activation_adapter(service)?;
                 let target = self.rendered_path(service, sysroot)?;
                 if target.parent() != Some(target_directory.as_path()) {
                     return Err(SysError::Invalid(format!(
@@ -185,7 +271,7 @@ impl TemplateServiceGenerator {
                         target_directory.display()
                     )));
                 }
-                self.render_service_to(
+                self.render_primary_to(
                     service,
                     sysroot,
                     &staging.join(target.file_name().ok_or_else(|| {
@@ -208,6 +294,9 @@ impl TemplateServiceGenerator {
                 let _ = fs::rename(&backup, &target_directory);
             }
             return Err(error.into());
+        }
+        for service in services {
+            self.render_activation_artifacts(service, sysroot)?;
         }
         if let Some(service) = services.first()
             && let Err(error) = self.validate_rendered_services(service, sysroot)
@@ -244,11 +333,13 @@ impl TemplateServiceGenerator {
             .as_deref()
             .map(|directory| target_path(sysroot, Path::new(directory)))
             .transpose()?;
+        let mut rendered_paths = BTreeSet::new();
         for service in services {
             service.validate()?;
             self.validate_service_type(service)?;
+            self.activation_adapter(service)?;
             let variables = self.service_variables(service, sysroot)?;
-            expand_template(&self.template, &variables)?;
+            expand_template(self.service_template(service)?, &variables)?;
             let target = self.rendered_path(service, sysroot)?;
             if let Some(directory) = &managed_directory
                 && target.parent() != Some(directory.as_path())
@@ -259,12 +350,34 @@ impl TemplateServiceGenerator {
                     directory.display()
                 )));
             }
+            for target in self.rendered_paths(service, sysroot)? {
+                if !rendered_paths.insert(target.clone()) {
+                    return Err(SysError::Invalid(format!(
+                        "duplicate native service output {}",
+                        target.display()
+                    )));
+                }
+            }
+            if let Some(adapter) = self.activation_adapter(service)? {
+                for artifact in &adapter.artifacts {
+                    expand_template(&artifact.template, &variables)?;
+                }
+            }
             self.validate_compile_command(&variables, sysroot)?;
             for (kind, command) in [
                 ("validate", self.validate_command.as_deref()),
-                ("enable", self.enable_command.as_deref()),
-                ("disable", self.disable_command.as_deref()),
-                ("is-enabled", self.is_enabled_command.as_deref()),
+                (
+                    "enable",
+                    self.lifecycle_command(service, LifecycleCommand::Enable)?,
+                ),
+                (
+                    "disable",
+                    self.lifecycle_command(service, LifecycleCommand::Disable)?,
+                ),
+                (
+                    "is-enabled",
+                    self.lifecycle_command(service, LifecycleCommand::IsEnabled)?,
+                ),
             ] {
                 if let Some(command) = command {
                     self.validate_command_path(kind, command, &variables, sysroot)?;
@@ -292,15 +405,13 @@ impl TemplateServiceGenerator {
                 ("validate", self.validate_command.as_deref()),
                 (
                     "enable",
-                    self.enable_command
-                        .as_deref()
+                    self.lifecycle_command(service, LifecycleCommand::Enable)?
                         .filter(|_| enabled.contains(&service.name)),
                 ),
                 // Only enabled services need an eventual disable command.
                 (
                     "disable",
-                    self.disable_command
-                        .as_deref()
+                    self.lifecycle_command(service, LifecycleCommand::Disable)?
                         .filter(|_| enabled.contains(&service.name)),
                 ),
             ] {
@@ -320,8 +431,7 @@ impl TemplateServiceGenerator {
         service: &ServiceSpec,
         sysroot: &Path,
     ) -> Result<Option<PathBuf>, SysError> {
-        self.disable_command
-            .as_deref()
+        self.lifecycle_command(service, LifecycleCommand::Disable)?
             .map(|command| {
                 self.validate_command_path(
                     "disable",
@@ -351,7 +461,7 @@ impl TemplateServiceGenerator {
     /// Executes the init class's generic enable action, when it declares one.
     pub fn enable_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
         self.validate_service_type(service)?;
-        if let Some(command) = &self.enable_command {
+        if let Some(command) = self.lifecycle_command(service, LifecycleCommand::Enable)? {
             run_validation(
                 &expand_template(command, &self.service_variables(service, sysroot)?)?,
                 sysroot,
@@ -363,7 +473,7 @@ impl TemplateServiceGenerator {
     /// Executes the provider's offline disable action, when present.
     pub fn disable_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
         self.validate_service_type(service)?;
-        if let Some(command) = &self.disable_command {
+        if let Some(command) = self.lifecycle_command(service, LifecycleCommand::Disable)? {
             run_validation(
                 &expand_template(command, &self.service_variables(service, sysroot)?)?,
                 sysroot,
@@ -378,7 +488,7 @@ impl TemplateServiceGenerator {
         service: &ServiceSpec,
         sysroot: &Path,
     ) -> Result<Option<bool>, SysError> {
-        let Some(command) = &self.is_enabled_command else {
+        let Some(command) = self.lifecycle_command(service, LifecycleCommand::IsEnabled)? else {
             return Ok(None);
         };
         let variables = self.service_variables(service, sysroot)?;
@@ -424,23 +534,120 @@ impl TemplateServiceGenerator {
         target_path(sysroot, Path::new(&relative))
     }
 
-    /// Removes a previously rendered provider file without following links.
+    /// Resolves every provider-owned output for a service, including activation
+    /// artifacts. Callers use the complete set for collision checks, previews,
+    /// stale cleanup, and crash-safe provider transitions.
+    pub fn rendered_paths(
+        &self,
+        service: &ServiceSpec,
+        sysroot: &Path,
+    ) -> Result<Vec<PathBuf>, SysError> {
+        let variables = self.service_variables(service, sysroot)?;
+        let mut paths = vec![self.rendered_path(service, sysroot)?];
+        if let Some(adapter) = self.activation_adapter(service)? {
+            for artifact in &adapter.artifacts {
+                paths.push(self.artifact_path(artifact, &variables, sysroot)?);
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Returns true when all native files required for a service exist.
+    pub fn is_rendered(&self, service: &ServiceSpec, sysroot: &Path) -> Result<bool, SysError> {
+        Ok(self
+            .rendered_paths(service, sysroot)?
+            .iter()
+            .all(|path| path.is_file()))
+    }
+
+    /// Whether this service is installed as an automatically available
+    /// activation rather than a boot-policy-controlled service.
+    pub fn is_automatic(&self, service: &ServiceSpec) -> Result<bool, SysError> {
+        self.activation_adapter(service)?;
+        Ok(service.activation.is_automatic())
+    }
+
+    /// Removes all previously rendered provider files without following links.
     pub fn remove_service(&self, service: &ServiceSpec, sysroot: &Path) -> Result<(), SysError> {
-        let path = self.rendered_path(service, sysroot)?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-                fs::remove_file(path)?;
+        for path in self.rendered_paths(service, sysroot)? {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() =>
+                {
+                    fs::remove_file(path)?;
+                }
+                Ok(_) => {
+                    return Err(SysError::Invalid(format!(
+                        "rendered service target is not a file: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Ok(_) => {
-                return Err(SysError::Invalid(format!(
-                    "rendered service target is not a file: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    fn service_template<'a>(&'a self, service: &ServiceSpec) -> Result<&'a str, SysError> {
+        Ok(self
+            .activation_adapter(service)?
+            .and_then(|adapter| adapter.service_template.as_deref())
+            .unwrap_or(&self.template))
+    }
+
+    fn activation_adapter(
+        &self,
+        service: &ServiceSpec,
+    ) -> Result<Option<&TemplateActivationAdapter>, SysError> {
+        if matches!(service.activation, ServiceActivation::Service) {
+            return Ok(None);
+        }
+        let kind = service.activation.kind();
+        let adapter = self.activations.get(kind).ok_or_else(|| {
+            SysError::Invalid(format!(
+                "init provider does not support {kind} activation for {}",
+                service.name
+            ))
+        })?;
+        if adapter.automatic != service.activation.is_automatic() {
+            return Err(SysError::Invalid(format!(
+                "init provider has invalid automatic policy for {kind} activation"
+            )));
+        }
+        Ok(Some(adapter))
+    }
+
+    fn artifact_path(
+        &self,
+        artifact: &TemplateArtifact,
+        variables: &BTreeMap<String, String>,
+        sysroot: &Path,
+    ) -> Result<PathBuf, SysError> {
+        let relative = expand_template(&artifact.target_path_template, variables)?;
+        target_path(sysroot, Path::new(&relative))
+    }
+
+    fn lifecycle_command<'a>(
+        &'a self,
+        service: &ServiceSpec,
+        command: LifecycleCommand,
+    ) -> Result<Option<&'a str>, SysError> {
+        if self.is_automatic(service)? {
+            return Ok(None);
+        }
+        let adapter = self.activation_adapter(service)?;
+        Ok(match command {
+            LifecycleCommand::Enable => adapter
+                .and_then(|value| value.enable_command.as_deref())
+                .or(self.enable_command.as_deref()),
+            LifecycleCommand::Disable => adapter
+                .and_then(|value| value.disable_command.as_deref())
+                .or(self.disable_command.as_deref()),
+            LifecycleCommand::IsEnabled => adapter
+                .and_then(|value| value.is_enabled_command.as_deref())
+                .or(self.is_enabled_command.as_deref()),
+        })
     }
 
     fn validate_service_type(&self, service: &ServiceSpec) -> Result<(), SysError> {
@@ -574,6 +781,41 @@ fn service_variables(
         dependency_aliases,
         service_dependency_suffix,
     );
+    let (listen_stream, accept, socket_mode, dbus_name, dbus_bus, dbus_user) =
+        match &service.activation {
+            ServiceActivation::Service => (
+                String::new(),
+                false,
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            ServiceActivation::Socket {
+                listen_stream,
+                accept,
+                mode,
+            } => (
+                listen_stream.clone(),
+                *accept,
+                *mode,
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            ServiceActivation::Dbus { name, bus, user } => (
+                String::new(),
+                false,
+                0,
+                name.clone(),
+                bus.clone(),
+                if user.is_empty() {
+                    service.user.clone()
+                } else {
+                    user.clone()
+                },
+            ),
+        };
     Ok(BTreeMap::from([
         ("service.name".into(), service.name.clone()),
         ("service.description".into(), service.description.clone()),
@@ -689,6 +931,34 @@ fn service_variables(
         (
             "service.runtime_json".into(),
             json_quote_str(&service.runtime),
+        ),
+        ("activation.kind".into(), service.activation.kind().into()),
+        (
+            "activation.kind_json".into(),
+            json_quote_str(service.activation.kind()),
+        ),
+        ("activation.listen_stream".into(), listen_stream.clone()),
+        (
+            "activation.listen_stream_json".into(),
+            json_quote_str(&listen_stream),
+        ),
+        ("activation.accept".into(), accept.to_string()),
+        (
+            "activation.socket_mode".into(),
+            format!("{socket_mode:04o}"),
+        ),
+        ("activation.socket_mode_int".into(), socket_mode.to_string()),
+        ("activation.dbus_name".into(), dbus_name.clone()),
+        (
+            "activation.dbus_name_json".into(),
+            json_quote_str(&dbus_name),
+        ),
+        ("activation.dbus_bus".into(), dbus_bus.clone()),
+        ("activation.dbus_bus_json".into(), json_quote_str(&dbus_bus)),
+        ("activation.dbus_user".into(), dbus_user.clone()),
+        (
+            "activation.dbus_user_json".into(),
+            json_quote_str(&dbus_user),
         ),
         ("SYSROOT".into(), sysroot.display().to_string()),
     ]))

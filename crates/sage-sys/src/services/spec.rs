@@ -39,6 +39,118 @@ pub struct ServiceSpec {
     pub before: Vec<String>,
     #[serde(default)]
     pub runtime: String,
+    /// Process activation contract. Boot enablement remains a separate system
+    /// policy in `/etc/sage/services.toml`; this field only describes how the
+    /// selected init provider or D-Bus reaches the process.
+    #[serde(default)]
+    pub activation: ServiceActivation,
+}
+
+/// Init-independent activation contract attached to one service process.
+///
+/// `Service` is the backwards-compatible direct-start mode. `Socket` lets the
+/// init provider own a listening UNIX socket and start the process on demand.
+/// `Dbus` publishes a system-bus activation descriptor and is automatically
+/// available after rebuild while its package remains installed, so it is
+/// deliberately excluded from the boot enable/disable policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ServiceActivation {
+    #[default]
+    Service,
+    Socket {
+        listen_stream: String,
+        #[serde(default)]
+        accept: bool,
+        #[serde(default = "default_socket_mode")]
+        mode: u32,
+    },
+    Dbus {
+        name: String,
+        #[serde(default = "default_dbus_bus")]
+        bus: String,
+        #[serde(default)]
+        user: String,
+    },
+}
+
+fn default_dbus_bus() -> String {
+    "system".into()
+}
+
+fn default_socket_mode() -> u32 {
+    0o666
+}
+
+impl ServiceActivation {
+    /// Stable key consumed by init rclass activation adapters.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Socket { .. } => "socket",
+            Self::Dbus { .. } => "dbus",
+        }
+    }
+
+    /// D-Bus activation is present whenever the package definition is
+    /// rendered; it does not have a boot enablement transition.
+    pub fn is_automatic(&self) -> bool {
+        matches!(self, Self::Dbus { .. })
+    }
+
+    fn validate(&self, service: &ServiceSpec) -> Result<(), SysError> {
+        match self {
+            Self::Service => Ok(()),
+            Self::Socket {
+                listen_stream,
+                accept,
+                mode,
+            } => {
+                if !Path::new(listen_stream).is_absolute()
+                    || listen_stream.contains(['\n', '\r', '\0'])
+                {
+                    return Err(SysError::Invalid(format!(
+                        "service {} socket listen_stream must be an absolute path",
+                        service.name
+                    )));
+                }
+                if *accept {
+                    return Err(SysError::Invalid(format!(
+                        "service {} requests unsupported per-connection socket activation",
+                        service.name
+                    )));
+                }
+                if *mode > 0o777 {
+                    return Err(SysError::Invalid(format!(
+                        "service {} socket mode must contain permission bits only",
+                        service.name
+                    )));
+                }
+                Ok(())
+            }
+            Self::Dbus { name, bus, user } => {
+                if bus != "system" {
+                    return Err(SysError::Invalid(format!(
+                        "service {} only supports system D-Bus activation",
+                        service.name
+                    )));
+                }
+                if !valid_dbus_name(name) {
+                    return Err(SysError::Invalid(format!(
+                        "service {} has invalid D-Bus name {}",
+                        service.name, name
+                    )));
+                }
+                if !user.is_empty() && !valid_declaration_name(user) {
+                    return Err(SysError::Invalid(format!(
+                        "service {} has invalid D-Bus activation user {}",
+                        service.name, user
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +257,15 @@ impl RenderedServicesState {
         if let Some(name) = state.enabled.iter().find(|name| !names.contains(*name)) {
             return Err(SysError::Invalid(format!(
                 "enabled service {name} has no rendered definition"
+            )));
+        }
+        if let Some(service) = state.services.iter().find(|service| {
+            service.activation.is_automatic() && state.enabled.contains(&service.name)
+        }) {
+            return Err(SysError::Invalid(format!(
+                "automatic {} service {} cannot be boot-enabled",
+                service.activation.kind(),
+                service.name
             )));
         }
         Ok(state)
@@ -261,8 +382,23 @@ impl ServiceSpec {
                 )));
             }
         }
+        self.activation.validate(self)?;
         Ok(())
     }
+}
+
+fn valid_dbus_name(name: &str) -> bool {
+    name.len() <= 255
+        && name.contains('.')
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && name.split('.').all(|part| {
+            !part.is_empty()
+                && !part.as_bytes()[0].is_ascii_digit()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
 }
 
 fn validate_service_command(

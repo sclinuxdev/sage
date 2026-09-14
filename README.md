@@ -84,7 +84,9 @@ Sage keeps package/provider declarations separate from service activation:
 
 After both files and the corresponding package indexes are available, reconcile
 the target system with `sage rebuild`, then inspect service state with
-`sage service list`.
+`sage service list`. Service declarations can select direct, socket, or system
+D-Bus activation; the active systemd or Loom rclass renders the native outputs,
+while `services.toml` remains the independent boot-enablement policy.
 
 ---
 

@@ -26,7 +26,54 @@ type = "simple"                # "simple" | "forking"
 after = ["net", "syslog"]
 before = []
 runtime = ""                   # 绑定运行时，例如 "runtime/java:openjdk-21"
+
+[service.activation]
+kind = "service"               # Optional; direct service is the default
 ```
+
+### 1.1 Activation contracts
+
+`service.toml` separates the process definition from both its activation
+mechanism and the administrator's boot policy. Schema v1 supports the activation
+contracts required by the base and desktop system:
+
+| `kind` | Package declaration | `/etc/sage/services.toml` meaning |
+| :--- | :--- | :--- |
+| `service` | Directly managed daemon; this is the default when the table is absent | `enabled` starts it at boot; `disabled` records an explicit disabled policy |
+| `socket` | Init-owned UNIX stream listener that launches the daemon with the `sd-listen-fds` descriptor contract | The logical service name enables, disables, and queries the listener rather than the process unit |
+| `dbus` | System-bus activation name and launch user | Automatically available after rebuild while installed; it must not appear in `enabled` or `disabled` |
+
+Socket activation example:
+
+```toml
+[service.activation]
+kind = "socket"
+listen_stream = "/run/dbus/system_bus_socket"
+accept = false
+mode = 438                    # 0666
+```
+
+Schema v1 socket activation is deliberately limited to one absolute UNIX stream
+path with `accept = false`. `mode` defaults to decimal `438` (`0666`).
+Per-connection template services are rejected until both init providers have a
+common instance identity contract.
+
+D-Bus activation example:
+
+```toml
+[service.activation]
+kind = "dbus"
+name = "org.freedesktop.PolicyKit1"
+bus = "system"
+user = "root"
+```
+
+Only system-bus activation is currently supported. The D-Bus adapter emits the
+standard service descriptor and launches `service.command` directly, which is
+portable across systemd and Loom. The generated native service definition remains
+available for inspection and explicit process startup, but boot-policy lifecycle
+commands reject automatic services instead of pretending that they can be
+enabled or disabled.
 
 ---
 
@@ -40,11 +87,23 @@ runtime = ""                   # 绑定运行时，例如 "runtime/java:openjdk-
                    │
                    ├─► 读取各个包的 .METADATA/service.toml
                    ├─► 展开 template 模板字符串
-                   └─► 写入目标文件 /etc/init.d/<name> (mode 0755)
+                   └─► 原子写入主定义及 activation adapter 的附加产物
 ```
 
 1. **引擎完全通用**: `sage-sys` 内部不包含任何针对特定 Init（如 OpenRC、Systemd、Loom、Runit、s6）的硬编码分支。
 2. **完全可扩展**: 增加对新 Init 系统的支持，仅需在包仓库中添加 `rclass/init-<name>.toml`，无需重新编译 `sage` 二进制。
+
+The engine always renders definitions for every installed service. An activation
+adapter may replace the provider's primary service template, add files such as a
+systemd `.socket` or D-Bus `.service` descriptor, and override enable/disable/query
+commands. All produced paths participate in preflight ownership checks, stale
+cleanup, provider switching, and recovery.
+
+| Contract | systemd adapter | Loom adapter |
+| :--- | :--- | :--- |
+| `service` | Generates `<name>.service`; lifecycle targets that unit | Compiles the generic process into the Loom service graph |
+| `socket` | Generates `<name>.service` and `<name>.socket`; lifecycle targets the socket | Compiles an activation section into the Loom graph using the `sd-listen-fds` ABI |
+| `dbus` | Generates an inactive process unit plus a system-bus activation descriptor | Compiles the process definition and generates the same portable system-bus descriptor |
 
 ## Rebuild lifecycle and recovery
 
@@ -118,6 +177,13 @@ $$\text{Actual Init State} = \text{Sage Managed State} + \text{Administrator Man
 3. **`unmanaged`**：
    - 从未被 Sage 接管或声明。
    - Sage 绝对不擅自执行 `disable`。若管理员在外部执行了 `systemctl enable`，Sage 在调和时予以保留，绝不破坏管理员的手工操作。
+4. **`automatic`**：
+   - The installed and rendered service uses D-Bus activation and is available on demand.
+   - A newly installed definition that has not been reconciled reports
+     `automatic (pending rebuild)`.
+   - It is not boot-enabled and does not participate in drift detection.
+   - `sage service enable`, `disable`, and `adopt` reject it; removing the owning
+     package withdraws the generated activation descriptor.
 
 ### 3.3 漂移探测 (Drift Detection)
 Init Provider 的 `rclass/init-*.toml` 可声明 `is_enabled_cmd`：
@@ -144,6 +210,8 @@ Hint:
 - `sage service disable <svc>`：从 `enabled` 移除并记录入 `disabled`，调用底层 Init Provider 禁用。
 - `sage service adopt <svc>`：将管理员外部手工启用的服务平滑纳管至 Sage 声明式配置中（转为 `managed-enabled`）。
 - `sage service list`：列出系统已知的所有服务及其管理状态（`managed-enabled`、`managed-disabled`、`managed-disabled (drift)`、`unmanaged`、`unmanaged (drift)`）。对尚未渲染原生单元定义（如刚安装包但尚未 `sage rebuild`）或查询状态不确定的服务，以声明状态与未知/未接管状态安全呈现，不中断只读查询。
+- The list includes an `ACTIVATION` column (`service`, `socket`, or `dbus`);
+  automatically activated services report `automatic` in `STATUS`.
 
 Before the first native render, enable previews validate the service, renderer,
 templates, and command paths without executing the provider state query. Real

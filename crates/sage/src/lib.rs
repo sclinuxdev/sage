@@ -346,13 +346,13 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
             ServiceAction::List => {
                 let services = sage_sys::list_services(&cli.root)?;
                 println!(
-                    "{:<20} {:<20} {:<15} {:<15}",
-                    "SERVICE", "STATUS", "PROVIDER", "PACKAGE"
+                    "{:<20} {:<20} {:<12} {:<15} {:<15}",
+                    "SERVICE", "STATUS", "ACTIVATION", "PROVIDER", "PACKAGE"
                 );
                 for s in services {
                     println!(
-                        "{:<20} {:<20} {:<15} {:<15}",
-                        s.name, s.state, s.provider, s.package
+                        "{:<20} {:<20} {:<12} {:<15} {:<15}",
+                        s.name, s.state, s.activation, s.provider, s.package
                     );
                 }
             }
