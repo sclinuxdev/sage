@@ -32,7 +32,7 @@ async fn install(
     save: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    sage::execute(sage::Cli {
+    sage_tests::execute(sage::Cli {
         verbose: false,
         dry_run,
         root: lab.root().into(),
@@ -344,7 +344,7 @@ async fn shared_library_cli_overrides_survive_install_and_rebuild() {
             ])
             .unwrap();
             cli.dry_run = dry_run;
-            sage::execute(cli).await.unwrap();
+            sage_tests::execute(cli).await.unwrap();
             if dry_run {
                 assert_eq!(lab.snapshot().unwrap(), before);
                 assert_eq!(fs::read(&config_path).unwrap(), before_config);

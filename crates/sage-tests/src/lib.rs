@@ -8,6 +8,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// Executes the production command path with an unprivileged, external lock.
+///
+/// The temporary coordination directory is outside the target root and lives
+/// until the command releases its lock, so read-only sysroot tests retain the
+/// same zero-write boundary as production.
+pub async fn execute(cli: Cli) -> Result<()> {
+    let coordination = tempfile::Builder::new()
+        .prefix("sage-test-lock-")
+        .tempdir()?;
+    sage::execute_with_test_lock(cli, &coordination.path().join("operation.lock")).await
+}
+
 /// Declarative package fixture that is converted into a real signed Sage archive.
 #[derive(Debug, Clone)]
 pub struct PackageSpec {
@@ -247,7 +259,7 @@ target_root="/opt/channels/torture/1"
 
     pub async fn install(&mut self, name: &str, channel: &str) -> Result<()> {
         self.steps.push(format!("install {channel}/{name}"));
-        sage::execute(cli(
+        execute(cli(
             self.root(),
             Commands::Install {
                 packages: vec![name.into()],
@@ -261,7 +273,7 @@ target_root="/opt/channels/torture/1"
 
     pub async fn upgrade(&mut self, name: &str, channel: &str) -> Result<()> {
         self.steps.push(format!("upgrade {channel}/{name}"));
-        sage::execute(cli(
+        execute(cli(
             self.root(),
             Commands::Upgrade {
                 packages: vec![name.into()],
@@ -274,7 +286,7 @@ target_root="/opt/channels/torture/1"
 
     pub async fn remove(&mut self, name: &str, channel: &str) -> Result<()> {
         self.steps.push(format!("remove {channel}/{name}"));
-        sage::execute(cli(
+        execute(cli(
             self.root(),
             Commands::Remove {
                 packages: vec![name.into()],

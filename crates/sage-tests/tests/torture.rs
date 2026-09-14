@@ -403,7 +403,7 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
         lab.add("system", name, 2, path, content).unwrap();
     }
     lab.publish().unwrap();
-    sage::execute(sage::Cli {
+    sage_tests::execute(sage::Cli {
         verbose: false,
         dry_run: false,
         root: lab.root().into(),
@@ -450,7 +450,7 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     cycle.publish().unwrap();
     let before = cycle.audit().unwrap();
     assert!(
-        sage::execute(sage::Cli {
+        sage_tests::execute(sage::Cli {
             verbose: false,
             dry_run: false,
             root: cycle.root().into(),
@@ -483,7 +483,7 @@ async fn ownership_handoffs_are_ordered_and_cycles_are_atomic() {
     }
     hierarchy.publish().unwrap();
     let before = hierarchy.audit().unwrap();
-    let error = sage::execute(sage::Cli {
+    let error = sage_tests::execute(sage::Cli {
         verbose: false,
         dry_run: false,
         root: hierarchy.root().into(),
@@ -590,14 +590,11 @@ fn concurrent_process_writers_serialize_real_package_operations() {
             .unwrap();
     }
     lab.publish().unwrap();
-    let operation_lock = lab
-        .root()
-        .canonicalize()
-        .unwrap()
-        .join("run/sage/operation.lock");
+    let coordination = tempfile::tempdir().unwrap();
+    let operation_lock = coordination.path().join("operation.lock");
     let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
-    let mut left = worker(lab.root(), "install", "left", "system");
-    let mut right = worker(lab.root(), "install", "right", "system");
+    let mut left = worker_with_lock(lab.root(), "install", "left", "system", &operation_lock);
+    let mut right = worker_with_lock(lab.root(), "install", "right", "system", &operation_lock);
     drop(gate);
     assert!(left.wait().unwrap().success());
     assert!(right.wait().unwrap().success());
@@ -618,9 +615,16 @@ fn concurrent_process_writers_serialize_real_package_operations() {
     let gate = sage_core::HostLock::acquire_exclusive(&operation_lock).unwrap();
     let mut query = std::process::Command::new(env!("CARGO_BIN_EXE_sage-torture"))
         .args(["worker-query", lab.root().to_str().unwrap()])
+        .env("SAGE_TORTURE_LOCK_PATH", &operation_lock)
         .spawn()
         .unwrap();
-    let mut query_race = worker(lab.root(), "install", "query-race", "system");
+    let mut query_race = worker_with_lock(
+        lab.root(),
+        "install",
+        "query-race",
+        "system",
+        &operation_lock,
+    );
     drop(gate);
     assert!(query.wait().unwrap().success());
     assert!(query_race.wait().unwrap().success());
@@ -800,6 +804,25 @@ fn worker(
             package,
             channel,
         ])
+        .spawn()
+        .unwrap()
+}
+
+fn worker_with_lock(
+    root: &std::path::Path,
+    action: &str,
+    package: &str,
+    channel: &str,
+    lock_path: &std::path::Path,
+) -> std::process::Child {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sage-torture"))
+        .args([
+            &format!("worker-{action}"),
+            root.to_str().unwrap(),
+            package,
+            channel,
+        ])
+        .env("SAGE_TORTURE_LOCK_PATH", lock_path)
         .spawn()
         .unwrap()
 }

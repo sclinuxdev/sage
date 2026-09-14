@@ -1,5 +1,6 @@
 use sage::*;
 use sage_core::hex;
+use sage_tests::execute;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -148,6 +149,34 @@ fn source_pool_overlays_local_artifacts_into_solver_universe() {
         available.releases[&(key, version)].location,
         ReleaseLocation::Local(_)
     ));
+}
+
+#[tokio::test]
+async fn read_only_command_does_not_create_a_lock_under_target_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = root.path().join("etc/sage");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let channels = config_dir.join("channels.toml");
+    std::fs::write(&channels, "schema_version = 1\n[channels]\n").unwrap();
+    let original = std::fs::read(&channels).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = execute(Cli {
+        verbose: false,
+        dry_run: false,
+        root: root.path().into(),
+        command: Commands::Channel {
+            action: ChannelAction::List,
+        },
+    })
+    .await;
+
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert_eq!(std::fs::read(channels).unwrap(), original);
+    assert!(!root.path().join("run").exists());
 }
 
 fn cli(root: &Path, command: Commands) -> Cli {

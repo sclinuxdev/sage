@@ -32,13 +32,16 @@ async fn main() -> Result<()> {
                 _ => bail!("unknown worker mode {mode}"),
             }
         };
-        return sage::execute(sage::Cli {
+        let cli = sage::Cli {
             verbose: false,
             dry_run: false,
             root,
             command,
-        })
-        .await;
+        };
+        if let Some(lock_path) = std::env::var_os("SAGE_TORTURE_LOCK_PATH") {
+            return sage::execute_with_test_lock(cli, std::path::Path::new(&lock_path)).await;
+        }
+        return sage_tests::execute(cli).await;
     }
     let mut seed = 0x5a6e_2026_u64;
     let mut operations = 100_usize;

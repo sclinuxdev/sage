@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+const HOST_OPERATION_LOCK: &str = "/run/sage/operation.lock";
+
 pub use sage_build::{
     BuildInvocation, bootstrap_sources, build_recipe, mass_rebuild, stage_declarative_metadata,
     stage_sysusers,
@@ -193,7 +195,21 @@ pub async fn run() -> Result<()> {
 }
 
 /// Executes one parsed command through the binary's production interface.
-pub async fn execute(mut cli: Cli) -> Result<()> {
+pub async fn execute(cli: Cli) -> Result<()> {
+    execute_with_operation_lock(cli, Path::new(HOST_OPERATION_LOCK)).await
+}
+
+/// Executes a command with an isolated coordination lock for the Torture Lab.
+///
+/// Production callers must use [`execute`], whose lock namespace is fixed on
+/// the host. This feature-gated entry point lets unprivileged test processes
+/// coordinate without creating `/run/sage` or mutating their target sysroot.
+#[cfg(feature = "torture")]
+pub async fn execute_with_test_lock(cli: Cli, lock_path: &Path) -> Result<()> {
+    execute_with_operation_lock(cli, lock_path).await
+}
+
+async fn execute_with_operation_lock(mut cli: Cli, lock_path: &Path) -> Result<()> {
     if cli.verbose {
         tracing_subscriber::fmt::init();
     }
@@ -208,7 +224,9 @@ pub async fn execute(mut cli: Cli) -> Result<()> {
     );
     cli.root = std::fs::canonicalize(&cli.root)
         .with_context(|| format!("cannot resolve target root {}", cli.root.display()))?;
-    let lock_path = sage_core::under_root(&cli.root, Path::new("/run/sage/operation.lock"));
+    // Coordination belongs to the running host, not the filesystem being
+    // managed. Keeping this path outside `cli.root` also preserves the
+    // zero-write guarantee for read-only and dry-run operations on a sysroot.
     let _lock = if cli.dry_run || read_only {
         sage_core::HostLock::acquire_shared(lock_path)?
     } else {
@@ -383,6 +401,19 @@ fn parse_provider_override(input: &str) -> std::result::Result<(String, String),
             .into(),
         selector.into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_operation_lock_is_host_absolute() {
+        assert_eq!(
+            Path::new(HOST_OPERATION_LOCK),
+            Path::new("/run/sage/operation.lock")
+        );
+    }
 }
 
 #[cfg(test)]

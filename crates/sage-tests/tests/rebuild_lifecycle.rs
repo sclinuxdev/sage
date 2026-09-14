@@ -275,7 +275,7 @@ fn configure(lab: &TortureLab, packages: &[&str], init: &str, enabled: &[&str]) 
 }
 
 async fn rebuild(lab: &TortureLab, dry_run: bool) -> anyhow::Result<()> {
-    sage::execute(sage::Cli {
+    sage_tests::execute(sage::Cli {
         verbose: false,
         dry_run,
         root: lab.root().into(),
@@ -518,7 +518,7 @@ async fn ordinary_remove_rejects_the_bound_provider_even_with_an_installed_alter
     let before = lifecycle_snapshot(&lab);
     let config = fs::read(lab.root().join("etc/sage/system.toml")).unwrap();
     for dry_run in [true, false] {
-        let error = sage::execute(sage::Cli {
+        let error = sage_tests::execute(sage::Cli {
             verbose: false,
             dry_run,
             root: lab.root().into(),
@@ -947,7 +947,7 @@ fn lifecycle_rebuild_worker() {
     };
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(sage::execute(sage::Cli {
+        .block_on(sage_tests::execute(sage::Cli {
             verbose: false,
             dry_run: false,
             root: root.into(),
@@ -1344,7 +1344,7 @@ async fn dry_run_removal_reads_bindings_without_writing_the_database() {
     let permissions = fs::metadata(&data).unwrap().permissions();
     fs::set_permissions(&data, fs::Permissions::from_mode(0o444)).unwrap();
     let preview = |package: &str| {
-        sage::execute(sage::Cli {
+        sage_tests::execute(sage::Cli {
             verbose: false,
             dry_run: true,
             root: lab.root().into(),
