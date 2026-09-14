@@ -305,7 +305,13 @@ async fn execute_source_layers(
                         blocked_symbols.extend(produced_symbols);
                     }
                     Err(error) => {
-                        log_failure(&format!("build task panicked or was cancelled: {error}"))?;
+                        // A task that does not return its unit metadata cannot
+                        // safely identify the symbols that must be blocked. Stop
+                        // the source build so no dependent can consume a stale
+                        // provider retained in the pool.
+                        let message = format!("build task panicked or was cancelled: {error}");
+                        log_failure(&message)?;
+                        bail!(message);
                     }
                 }
             }
