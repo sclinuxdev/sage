@@ -242,3 +242,22 @@ fn publication_timestamp_advances_after_clock_rollback() {
     );
     assert!(crate::build_index(&pool, &output, &key).is_err());
 }
+
+#[tokio::test]
+async fn concurrent_chunked_downloads_use_isolated_part_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("pkg.pkg.tar.zst");
+    let tmp1 = temporary_path(&dest);
+    let tmp2 = temporary_path(&dest);
+    assert_ne!(tmp1, tmp2);
+
+    let name1 = tmp1.file_name().and_then(|n| n.to_str()).unwrap();
+    let name2 = tmp2.file_name().and_then(|n| n.to_str()).unwrap();
+    assert_ne!(name1, name2);
+
+    let part1 = tmp1.with_file_name(format!("{name1}.part-0"));
+    let part2 = tmp2.with_file_name(format!("{name2}.part-0"));
+    assert_ne!(part1, part2);
+    assert!(part1.to_string_lossy().contains("sage-tmp-"));
+    assert!(part2.to_string_lossy().contains("sage-tmp-"));
+}

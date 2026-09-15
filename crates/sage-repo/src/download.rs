@@ -123,13 +123,17 @@ impl DownloadEngine {
         let part_size = length.div_ceil(CHUNKS);
         let mut tasks = tokio::task::JoinSet::new();
         let mut parts = Vec::new();
+        let filename = destination
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
         for index in 0..CHUNKS {
             let start = index * part_size;
             if start >= length {
                 break;
             }
             let end = (start + part_size - 1).min(length - 1);
-            let part = destination.with_extension(format!("part-{index}"));
+            let part = destination.with_file_name(format!("{filename}.part-{index}"));
             parts.push(part.clone());
             let client = self.client.clone();
             let url = url.to_owned();

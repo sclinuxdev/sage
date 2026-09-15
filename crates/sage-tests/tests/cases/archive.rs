@@ -158,3 +158,70 @@ build_time=1
         vec![PathBuf::from("etc/demo.conf.sage-new")]
     );
 }
+
+#[test]
+fn inspect_package_validates_provides_conflicts_and_dependencies() {
+    let temp = tempfile::tempdir().unwrap();
+    let stage = temp.path().join("stage");
+    fs::create_dir_all(stage.join(".METADATA")).unwrap();
+    fs::create_dir_all(stage.join("data")).unwrap();
+    fs::write(stage.join(".METADATA/files.idx"), b"").unwrap();
+
+    // Malformed provides
+    fs::write(
+        stage.join(".METADATA/manifest.toml"),
+        r#"schema_version=1
+name="badpkg"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+provides=["bad/provide/nested"]
+"#,
+    )
+    .unwrap();
+    let package = temp.path().join("bad_provides.pkg.tar.zst");
+    create_package(&stage, &package, 1).unwrap();
+    assert!(inspect_package(&package).is_err());
+
+    // Malformed conflicts
+    fs::write(
+        stage.join(".METADATA/manifest.toml"),
+        r#"schema_version=1
+name="badpkg"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+conflicts=["lib >= invalid-version"]
+"#,
+    )
+    .unwrap();
+    let package = temp.path().join("bad_conflicts.pkg.tar.zst");
+    create_package(&stage, &package, 1).unwrap();
+    assert!(inspect_package(&package).is_err());
+
+    // Valid package
+    fs::write(
+        stage.join(".METADATA/manifest.toml"),
+        r#"schema_version=1
+name="goodpkg"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="demo"
+license="MIT"
+provides=["virtual/init", "so:libc.so.6"]
+conflicts=["other >= 2.0-1"]
+"#,
+    )
+    .unwrap();
+    let package = temp.path().join("good.pkg.tar.zst");
+    create_package(&stage, &package, 1).unwrap();
+    assert!(inspect_package(&package).is_ok());
+}

@@ -445,3 +445,33 @@ fn exact_default_slot_roots_remain_distinct_from_unqualified_requirements() {
         assert_eq!(chosen, &PackageKey::new("main/system", "codec", "0"));
     }
 }
+
+#[test]
+fn explicit_channel_virtual_dependencies_resolve_to_specified_channel() {
+    let mut universe = PackageUniverse::default();
+    let sys_provider = sage_core::Package::from_release(
+        PackageKey::new("main/system", "mesa-sys", "0"),
+        "1-1".parse().unwrap(),
+        vec![],
+        vec!["virtual/graphics".into()],
+    );
+    let extra_provider = sage_core::Package::from_release(
+        PackageKey::new("main/extra", "mesa-extra", "0"),
+        "1-1".parse().unwrap(),
+        vec![],
+        vec!["virtual/graphics".into()],
+    );
+    let app = release("main/extra", "game", "1-1", &["extra/virtual/graphics"]);
+    universe.insert(sys_provider);
+    universe.insert(extra_provider);
+    universe.insert(app);
+
+    let solver = SageSolver::new(&universe);
+    let solution = solver
+        .resolve(&[PackageKey::new("main/extra", "game", "0")])
+        .unwrap();
+
+    // Must have chosen mesa-extra from main/extra, NOT mesa-sys from main/system
+    assert!(solution.contains_key(&PackageKey::new("main/extra", "mesa-extra", "0")));
+    assert!(!solution.contains_key(&PackageKey::new("main/system", "mesa-sys", "0")));
+}

@@ -445,12 +445,17 @@ impl SageProvider {
                 .expect("conflict owner was inserted above")
                 .insert(marker.clone(), VersionRange::singleton(one));
             let targets: Vec<_> = if is_virtual(&conflict) {
+                let channel = if let Some(explicit) = conflict.channel.as_deref() {
+                    dependency_channel(&owner, Some(explicit))
+                } else {
+                    system_channel(&owner.channel)
+                };
                 universe
                     .providers
                     .get(&conflict.name)
                     .into_iter()
                     .flatten()
-                    .filter(|key| key.channel == system_channel(&owner.channel))
+                    .filter(|key| key.channel == channel)
                     .filter(|key| conflict.slot.as_ref().is_none_or(|slot| &key.slot == slot))
                     .cloned()
                     .collect()
@@ -556,22 +561,26 @@ fn dependency_key(
     dependency: &Dependency,
 ) -> PackageKey {
     if is_virtual(dependency) {
-        // Prefer the repository's system policy even when a runtime channel
-        // also provides the symbol. This keeps virtual root upgrade locks and
-        // configured provider bindings scoped to the same system channel.
-        let sys_chan = system_channel(&parent.channel);
-        let channel = if let Some(providers) = universe.providers.get(&dependency.name) {
-            providers
-                .iter()
-                .find(|p| p.channel == sys_chan)
-                .or_else(|| providers.iter().find(|p| p.channel == parent.channel))
-                .or_else(|| providers.first())
-                .map(|p| p.channel.as_str())
-                .unwrap_or(sys_chan.as_str())
+        let channel = if let Some(explicit) = dependency.channel.as_deref() {
+            dependency_channel(parent, Some(explicit))
         } else {
-            sys_chan.as_str()
+            // Prefer the repository's system policy even when a runtime channel
+            // also provides the symbol. This keeps virtual root upgrade locks and
+            // configured provider bindings scoped to the same system channel.
+            let sys_chan = system_channel(&parent.channel);
+            if let Some(providers) = universe.providers.get(&dependency.name) {
+                providers
+                    .iter()
+                    .find(|p| p.channel == sys_chan)
+                    .or_else(|| providers.iter().find(|p| p.channel == parent.channel))
+                    .or_else(|| providers.first())
+                    .map(|p| p.channel.clone())
+                    .unwrap_or(sys_chan)
+            } else {
+                sys_chan
+            }
         };
-        return virtual_key(channel, dependency);
+        return virtual_key(&channel, dependency);
     }
     let concrete = PackageKey::new(
         dependency_channel(parent, dependency.channel.as_deref()),
@@ -634,6 +643,7 @@ fn virtual_key(channel: &str, dependency: &Dependency) -> PackageKey {
     // slot instead: empty means None, and a leading ':' identifies Some(slot).
     // The prefix also distinguishes a malformed empty slot from an absent one.
     let mut requirement = dependency.clone();
+    requirement.channel = None;
     let slot = requirement
         .slot
         .take()

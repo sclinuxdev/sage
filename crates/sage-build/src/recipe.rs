@@ -424,7 +424,18 @@ fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildS
 pub struct BuildGraph;
 
 impl BuildGraph {
+    /// Discovers all recipes below `root` matching default architecture rules.
     pub fn discover(root: &Path) -> Result<Vec<BuildUnit>, BuildError> {
+        Self::discover_for_arch(root, None)
+    }
+
+    /// Discovers recipes below `root`, optionally filtered for a target architecture.
+    /// Deduplicates recipes by (channel, name, slot) coordinate, preferring exact architecture
+    /// matches over generic ones ('any' / 'noarch') and selecting the highest version.
+    pub fn discover_for_arch(
+        root: &Path,
+        target_arch: Option<&str>,
+    ) -> Result<Vec<BuildUnit>, BuildError> {
         let mut recipes: Vec<_> = walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -437,23 +448,40 @@ impl BuildGraph {
             })
             .collect::<Result<_, _>>()?;
         recipes.sort();
-        let mut latest = BTreeMap::new();
+        let mut latest: BTreeMap<_, (sage_core::Version, PathBuf, RecipeSpec)> = BTreeMap::new();
         for path in recipes {
             let recipe = RecipeSpec::load(&path)?;
+            if let Some(wanted) = target_arch
+                && !sage_sys::arch_matches(&recipe.package.arch, wanted)
+            {
+                continue;
+            }
             let key = (
                 recipe.package.channel.clone(),
                 recipe.package.name.clone(),
                 recipe.package.slot.clone(),
-                recipe.package.arch.clone(),
             );
             let version = sage_core::Version::new(
                 recipe.package.epoch,
                 recipe.package.version.clone(),
                 recipe.package.release,
             );
-            let replace = latest
-                .get(&key)
-                .is_none_or(|(selected, _, _)| version > *selected);
+            let replace = match latest.get(&key) {
+                None => true,
+                Some((selected_ver, _, selected_recipe)) => {
+                    if version > *selected_ver {
+                        true
+                    } else if version == *selected_ver {
+                        if let Some(wanted) = target_arch {
+                            recipe.package.arch == wanted && selected_recipe.package.arch != wanted
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
             if replace {
                 latest.insert(key, (version, path, recipe));
             }

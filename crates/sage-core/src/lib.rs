@@ -52,4 +52,47 @@ mod tests {
         let candidate: Version = "2.41-1".parse().unwrap();
         assert!(dep.op.matches(&candidate, dep.version.as_ref()));
     }
+
+    #[test]
+    fn package_validation_checks_provides_conflicts_and_dependencies() {
+        let mut pkg = Package {
+            schema_version: 1,
+            name: "testpkg".into(),
+            slot: "0".into(),
+            version: "1.0.0".into(),
+            release: 1,
+            epoch: 0,
+            arch: "x86_64".into(),
+            channel: "system".into(),
+            description: "desc".into(),
+            license: "MIT".into(),
+            dependencies: vec![],
+            provides: vec![],
+            conflicts: vec![],
+            features: vec![],
+            installed_size: 0,
+            build_time: 0,
+            managed_build_tools: vec![],
+        };
+        assert!(pkg.validate().is_ok());
+
+        // Invalid provide
+        pkg.provides.push("bad/provide/nested".into());
+        assert!(pkg.validate().is_err());
+        pkg.provides.clear();
+
+        // Valid provide
+        pkg.provides.push("virtual/init".into());
+        pkg.provides.push("so:libc.so.6".into());
+        assert!(pkg.validate().is_ok());
+
+        // Invalid conflict
+        pkg.conflicts.push("bad >= not-a-version".into());
+        assert!(pkg.validate().is_err());
+        pkg.conflicts.clear();
+
+        // Valid conflict
+        pkg.conflicts.push("other:1 >= 2.0-1".into());
+        assert!(pkg.validate().is_ok());
+    }
 }

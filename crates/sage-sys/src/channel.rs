@@ -50,8 +50,14 @@ pub async fn sync_channels(root: &Path, selected: Option<&str>, dry_run: bool) -
 }
 
 /// Checks whether package architecture matches target host architecture or architecture-independent rules.
-pub(crate) fn arch_matches(arch: &str, wanted: &str) -> bool {
-    arch == wanted || arch == "any" || arch == "noarch"
+pub fn arch_matches(arch: &str, wanted: &str) -> bool {
+    arch == wanted
+        || arch == "any"
+        || arch == "noarch"
+        || (arch == "amd64" && wanted == "x86_64")
+        || (arch == "x86_64" && wanted == "amd64")
+        || (arch == "aarch64" && wanted == "arm64")
+        || (arch == "arm64" && wanted == "aarch64")
 }
 
 /// Identifies whether a given path has standard Sage package archive extension.

@@ -1143,3 +1143,60 @@ fn recipe_spec_load_rejects_unsafe_channel_or_coordinates() {
     .unwrap();
     assert!(RecipeSpec::load(&bad_subpackage_channel).is_err());
 }
+
+#[test]
+fn multi_arch_recipes_filter_correctly_without_duplicate_producer_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let amd64_dir = directory.path().join("amd64");
+    let aarch64_dir = directory.path().join("aarch64");
+    fs::create_dir(&amd64_dir).unwrap();
+    fs::create_dir(&aarch64_dir).unwrap();
+    fs::write(
+        amd64_dir.join("recipe.toml"),
+        r#"schema_version=1
+[package]
+name="libfoo"
+slot="0"
+version="1.0"
+release=1
+arch="amd64"
+channel="system"
+description="lib"
+license="MIT"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        aarch64_dir.join("recipe.toml"),
+        r#"schema_version=1
+[package]
+name="libfoo"
+slot="0"
+version="1.0"
+release=1
+arch="aarch64"
+channel="system"
+description="lib"
+license="MIT"
+"#,
+    )
+    .unwrap();
+
+    // Discover for amd64 filters out aarch64
+    let units_amd64 = BuildGraph::discover_for_arch(directory.path(), Some("amd64")).unwrap();
+    assert_eq!(units_amd64.len(), 1);
+    let layers_amd64 = BuildGraph::layers(units_amd64).unwrap();
+    assert_eq!(layers_amd64.len(), 1);
+
+    // Discover for aarch64 filters out amd64
+    let units_aarch64 = BuildGraph::discover_for_arch(directory.path(), Some("aarch64")).unwrap();
+    assert_eq!(units_aarch64.len(), 1);
+    let layers_aarch64 = BuildGraph::layers(units_aarch64).unwrap();
+    assert_eq!(layers_aarch64.len(), 1);
+
+    // Default discover deduplicates by coordinate without colliding in layers
+    let units_default = BuildGraph::discover(directory.path()).unwrap();
+    assert_eq!(units_default.len(), 1);
+    let layers_default = BuildGraph::layers(units_default).unwrap();
+    assert_eq!(layers_default.len(), 1);
+}

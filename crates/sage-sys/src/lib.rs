@@ -32,8 +32,8 @@ pub use query::{
 
 // 4. Repository channels and availability pools
 pub use channel::{
-    AvailablePackages, canonical_channel, load_available_with_pool, obtain_release_archive,
-    sync_channels,
+    AvailablePackages, arch_matches, canonical_channel, load_available_with_pool,
+    obtain_release_archive, sync_channels,
 };
 
 // 5. Metadata and configuration specifications

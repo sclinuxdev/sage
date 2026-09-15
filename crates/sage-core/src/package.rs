@@ -57,7 +57,8 @@ pub fn valid_channel_name(value: &str) -> bool {
         && value.split('/').all(valid_package_component)
 }
 
-/// Validates a short virtual interface, `virtual/name`, or an opaque `so:soname`.
+/// Validates a short virtual interface, `virtual/name`, command `cmd:name`,
+/// synthetic solver interface `virtual/provider/name`, or an opaque `so:soname`.
 /// Sonames must be non-empty and exclude whitespace, controls, paths, and the
 /// override separator; they are not restricted to the package-name alphabet.
 pub fn valid_provider_symbol(value: &str) -> bool {
@@ -66,6 +67,10 @@ pub fn valid_provider_symbol(value: &str) -> bool {
             && !soname
                 .chars()
                 .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '/' | '='))
+    } else if let Some(cmd) = value.strip_prefix("cmd:") {
+        valid_package_component(cmd)
+    } else if let Some(inner) = value.strip_prefix("virtual/provider/") {
+        valid_provider_symbol(inner)
     } else {
         valid_package_component(value.strip_prefix("virtual/").unwrap_or(value))
     }
@@ -184,6 +189,47 @@ pub struct Dependency {
     pub version: Option<Version>,
 }
 
+impl Dependency {
+    /// Validates dependency component formats (provider or package name, channel, slot, and version).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if !valid_provider_symbol(&self.name) {
+            return Err(CoreError::InvalidDependency(format!(
+                "invalid dependency name: '{}'",
+                self.name
+            )));
+        }
+        if let Some(channel) = &self.channel
+            && !valid_channel_name(channel)
+        {
+            return Err(CoreError::InvalidDependency(format!(
+                "invalid dependency channel: '{channel}'"
+            )));
+        }
+        if let Some(slot) = &self.slot
+            && !valid_package_component(slot)
+        {
+            return Err(CoreError::InvalidDependency(format!(
+                "invalid dependency slot: '{slot}'"
+            )));
+        }
+        if self.op != ConstraintOp::Any {
+            let Some(version) = &self.version else {
+                return Err(CoreError::InvalidDependency(format!(
+                    "missing constraint version for dependency: '{}'",
+                    self.name
+                )));
+            };
+            if !valid_version_string(&version.upstream) {
+                return Err(CoreError::InvalidVersion(format!(
+                    "invalid dependency version: '{}'",
+                    version.upstream
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl FromStr for Dependency {
     type Err = CoreError;
 
@@ -196,6 +242,10 @@ impl FromStr for Dependency {
         // separates an optional channel, and the colon separates an optional slot.
         let (channel, package) = if fields[0].starts_with("virtual/") {
             (None, fields[0])
+        } else if let Some(idx) = fields[0].find("/virtual/") {
+            (Some(fields[0][..idx].into()), &fields[0][idx + 1..])
+        } else if let Some(idx) = fields[0].find("/so:") {
+            (Some(fields[0][..idx].into()), &fields[0][idx + 1..])
         } else {
             fields[0]
                 .rsplit_once('/')
@@ -218,13 +268,15 @@ impl FromStr for Dependency {
             [_, op, version] => (parse_op(op, input)?, Some(version.parse()?)),
             _ => return Err(CoreError::InvalidDependency(input.into())),
         };
-        Ok(Self {
+        let dep = Self {
             name: name.into(),
             slot,
             channel,
             op,
             version,
-        })
+        };
+        dep.validate()?;
+        Ok(dep)
     }
 }
 
@@ -346,6 +398,27 @@ impl Package {
             )));
         }
         crate::error::validate_spdx_expression(&self.license)?;
+        for dep in &self.dependencies {
+            dep.validate()?;
+        }
+        for provide in &self.provides {
+            if !valid_provider_symbol(provide) {
+                return Err(CoreError::InvalidPackageKey(format!(
+                    "invalid provides symbol: '{provide}'"
+                )));
+            }
+        }
+        for conflict in &self.conflicts {
+            let dep = conflict.parse::<Dependency>()?;
+            dep.validate()?;
+        }
+        for feature in &self.features {
+            if !valid_package_component(feature) {
+                return Err(CoreError::InvalidPackageKey(format!(
+                    "invalid feature: '{feature}'"
+                )));
+            }
+        }
         Ok(())
     }
 

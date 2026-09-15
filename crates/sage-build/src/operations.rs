@@ -10,7 +10,14 @@ pub async fn mass_rebuild(
     jobs: usize,
     dry_run: bool,
 ) -> Result<()> {
-    let units = source_build_units(root, sage_build::BuildGraph::discover(recipe_root)?)?;
+    let target_arch =
+        sage_sys::SystemConfig::load(under_root(root, Path::new("/etc/sage/system.toml")))
+            .map(|cfg| cfg.system.architecture)
+            .ok();
+    let units = source_build_units(
+        root,
+        sage_build::BuildGraph::discover_for_arch(recipe_root, target_arch.as_deref())?,
+    )?;
     let layers = sage_build::BuildGraph::layers(units)?;
     let pool = output
         .map(Path::to_path_buf)

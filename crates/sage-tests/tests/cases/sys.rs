@@ -1526,3 +1526,40 @@ fn available_services_prefers_installed_spec_over_rendered_history() {
         .expect("demo found");
     assert_eq!(demo.description, "newly installed package version");
 }
+
+#[test]
+fn toolchain_switch_cleans_up_old_profile_symlinks() {
+    let sysroot = tempfile::tempdir().unwrap();
+    let opt_gcc = sysroot.path().join("opt/channels/gcc-13/bin");
+    let opt_clang = sysroot.path().join("opt/channels/clang-17/bin");
+    fs::create_dir_all(&opt_gcc).unwrap();
+    fs::create_dir_all(&opt_clang).unwrap();
+    fs::write(opt_gcc.join("gcc"), "#!/bin/sh\n").unwrap();
+    fs::write(opt_gcc.join("g++"), "#!/bin/sh\n").unwrap();
+    fs::write(opt_clang.join("clang"), "#!/bin/sh\n").unwrap();
+
+    let etc_sage = sysroot.path().join("etc/sage");
+    fs::create_dir_all(&etc_sage).unwrap();
+    fs::write(
+        etc_sage.join("system.toml"),
+        r#"schema_version = 1
+[system]
+architecture = "amd64"
+profile = "default"
+"#,
+    )
+    .unwrap();
+
+    // First activate gcc-13
+    sage_sys::use_toolchain(sysroot.path(), "gcc-13", false).unwrap();
+    let profile_bin = sysroot.path().join("etc/sage/profiles/default/bin");
+    assert!(profile_bin.join("gcc").is_symlink());
+    assert!(profile_bin.join("g++").is_symlink());
+
+    // Switch to clang-17
+    sage_sys::use_toolchain(sysroot.path(), "clang-17", false).unwrap();
+    assert!(profile_bin.join("clang").is_symlink());
+    // Stale gcc-13 binaries must have been cleaned up
+    assert!(!profile_bin.join("gcc").is_symlink());
+    assert!(!profile_bin.join("g++").is_symlink());
+}

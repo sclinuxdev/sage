@@ -752,6 +752,37 @@ impl ProfileEngine {
             )));
         }
         let base = PathBuf::from("etc/sage/profiles").join(profile);
+        // Identify all subdirectories referenced by the new profile links (and always include 'bin').
+        // Stale symlinks belonging to previous toolchains under these directories must be removed.
+        let mut target_subdirs = BTreeSet::new();
+        target_subdirs.insert(PathBuf::from("bin"));
+        for link in links.keys() {
+            if let Some(parent) = link.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                target_subdirs.insert(parent.to_path_buf());
+            }
+        }
+        for dir in target_subdirs {
+            let target_dir = target_path(sysroot, &base.join(&dir))?;
+            if target_dir.is_dir()
+                && let Ok(entries) = std::fs::read_dir(&target_dir)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_symlink() {
+                        let rel_link = dir.join(entry.file_name());
+                        if !links.contains_key(&rel_link)
+                            && let Ok(target) = std::fs::read_link(&path)
+                            && (target.starts_with("/opt/channels")
+                                || target.starts_with(Path::new("/opt/channels")))
+                        {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+        }
         for (link, target) in links {
             atomic_symlink(sysroot, &base.join(link), target)?;
         }

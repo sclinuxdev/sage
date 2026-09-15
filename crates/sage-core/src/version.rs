@@ -36,7 +36,7 @@ impl FromStr for Version {
         let (upstream, release) = rest
             .rsplit_once('-')
             .ok_or_else(|| CoreError::InvalidVersion(input.into()))?;
-        if upstream.is_empty() {
+        if upstream.is_empty() || !crate::package::valid_version_string(upstream) {
             return Err(CoreError::InvalidVersion(input.into()));
         }
         Ok(Self::new(epoch, upstream, parse_number(release, input)?))
@@ -76,11 +76,27 @@ impl Ord for Version {
 /// Compares alternating numeric and alphabetic runs without integer conversion.
 /// Numeric runs ignore leading zeroes and compare by significant length first,
 /// so even adversarially long version components cannot overflow.
+/// The tilde '~' character denotes pre-release status and sorts before everything,
+/// including empty/end-of-string.
 fn compare_upstream(left: &str, right: &str) -> Ordering {
     let (mut a, mut b) = (left.as_bytes(), right.as_bytes());
     loop {
         a = trim_separators(a);
         b = trim_separators(b);
+
+        if a.first() == Some(&b'~') || b.first() == Some(&b'~') {
+            match (a.first() == Some(&b'~'), b.first() == Some(&b'~')) {
+                (true, true) => {
+                    a = &a[1..];
+                    b = &b[1..];
+                    continue;
+                }
+                (true, false) => return Ordering::Less,
+                (false, true) => return Ordering::Greater,
+                (false, false) => unreachable!(),
+            }
+        }
+
         if a.is_empty() || b.is_empty() {
             return a.len().cmp(&b.len());
         }
@@ -105,7 +121,7 @@ fn compare_upstream(left: &str, right: &str) -> Ordering {
 fn trim_separators(mut value: &[u8]) -> &[u8] {
     while value
         .first()
-        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+        .is_some_and(|byte| !byte.is_ascii_alphanumeric() && *byte != b'~')
     {
         value = &value[1..];
     }
@@ -129,4 +145,33 @@ fn compare_numeric(left: &[u8], right: &[u8]) -> Ordering {
         .then_with(|| significant_left.cmp(significant_right))
         // Preserve the Ord/Eq contract for differently spelled equal numbers.
         .then_with(|| left.cmp(right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilde_pre_release_sorts_before_final_release() {
+        let rc: Version = "1.0~rc1-1".parse().unwrap();
+        let final_rel: Version = "1.0-1".parse().unwrap();
+        let patch: Version = "1.0.1-1".parse().unwrap();
+        let beta: Version = "1.0~beta-1".parse().unwrap();
+        let rc2: Version = "1.0~rc2-1".parse().unwrap();
+        let double_tilde: Version = "1.0~~-1".parse().unwrap();
+
+        assert!(double_tilde < rc);
+        assert!(beta < rc);
+        assert!(rc < rc2);
+        assert!(rc2 < final_rel);
+        assert!(final_rel < patch);
+    }
+
+    #[test]
+    fn malformed_version_strings_rejected() {
+        assert!("..-1".parse::<Version>().is_err());
+        assert!("1.0/bad-1".parse::<Version>().is_err());
+        assert!("1.0:bad-1".parse::<Version>().is_err());
+        assert!("1.0~rc1-1".parse::<Version>().is_ok());
+    }
 }
