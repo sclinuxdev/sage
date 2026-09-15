@@ -130,3 +130,13 @@ versions and their dependencies when other desired roots require compatible
 releases. A normal pruning rebuild may remove an obsolete provider when no
 desired or retained package requires it. `--no-prune` does not authorize removing
 a conflicting retained package: an unsatisfiable combined graph fails planning.
+
+### 2.5 严格反序列化校验与原子写出 (Fail-Closed Deserialization & Atomic Write)
+
+为了防止配置漂移、拼写错误或恶意篡改隐蔽生效，`SystemConfig` 的加载与序列化遵循严格的 Fail-Closed 原则：
+- **Schema 版本强校验**: `schema_version` 必须严格解析为合法的 32 位无符号整数（`u32`），拒绝负数或溢出值。
+- **未知字段全面拒绝**: `SystemMetadata` 增加 `#[serde(deny_unknown_fields)]`；文档根级表严格检查所有顶级键，任何未识别的未知字段均立即报错中止。
+- **作用域隔离**: 严禁在 `[system]` 表内部声明 `packages`（报错提示应置于根级或 `[world]` 表）。旧式根级 `packages` 与标准底部的 `[world]` 表互斥，二者同时出现时直接拒绝。
+- **提供者结构校验**: `[providers]` 必须为严格的 TOML Table，且内部键值对必须为合法的字符串映射，拒绝数组或其他嵌套类型。
+- **根 fd 锚定原子写出**: 更新 `/etc/sage/system.toml` 时，通过基于根文件系统描述符的 `fs::write_atomic_under_root` 进行两阶段临时文件写入与 `renameat` 替换，杜绝断电或进程中断造成的半写入破坏。
+

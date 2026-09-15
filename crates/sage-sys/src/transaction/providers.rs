@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
-use sage_core::{ConstraintOp, Dependency, PackageKey, Version};
+use sage_core::{ConstraintOp, Dependency, PackageKey, Version, is_virtual_symbol};
 use sage_solver::{PackageUniverse, ProviderBindings, SageSolver, Solution};
 
 use crate::state::{SystemConfig, provider_symbol};
@@ -106,6 +106,9 @@ pub(super) fn resolve_virtual_selections(
     let requested = names
         .iter()
         .map(|name| -> Result<PackageKey> {
+            if name.starts_with("so:") || name.starts_with("cmd:") {
+                return Ok(PackageKey::new(channel, name, sage_core::DEFAULT_SLOT));
+            }
             let default_key = PackageKey::in_channel(channel, name)?;
             // Resolve omitted concrete slots before building solver roots and
             // upgrade locks. Explicit slots and virtual requirements retain
@@ -135,10 +138,14 @@ pub(super) fn resolve_virtual_selections(
     let requested_virtuals: Vec<_> = requested
         .iter()
         .zip(names)
-        .filter(|(key, _)| key.name.starts_with("virtual/"))
+        .filter(|(key, _)| is_virtual_symbol(&key.name))
         .map(|(key, selector)| Dependency {
             name: key.name.clone(),
-            slot: selector.split_once(':').map(|(_, slot)| slot.into()),
+            slot: if key.name.starts_with("so:") || key.name.starts_with("cmd:") {
+                None
+            } else {
+                selector.split_once(':').map(|(_, slot)| slot.into())
+            },
             channel: None,
             op: ConstraintOp::Any,
             version: None,
@@ -167,7 +174,7 @@ pub(super) fn resolve_virtual_selections(
     }
     let mut roots: Vec<_> = requested
         .iter()
-        .filter(|key| !key.name.starts_with("virtual/"))
+        .filter(|key| !is_virtual_symbol(&key.name))
         .cloned()
         .collect();
     roots.extend(installed.iter().map(|package| package.key.clone()));

@@ -29,5 +29,10 @@ pub async fn sync_channel_index(
 ## 2. 异步并行分块下载器 (`DownloadEngine`)
 
 - **Range 并发**: 对于大体积包文件，探测服务端 `Accept-Ranges: bytes` 头，使用 Tokio 任务并发拉取分块并合并。
+- **并发临时分块隔离 (Concurrent Chunk Isolation)**:
+  - 每一个分块下载任务均分配专有的目标临时文件（`tempfile::NamedTempFile`）。
+  - 分块切片命名锚定于该临时文件的专属名称：`destination.with_file_name(format!("{filename}.part-{index}"))`。
+  - 彻底杜绝并发构建任务（如 `mass-rebuild`）同时下载相同 SHA 包归档时，分块文件在同名磁盘路径上互相截断、覆盖或产生竞争删除导致的 `NotFound` 故障。
 - **流式哈希**: 边接收数据边通过 SHA-256 流式计算摘要，下载完成后即刻比对，失败则自动尝试备用镜像。
 - **进度通知**: 通过异步通道向 CLI 前端报告实时下载速率与百分比。
+

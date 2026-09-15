@@ -62,6 +62,13 @@ fn provider_symbols_share_cli_and_configuration_validation() {
             sage_core::PackageKey::new("main/system", "so", "abi+debug")
         );
     }
+    let cmd_prefs = config(&[], &[("cmd:sh", "dash:0")])
+        .provider_preferences("main/system")
+        .unwrap();
+    assert_eq!(
+        cmd_prefs["cmd:sh"],
+        sage_core::PackageKey::new("main/system", "dash", "0")
+    );
     for symbol in [
         "so:",
         "so:lib foo.so",
@@ -69,6 +76,8 @@ fn provider_symbols_share_cli_and_configuration_validation() {
         "so:lib\nfoo.so",
         "so:lib=foo.so",
         "virtual/so:libfoo.so",
+        "cmd:",
+        "cmd:bad/path",
     ] {
         assert!(
             config(&[], &[(symbol, "foo")])

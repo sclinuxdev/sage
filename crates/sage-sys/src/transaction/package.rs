@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use sage_core::under_root;
+use sage_core::{is_virtual_symbol, under_root};
 
 use super::plan::TransactionPlan;
 use super::preflight::{declaration_path, preflight_packages, write_atomic_under_root};
@@ -69,7 +69,7 @@ pub async fn apply_packages(
     let declaration = if save && channel == "main/system" {
         let mut next = config.clone();
         for name in names {
-            if !name.starts_with("virtual/") && !next.packages.contains(name) {
+            if !is_virtual_symbol(name) && !next.packages.contains(name) {
                 next.packages.insert(name.clone());
             }
         }
@@ -123,8 +123,7 @@ pub fn installation_order(
                 .release
                 .package;
             let blocked = package.dependencies.iter().any(|dependency| {
-                let is_virtual =
-                    dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:");
+                let is_virtual = is_virtual_symbol(&dependency.name);
                 pending.iter().any(|(candidate, candidate_version)| {
                     if candidate == key {
                         return false;
@@ -364,8 +363,7 @@ pub fn remove_packages(
         if selected.iter().any(|removed| {
             dependent.key != removed.key
                 && dependent.dependencies.iter().any(|dependency| {
-                    let virtual_dependency = dependency.name.starts_with("virtual/")
-                        || dependency.name.starts_with("so:");
+                    let virtual_dependency = is_virtual_symbol(&dependency.name);
                     let removed_direct = dependency.name == removed.key.name;
                     let matches_pkg =
                         |pkg: &sage_db::InstalledPackage, direct_only_non_virtual: bool| {

@@ -100,7 +100,7 @@ impl<'a> SageSolver<'a> {
         requested
             .iter()
             .map(|key| {
-                let target = if key.name.starts_with("virtual/") || key.name.starts_with("so:") {
+                let target = if sage_core::is_virtual_symbol(&key.name) {
                     virtual_key(
                         &system_channel(&key.channel),
                         &Dependency {
@@ -626,7 +626,7 @@ fn dependency_channel(parent: &PackageKey, requested: Option<&str>) -> String {
 }
 
 fn is_virtual(dependency: &Dependency) -> bool {
-    dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:")
+    sage_core::is_virtual_symbol(&dependency.name)
 }
 
 fn is_proxy_key(key: &PackageKey) -> bool {
@@ -656,7 +656,8 @@ fn virtual_requirement(key: &PackageKey) -> Option<(PackageKey, String, Dependen
     let boundary = key
         .name
         .find("/virtual/")
-        .or_else(|| key.name.find("/so:"))?;
+        .or_else(|| key.name.find("/so:"))
+        .or_else(|| key.name.find("/cmd:"))?;
     let (channel, dependency) = key.name.split_at(boundary);
     let mut requirement: Dependency = dependency.strip_prefix('/')?.parse().ok()?;
     requirement.slot = key.slot.strip_prefix(':').map(str::to_owned);

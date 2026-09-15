@@ -287,6 +287,16 @@ recursive = true
 Recipes with no upstream source are valid when their payload is fully
 declarative, including pure meta-packages whose only state is dependencies.
 
+To guarantee complete hermeticity against filesystem traversal attacks:
+- **`dirfd` Anchored Operations**: `stage_declarative_install` and directory copying
+  anchor all writes strictly beneath `DESTDIR` using directory file descriptors
+  (`openat`, `symlinkat`, `fchmod` with `O_NOFOLLOW | O_DIRECTORY`).
+- **Symlink Escape Prevention**: Even if prior build phases or malicious scripts created
+  symlinks inside `DESTDIR` pointing to host paths (e.g. `dest/foo -> /etc`), `openat`
+  refuses to follow symlinks to write files or create subdirectories.
+- **Source Traversal Auditing**: Copying from the recipe directory verifies that source
+  paths do not traverse symlink ancestors leading out of the recipe repository.
+
 Recipes may declare system accounts with `[[sysusers]]`; Sage stores the
 declaration as package metadata and reconciles `/etc/passwd`, `/etc/group`, and
 `/etc/shadow` directly without calling an init-system utility. Optional `service.toml` and
@@ -333,3 +343,16 @@ For cross builds, `target_dependencies` are architecture-filtered and extracted
 to a separate read-only `/sysroot`. Native build tools remain in `/toolchain`, so
 host executables can never be replaced by target binaries. Features may add the
 same field with `target_dependencies = [...]`.
+
+### 3.8 包坐标与标识安全约束 (Package Coordinate Validation)
+
+包配方的各个标识字段（包括主包及所有子包）在加载（`RecipeSpec::load`）和构建发布阶段接受全局强校验：
+- **`channel`**: 必须为合法的非空通道路径（如 `system`, `python3.14`），各路径段均不可为 `.` 或 `..`，严禁绝对路径前缀（如 `/etc`）或包含反斜杠。
+- **`name` / `subpackages.name`**: 必须由 ASCII 字母、数字、`+`、`-`、`_`、`.` 构成，禁止单独为 `.` 或 `..`，禁止包含路径分隔符。
+- **`slot`**: 必须符合包组件字符规范，禁止包含路径穿越或非法分隔符。
+- **`arch`**: 必须为已知有效架构或 `any` / `noarch`。
+- **`version`**: 必须为有效版本字符串，禁止包含控制字符或路径分隔符。
+- **`license`**: 必须为有效非空许可证表达式。
+
+任何不符合上述规则的配方均在加载阶段立即中止，杜绝产物发布时发生路径逃逸或任意文件覆盖。
+

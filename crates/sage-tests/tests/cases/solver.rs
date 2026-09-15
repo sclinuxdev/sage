@@ -475,3 +475,45 @@ fn explicit_channel_virtual_dependencies_resolve_to_specified_channel() {
     assert!(solution.contains_key(&PackageKey::new("main/extra", "mesa-extra", "0")));
     assert!(!solution.contains_key(&PackageKey::new("main/system", "mesa-sys", "0")));
 }
+
+#[test]
+fn cmd_provider_dependencies_resolve() {
+    let mut universe = PackageUniverse::default();
+    universe.insert(release(
+        "main/system",
+        "script-runner",
+        "1-1",
+        &["cmd:bash"],
+    ));
+    let mut bash = release("main/system", "bash", "5.2-1", &[]);
+    bash.provides.push("cmd:bash".into());
+    universe.insert(bash);
+    let solution = SageSolver::new(&universe)
+        .resolve(&[PackageKey::new("main/system", "script-runner", "0")])
+        .unwrap();
+    assert_eq!(
+        solution[&PackageKey::new("main/system", "bash", "0")],
+        "5.2-1".parse().unwrap()
+    );
+}
+
+#[test]
+fn explicit_channel_cmd_provider_dependencies_resolve() {
+    let mut universe = PackageUniverse::default();
+    universe.insert(release(
+        "main/system",
+        "script-runner",
+        "1-1",
+        &["main/system/cmd:sh"],
+    ));
+    let mut sh = release("main/system", "dash", "0.5.12-1", &[]);
+    sh.provides.push("cmd:sh".into());
+    universe.insert(sh);
+    let solution = SageSolver::new(&universe)
+        .resolve(&[PackageKey::new("main/system", "script-runner", "0")])
+        .unwrap();
+    assert_eq!(
+        solution[&PackageKey::new("main/system", "dash", "0")],
+        "0.5.12-1".parse().unwrap()
+    );
+}

@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use sage_core::{valid_package_component, valid_provider_symbol};
+use sage_core::{is_virtual_symbol, valid_package_component, valid_provider_symbol};
 use serde::{Deserialize, Serialize};
 
 use crate::services::{ensure_directory_beneath, target_path, valid_declaration_name};
@@ -230,7 +230,7 @@ impl SystemConfig {
 /// Restores a configured or persisted binding key to its solver symbol. Virtual
 /// bindings use short keys in the state table; shared-library symbols stay exact.
 pub fn provider_symbol(interface: &str) -> String {
-    if interface.starts_with("virtual/") || interface.starts_with("so:") {
+    if is_virtual_symbol(interface) {
         interface.to_owned()
     } else {
         format!("virtual/{interface}")

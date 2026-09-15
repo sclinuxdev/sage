@@ -106,3 +106,51 @@ Kahn layers run with bounded package parallelism. Completed artifacts enter a
 transient local repository view and are locked into later PubGrub solves.
 Bootstrap plans compose several such graphs, allowing explicit seed stages to
 break unavoidable self-hosting cycles.
+
+---
+
+## 7. 源码集群构建流水线: Bootstrap 与 Mass-Rebuild 语义差异
+
+在全源码构建生命周期中，`sage` 对两种典型构建场景采用了明确分化的产物重用与调度策略：
+
+### 7.1 闭环恢复与强制重构策略 (`resume_existing`)
+1. **`sage bootstrap` (支持断点续建)**:
+   - 调度参数设置 `resume_existing: true`。
+   - 针对多阶段自举方案中的各个单元，若目标构建池（`pool`）中已存在对应版本与架构的完整归档（`should_skip_existing_unit`），则**自动跳过构建并复用已有产物**。这避免了自举流水线在后置阶段失败重启时，反复对极其耗时的底层工具链（seed compiler, binutils, glibc）执行重复编译。
+2. **`sage mass-rebuild` (无条件全量重构)**:
+   - 调度参数设置 `resume_existing: false`。
+   - 即使包池中已存在同名版本产物，**仍然无条件重新调度并编译每一个被发现的配方**，新产物原子覆盖旧文件，确保源码仓库变动或外部全局编译配置调整能够完整反映到产物中。
+
+### 7.2 通道限定与多生产者符号调度 (Multi-Producer Symbols)
+- **虚拟符号通道限定**: 导出的虚拟符号 `BuildSymbol::Provided` 严格限定所属 Channel（`{ channel, name }`），彻底杜绝跨通道符号污染。
+- **提供者符号自动分类**: 构建图生成时通过 `sage_core::is_virtual_symbol(&dependency.name)` 自动将 `virtual/*`、`so:*` 以及 `cmd:*` 依赖映射为 `BuildSymbol::Provided`，与配方主包及子包中声明的 `provides` 列表严格对齐。
+- **多候选生产者容错**: 调度器在层级构建开始前对所有层级的 candidate producers 建立全量倒排索引。仅当某符号的**所有候选生产者均宣告失败**时，该符号才会被标记为 `blocked_symbols` 并级联阻塞依赖它的下游单元；若存在任一候选生产者构建成功，下游单元仍能正常调度执行。
+- **任务失败致命性保证**: Tokio 异步 worker 发生 Panic 或被异常取消时，调度器将其视为不可恢复的致命故障（Fatal Error），立即中止构建流程，防止丢失的生产符号导致下游构建进入未定义状态。
+
+### 7.3 多架构配方树过滤与坐标去重 (`BuildGraph::discover_for_arch`)
+- **跨架构别名适配**: 通过 `sage_sys::arch_matches(&recipe.package.arch, target_arch)` 兼容 `x86_64` / `amd64`、`aarch64` / `arm64`、`riscv64` / `riscv64gc` 以及 `any` / `noarch`。
+- **同坐标精准度优先去重**: 当配方树中针对相同的 `(channel, name, slot)` 存在多个配方候选时（例如特定架构优化版本与通用版本并存），优先采纳与目标架构完全一致的精准配方，回退采纳通用 `any`/`noarch` 配方，拒绝将无关架构配方引入构建图。
+
+
+---
+
+## 8. DESTDIR 目录隔离与 Dirfd 安全声明式安装
+
+针对免源码的数据、元包与声明式安装配方（`[install]`），`sage-build` 通过 `dirfd` 与 `O_NOFOLLOW` 建立了严苛的容器级文件系统安全边界：
+
+1. **防路径穿越与 Symlink 逃逸**:
+   - 声明式文件写出（`stage_declarative_install`）与目录递归复制（`copy_dir_entries_beneath`）完全锚定于 `DESTDIR` 的文件描述符。
+   - 创建目录、写入文件或建立软链接均使用 `openat` / `symlinkat` / `fchmod`，强制附加 `O_NOFOLLOW | O_DIRECTORY`。如果 `DESTDIR` 内部存在构建脚本预先埋设的指向宿主机敏感目录（如 `/etc` 或 `/usr`）的软链接，`openat` 立即拒绝跟踪并报错拦截。
+2. **源目录祖先路径合法性审计**:
+   - 在从配方目录复制文件至 `DESTDIR` 时，逐级校验源路径与其各级祖先目录，拒绝跨越符号链接读取配方仓库外部的宿主机文件。
+
+---
+
+## 9. 包坐标校验与产物发布收敛 (Publishing Containment)
+
+1. **核心坐标强约束**:
+   - 配方加载（`RecipeSpec::load`）与发布时统一调用 `Package::validate`，严格验证 `channel`、`name`、`slot`、`arch`、`version` 与 `license`。
+   - 严禁包含路径分隔符（`/`、`\`）、目录穿越成分（`..`、`.`）以及 ASCII 控制字符。
+2. **发布路径严格收敛**:
+   - 在产物归档移入全局存储池（`pool`）时，发布路径被数学证明严格位于 `.slots/<channel>/<name>/<slot>/` 目录之内，杜绝通过恶意 channel 名或 slot 命名实施的任意路径覆盖攻击。
+

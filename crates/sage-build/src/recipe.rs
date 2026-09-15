@@ -403,7 +403,7 @@ fn symbol_id(symbol: &BuildSymbol) -> String {
 
 fn dependency_symbol(channel: &str, dependency: sage_core::Dependency) -> BuildSymbol {
     let resolved_channel = dependency.channel.as_deref().unwrap_or(channel);
-    if dependency.name.starts_with("virtual/") || dependency.name.starts_with("so:") {
+    if sage_core::is_virtual_symbol(&dependency.name) {
         BuildSymbol::Provided {
             channel: resolved_channel.to_string(),
             name: dependency.name,

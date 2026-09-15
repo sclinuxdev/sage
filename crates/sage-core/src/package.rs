@@ -76,6 +76,12 @@ pub fn valid_provider_symbol(value: &str) -> bool {
     }
 }
 
+/// Returns whether a dependency or interface name refers to a provided virtual symbol
+/// (such as `virtual/name`, shared library `so:soname`, or command `cmd:binary`).
+pub fn is_virtual_symbol(symbol: &str) -> bool {
+    symbol.starts_with("virtual/") || symbol.starts_with("so:") || symbol.starts_with("cmd:")
+}
+
 impl PackageKey {
     /// Constructs a package key from caller-owned string-like values.
     pub fn new(
@@ -228,6 +234,11 @@ impl Dependency {
         }
         Ok(())
     }
+
+    /// Returns true if this dependency targets a virtual interface, library SONAME, or command symbol.
+    pub fn is_virtual(&self) -> bool {
+        is_virtual_symbol(&self.name)
+    }
 }
 
 impl FromStr for Dependency {
@@ -246,6 +257,8 @@ impl FromStr for Dependency {
             (Some(fields[0][..idx].into()), &fields[0][idx + 1..])
         } else if let Some(idx) = fields[0].find("/so:") {
             (Some(fields[0][..idx].into()), &fields[0][idx + 1..])
+        } else if let Some(idx) = fields[0].find("/cmd:") {
+            (Some(fields[0][..idx].into()), &fields[0][idx + 1..])
         } else {
             fields[0]
                 .rsplit_once('/')
@@ -253,7 +266,7 @@ impl FromStr for Dependency {
                     (Some(channel.into()), package)
                 })
         };
-        let (name, slot) = if package.starts_with("so:") {
+        let (name, slot) = if package.starts_with("so:") || package.starts_with("cmd:") {
             (package, None)
         } else {
             package

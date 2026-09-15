@@ -156,6 +156,41 @@ this read-only query during `service enable` when the native definition exists
 (and unconditionally during `service disable` and `service adopt`),
 ensuring query errors are surfaced before mutating state or persisting journals.
 
+### Two-phase atomic service generation and rollback (`CommitGuard`)
+
+When rendering the complete service graph (`render_service_set`), an init provider
+may manage an entire service directory (e.g. Loom's `/usr/lib/loom/services`) or
+emit secondary activation descriptors across the filesystem (e.g. D-Bus system-services).
+To prevent partial, unvalidated, or corrupted service states on the host:
+- **Temporary Staging and Backups**: Native definitions are rendered to temporary files;
+  pre-existing activation descriptors targeted for replacement or deletion are captured
+  in memory backups; managed directories are compiled in a private staging workspace.
+- **Atomic Validation and Rollback**: If any individual service fails template expansion,
+  or if the provider's global `validate_command` fails, the `CommitGuard` automatically
+  triggers a complete rollback: managed directories are reverted to their pre-transaction
+  snapshot, and all modified or deleted activation descriptors are restored from backup.
+  No stale, half-written, or failing service units remain active on disk.
+
+### Metadata priority: package metadata over historical rendered state
+
+Service definitions are resolved with strict source priority:
+- `load_installed_services` extracts the current, authoritative service metadata directly
+  from the `.METADATA/service.toml` embedded in currently installed package records in LMDB.
+- `load_rendered_services` inspects the historical `/var/lib/sage/rendered-services.toml`.
+- When reconciling or executing lifecycle commands, freshly unpacked package metadata
+  strictly overrides historical rendered definitions. This ensures package upgrades with
+  altered commands, sockets, or activation kinds take immediate effect rather than being
+  masked by obsolete historical configurations.
+
+### Configuration schema strictness and dirfd isolation
+
+- `/etc/sage/services.toml` enforces strict deserialization with `#[serde(deny_unknown_fields)]`.
+  Any unrecognized root keys fail closed immediately.
+- Service definition file unlinking and directory pruning under the target root are
+  anchored using directory file descriptors (`dirfd`, `unlinkat`, and `O_NOFOLLOW`).
+  Even if symlinks exist within the rendered service directory pointing outside `sysroot`,
+  the unlinking routines refuse to follow them, guaranteeing host filesystem safety.
+
 ---
 
 ## 3. 服务状态模型与不变量 (Service State Model & Invariants)

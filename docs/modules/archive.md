@@ -7,11 +7,12 @@
 
 ---
 
-## 1. 恒定代价检视 (`inspect_package`)
+## 1. 恒定代价检视与强校验 (`inspect_package`)
 
 流式读取 Zstandard 解压流：
 - 逐个匹配 Tar Entry 头部。
 - 读取 `.METADATA/manifest.toml`、`files.idx`、`service.toml`、`triggers.toml`。
+- **坐标强制校验**：解析 `manifest.toml` 后立即执行 `manifest.validate()`，严格检验包名、版本、架构、Slot、Channel 等坐标合法性，拒绝格式异常或含有路径穿越成分的恶意包。
 - 一旦检测到 `data/` 目录立即停止解包，耗时 < 1ms。
 
 ---

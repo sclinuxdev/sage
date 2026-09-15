@@ -97,3 +97,18 @@ usr/share/man/man1/rg.1	0644	4912	0123456789abcdef0123456789abcdef0123456789abcd
 records the selection baked into the immutable artifact. Conditional runtime
 dependencies are already expanded into `dependencies`, keeping repository lookup
 and the PubGrub hot path identical to ordinary packages.
+
+---
+
+## 5. 元数据不变量与提供者符号约束 (Manifest Invariants)
+
+为了保证归档在解析、安装和被依赖时具备确定性与安全性，`manifest.toml` 必须满足以下不变量：
+1. **坐标完备性**: `channel`, `name`, `slot`, `arch`, `version`, `release`, `epoch`, `license` 必须均通过 `Package::validate` 强校验；`license` 必须为合法的 SPDX 表达式。
+2. **依赖与冲突声明**:
+   - `dependencies` 与 `conflicts` 列表中的每个字符串必须符合 `Dependency` 语法规范；
+   - 依赖名允许为具象包名或由 `is_virtual_symbol` 认可的提供者符号（`virtual/*`, `so:*`, `cmd:*`）；
+   - 依赖版本约束操作符必须为合法符号（`=`, `!=`, `>`, `>=`, `<`, `<=`）；
+3. **提供者声明 (`provides`)**:
+   - 允许声明具象兼容别名、虚拟接口（`virtual/*`）、动态链接库符号（`so:*`）或命令行二进制提供者（`cmd:*`）；
+   - 严禁包含路径分隔符、控制字符或空白。
+

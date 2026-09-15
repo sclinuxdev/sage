@@ -17,7 +17,8 @@ pub use lock::{HostLock, under_root};
 pub use mmap::Mmap;
 pub use package::{
     ConstraintOp, Dependency, ManagedBuildTool, Package, PackageCoordinate, PackageKey,
-    valid_channel_name, valid_package_component, valid_provider_symbol, valid_version_string,
+    is_virtual_symbol, valid_channel_name, valid_package_component, valid_provider_symbol,
+    valid_version_string,
 };
 pub use symbol::{SymbolId, SymbolTable};
 pub use version::Version;
@@ -94,5 +95,25 @@ mod tests {
         // Valid conflict
         pkg.conflicts.push("other:1 >= 2.0-1".into());
         assert!(pkg.validate().is_ok());
+    }
+
+    #[test]
+    fn virtual_symbol_and_cmd_dependency_parsing() {
+        assert!(is_virtual_symbol("virtual/awk"));
+        assert!(is_virtual_symbol("so:libc.so.6"));
+        assert!(is_virtual_symbol("cmd:bash"));
+        assert!(!is_virtual_symbol("glibc"));
+
+        let dep1: Dependency = "cmd:grep >= 3.0-1".parse().unwrap();
+        assert_eq!(dep1.name, "cmd:grep");
+        assert_eq!(dep1.slot, None);
+        assert_eq!(dep1.channel, None);
+        assert!(dep1.is_virtual());
+
+        let dep2: Dependency = "main/system/cmd:bash".parse().unwrap();
+        assert_eq!(dep2.name, "cmd:bash");
+        assert_eq!(dep2.slot, None);
+        assert_eq!(dep2.channel.as_deref(), Some("main/system"));
+        assert!(dep2.is_virtual());
     }
 }
